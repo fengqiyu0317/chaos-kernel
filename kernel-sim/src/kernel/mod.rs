@@ -1,3 +1,5 @@
+// AGENT
+// Standalone copy of chaos/kernel/src/kernel.rs for future module splitting.
 #![allow(unused, dead_code, non_upper_case_globals, non_camel_case_types, unused_assignments, unused_mut)]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque, HashMap, LinkedList};
