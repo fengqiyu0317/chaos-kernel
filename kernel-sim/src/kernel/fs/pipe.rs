@@ -105,7 +105,6 @@ impl FLike {
                 let cloned = EpInst {
                     events: e.events.clone(),
                     ready: e.ready.clone(),
-                    new_ctl: e.new_ctl.clone(),
                 };
                 FLike::Ep(cloned)
             }

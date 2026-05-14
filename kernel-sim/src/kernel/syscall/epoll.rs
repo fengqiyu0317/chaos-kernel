@@ -47,6 +47,10 @@ pub(super) fn sys_epoll_ctl(
     }
 
     let task = kernel.cur_task(0).ok_or("esrch")?;
+    // AGENT: this only rejects direct self-watch; nested epoll instances would need cycle detection.
+    if fd == epfd {
+        return Err("einval");
+    }
     if task.get_file(fd).is_none() {
         return Err("eperm");
     }
