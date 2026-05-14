@@ -57,6 +57,7 @@ pub(super) fn sys_exit(kernel: &Kernel, a0: usize) -> Result<usize, &'static str
     let cur = kernel.cur_task(0);
     if let Some(t) = cur {
         t.exit_proc(status);
+        kernel.run_queue.remove(t.id());
         let parent = t.parent.lock().unwrap();
         if let Some(p) = parent.as_ref() {
             p.send_sig(SIGCHLD as i32, t.id() as isize);
@@ -70,6 +71,8 @@ pub(super) fn sys_exit(kernel: &Kernel, a0: usize) -> Result<usize, &'static str
                 init_task.subtasks.lock().unwrap().push(child);
             }
         }
+        kernel.set_cur(0, None);
+        kernel.schedule_next_runnable(0);
     }
     Ok(0)
 }

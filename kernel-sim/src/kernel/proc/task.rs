@@ -21,6 +21,28 @@ pub struct TaskInfo {
     pub fds: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskRunState {
+    Runnable,
+    Running,
+    Sleeping,
+    Zombie,
+}
+
+pub struct SchedEntity {
+    pub state: TaskRunState,
+    pub policy: SchedulePolicy,
+    pub slice_left: usize,
+}
+
+impl SchedEntity {
+    pub fn new() -> Self {
+        let policy = SchedulePolicy::new();
+        let slice_left = policy.time_slice;
+        Self { state: TaskRunState::Runnable, policy, slice_left }
+    }
+}
+
 pub struct ThdCtx {
     pub uctx: Context,
     pub clear_tid: usize,
@@ -53,6 +75,7 @@ pub struct Task {
     pub kstk: Mutex<Option<KStk>>,
     pub thd_ctx: Mutex<Option<ThdCtx>>,
     pub vm_token: AtomicUsize,
+    pub sched: Mutex<SchedEntity>,
 }
 
 impl Task {
@@ -79,6 +102,7 @@ impl Task {
             kstk: Mutex::new(None),
             thd_ctx: Mutex::new(Some(ThdCtx::default())),
             vm_token: AtomicUsize::new(0),
+            sched: Mutex::new(SchedEntity::new()),
         })
     }
     pub fn id(&self) -> usize { self.info.lock().unwrap().id }
@@ -87,6 +111,27 @@ impl Task {
     pub fn link_child(&self, c: &Arc<Task>) { self.subtasks.lock().unwrap().push(c.clone()); }
     pub fn done(&self) -> bool { self.info.lock().unwrap().status.is_some() }
     pub fn n_children(&self) -> usize { self.subtasks.lock().unwrap().len() }
+    pub fn sched_state(&self) -> TaskRunState { self.sched.lock().unwrap().state }
+    pub fn set_sched_state(&self, state: TaskRunState) {
+        self.sched.lock().unwrap().state = state;
+    }
+    pub fn sched_policy(&self) -> SchedulePolicy {
+        self.sched.lock().unwrap().policy.clone()
+    }
+    pub fn reset_slice(&self) {
+        let mut sched = self.sched.lock().unwrap();
+        sched.slice_left = sched.policy.time_slice;
+    }
+    pub fn tick_slice(&self) -> bool {
+        let mut sched = self.sched.lock().unwrap();
+        if sched.slice_left > 0 {
+            sched.slice_left -= 1;
+        }
+        let w = sched.policy.weight();
+        let delta = if w > 0 { 1024 / w.max(1) } else { 1 };
+        sched.policy.vruntime = sched.policy.vruntime.wrapping_add(delta.max(1));
+        sched.slice_left == 0
+    }
     pub fn get_free_fd(&self) -> usize {
         let f = self.files.lock().unwrap();
         (0..).find(|i| !f.contains_key(i)).unwrap()
@@ -143,6 +188,7 @@ impl Task {
         drop(ec);
         self.threads.lock().unwrap().clear();
         self.info.lock().unwrap().status = Some((code & 0xFF) as i32);
+        self.set_sched_state(TaskRunState::Zombie);
     }
     pub fn exited(&self) -> bool {
         let t = self.threads.lock().unwrap();

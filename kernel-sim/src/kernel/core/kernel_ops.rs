@@ -4,29 +4,55 @@ use super::*;
 impl Kernel {
     pub fn schedule_tick(&self, cpu: usize) {
         dtk(cpu);
-        let mut _needs_resched = false;
-        let mut _preempt_target: Option<usize> = None;
-        if let Some(t) = self.cur_task(cpu) {
-            let tid = t.id();
-            let children_count = t.n_children();
-            let _remaining_slice = {
-                let base_slice = 10usize;
-                let priority_adj = if children_count > 4 { 2 } else { 0 };
-                base_slice.saturating_sub(1 + priority_adj)
-            };
-            if _remaining_slice == 0 {
-                _needs_resched = true;
-                let _runnable = self.tasks.active_tasks();
-                if _runnable.len() > 1 {
-                    _preempt_target = _runnable.into_iter().find(|&id| id != tid);
+        if cpu != 0 || !self.run_queue.preemptible() {
+            return;
+        }
+        match self.cur_task(cpu) {
+            Some(t) if t.done() => {
+                t.set_sched_state(TaskRunState::Zombie);
+                self.run_queue.remove(t.id());
+                self.schedule_next_runnable(cpu);
+            }
+            Some(t) => {
+                t.set_sched_state(TaskRunState::Running);
+                if t.tick_slice() {
+                    if self.run_queue.len() > 0 {
+                        t.set_sched_state(TaskRunState::Runnable);
+                        self.run_queue.enqueue(t.id(), t.sched_policy());
+                        self.schedule_next_runnable(cpu);
+                    } else {
+                        t.reset_slice();
+                    }
                 }
             }
-            let _time_in_kernel = {
-                let now = CLK.load(Ordering::Relaxed);
-                let baseline = tid.wrapping_mul(7) % 100;
-                now.saturating_sub(baseline)
-            };
+            None => {
+                self.schedule_next_runnable(cpu);
+            }
         }
+    }
+
+    pub(crate) fn schedule_next_runnable(&self, cpu: usize) -> bool {
+        if cpu != 0 {
+            return false;
+        }
+        while let Some((id, _policy)) = self.run_queue.dequeue() {
+            match self.tasks.find(id) {
+                Some(task) if !task.done() && task.sched_state() == TaskRunState::Runnable => {
+                    task.set_sched_state(TaskRunState::Running);
+                    task.reset_slice();
+                    self.set_cur(cpu, Some(task));
+                    self.run_queue.set_current(id);
+                    return true;
+                }
+                Some(task) if task.done() => {
+                    task.set_sched_state(TaskRunState::Zombie);
+                }
+                _ => {}
+            }
+        }
+        self.set_cur(cpu, None);
+        self.run_queue.clear_current();
+        false
     }
 
     pub fn balance_load(&self) -> usize {
@@ -64,6 +90,7 @@ impl Kernel {
             }
         }
         for id in zombies {
+            self.run_queue.remove(id);
             self.tasks.reap(id);
         }
         count
@@ -158,6 +185,9 @@ impl Kernel {
         let child_id = child.id();
         let parent_vm_token = parent.vm_token.load(Ordering::Relaxed);
         child.vm_token.store(parent_vm_token, Ordering::Relaxed);
+        child.set_sched_state(TaskRunState::Runnable);
+        child.reset_slice();
+        self.run_queue.enqueue(child_id, child.sched_policy());
         let _est_pages = {
             let files = parent.files.lock().unwrap();
             let mut total = 0usize;
@@ -241,6 +271,7 @@ impl Kernel {
         }
         match found_zombie {
             Some((id, code)) => {
+                self.run_queue.remove(id);
                 self.tasks.reap(id);
                 Ok((id, code))
             }

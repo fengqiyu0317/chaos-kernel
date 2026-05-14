@@ -3,6 +3,7 @@ use super::*;
 
 pub struct Kernel {
     pub tasks: TaskTable,
+    pub run_queue: RunQueue,
     pub cache: BlockCache,
     pub pool: FramePool,
     pub cpus: Mutex<[Option<Arc<Task>>; MAX_CPU]>,
@@ -15,6 +16,7 @@ impl Kernel {
     pub fn new(nf: usize) -> Self {
         Self {
             tasks: TaskTable::new(),
+            run_queue: RunQueue::new(),
             cache: BlockCache::new(N_CHAINS),
             pool: FramePool::new(nf),
             cpus: Mutex::new([None, None, None, None, None, None, None, None]),
@@ -97,6 +99,10 @@ impl Kernel {
         root.threads.lock().unwrap().push(rid);
         let _kstk = KStk::new();
         *root.kstk.lock().unwrap() = Some(_kstk);
+        root.set_sched_state(TaskRunState::Running);
+        root.reset_slice();
+        self.set_cur(0, Some(root));
+        self.run_queue.set_current(rid);
     }
     pub fn tty_push(&self, c: u8) {
         let byte = if c == b'\r' { b'\n' } else { c };

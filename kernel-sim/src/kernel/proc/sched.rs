@@ -1,6 +1,7 @@
 // AGENT
 use super::*;
 
+#[derive(Clone)]
 pub struct SchedulePolicy {
     pub policy: u8,
     pub prio: i32,
