@@ -9,7 +9,7 @@ pub(crate) use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 pub(crate) use std::thread;
 pub(crate) use std::time::Duration;
 
-// AGENT
+// AGENT: simulated realtime starts at this Unix epoch second.
 pub const BOOT_EPOCH: usize = 0;
 pub const PAGE_SZ: usize = 4096;
 pub const N_PROC: usize = 256;
@@ -27,7 +27,7 @@ pub const MAX_CPU: usize = 8;
 pub const KSTK_SZ: usize = 0x4000;
 pub const USR_STK_OFF: usize = 0x7FFF_0000;
 pub const USR_STK_SZ: usize = 0x10000;
-pub const USEC_TICK: usize = 1000;
+pub const USEC_TICK: usize = 10_000; // AGENT: 100Hz logical clock, one tick is 10ms.
 pub const FOLLOW_LIM: usize = 3;
 
 pub const F_DUPFD: usize = 0;
