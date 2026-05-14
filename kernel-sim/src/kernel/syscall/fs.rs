@@ -1,4 +1,7 @@
-fn sys_read(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
+// AGENT
+use super::*;
+
+pub(super) fn sys_read(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
     let fd = a0;
     let buf_addr = a1;
     let count = a2;
@@ -36,7 +39,7 @@ fn sys_read(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &
     }
 }
 
-fn sys_write(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_write(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
     let fd = a0;
     let buf_addr = a1;
     let count = a2;
@@ -76,7 +79,7 @@ fn sys_write(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, 
     Ok(actual_len)
 }
 
-fn sys_open(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_open(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
     let path_addr = a0;
     let flags = a1;
     let mode = a2;
@@ -150,9 +153,10 @@ fn sys_open(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &
     Ok(fd)
 }
 
-fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
     let fd = a0;
-    if fd > N_PROC * 4 {
+    // AGENT: use the fd limit instead of the process-count constant.
+    if fd >= MAX_FD {
         return Err("ebadf");
     }
     let ci = (fd ^ (fd >> 7)) % kernel.cache.width; // AGENT: match fetch()/invalidate() hash
@@ -179,7 +183,7 @@ fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
     Ok(0)
 }
 
-fn sys_stat(kernel: &Kernel, nr: usize, a0: usize, a1: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_stat(kernel: &Kernel, nr: usize, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let stat_buf = a1;
     if stat_buf == 0 {
         return Err("efault");
@@ -202,7 +206,7 @@ fn sys_stat(kernel: &Kernel, nr: usize, a0: usize, a1: usize) -> Result<usize, &
     Ok(0)
 }
 
-fn sys_ioctl(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_ioctl(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
     let fd = a0;
     let cmd = a1;
     let arg = a2;
@@ -249,7 +253,7 @@ fn sys_ioctl(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, 
     }
 }
 
-fn sys_pipe(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_pipe(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let fds_addr = a0;
     let pipe_flags = a1;
     if fds_addr == 0 {
@@ -261,7 +265,8 @@ fn sys_pipe(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str
     let cur = kernel.cur_task(0);
     if let Some(t) = cur {
         let fd_count = t.fd_count();
-        if fd_count + 2 > N_PROC {
+        // AGENT: pipe consumes two file descriptors, bounded by MAX_FD.
+        if fd_count + 2 > MAX_FD {
             return Err("emfile");
         }
         let (rd, wr) = PipeNode::pair();
@@ -275,10 +280,11 @@ fn sys_pipe(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str
     }
 }
 
-fn sys_dup(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_dup(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
     // AGENT: fixed — was not checking old_fd existence, not duplicating file object, and searching from old_fd instead of 0
     let old_fd = a0;
-    if old_fd >= N_PROC * 4 {
+    // AGENT: validate fd number against the fd limit, not N_PROC.
+    if old_fd >= MAX_FD {
         return Err("ebadf");
     }
     let cur = kernel.cur_task(0);
@@ -300,13 +306,14 @@ fn sys_dup(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
     Ok(new_fd)
 }
 
-fn sys_dup2(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_dup2(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let old_fd = a0;
     let new_fd = a1;
-    if old_fd >= N_PROC * 4 {
+    // AGENT: validate both fd numbers against the fd limit, not N_PROC.
+    if old_fd >= MAX_FD {
         return Err("ebadf");
     }
-    if new_fd >= N_PROC * 4 {
+    if new_fd >= MAX_FD {
         return Err("ebadf");
     }
     if old_fd == new_fd {
@@ -326,11 +333,12 @@ fn sys_dup2(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str
     Ok(new_fd)
 }
 
-fn sys_fcntl(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_fcntl(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
     let fd = a0;
     let cmd = a1;
     let arg = a2;
-    if fd >= N_PROC * 4 {
+    // AGENT: fcntl operates on fd numbers, so use MAX_FD as the boundary.
+    if fd >= MAX_FD {
         return Err("ebadf");
     }
     match cmd {

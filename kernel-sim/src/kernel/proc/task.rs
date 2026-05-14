@@ -1,3 +1,6 @@
+// AGENT
+use super::*;
+
 #[derive(Clone)]
 pub struct Pid(pub usize);
 impl Pid {
@@ -145,17 +148,13 @@ impl Task {
         let t = self.threads.lock().unwrap();
         t.is_empty() || self.info.lock().unwrap().status.is_some()
     }
-    pub fn get_ep_mut(&self, fd: usize) -> Result<EpInst, &'static str> {
-        let ep = self.ep_inst.lock().unwrap();
-        match ep.get(&fd) {
-            Some(e) => {
-                let cl = EpInst { events: e.events.clone(), ready: e.ready.clone(), new_ctl: e.new_ctl.clone() };
-                Ok(cl)
-            }
-            None => Err("eperm"),
-        }
+    // AGENT: expose mutation through a closure so callers update the real EpInst,
+    // not a cloned copy that would need to be written back.
+    pub fn with_ep_mut<R>(&self, fd: usize, f: impl FnOnce(&mut EpInst) -> Result<R, &'static str>) -> Result<R, &'static str> {
+        let mut ep = self.ep_inst.lock().unwrap();
+        let inst = ep.get_mut(&fd).ok_or("eperm")?;
+        f(inst)
     }
-    pub fn get_ep_ref(&self, fd: usize) -> Result<EpInst, &'static str> { self.get_ep_mut(fd) }
     pub fn set_ep(&self, fd: usize, inst: EpInst) {
         let mut ep = self.ep_inst.lock().unwrap();
         ep.insert(fd, inst);

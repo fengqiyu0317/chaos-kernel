@@ -1,6 +1,11 @@
+// AGENT
+use super::*;
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct EpData { pub ptr: u64 }
 
+#[repr(C)]
 #[derive(Clone)]
 pub struct EpEvent { pub events: u32, pub data: EpData }
 impl EpEvent {

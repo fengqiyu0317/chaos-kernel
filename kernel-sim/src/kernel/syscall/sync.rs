@@ -1,4 +1,7 @@
-fn sys_futex(
+// AGENT
+use super::*;
+
+pub(super) fn sys_futex(
     kernel: &Kernel,
     a0: usize,
     a1: usize,

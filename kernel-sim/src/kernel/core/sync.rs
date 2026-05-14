@@ -1,7 +1,10 @@
+// AGENT
+use super::*;
+
 pub struct KernLock {
-    flag: AtomicBool,
-    holder: AtomicUsize,
-    depth: AtomicUsize,
+    pub(crate) flag: AtomicBool,
+    pub(crate) holder: AtomicUsize,
+    pub(crate) depth: AtomicUsize,
 }
 impl KernLock {
     pub const fn new() -> Self {
@@ -19,7 +22,7 @@ impl KernLock {
             return;
         }
         while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
+            ::core::hint::spin_loop();
         }
         self.holder.store(id, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
@@ -58,12 +61,12 @@ unsafe impl Sync for KernLock {}
 pub static GKL: KernLock = KernLock::new();
 
 
-pub struct Spin { v: AtomicBool }
+pub struct Spin { pub(crate) v: AtomicBool }
 impl Spin {
     pub const fn new() -> Self { Self { v: AtomicBool::new(false) } }
     pub fn acquire(&self) {
         while self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
+            ::core::hint::spin_loop();
         }
     }
     pub fn try_acquire(&self) -> bool {
@@ -141,7 +144,7 @@ pub enum SocketState {
 }
 
 pub struct SyncQueue {
-    q: Mutex<VecDeque<thread::Thread>>,
+    pub(crate) q: Mutex<VecDeque<thread::Thread>>,
     eq: Mutex<VecDeque<RegEp>>,
 }
 impl SyncQueue {

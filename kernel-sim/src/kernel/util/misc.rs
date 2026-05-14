@@ -1,3 +1,6 @@
+// AGENT
+use super::*;
+
 pub fn validate_access(mode: u8, addr: usize, len: usize, pid: usize) -> Result<(), &'static str> {
     if len == 0 { return Ok(()); }
     let end = addr.wrapping_add(len);

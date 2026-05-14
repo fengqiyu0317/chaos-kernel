@@ -1,3 +1,6 @@
+// AGENT
+use super::*;
+
 pub struct Channel {
     pub buf: Mutex<CircBuf>,
     pub guard: Spin,
@@ -25,7 +28,7 @@ impl Channel {
     pub fn recv(&self) -> Option<u8> {
         loop {
             if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                core::hint::spin_loop();
+                ::core::hint::spin_loop();
                 continue;
             }
             break;
@@ -168,7 +171,7 @@ impl Channel {
         // HUMAN: add the lock
         loop {
             if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                core::hint::spin_loop();
+                ::core::hint::spin_loop();
                 continue;
             }
             break;

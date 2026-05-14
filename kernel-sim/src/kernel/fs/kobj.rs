@@ -1,3 +1,6 @@
+// AGENT
+use super::*;
+
 pub struct KObjEntry {
     pub obj_id: usize,
     pub type_tag: u32,

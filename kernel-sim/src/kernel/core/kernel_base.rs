@@ -1,3 +1,6 @@
+// AGENT
+use super::*;
+
 pub struct Kernel {
     pub tasks: TaskTable,
     pub cache: BlockCache,
@@ -27,7 +30,7 @@ impl Kernel {
         if GKL.holder.load(Ordering::Relaxed) == id {
             GKL.depth.fetch_add(1, Ordering::Relaxed);
         } else {
-            while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
+            while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { ::core::hint::spin_loop(); }
             GKL.holder.store(id, Ordering::Relaxed);
             GKL.depth.store(1, Ordering::Relaxed);
         }
@@ -44,7 +47,7 @@ impl Kernel {
         {
             for ci in 0..self.cache.chains.len() {
                 let ch = &self.cache.chains[ci];
-                while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
+                while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { ::core::hint::spin_loop(); }
                 { let mut items = ch.items.lock().unwrap(); for s in items.iter_mut() { s.modified = false; } }
                 ch.lk.v.store(false, Ordering::Release);
             }

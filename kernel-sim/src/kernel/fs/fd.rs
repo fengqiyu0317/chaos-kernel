@@ -1,3 +1,6 @@
+// AGENT
+use super::*;
+
 #[derive(Debug, Clone, Copy)]
 pub struct FdOpt {
     pub rd: bool,
@@ -9,7 +12,7 @@ impl Default for FdOpt {
     fn default() -> Self { Self { rd: true, wr: false, ap: false, nb: false } }
 }
 
-struct FdState { off: u64, opt: FdOpt, flk: u8 }
+pub(crate) struct FdState { pub(crate) off: u64, pub(crate) opt: FdOpt, pub(crate) flk: u8 }
 impl FdState {
     fn create(opt: FdOpt) -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(FdState { off: 0, opt, flk: 0 }))
@@ -20,7 +23,7 @@ impl FdState {
 pub struct FHandle {
     pub path: String,
     pub data: Arc<Mutex<Vec<u8>>>,
-    desc: Arc<RwLock<FdState>>,
+    pub(crate) desc: Arc<RwLock<FdState>>,
     pub pipe: bool,
     pub cloexec: bool,
 }

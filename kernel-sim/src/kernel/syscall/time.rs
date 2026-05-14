@@ -1,4 +1,7 @@
-fn sys_clock_gettime(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
+// AGENT
+use super::*;
+
+pub(super) fn sys_clock_gettime(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let clk_id = a0;
     let tp_addr = a1;
     if tp_addr == 0 {

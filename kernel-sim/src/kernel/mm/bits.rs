@@ -1,3 +1,6 @@
+// AGENT
+use super::*;
+
 pub fn bitwise_merge(a: u64, b: u64, mask: u64) -> u64 {
     (a & !mask) | (b & mask)
 }

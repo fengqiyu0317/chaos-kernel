@@ -1,17 +1,19 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque, HashMap, LinkedList};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak, Condvar};
-use std::thread;
-use std::time::Duration;
-use std::fmt;
-use std::ops::{Deref, DerefMut, Index};
-use std::any::Any;
-use std::cmp::{min, max, Ordering as CmpOrd};
+// AGENT
+pub(crate) use std::any::Any;
+pub(crate) use std::cmp::{max, min, Ordering as CmpOrd};
+pub(crate) use std::collections::{BTreeMap, BTreeSet, HashMap, LinkedList, VecDeque};
+pub(crate) use std::fmt;
+pub(crate) use std::ops::{Deref, DerefMut, Index};
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+pub(crate) use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+pub(crate) use std::thread;
+pub(crate) use std::time::Duration;
 
 // AGENT
 pub const BOOT_EPOCH: usize = 0;
 pub const PAGE_SZ: usize = 4096;
 pub const N_PROC: usize = 256;
+pub const MAX_FD: usize = 256; // AGENT
 pub const N_FRAMES: usize = 65536;
 pub const KERN_BASE: usize = 0xFFFF_FFFF_8000_0000;
 pub const PHYS_OFF: usize = 0xFFFF_FFFF_0000_0000;

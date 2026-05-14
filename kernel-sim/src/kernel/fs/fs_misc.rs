@@ -1,3 +1,6 @@
+// AGENT
+use super::*;
+
 pub struct CircBuf {
     pub data: Vec<u8>,
     pub rd: usize,

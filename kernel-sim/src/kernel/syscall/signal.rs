@@ -1,4 +1,7 @@
-fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
+// AGENT
+use super::*;
+
+pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let pid = a0 as isize;
     let sig = a1;
     if sig > NSIG as usize {
@@ -65,7 +68,7 @@ fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str
     }
 }
 
-fn sys_sigaction(
+pub(super) fn sys_sigaction(
     kernel: &Kernel,
     a0: usize,
     a1: usize,
@@ -93,7 +96,7 @@ fn sys_sigaction(
     Ok(0)
 }
 
-fn sys_sigprocmask(
+pub(super) fn sys_sigprocmask(
     kernel: &Kernel,
     a0: usize,
     a1: usize,

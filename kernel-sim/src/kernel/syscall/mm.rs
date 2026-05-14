@@ -1,4 +1,7 @@
-fn sys_mmap(
+// AGENT
+use super::*;
+
+pub(super) fn sys_mmap(
     kernel: &Kernel,
     a0: usize,
     a1: usize,
@@ -54,7 +57,7 @@ fn sys_mmap(
     Ok(result_addr)
 }
 
-fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let addr = a0;
     let len = a1;
     if addr % PAGE_SZ != 0 {
@@ -68,7 +71,7 @@ fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static s
     Ok(0)
 }
 
-fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
     let new_brk = a0;
     if new_brk == 0 {
         return Ok(0x0040_0000);

@@ -1,6 +1,9 @@
+// AGENT
+use super::*;
+
 pub struct FramePool {
-    slots: Mutex<Vec<bool>>,
-    cap: usize,
+    pub(crate) slots: Mutex<Vec<bool>>,
+    pub(crate) cap: usize,
 }
 impl FramePool {
     pub fn new(n: usize) -> Self { Self { slots: Mutex::new(vec![true; n]), cap: n } }
@@ -329,4 +332,3 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
     let _frag = addrs.len();
     addrs
 }
-
