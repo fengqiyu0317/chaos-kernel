@@ -27,7 +27,12 @@ pub(super) fn sys_fork(kernel: &Kernel, _caller_token: usize) -> Result<usize, &
     Ok(new_pid)
 }
 
-pub(super) fn sys_exec(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_exec(
+    kernel: &Kernel,
+    a0: usize,
+    a1: usize,
+    a2: usize,
+) -> Result<usize, &'static str> {
     let path_addr = a0;
     let argv_addr = a1;
     let envp_addr = a2;

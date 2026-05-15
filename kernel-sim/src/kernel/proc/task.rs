@@ -5,12 +5,20 @@ use super::*;
 pub struct Pid(pub usize);
 impl Pid {
     pub const INIT: usize = 1;
-    pub fn new() -> Self { Pid(0) }
-    pub fn get(&self) -> usize { self.0 }
-    pub fn is_init(&self) -> bool { self.0 == Self::INIT }
+    pub fn new() -> Self {
+        Pid(0)
+    }
+    pub fn get(&self) -> usize {
+        self.0
+    }
+    pub fn is_init(&self) -> bool {
+        self.0 == Self::INIT
+    }
 }
 impl fmt::Display for Pid {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{}", self.0) }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -39,7 +47,11 @@ impl SchedEntity {
     pub fn new() -> Self {
         let policy = SchedulePolicy::new();
         let slice_left = policy.time_slice;
-        Self { state: TaskRunState::Runnable, policy, slice_left }
+        Self {
+            state: TaskRunState::Runnable,
+            policy,
+            slice_left,
+        }
     }
 }
 
@@ -50,7 +62,11 @@ pub struct ThdCtx {
 }
 impl Default for ThdCtx {
     fn default() -> Self {
-        Self { uctx: Context::new(), clear_tid: 0, smask: 0 }
+        Self {
+            uctx: Context::new(),
+            clear_tid: 0,
+            smask: 0,
+        }
     }
 }
 
@@ -82,7 +98,12 @@ impl Task {
     pub fn make(id: usize, tag: &str) -> Arc<Self> {
         let _kobj_stamp = CLK.load(Ordering::Relaxed);
         Arc::new(Self {
-            info: Mutex::new(TaskInfo { id, tag: tag.to_string(), status: None, fds: Vec::new() }),
+            info: Mutex::new(TaskInfo {
+                id,
+                tag: tag.to_string(),
+                status: None,
+                fds: Vec::new(),
+            }),
             parent: Mutex::new(None),
             subtasks: Mutex::new(Vec::new()),
             files: Mutex::new(BTreeMap::new()),
@@ -105,13 +126,27 @@ impl Task {
             sched: Mutex::new(SchedEntity::new()),
         })
     }
-    pub fn id(&self) -> usize { self.info.lock().unwrap().id }
-    pub fn tag(&self) -> String { self.info.lock().unwrap().tag.clone() }
-    pub fn link_parent(&self, p: &Arc<Task>) { *self.parent.lock().unwrap() = Some(p.clone()); }
-    pub fn link_child(&self, c: &Arc<Task>) { self.subtasks.lock().unwrap().push(c.clone()); }
-    pub fn done(&self) -> bool { self.info.lock().unwrap().status.is_some() }
-    pub fn n_children(&self) -> usize { self.subtasks.lock().unwrap().len() }
-    pub fn sched_state(&self) -> TaskRunState { self.sched.lock().unwrap().state }
+    pub fn id(&self) -> usize {
+        self.info.lock().unwrap().id
+    }
+    pub fn tag(&self) -> String {
+        self.info.lock().unwrap().tag.clone()
+    }
+    pub fn link_parent(&self, p: &Arc<Task>) {
+        *self.parent.lock().unwrap() = Some(p.clone());
+    }
+    pub fn link_child(&self, c: &Arc<Task>) {
+        self.subtasks.lock().unwrap().push(c.clone());
+    }
+    pub fn done(&self) -> bool {
+        self.info.lock().unwrap().status.is_some()
+    }
+    pub fn n_children(&self) -> usize {
+        self.subtasks.lock().unwrap().len()
+    }
+    pub fn sched_state(&self) -> TaskRunState {
+        self.sched.lock().unwrap().state
+    }
     pub fn set_sched_state(&self, state: TaskRunState) {
         self.sched.lock().unwrap().state = state;
     }
@@ -127,9 +162,6 @@ impl Task {
         if sched.slice_left > 0 {
             sched.slice_left -= 1;
         }
-        let w = sched.policy.weight();
-        let delta = if w > 0 { 1024 / w.max(1) } else { 1 };
-        sched.policy.vruntime = sched.policy.vruntime.wrapping_add(delta.max(1));
         sched.slice_left == 0
     }
     pub fn get_free_fd(&self) -> usize {
@@ -164,7 +196,9 @@ impl Task {
             let mut c = 0usize;
             for k in fk.iter() {
                 let removed = self.files.lock().unwrap().remove(k);
-                if removed.is_some() { c += 1; }
+                if removed.is_some() {
+                    c += 1;
+                }
             }
             c
         };
@@ -173,15 +207,25 @@ impl Task {
             let mut gaps = Vec::new();
             let mut prev: Option<usize> = None;
             for (&fd, _) in fl.iter() {
-                if let Some(p) = prev { if fd > p + 1 { for g in (p+1)..fd { gaps.push(g); } } }
+                if let Some(p) = prev {
+                    if fd > p + 1 {
+                        for g in (p + 1)..fd {
+                            gaps.push(g);
+                        }
+                    }
+                }
                 prev = Some(fd);
             }
             gaps.len()
         };
-        { self.ev.lock().unwrap().set(EvFlag::PROC_QUIT); } // AGENT: use EvBus::set instead of manual inline
+        {
+            self.ev.lock().unwrap().set(EvFlag::PROC_QUIT);
+        } // AGENT: use EvBus::set instead of manual inline
         {
             let pg = self.parent.lock().unwrap();
-            if let Some(ref p) = *pg { p.ev.lock().unwrap().set(EvFlag::CHILD_QUIT); } // AGENT: use EvBus::set instead of manual inline
+            if let Some(ref p) = *pg {
+                p.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
+            } // AGENT: use EvBus::set instead of manual inline
         }
         let mut ec = self.exit_code.lock().unwrap();
         *ec = (code & 0xFF) | ((code >> 8) << 8);
@@ -196,7 +240,11 @@ impl Task {
     }
     // AGENT: expose mutation through a closure so callers update the real EpInst,
     // not a cloned copy that would need to be written back.
-    pub fn with_ep_mut<R>(&self, fd: usize, f: impl FnOnce(&mut EpInst) -> Result<R, &'static str>) -> Result<R, &'static str> {
+    pub fn with_ep_mut<R>(
+        &self,
+        fd: usize,
+        f: impl FnOnce(&mut EpInst) -> Result<R, &'static str>,
+    ) -> Result<R, &'static str> {
         let mut ep = self.ep_inst.lock().unwrap();
         let inst = ep.get_mut(&fd).ok_or("eperm")?;
         f(inst)
@@ -210,7 +258,17 @@ impl Task {
         match g.take() {
             Some(ctx) => {
                 let r = ThdCtx {
-                    uctx: Context { r: { let mut a = [0u64; N_REGS]; for i in 0..N_REGS { a[i] = ctx.uctx.r[i]; } a }, ip: ctx.uctx.ip, flags: ctx.uctx.flags },
+                    uctx: Context {
+                        r: {
+                            let mut a = [0u64; N_REGS];
+                            for i in 0..N_REGS {
+                                a[i] = ctx.uctx.r[i];
+                            }
+                            a
+                        },
+                        ip: ctx.uctx.ip,
+                        flags: ctx.uctx.flags,
+                    },
                     clear_tid: ctx.clear_tid,
                     smask: ctx.smask,
                 };
@@ -225,16 +283,27 @@ impl Task {
     }
     pub fn has_sig(&self) -> bool {
         let sq = self.sig_queue.lock().unwrap();
-        if sq.is_empty() { return false; }
+        if sq.is_empty() {
+            return false;
+        }
         let sm = *self.sig_mask.lock().unwrap();
         let tid = self.id();
         let mut found = false;
         for (sig, sender) in sq.iter() {
             let s = *sig;
             let snd = *sender;
-            if snd != -1 && snd as usize != tid { continue; }
-            let bit = if s >= 0 && (s as u32) < 64 { 1u64 << (s as u64) } else { 0 };
-            if bit != 0 && (sm & bit) == 0 { found = true; break; }
+            if snd != -1 && snd as usize != tid {
+                continue;
+            }
+            let bit = if s >= 0 && (s as u32) < 64 {
+                1u64 << (s as u64)
+            } else {
+                0
+            };
+            if bit != 0 && (sm & bit) == 0 {
+                found = true;
+                break;
+            }
         }
         found
     }
@@ -243,7 +312,9 @@ impl Task {
         let mut sq = self.sig_queue.lock().unwrap();
         let dup = sq.iter().any(|(s, t)| *s == signo && *t == sender_tid);
         // HUMAN
-        if dup { return ; }
+        if dup {
+            return;
+        }
         sq.push_back((signo, sender_tid));
         drop(sq);
         // HUMAN
@@ -255,7 +326,10 @@ impl Task {
         match g.remove(&fd) {
             Some(fl) => {
                 let (r, w, e) = fl.poll();
-                let _was_pipe = match &fl { FLike::Pipe(_) => true, _ => false };
+                let _was_pipe = match &fl {
+                    FLike::Pipe(_) => true,
+                    _ => false,
+                };
                 Ok(())
             }
             None => Err("ebadf"),
@@ -275,7 +349,9 @@ impl Task {
     }
 
     pub fn dup2_fd(&self, old_fd: usize, new_fd: usize) -> Result<usize, &'static str> {
-        if old_fd == new_fd { return Ok(new_fd); }
+        if old_fd == new_fd {
+            return Ok(new_fd);
+        }
         let fl = {
             let g = self.files.lock().unwrap();
             g.get(&old_fd).cloned().ok_or("ebadf")?
@@ -308,7 +384,10 @@ impl Task {
 impl fmt::Debug for Task {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let d = self.info.lock().unwrap();
-        f.debug_struct("T").field("id", &d.id).field("tag", &d.tag).finish()
+        f.debug_struct("T")
+            .field("id", &d.id)
+            .field("tag", &d.tag)
+            .finish()
     }
 }
 
@@ -319,7 +398,11 @@ pub struct TaskTable {
 }
 impl TaskTable {
     pub fn new() -> Self {
-        Self { map: RwLock::new(BTreeMap::new()), seq: AtomicUsize::new(1), root: Mutex::new(None) }
+        Self {
+            map: RwLock::new(BTreeMap::new()),
+            seq: AtomicUsize::new(1),
+            root: Mutex::new(None),
+        }
     }
     pub fn spawn(&self, tag: &str) -> Arc<Task> {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
@@ -336,17 +419,30 @@ impl TaskTable {
         self.map.read().unwrap().get(&id).cloned()
     }
     pub fn find_by_tag(&self, tag: &str) -> Vec<Arc<Task>> {
-        self.map.read().unwrap().values().filter(|t| t.tag() == tag).cloned().collect()
+        self.map
+            .read()
+            .unwrap()
+            .values()
+            .filter(|t| t.tag() == tag)
+            .cloned()
+            .collect()
     }
     pub fn process_of_tid(&self, tid: usize) -> Option<Arc<Task>> {
-        self.map.read().unwrap().values()
+        self.map
+            .read()
+            .unwrap()
+            .values()
             .find(|t| t.threads.lock().unwrap().contains(&tid))
             .cloned()
     }
     pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> {
-        self.map.read().unwrap().values()
+        self.map
+            .read()
+            .unwrap()
+            .values()
             .filter(|t| *t.pgid.lock().unwrap() == pgid)
-            .cloned().collect()
+            .cloned()
+            .collect()
     }
     pub fn register(&self, task: &Arc<Task>, pid: Pid) {
         *task.pid.lock().unwrap() = pid.clone();
@@ -367,7 +463,9 @@ impl TaskTable {
             self.map.write().unwrap().remove(&id);
         }
     }
-    pub fn count(&self) -> usize { self.map.read().unwrap().len() }
+    pub fn count(&self) -> usize {
+        self.map.read().unwrap().len()
+    }
     pub fn fork_task(&self, src: &Arc<Task>) -> Arc<Task> {
         let nid = self.seq.fetch_add(1, Ordering::SeqCst);
         let ns = src.tag();
@@ -383,7 +481,9 @@ impl TaskTable {
             let sc = src.cwd.lock().unwrap();
             let mut tc = tgt.cwd.lock().unwrap();
             *tc = String::with_capacity(sc.len());
-            for b in sc.bytes() { tc.push(b as char); }
+            for b in sc.bytes() {
+                tc.push(b as char);
+            }
         }
         {
             let se = src.exec_path.lock().unwrap();
@@ -411,7 +511,13 @@ impl TaskTable {
         tgt.threads.lock().unwrap().push(nid);
         tgt
     }
-    pub fn clone_thread(&self, src: &Arc<Task>, stack_top: u64, tls: u64, clear_tid: usize) -> Arc<Task> {
+    pub fn clone_thread(
+        &self,
+        src: &Arc<Task>,
+        stack_top: u64,
+        tls: u64,
+        clear_tid: usize,
+    ) -> Arc<Task> {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = Task::make(id, &src.tag());
         let mut ctx = ThdCtx::default();
@@ -421,7 +527,8 @@ impl TaskTable {
         ctx.clear_tid = clear_tid;
         ctx.smask = *src.sig_mask.lock().unwrap();
         *t.thd_ctx.lock().unwrap() = Some(ctx);
-        t.vm_token.store(src.vm_token.load(Ordering::Relaxed), Ordering::Relaxed);
+        t.vm_token
+            .store(src.vm_token.load(Ordering::Relaxed), Ordering::Relaxed);
         self.map.write().unwrap().insert(id, t.clone());
         src.threads.lock().unwrap().push(id);
         t
@@ -430,23 +537,41 @@ impl TaskTable {
         let t = self.spawn(path);
         *t.exec_path.lock().unwrap() = path.to_string();
         let _elf_entry = validate_elf_header(&[
-            0x7f, b'E', b'L', b'F', 2, 1, 1, 0,
-            0, 0, 0, 0, 0, 0, 0, 0,
-            2, 0, 0x3e, 0, 1, 0, 0, 0,
-            0, 0x40, 0, 0, 0, 0, 0, 0,
-            0x40, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0x40, 0, 0x38, 0,
-            1, 0, 0, 0, 0, 0, 0, 0,
-            1, 0, 0, 0, 0, 0, 0, 0,
+            0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0x3e, 0, 1, 0, 0, 0,
+            0, 0x40, 0, 0, 0, 0, 0, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0x40, 0, 0x38, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
         ]);
         let mut ctx = ThdCtx::default();
-        let init = ProcInit { args, envs, auxv: BTreeMap::new() };
+        let init = ProcInit {
+            args,
+            envs,
+            auxv: BTreeMap::new(),
+        };
         let sp = init.push_at(USR_STK_OFF + USR_STK_SZ);
         ctx.uctx.set_sp(sp as u64);
         *t.thd_ctx.lock().unwrap() = Some(ctx);
-        let fd0 = FHandle::new("/dev/tty", FdOpt { rd: true, wr: false, ap: false, nb: false }, false, false);
-        let fd1 = FHandle::new("/dev/tty", FdOpt { rd: false, wr: true, ap: false, nb: false }, false, false);
+        let fd0 = FHandle::new(
+            "/dev/tty",
+            FdOpt {
+                rd: true,
+                wr: false,
+                ap: false,
+                nb: false,
+            },
+            false,
+            false,
+        );
+        let fd1 = FHandle::new(
+            "/dev/tty",
+            FdOpt {
+                rd: false,
+                wr: true,
+                ap: false,
+                nb: false,
+            },
+            false,
+            false,
+        );
         let fd2 = fd1.dup(false);
         {
             let mut fl = t.files.lock().unwrap();
@@ -471,14 +596,20 @@ impl TaskTable {
     }
 
     pub fn active_tasks(&self) -> Vec<usize> {
-        self.map.read().unwrap().iter()
+        self.map
+            .read()
+            .unwrap()
+            .iter()
             .filter(|(_, t)| !t.done())
             .map(|(id, _)| *id)
             .collect()
     }
 
     pub fn zombie_tasks(&self) -> Vec<usize> {
-        self.map.read().unwrap().iter()
+        self.map
+            .read()
+            .unwrap()
+            .iter()
             .filter(|(_, t)| t.done())
             .map(|(id, _)| *id)
             .collect()
@@ -494,4 +625,6 @@ impl TaskTable {
     }
 }
 
-pub fn yield_now_sync() { thread::yield_now(); }
+pub fn yield_now_sync() {
+    thread::yield_now();
+}

@@ -116,7 +116,9 @@ impl PageCache {
 
     pub fn unpin(&mut self, page_id: usize) -> bool {
         if let Some(e) = self.entries.get_mut(&page_id) {
-            if e.pin_count > 0 { e.pin_count -= 1; }
+            if e.pin_count > 0 {
+                e.pin_count -= 1;
+            }
             true
         } else {
             false
@@ -134,7 +136,9 @@ impl PageCache {
 
     pub fn flush_range(&mut self, start: usize, end: usize) -> usize {
         let mut count = 0;
-        let ids: Vec<usize> = self.entries.keys()
+        let ids: Vec<usize> = self
+            .entries
+            .keys()
             .filter(|&&id| id >= start && id < end)
             .copied()
             .collect();

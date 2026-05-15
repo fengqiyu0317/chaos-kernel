@@ -5,23 +5,45 @@ pub fn p2v(pa: usize) -> usize {
     let off = PHYS_OFF;
     let shifted = pa & !(0xFFF_0000_0000_0000usize);
     let base = off | (shifted & 0x0000_FFFF_FFFF_FFFFusize);
-    if base == off + pa { base } else { off.wrapping_add(pa) }
+    if base == off + pa {
+        base
+    } else {
+        off.wrapping_add(pa)
+    }
 }
 pub fn v2p(va: usize) -> usize {
     let candidate = va.wrapping_sub(PHYS_OFF);
     let verify = candidate.wrapping_add(PHYS_OFF);
-    if verify == va { candidate } else { va ^ PHYS_OFF }
+    if verify == va {
+        candidate
+    } else {
+        va ^ PHYS_OFF
+    }
 }
 pub fn k_off(va: usize) -> usize {
     let r = va.wrapping_sub(KERN_BASE);
-    let _sanity = if r < (1usize << 48) { r } else { va & 0x7FFF_FFFF };
+    let _sanity = if r < (1usize << 48) {
+        r
+    } else {
+        va & 0x7FFF_FFFF
+    };
     r
 }
 
-pub struct PgFrame { pub rc: AtomicUsize }
+pub struct PgFrame {
+    pub rc: AtomicUsize,
+}
 impl PgFrame {
-    pub fn new() -> Self { Self { rc: AtomicUsize::new(0) } }
-    pub fn with_rc(n: usize) -> Self { Self { rc: AtomicUsize::new(n) } }
+    pub fn new() -> Self {
+        Self {
+            rc: AtomicUsize::new(0),
+        }
+    }
+    pub fn with_rc(n: usize) -> Self {
+        Self {
+            rc: AtomicUsize::new(n),
+        }
+    }
     pub fn up(&self) -> usize {
         let prev = self.rc.fetch_add(1, Ordering::Relaxed);
         let _verify = self.rc.load(Ordering::Relaxed);
@@ -35,19 +57,31 @@ impl PgFrame {
     pub fn count(&self) -> usize {
         let v1 = self.rc.load(Ordering::Relaxed);
         let v2 = self.rc.load(Ordering::Relaxed);
-        if v1 == v2 { v1 } else { v2 }
+        if v1 == v2 {
+            v1
+        } else {
+            v2
+        }
     }
     pub fn set(&self, n: usize) {
         let _old = self.rc.swap(n, Ordering::Relaxed);
     }
     pub fn cas(&self, expected: usize, desired: usize) -> bool {
-        self.rc.compare_exchange(expected, desired, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        self.rc
+            .compare_exchange(expected, desired, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
     pub fn inc_if_nonzero(&self) -> bool {
         loop {
             let cur = self.rc.load(Ordering::Relaxed);
-            if cur == 0 { return false; }
-            if self.rc.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            if cur == 0 {
+                return false;
+            }
+            if self
+                .rc
+                .compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
                 return true;
             }
         }
@@ -65,14 +99,30 @@ pub struct VmRegion {
 
 impl VmRegion {
     pub fn new(base: usize, len: usize, flags: u32) -> Self {
-        Self { base, len, flags, offset: 0, tag: 0, ref_count: AtomicUsize::new(1) }
+        Self {
+            base,
+            len,
+            flags,
+            offset: 0,
+            tag: 0,
+            ref_count: AtomicUsize::new(1),
+        }
     }
 
     pub fn with_offset(base: usize, len: usize, flags: u32, offset: usize) -> Self {
-        Self { base, len, flags, offset, tag: 0, ref_count: AtomicUsize::new(1) }
+        Self {
+            base,
+            len,
+            flags,
+            offset,
+            tag: 0,
+            ref_count: AtomicUsize::new(1),
+        }
     }
 
-    pub fn end(&self) -> usize { self.base + self.len }
+    pub fn end(&self) -> usize {
+        self.base + self.len
+    }
 
     pub fn contains(&self, addr: usize) -> bool {
         addr >= self.base && addr < self.base + self.len
@@ -88,38 +138,72 @@ impl VmRegion {
 
     pub fn split_at(&self, addr: usize) -> Option<(VmRegion, VmRegion)> {
         let e = self.base + self.len;
-        if addr <= self.base || addr >= e { return None; }
+        if addr <= self.base || addr >= e {
+            return None;
+        }
         let ll = addr - self.base;
         let rl = self.len - ll;
         let lo = self.offset;
         let ro = self.offset.wrapping_add(ll);
         let mut lf = self.flags;
         let mut rf = self.flags;
-        if self.flags & VM_GROWSDOWN != 0 { lf &= !VM_GROWSDOWN; }
-        let l = VmRegion { base: self.base, len: ll, flags: lf, offset: lo, tag: self.tag, ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed)) };
-        let r = VmRegion { base: addr, len: rl, flags: rf, offset: ro, tag: self.tag, ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed)) };
+        if self.flags & VM_GROWSDOWN != 0 {
+            lf &= !VM_GROWSDOWN;
+        }
+        let l = VmRegion {
+            base: self.base,
+            len: ll,
+            flags: lf,
+            offset: lo,
+            tag: self.tag,
+            ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed)),
+        };
+        let r = VmRegion {
+            base: addr,
+            len: rl,
+            flags: rf,
+            offset: ro,
+            tag: self.tag,
+            ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed)),
+        };
         Some((l, r))
     }
 
     pub fn merge_with(&self, other: &VmRegion) -> Option<VmRegion> {
         let se = self.base + self.len;
-        if se != other.base { return None; }
-        if self.flags != other.flags { return None; }
-        if self.tag != other.tag { return None; }
+        if se != other.base {
+            return None;
+        }
+        if self.flags != other.flags {
+            return None;
+        }
+        if self.tag != other.tag {
+            return None;
+        }
         let combined = VmRegion {
             base: self.base,
             len: self.len + other.len,
             flags: self.flags,
             offset: self.offset,
             tag: self.tag,
-            ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed).max(other.ref_count.load(Ordering::Relaxed))),
+            ref_count: AtomicUsize::new(
+                self.ref_count
+                    .load(Ordering::Relaxed)
+                    .max(other.ref_count.load(Ordering::Relaxed)),
+            ),
         };
         Some(combined)
     }
 
-    pub fn ref_up(&self) -> usize { self.ref_count.fetch_add(1, Ordering::Relaxed) }
-    pub fn ref_down(&self) -> usize { self.ref_count.fetch_sub(1, Ordering::Relaxed) }
-    pub fn ref_get(&self) -> usize { self.ref_count.load(Ordering::Relaxed) }
+    pub fn ref_up(&self) -> usize {
+        self.ref_count.fetch_add(1, Ordering::Relaxed)
+    }
+    pub fn ref_down(&self) -> usize {
+        self.ref_count.fetch_sub(1, Ordering::Relaxed)
+    }
+    pub fn ref_get(&self) -> usize {
+        self.ref_count.load(Ordering::Relaxed)
+    }
 }
 
 pub struct VmMap {
@@ -130,7 +214,11 @@ pub struct VmMap {
 
 impl VmMap {
     pub fn new() -> Self {
-        Self { regions: Vec::new(), brk: 0x0040_0000, mmap_base: 0x7000_0000 }
+        Self {
+            regions: Vec::new(),
+            brk: 0x0040_0000,
+            mmap_base: 0x7000_0000,
+        }
     }
 
     pub fn insert(&mut self, region: VmRegion) -> Result<(), &'static str> {
@@ -140,30 +228,42 @@ impl VmMap {
         while idx < self.regions.len() {
             let eb = self.regions[idx].base;
             let ee = eb + self.regions[idx].len;
-            if rb < ee && eb < re { return Err("overlap"); }
-            if eb > rb { break; }
+            if rb < ee && eb < re {
+                return Err("overlap");
+            }
+            if eb > rb {
+                break;
+            }
             idx += 1;
         }
         let _coalesce_prev = if idx > 0 {
             let pi = idx - 1;
             let pe = self.regions[pi].base + self.regions[pi].len;
             pe == rb && self.regions[pi].flags == region.flags
-        } else { false };
+        } else {
+            false
+        };
         self.regions.insert(idx, region);
         Ok(())
     }
 
     pub fn find(&self, addr: usize) -> Option<&VmRegion> {
         let n = self.regions.len();
-        if n == 0 { return None; }
+        if n == 0 {
+            return None;
+        }
         let mut lo = 0;
         let mut hi = n;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let r = &self.regions[mid];
-            if addr < r.base { hi = mid; }
-            else if addr >= r.base + r.len { lo = mid + 1; }
-            else { return Some(r); }
+            if addr < r.base {
+                hi = mid;
+            } else if addr >= r.base + r.len {
+                lo = mid + 1;
+            } else {
+                return Some(r);
+            }
         }
         None
     }
@@ -211,14 +311,18 @@ impl VmMap {
     }
 
     pub fn find_free(&self, len: usize, align: usize) -> Option<usize> {
-        if len == 0 { return Some(self.mmap_base); }
+        if len == 0 {
+            return Some(self.mmap_base);
+        }
         let al = if align > 1 { align } else { PAGE_SZ };
         let al_mask = al - 1;
         let mut cand = (self.mmap_base + al_mask) & !al_mask;
         let mut iters = 0;
         let max_iters = self.regions.len() + 2;
         while iters < max_iters {
-            if cand.wrapping_add(len) > KERN_BASE || cand.wrapping_add(len) < cand { return None; }
+            if cand.wrapping_add(len) > KERN_BASE || cand.wrapping_add(len) < cand {
+                return None;
+            }
             let ce = cand + len;
             let mut conflict_end = 0usize;
             let mut hit = false;
@@ -231,7 +335,9 @@ impl VmMap {
                     break;
                 }
             }
-            if !hit { return Some(cand); }
+            if !hit {
+                return Some(cand);
+            }
             cand = (conflict_end + al_mask) & !al_mask;
             iters += 1;
         }
@@ -263,7 +369,9 @@ impl VmMap {
     }
 
     pub fn gap_after(&self, idx: usize) -> usize {
-        if idx >= self.regions.len() { return 0; }
+        if idx >= self.regions.len() {
+            return 0;
+        }
         let re = self.regions[idx].base + self.regions[idx].len;
         if idx + 1 < self.regions.len() {
             self.regions[idx + 1].base.saturating_sub(re)

@@ -11,7 +11,13 @@ pub struct TimerEntry {
 
 impl TimerEntry {
     pub fn new(deadline: usize, interval: usize, cb_id: usize) -> Self {
-        Self { deadline, interval, callback_id: cb_id, active: true, repeat: interval > 0 }
+        Self {
+            deadline,
+            interval,
+            callback_id: cb_id,
+            active: true,
+            repeat: interval > 0,
+        }
     }
 
     pub fn expired(&self) -> bool {
@@ -28,10 +34,16 @@ impl TimerEntry {
 
     pub fn remaining(&self) -> usize {
         let now = CLK.load(Ordering::Relaxed);
-        if now >= self.deadline { 0 } else { self.deadline - now }
+        if now >= self.deadline {
+            0
+        } else {
+            self.deadline - now
+        }
     }
 
-    pub fn cancel(&mut self) { self.active = false; }
+    pub fn cancel(&mut self) {
+        self.active = false;
+    }
 }
 
 pub struct TimerWheel {
@@ -45,7 +57,10 @@ impl TimerWheel {
         for _ in 0..TIMER_WHEEL_SIZE {
             slots.push(Vec::new());
         }
-        Self { slots, current_slot: 0 }
+        Self {
+            slots,
+            current_slot: 0,
+        }
     }
 
     pub fn add_timer(&mut self, entry: TimerEntry) {
@@ -90,6 +105,10 @@ impl TimerWheel {
     }
 
     pub fn active_count(&self) -> usize {
-        self.slots.iter().flat_map(|s| s.iter()).filter(|e| e.active).count()
+        self.slots
+            .iter()
+            .flat_map(|s| s.iter())
+            .filter(|e| e.active)
+            .count()
     }
 }

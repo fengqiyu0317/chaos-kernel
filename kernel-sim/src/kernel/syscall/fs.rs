@@ -1,7 +1,12 @@
 // AGENT
 use super::*;
 
-pub(super) fn sys_read(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_read(
+    kernel: &Kernel,
+    a0: usize,
+    a1: usize,
+    a2: usize,
+) -> Result<usize, &'static str> {
     let fd = a0;
     let buf_addr = a1;
     let count = a2;
@@ -39,7 +44,12 @@ pub(super) fn sys_read(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Resu
     }
 }
 
-pub(super) fn sys_write(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_write(
+    kernel: &Kernel,
+    a0: usize,
+    a1: usize,
+    a2: usize,
+) -> Result<usize, &'static str> {
     let fd = a0;
     let buf_addr = a1;
     let count = a2;
@@ -79,7 +89,12 @@ pub(super) fn sys_write(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Res
     Ok(actual_len)
 }
 
-pub(super) fn sys_open(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_open(
+    kernel: &Kernel,
+    a0: usize,
+    a1: usize,
+    a2: usize,
+) -> Result<usize, &'static str> {
     let path_addr = a0;
     let flags = a1;
     let mode = a2;
@@ -183,7 +198,12 @@ pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static st
     Ok(0)
 }
 
-pub(super) fn sys_stat(kernel: &Kernel, nr: usize, a0: usize, a1: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_stat(
+    kernel: &Kernel,
+    nr: usize,
+    a0: usize,
+    a1: usize,
+) -> Result<usize, &'static str> {
     let stat_buf = a1;
     if stat_buf == 0 {
         return Err("efault");
@@ -206,7 +226,12 @@ pub(super) fn sys_stat(kernel: &Kernel, nr: usize, a0: usize, a1: usize) -> Resu
     Ok(0)
 }
 
-pub(super) fn sys_ioctl(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_ioctl(
+    kernel: &Kernel,
+    a0: usize,
+    a1: usize,
+    a2: usize,
+) -> Result<usize, &'static str> {
     let fd = a0;
     let cmd = a1;
     let arg = a2;
@@ -333,7 +358,12 @@ pub(super) fn sys_dup2(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
     Ok(new_fd)
 }
 
-pub(super) fn sys_fcntl(kernel: &Kernel, a0: usize, a1: usize, a2: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_fcntl(
+    kernel: &Kernel,
+    a0: usize,
+    a1: usize,
+    a2: usize,
+) -> Result<usize, &'static str> {
     let fd = a0;
     let cmd = a1;
     let arg = a2;

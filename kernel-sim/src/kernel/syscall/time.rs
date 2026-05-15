@@ -16,7 +16,11 @@ fn ticks_to_timespec(ticks: usize) -> ClockTimeSpec {
     }
 }
 
-pub(super) fn sys_clock_gettime(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_clock_gettime(
+    kernel: &Kernel,
+    a0: usize,
+    a1: usize,
+) -> Result<usize, &'static str> {
     let _ = kernel;
     let clk_id = a0;
     let tp_addr = a1;
@@ -39,6 +43,8 @@ pub(super) fn sys_clock_gettime(kernel: &Kernel, a0: usize, a1: usize) -> Result
         _ => return Err("einval"),
     };
     // AGENT: timespec is a syscall ABI object; user buffers may be unaligned.
-    unsafe { std::ptr::write_unaligned(tp_addr as *mut ClockTimeSpec, out); }
+    unsafe {
+        std::ptr::write_unaligned(tp_addr as *mut ClockTimeSpec, out);
+    }
     Ok(0)
 }

@@ -15,13 +15,22 @@ impl KernLock {
         }
     }
     pub fn enter(&self, id: usize) {
-        assert!(id <= MAX_THREAD_ID, "thread id {} exceeds MAX_THREAD_ID {}", id, MAX_THREAD_ID);
+        assert!(
+            id <= MAX_THREAD_ID,
+            "thread id {} exceeds MAX_THREAD_ID {}",
+            id,
+            MAX_THREAD_ID
+        );
         if self.holder.load(Ordering::Relaxed) == id {
             // AGENT: sentinel is MAX_THREAD_ID+1, no need for id != 0 guard
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        while self
+            .flag
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             ::core::hint::spin_loop();
         }
         self.holder.store(id, Ordering::Relaxed);
@@ -37,17 +46,32 @@ impl KernLock {
             self.flag.store(false, Ordering::Release);
         }
     }
-    pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
-    pub fn owner(&self) -> usize { self.holder.load(Ordering::Relaxed) }
-    pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
+    pub fn held(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+    pub fn owner(&self) -> usize {
+        self.holder.load(Ordering::Relaxed)
+    }
+    pub fn level(&self) -> usize {
+        self.depth.load(Ordering::Relaxed)
+    }
     pub fn try_enter(&self, id: usize) -> bool {
-        assert!(id <= MAX_THREAD_ID, "thread id {} exceeds MAX_THREAD_ID {}", id, MAX_THREAD_ID);
+        assert!(
+            id <= MAX_THREAD_ID,
+            "thread id {} exceeds MAX_THREAD_ID {}",
+            id,
+            MAX_THREAD_ID
+        );
         if self.holder.load(Ordering::Relaxed) == id {
             // AGENT: sentinel is MAX_THREAD_ID+1, no need for id != 0 guard
             self.depth.fetch_add(1, Ordering::Relaxed);
             return true;
         }
-        if self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        if self
+            .flag
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
             self.holder.store(id, Ordering::Relaxed);
             self.depth.store(1, Ordering::Relaxed);
             true
@@ -60,20 +84,35 @@ unsafe impl Send for KernLock {}
 unsafe impl Sync for KernLock {}
 pub static GKL: KernLock = KernLock::new();
 
-
-pub struct Spin { pub(crate) v: AtomicBool }
+pub struct Spin {
+    pub(crate) v: AtomicBool,
+}
 impl Spin {
-    pub const fn new() -> Self { Self { v: AtomicBool::new(false) } }
+    pub const fn new() -> Self {
+        Self {
+            v: AtomicBool::new(false),
+        }
+    }
     pub fn acquire(&self) {
-        while self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        while self
+            .v
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             ::core::hint::spin_loop();
         }
     }
     pub fn try_acquire(&self) -> bool {
-        self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
+        self.v
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
     }
-    pub fn release(&self) { self.v.store(false, Ordering::Release); }
-    pub fn is_held(&self) -> bool { self.v.load(Ordering::Relaxed) }
+    pub fn release(&self) {
+        self.v.store(false, Ordering::Release);
+    }
+    pub fn is_held(&self) -> bool {
+        self.v.load(Ordering::Relaxed)
+    }
 }
 unsafe impl Send for Spin {}
 unsafe impl Sync for Spin {}
@@ -103,21 +142,38 @@ pub struct EvBus {
     pub cbs: Vec<Box<dyn Fn(u32) -> bool + Send>>,
 }
 impl EvBus {
-    pub fn make() -> Arc<Mutex<Self>> { Arc::new(Mutex::new(Self::default())) }
-    pub fn set(&mut self, s: u32) { self.change(0, s); }
-    pub fn clear(&mut self, s: u32) { self.change(s, 0); }
+    pub fn make() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self::default()))
+    }
+    pub fn set(&mut self, s: u32) {
+        self.change(0, s);
+    }
+    pub fn clear(&mut self, s: u32) {
+        self.change(s, 0);
+    }
     pub fn change(&mut self, rst: u32, s: u32) {
         let orig = self.ev;
         self.ev = (self.ev & !rst) | s;
-        if self.ev != orig { self.cbs.retain(|f| !f(self.ev)); }
+        if self.ev != orig {
+            self.cbs.retain(|f| !f(self.ev));
+        }
     }
-    pub fn sub(&mut self, cb: Box<dyn Fn(u32) -> bool + Send>) { self.cbs.push(cb); }
-    pub fn cb_len(&self) -> usize { self.cbs.len() }
+    pub fn sub(&mut self, cb: Box<dyn Fn(u32) -> bool + Send>) {
+        self.cbs.push(cb);
+    }
+    pub fn cb_len(&self) -> usize {
+        self.cbs.len()
+    }
 }
 
 pub fn wait_ev(bus: &Arc<Mutex<EvBus>>, mask: u32) -> u32 {
     loop {
-        { let g = bus.lock().unwrap(); if (g.ev & mask) != 0 { return g.ev; } }
+        {
+            let g = bus.lock().unwrap();
+            if (g.ev & mask) != 0 {
+                return g.ev;
+            }
+        }
         thread::yield_now();
     }
 }
@@ -148,12 +204,19 @@ pub struct SyncQueue {
     eq: Mutex<VecDeque<RegEp>>,
 }
 impl SyncQueue {
-    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()) } }
+    pub fn new() -> Self {
+        Self {
+            q: Mutex::new(VecDeque::new()),
+            eq: Mutex::new(VecDeque::new()),
+        }
+    }
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
         let d = g.lock().unwrap();
         let satisfied = pred(&d);
         drop(d);
-        if satisfied { return true; }
+        if satisfied {
+            return true;
+        }
         let th = thread::current();
         let mut wq = self.q.lock().unwrap();
         wq.push_back(th);
@@ -165,15 +228,25 @@ impl SyncQueue {
         let mut q = self.q.lock().unwrap();
         match q.len() {
             0 => {}
-            1 => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
-            _ => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
+            1 => {
+                let t = q.pop_front().unwrap();
+                drop(q);
+                t.unpark();
+            }
+            _ => {
+                let t = q.pop_front().unwrap();
+                drop(q);
+                t.unpark();
+            }
         }
     }
     pub fn broadcast(&self) {
         let mut q = self.q.lock().unwrap();
         let batch: Vec<thread::Thread> = q.drain(..).collect();
         drop(q);
-        for t in batch { t.unpark(); }
+        for t in batch {
+            t.unpark();
+        }
     }
     // AGENT: replaced locked-while-unparking with batch-drain-then-unpark (consistent with signal/broadcast)
     pub fn signal_n(&self, n: usize) -> usize {
@@ -181,22 +254,41 @@ impl SyncQueue {
         let to_wake = n.min(q.len());
         let batch: Vec<_> = q.drain(..to_wake).collect();
         drop(q);
-        for t in &batch { t.unpark(); }
+        for t in &batch {
+            t.unpark();
+        }
         batch.len()
     }
-    pub fn pending(&self) -> usize { let q = self.q.lock().unwrap(); q.len() }
-    pub fn wait_ev<T>(&self, g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
-        loop {
-            { let d = g.lock().unwrap(); if let Some(r) = cond(&d) { return r; } }
-            { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
-            thread::park();
-        }
+    pub fn pending(&self) -> usize {
+        let q = self.q.lock().unwrap();
+        q.len()
     }
-    pub fn wait_events<T>(queues: &[&SyncQueue], g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
+    pub fn wait_ev<T>(&self, g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
         loop {
             {
                 let d = g.lock().unwrap();
-                if let Some(r) = cond(&d) { return r; }
+                if let Some(r) = cond(&d) {
+                    return r;
+                }
+            }
+            {
+                let mut q = self.q.lock().unwrap();
+                q.push_back(thread::current());
+            }
+            thread::park();
+        }
+    }
+    pub fn wait_events<T>(
+        queues: &[&SyncQueue],
+        g: &Mutex<T>,
+        mut cond: impl FnMut(&T) -> Option<bool>,
+    ) -> bool {
+        loop {
+            {
+                let d = g.lock().unwrap();
+                if let Some(r) = cond(&d) {
+                    return r;
+                }
             }
             for wq in queues {
                 let mut q = wq.q.lock().unwrap();
@@ -206,18 +298,27 @@ impl SyncQueue {
         }
     }
     pub fn wait_guard<T>(&self, g: &Mutex<T>) {
-        { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
+        {
+            let mut q = self.q.lock().unwrap();
+            q.push_back(thread::current());
+        }
         drop(g.lock().unwrap());
         thread::park();
     }
     pub fn wait_timeout<T>(&self, g: &Mutex<T>, timeout: Duration) -> bool {
-        { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
+        {
+            let mut q = self.q.lock().unwrap();
+            q.push_back(thread::current());
+        }
         drop(g.lock().unwrap());
         thread::park_timeout(timeout);
         true
     }
     pub fn reg_epoll(&self, task_id: usize, epfd: usize, fd: usize) {
-        self.eq.lock().unwrap().push_back(RegEp { task_id, epfd, fd });
+        self.eq
+            .lock()
+            .unwrap()
+            .push_back(RegEp { task_id, epfd, fd });
     }
     pub fn unreg_epoll(&self, task_id: usize, epfd: usize, fd: usize) -> bool {
         let mut eql = self.eq.lock().unwrap();
@@ -231,15 +332,31 @@ impl SyncQueue {
     }
 }
 
-struct SemaInner { cnt: isize, pid: usize, rm: bool, bus: EvBus }
+struct SemaInner {
+    cnt: isize,
+    pid: usize,
+    rm: bool,
+    bus: EvBus,
+}
 
-pub struct Sema { inner: Arc<Mutex<SemaInner>> }
+pub struct Sema {
+    inner: Arc<Mutex<SemaInner>>,
+}
 
-pub struct SemaGuard<'a> { s: &'a Sema }
+pub struct SemaGuard<'a> {
+    s: &'a Sema,
+}
 
 impl Sema {
     pub fn new(c: isize) -> Self {
-        Sema { inner: Arc::new(Mutex::new(SemaInner { cnt: c, rm: false, pid: 0, bus: EvBus::default() })) }
+        Sema {
+            inner: Arc::new(Mutex::new(SemaInner {
+                cnt: c,
+                rm: false,
+                pid: 0,
+                bus: EvBus::default(),
+            })),
+        }
     }
     pub fn remove(&self) {
         let mut i = self.inner.lock().unwrap();
@@ -249,14 +366,20 @@ impl Sema {
     pub fn release(&self) {
         let mut i = self.inner.lock().unwrap();
         i.cnt += 1;
-        if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
+        if i.cnt >= 1 {
+            i.bus.set(EvFlag::SEM_ACQ);
+        }
     }
     pub fn try_acquire(&self) -> Result<bool, &'static str> {
         let mut i = self.inner.lock().unwrap();
-        if i.rm { return Err("removed"); }
+        if i.rm {
+            return Err("removed");
+        }
         if i.cnt >= 1 {
             i.cnt -= 1;
-            if i.cnt < 1 { i.bus.clear(EvFlag::SEM_ACQ); }
+            if i.cnt < 1 {
+                i.bus.clear(EvFlag::SEM_ACQ);
+            }
             Ok(true)
         } else {
             Ok(false)
@@ -274,37 +397,75 @@ impl Sema {
         self.acquire_spin()?;
         Ok(SemaGuard { s: self })
     }
-    pub fn get_val(&self) -> isize { self.inner.lock().unwrap().cnt }
-    pub fn get_ncnt(&self) -> usize { self.inner.lock().unwrap().bus.cb_len() }
-    pub fn get_pid(&self) -> usize { self.inner.lock().unwrap().pid }
-    pub fn set_pid(&self, p: usize) { self.inner.lock().unwrap().pid = p; }
+    pub fn get_val(&self) -> isize {
+        self.inner.lock().unwrap().cnt
+    }
+    pub fn get_ncnt(&self) -> usize {
+        self.inner.lock().unwrap().bus.cb_len()
+    }
+    pub fn get_pid(&self) -> usize {
+        self.inner.lock().unwrap().pid
+    }
+    pub fn set_pid(&self, p: usize) {
+        self.inner.lock().unwrap().pid = p;
+    }
     pub fn set_val(&self, v: isize) {
         let mut i = self.inner.lock().unwrap();
         i.cnt = v;
-        if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
+        if i.cnt >= 1 {
+            i.bus.set(EvFlag::SEM_ACQ);
+        }
     }
 }
 
-impl<'a> Drop for SemaGuard<'a> { fn drop(&mut self) { self.s.release(); } }
+impl<'a> Drop for SemaGuard<'a> {
+    fn drop(&mut self) {
+        self.s.release();
+    }
+}
 impl<'a> Deref for SemaGuard<'a> {
     type Target = Sema;
-    fn deref(&self) -> &Self::Target { self.s }
+    fn deref(&self) -> &Self::Target {
+        self.s
+    }
 }
 
 pub struct FutexBucket {
     waiters: Mutex<VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>,
 }
 impl FutexBucket {
-    pub fn new() -> Self { Self { waiters: Mutex::new(VecDeque::new()) } }
+    pub fn new() -> Self {
+        Self {
+            waiters: Mutex::new(VecDeque::new()),
+        }
+    }
     // AGENT: added assert to enforce addr == val address
-    pub fn wait(&self, addr: usize, expected: u32, val: &AtomicU32, timeout: Option<Duration>) -> Result<(), &'static str> {
+    pub fn wait(
+        &self,
+        addr: usize,
+        expected: u32,
+        val: &AtomicU32,
+        timeout: Option<Duration>,
+    ) -> Result<(), &'static str> {
         assert_eq!(val.as_ptr() as usize, addr, "addr must match val address");
         let flag = Arc::new(AtomicBool::new(false));
-        if val.load(Ordering::SeqCst) != expected { return Err("changed"); }
-        { let mut w = self.waiters.lock().unwrap();
-          w.push_back((addr, thread::current(), flag.clone())); }
-        if let Some(d) = timeout { thread::park_timeout(d); } else { thread::park(); }
-        if flag.load(Ordering::Relaxed) { Ok(()) } else { Err("timeout") }
+        if val.load(Ordering::SeqCst) != expected {
+            return Err("changed");
+        }
+        {
+            let mut w = self.waiters.lock().unwrap();
+            w.push_back((addr, thread::current(), flag.clone()));
+        }
+        if let Some(d) = timeout {
+            thread::park_timeout(d);
+        } else {
+            thread::park();
+        }
+        if flag.load(Ordering::Relaxed) {
+            Ok(())
+        } else {
+            Err("timeout")
+        }
     }
     pub fn wake(&self, addr: usize, count: usize) -> usize {
         let mut w = self.waiters.lock().unwrap();
@@ -315,7 +476,9 @@ impl FutexBucket {
                 t.unpark();
                 woken += 1;
                 false
-            } else { true }
+            } else {
+                true
+            }
         });
         woken
     }
@@ -338,7 +501,12 @@ impl FutexBucket {
         wk
     }
     pub fn pending_at(&self, addr: usize) -> usize {
-        self.waiters.lock().unwrap().iter().filter(|(a, _, _)| *a == addr).count()
+        self.waiters
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(a, _, _)| *a == addr)
+            .count()
     }
 }
 
@@ -347,12 +515,18 @@ pub struct FutexTable {
 }
 
 impl FutexTable {
-    pub fn new() -> Self { Self { table: Mutex::new(VecDeque::new()) } }
+    pub fn new() -> Self {
+        Self {
+            table: Mutex::new(VecDeque::new()),
+        }
+    }
 
     // AGENT: added assert to enforce addr == val address
     pub fn ftx_wait(&self, addr: usize, expected: u32, val: &AtomicU32) -> bool {
         assert_eq!(val.as_ptr() as usize, addr, "addr must match val address");
-        if val.load(Ordering::SeqCst) != expected { return false; }
+        if val.load(Ordering::SeqCst) != expected {
+            return false;
+        }
         let mut wq = self.table.lock().unwrap();
         wq.push_back((addr, thread::current()));
         drop(wq);
@@ -378,7 +552,13 @@ impl FutexTable {
         wk
     }
 
-    pub fn ftx_requeue(&self, src_addr: usize, dst_addr: usize, wake_n: usize, move_n: usize) -> usize {
+    pub fn ftx_requeue(
+        &self,
+        src_addr: usize,
+        dst_addr: usize,
+        wake_n: usize,
+        move_n: usize,
+    ) -> usize {
         let mut wq = self.table.lock().unwrap();
         let mut wk = 0;
         let mut mv = 0;

@@ -4,7 +4,9 @@ pub(crate) use std::cmp::{max, min, Ordering as CmpOrd};
 pub(crate) use std::collections::{BTreeMap, BTreeSet, HashMap, LinkedList, VecDeque};
 pub(crate) use std::fmt;
 pub(crate) use std::ops::{Deref, DerefMut, Index};
-pub(crate) use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+pub(crate) use std::sync::atomic::{
+    AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 pub(crate) use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 pub(crate) use std::thread;
 pub(crate) use std::time::Duration;
@@ -167,6 +169,5 @@ pub const SYS_SIGPROCMASK: usize = 14;
 pub const SYS_FUTEX: usize = 202;
 
 pub const IOQUEUE_DEPTH: usize = 128;
-
 
 pub const MAX_THREAD_ID: usize = N_PROC - 1; // AGENT

@@ -24,12 +24,24 @@ impl ResourceLimits {
         }
     }
 
-    pub fn check_fd(&self, current: usize) -> bool { current < self.max_fds }
-    pub fn check_threads(&self, current: usize) -> bool { current < self.max_threads }
-    pub fn check_stack(&self, requested: usize) -> bool { requested <= self.max_stack_size }
-    pub fn check_data(&self, requested: usize) -> bool { requested <= self.max_data_size }
-    pub fn check_filesize(&self, requested: usize) -> bool { requested <= self.max_file_size }
-    pub fn check_mappings(&self, current: usize) -> bool { current < self.max_mappings }
+    pub fn check_fd(&self, current: usize) -> bool {
+        current < self.max_fds
+    }
+    pub fn check_threads(&self, current: usize) -> bool {
+        current < self.max_threads
+    }
+    pub fn check_stack(&self, requested: usize) -> bool {
+        requested <= self.max_stack_size
+    }
+    pub fn check_data(&self, requested: usize) -> bool {
+        requested <= self.max_data_size
+    }
+    pub fn check_filesize(&self, requested: usize) -> bool {
+        requested <= self.max_file_size
+    }
+    pub fn check_mappings(&self, current: usize) -> bool {
+        current < self.max_mappings
+    }
 
     pub fn inherit(&self) -> Self {
         Self {
@@ -45,11 +57,26 @@ impl ResourceLimits {
 
     pub fn set_limit(&mut self, resource: usize, value: usize) -> Result<(), &'static str> {
         match resource {
-            0 => { self.cpu_time_limit = value; Ok(()) }
-            1 => { self.max_file_size = value; Ok(()) }
-            2 => { self.max_data_size = value; Ok(()) }
-            3 => { self.max_stack_size = value; Ok(()) }
-            7 => { self.max_fds = value; Ok(()) }
+            0 => {
+                self.cpu_time_limit = value;
+                Ok(())
+            }
+            1 => {
+                self.max_file_size = value;
+                Ok(())
+            }
+            2 => {
+                self.max_data_size = value;
+                Ok(())
+            }
+            3 => {
+                self.max_stack_size = value;
+                Ok(())
+            }
+            7 => {
+                self.max_fds = value;
+                Ok(())
+            }
             _ => Err("einval"),
         }
     }
@@ -67,9 +94,15 @@ impl ResourceLimits {
 
     pub fn exceeds_any(&self, fds: usize, threads: usize, stack: usize) -> bool {
         let mut violations = 0usize;
-        if fds > self.max_fds { violations += 1; }
-        if threads > self.max_threads { violations += 1; }
-        if stack > self.max_stack_size { violations += 1; }
+        if fds > self.max_fds {
+            violations += 1;
+        }
+        if threads > self.max_threads {
+            violations += 1;
+        }
+        if stack > self.max_stack_size {
+            violations += 1;
+        }
         violations > 0
     }
 }

@@ -71,7 +71,12 @@ impl KObjRegistry {
     }
 
     pub fn find_by_type(&self, tag: u32) -> Vec<usize> {
-        self.type_index.lock().unwrap().get(&tag).cloned().unwrap_or_default()
+        self.type_index
+            .lock()
+            .unwrap()
+            .get(&tag)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn dump_graph(&self) -> Vec<(usize, usize)> {
@@ -87,7 +92,8 @@ impl KObjRegistry {
 
     pub fn gc_sweep(&self) -> usize {
         let mut objs = self.objects.lock().unwrap();
-        let dead: Vec<usize> = objs.iter()
+        let dead: Vec<usize> = objs
+            .iter()
             .filter(|(_, e)| e.ref_count == 0)
             .map(|(id, _)| *id)
             .collect();
@@ -112,8 +118,9 @@ impl KObjRegistry {
     pub fn ref_down(&self, id: usize) -> bool {
         let mut objs = self.objects.lock().unwrap();
         if let Some(e) = objs.get_mut(&id) {
-            if e.ref_count > 0
-                {e.ref_count = e.ref_count.saturating_sub(1);}
+            if e.ref_count > 0 {
+                e.ref_count = e.ref_count.saturating_sub(1);
+            }
             true
         } else {
             false
@@ -125,7 +132,10 @@ impl KObjRegistry {
     }
 
     pub fn owner_objects(&self, pid: usize) -> Vec<usize> {
-        self.objects.lock().unwrap().iter()
+        self.objects
+            .lock()
+            .unwrap()
+            .iter()
             .filter(|(_, e)| e.owner_pid == pid)
             .map(|(id, _)| *id)
             .collect()

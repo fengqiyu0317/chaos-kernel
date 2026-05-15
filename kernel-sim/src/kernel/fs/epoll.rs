@@ -3,11 +3,16 @@ use super::*;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct EpData { pub ptr: u64 }
+pub struct EpData {
+    pub ptr: u64,
+}
 
 #[repr(C)]
 #[derive(Clone)]
-pub struct EpEvent { pub events: u32, pub data: EpData }
+pub struct EpEvent {
+    pub events: u32,
+    pub data: EpData,
+}
 impl EpEvent {
     pub const IN: u32 = 0x001;
     pub const OUT: u32 = 0x004;
@@ -24,7 +29,9 @@ impl EpEvent {
     pub const WAKEUP: u32 = 1 << 29;
     pub const ONESHOT: u32 = 1 << 30;
     pub const ET: u32 = 1 << 31;
-    pub fn has(&self, ev: u32) -> bool { (self.events & ev) != 0 }
+    pub fn has(&self, ev: u32) -> bool {
+        (self.events & ev) != 0
+    }
 }
 
 pub struct EpCtlOp;

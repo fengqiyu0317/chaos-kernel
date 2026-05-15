@@ -51,7 +51,9 @@ impl AddrSpace {
     pub fn handle_cow_fault(&self, addr: usize, pool: &FramePool) -> Result<usize, &'static str> {
         let page_addr = addr & !(PAGE_SZ - 1);
         let region = self.vm_map.find(addr).ok_or("segfault")?;
-        if region.flags & VM_WRITE == 0 { return Err("segfault"); }
+        if region.flags & VM_WRITE == 0 {
+            return Err("segfault");
+        }
         let mut cow = self.cow_pages.lock().unwrap();
         if let Some(frame) = cow.get(&page_addr) {
             let rc = frame.count();
@@ -74,7 +76,8 @@ impl AddrSpace {
         let end = start + len;
         let removed = self.vm_map.remove_range(start, len);
         let mut cow = self.cow_pages.lock().unwrap();
-        let pages_to_remove: Vec<usize> = cow.keys()
+        let pages_to_remove: Vec<usize> = cow
+            .keys()
             .filter(|&&addr| addr >= start && addr < end)
             .copied()
             .collect();
@@ -86,7 +89,12 @@ impl AddrSpace {
         removed + pages_to_remove.len()
     }
 
-    pub fn protect(&mut self, start: usize, len: usize, new_flags: u32) -> Result<(), &'static str> {
+    pub fn protect(
+        &mut self,
+        start: usize,
+        len: usize,
+        new_flags: u32,
+    ) -> Result<(), &'static str> {
         let end = start + len;
         let mut affected = Vec::new();
         for (i, r) in self.vm_map.regions.iter().enumerate() {
@@ -114,7 +122,9 @@ impl AddrSpace {
     pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> {
         let region = self.vm_map.find(addr).ok_or("enomem")?;
         let offset = addr - region.base;
-        if offset == 0 || offset >= region.len { return Err("einval"); }
+        if offset == 0 || offset >= region.len {
+            return Err("einval");
+        }
         let second = VmRegion::new(addr, region.len - offset, region.flags);
         self.vm_map.regions.push(second);
         Ok(())

@@ -17,16 +17,23 @@ impl SigSet {
     pub fn new() -> Self {
         let mut actions = Vec::with_capacity(NSIG as usize + 1);
         for _ in 0..=NSIG {
-            actions.push(SigAction { handler: SIG_DFL, flags: 0, mask: 0 });
+            actions.push(SigAction {
+                handler: SIG_DFL,
+                flags: 0,
+                mask: 0,
+            });
         }
-        Self { pending: 0, blocked: 0, actions }
+        Self {
+            pending: 0,
+            blocked: 0,
+            actions,
+        }
     }
 
     pub fn sig_pending(&self, signo: u32) -> bool {
         if signo < NSIG {
             (self.pending & (1u64 << signo)) != 0
-        }
-        else {
+        } else {
             false
         }
     }
@@ -37,7 +44,8 @@ impl SigSet {
         }
     }
 
-    pub fn coalesce_pending(&mut self) -> u64 { // AGENT
+    pub fn coalesce_pending(&mut self) -> u64 {
+        // AGENT
         (self.pending & !self.blocked) & !1u64
     }
 
@@ -62,7 +70,9 @@ impl SigSet {
 
     pub fn deliverable(&self) -> Option<u32> {
         let actionable = self.pending & !self.blocked;
-        if actionable == 0 { return None; }
+        if actionable == 0 {
+            return None;
+        }
         for i in 1..NSIG {
             if (actionable & (1u64 << i)) != 0 {
                 return Some(i);

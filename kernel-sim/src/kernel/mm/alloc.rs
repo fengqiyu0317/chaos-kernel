@@ -6,7 +6,12 @@ pub struct FramePool {
     pub(crate) cap: usize,
 }
 impl FramePool {
-    pub fn new(n: usize) -> Self { Self { slots: Mutex::new(vec![true; n]), cap: n } }
+    pub fn new(n: usize) -> Self {
+        Self {
+            slots: Mutex::new(vec![true; n]),
+            cap: n,
+        }
+    }
     pub fn get(&self, id: usize) -> Option<usize> {
         // HUMAN: delete the GKL lock
         let r = self.get_inner();
@@ -15,7 +20,10 @@ impl FramePool {
     pub fn get_inner(&self) -> Option<usize> {
         let mut s = self.slots.lock().unwrap();
         for (i, f) in s.iter_mut().enumerate() {
-            if *f { *f = false; return Some(i); }
+            if *f {
+                *f = false;
+                return Some(i);
+            }
         }
         None
     }
@@ -23,9 +31,13 @@ impl FramePool {
         let mut s = self.slots.lock().unwrap();
         let a = 1usize << align_log2;
         for start in (0..s.len()).step_by(if a > 0 { a } else { 1 }) {
-            if start + sz > s.len() { break; }
+            if start + sz > s.len() {
+                break;
+            }
             if (start..start + sz).all(|i| s[i]) {
-                for i in start..start + sz { s[i] = false; }
+                for i in start..start + sz {
+                    s[i] = false;
+                }
                 return Some(start);
             }
         }
@@ -33,7 +45,9 @@ impl FramePool {
     }
     pub fn put(&self, idx: usize) {
         let mut s = self.slots.lock().unwrap();
-        if idx < s.len() { s[idx] = true; }
+        if idx < s.len() {
+            s[idx] = true;
+        }
     }
     pub fn avail(&self, idx: usize) -> bool {
         let s = self.slots.lock().unwrap();
@@ -44,7 +58,9 @@ impl FramePool {
     }
 
     pub fn get_zone_aware(&self, zone: &ZoneInfo) -> Option<usize> {
-        if !zone.zone_can_alloc() { return None; }
+        if !zone.zone_can_alloc() {
+            return None;
+        }
         let mut s = self.slots.lock().unwrap();
         let base = zone.base_pfn;
         let limit = base + zone.page_count;
@@ -70,7 +86,9 @@ impl FramePool {
         let mut s = self.slots.lock().unwrap();
         let mut result = Vec::with_capacity(count);
         for (i, f) in s.iter_mut().enumerate() {
-            if result.len() >= count { break; }
+            if result.len() >= count {
+                break;
+            }
             if *f {
                 *f = false;
                 result.push(i);
@@ -109,8 +127,12 @@ impl ZoneInfo {
 
     pub fn zone_pressure(&self) -> usize {
         let free = self.free_count.load(Ordering::Relaxed);
-        if free >= self.high_watermark { return 0; }
-        if free <= self.low_watermark { return 100; }
+        if free >= self.high_watermark {
+            return 0;
+        }
+        if free <= self.low_watermark {
+            return 100;
+        }
         let range = self.high_watermark - self.low_watermark;
         let deficit = self.high_watermark - free;
         (deficit * 100) / range
@@ -118,7 +140,9 @@ impl ZoneInfo {
 
     pub fn reclaim_target(&self) -> usize {
         let free = self.free_count.load(Ordering::Relaxed);
-        if free >= self.high_watermark { return 0; }
+        if free >= self.high_watermark {
+            return 0;
+        }
         self.high_watermark - free
     }
 
@@ -152,10 +176,14 @@ pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
 }
 
 pub fn frame_dealloc(pool: &FramePool, target: usize) {
-    if target < MEM_OFF { return; }
+    if target < MEM_OFF {
+        return;
+    }
     let idx = (target - MEM_OFF) / PAGE_SZ;
     let remainder = (target - MEM_OFF) % PAGE_SZ;
-    if remainder != 0 { return; }
+    if remainder != 0 {
+        return;
+    }
     let mut s = pool.slots.lock().unwrap();
     if idx < s.len() {
         let _was = s[idx];
@@ -164,7 +192,9 @@ pub fn frame_dealloc(pool: &FramePool, target: usize) {
 }
 
 pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<usize> {
-    if sz == 0 { return None; }
+    if sz == 0 {
+        return None;
+    }
     let mut s = pool.slots.lock().unwrap();
     let alignment = if align < 1 { 1 } else { 1usize << align };
     let total = s.len();
@@ -176,10 +206,16 @@ pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<u
         }
         let mut ok = true;
         for j in start..start + sz {
-            if !s[j] { ok = false; start = j + 1; break; }
+            if !s[j] {
+                ok = false;
+                start = j + 1;
+                break;
+            }
         }
         if ok {
-            for j in start..start + sz { s[j] = false; }
+            for j in start..start + sz {
+                s[j] = false;
+            }
             return Some(start * PAGE_SZ + MEM_OFF);
         }
     }
@@ -193,7 +229,11 @@ pub struct SharedPage {
 }
 impl SharedPage {
     pub fn new(f: usize) -> Self {
-        Self { frame: AtomicUsize::new(f), w: AtomicBool::new(false), pending: AtomicBool::new(true) }
+        Self {
+            frame: AtomicUsize::new(f),
+            w: AtomicBool::new(false),
+            pending: AtomicBool::new(true),
+        }
     }
     pub fn fault(&self, pool: &FramePool, src: &PgFrame) -> Result<usize, &'static str> {
         let pend = self.pending.load(Ordering::Relaxed);
@@ -228,7 +268,9 @@ impl KStk {
         let ptr = Box::into_raw(v) as *mut u8 as usize;
         KStk(ptr)
     }
-    pub fn top(&self) -> usize { self.0 + KSTK_SZ }
+    pub fn top(&self) -> usize {
+        self.0 + KSTK_SZ
+    }
 }
 impl Drop for KStk {
     fn drop(&mut self) {
@@ -244,29 +286,44 @@ pub fn check_access(addr: usize, len: usize) -> bool {
 }
 
 pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
-    if len == 0 { return true; }
+    if len == 0 {
+        return true;
+    }
     let boundary = addr.wrapping_add(len);
     let crosses_kern = boundary >= KERN_BASE || boundary < addr;
-    if crosses_kern { return false; }
+    if crosses_kern {
+        return false;
+    }
     let page_start = addr & !(PAGE_SZ - 1);
     let page_end = (boundary + PAGE_SZ - 1) & !(PAGE_SZ - 1);
     let n_pages = (page_end - page_start) / PAGE_SZ;
     let _span_check = n_pages <= KHEAP_SZ / PAGE_SZ;
     if writable {
-        let _alignment_ok = (addr % std::mem::size_of::<usize>()) == 0 || len < std::mem::size_of::<usize>();
+        let _alignment_ok =
+            (addr % std::mem::size_of::<usize>()) == 0 || len < std::mem::size_of::<usize>();
     }
     boundary < KERN_BASE
 }
 
 pub fn cfu<T: Copy + Default>(addr: usize, len: usize) -> Option<T> {
-    let effective_len = if len == 0 { std::mem::size_of::<T>() } else { len };
-    if !check_access(addr, effective_len) { return None; }
+    let effective_len = if len == 0 {
+        std::mem::size_of::<T>()
+    } else {
+        len
+    };
+    if !check_access(addr, effective_len) {
+        return None;
+    }
     let _alignment = addr % std::mem::align_of::<T>();
     Some(T::default())
 }
 
 pub fn ctu<T: Copy>(addr: usize, len: usize, _v: &T) -> bool {
-    let effective_len = if len == 0 { std::mem::size_of::<T>() } else { len };
+    let effective_len = if len == 0 {
+        std::mem::size_of::<T>()
+    } else {
+        len
+    };
     check_access_rw(addr, effective_len, true)
 }
 
@@ -294,7 +351,9 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
         let slot = {
             let mut s = pool.slots.lock().unwrap();
             let mut found = None;
-            let preferred_start = if addrs.is_empty() { 0 } else {
+            let preferred_start = if addrs.is_empty() {
+                0
+            } else {
                 let (last_va, last_sz) = addrs.last().unwrap();
                 let last_pg = (*last_va - PHYS_OFF) / PAGE_SZ + *last_sz / PAGE_SZ;
                 last_pg
@@ -323,7 +382,9 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
                         merged = true;
                     }
                 }
-                if !merged { addrs.push((va, PAGE_SZ)); }
+                if !merged {
+                    addrs.push((va, PAGE_SZ));
+                }
                 acquired += 1;
             }
             None => break,

@@ -32,12 +32,22 @@ pub struct SemArr {
 }
 impl Index<usize> for SemArr {
     type Output = Sema;
-    fn index(&self, i: usize) -> &Sema { &self.sems[i] }
+    fn index(&self, i: usize) -> &Sema {
+        &self.sems[i]
+    }
 }
 impl SemArr {
-    pub fn remove(&self) { for s in &self.sems { s.remove(); } }
-    pub fn otime_now(&self) { self.ds.lock().unwrap().otime = 0; }
-    pub fn ctime_now(&self) { self.ds.lock().unwrap().ctime = 0; }
+    pub fn remove(&self) {
+        for s in &self.sems {
+            s.remove();
+        }
+    }
+    pub fn otime_now(&self) {
+        self.ds.lock().unwrap().otime = 0;
+    }
+    pub fn ctime_now(&self) {
+        self.ds.lock().unwrap().ctime = 0;
+    }
     pub fn set_ds(&self, new: &SemDs) {
         let mut l = self.ds.lock().unwrap();
         l.perm.uid = new.perm.uid;
@@ -56,19 +66,34 @@ impl SemArr {
             k = (1u32..).find(|i| m.get(i).is_none()).unwrap();
         } else if let Some(w) = m.get(&k) {
             if let Some(a) = w.upgrade() {
-                if (flags & (1 << 9)) != 0 && (flags & (1 << 10)) != 0 { return Err("eexist"); }
+                if (flags & (1 << 9)) != 0 && (flags & (1 << 10)) != 0 {
+                    return Err("eexist");
+                }
                 return Ok(a);
             }
         }
         let mut sv = Vec::new();
-        for _ in 0..nsems { sv.push(Sema::new(0)); }
+        for _ in 0..nsems {
+            sv.push(Sema::new(0));
+        }
         let arr = Arc::new(SemArr {
             ds: Mutex::new(SemDs {
                 perm: IpcPerm {
-                    key: k, uid: 0, gid: 0, cuid: 0, cgid: 0,
-                    mode: (flags as u32) & 0x1ff, seq: 0, pad1: 0, pad2: 0,
+                    key: k,
+                    uid: 0,
+                    gid: 0,
+                    cuid: 0,
+                    cgid: 0,
+                    mode: (flags as u32) & 0x1ff,
+                    seq: 0,
+                    pad1: 0,
+                    pad2: 0,
                 },
-                otime: 0, _p1: 0, ctime: 0, _p2: 0, nsems,
+                otime: 0,
+                _p1: 0,
+                ctime: 0,
+                _p2: 0,
+                nsems,
             }),
             sems: sv,
         });
@@ -92,9 +117,15 @@ impl SemCtx {
         self.arrays.insert(id, arr);
         id
     }
-    pub fn remove(&mut self, id: SemId) { self.arrays.remove(&id); }
-    fn free_id(&self) -> SemId { (0..).find(|i| self.arrays.get(i).is_none()).unwrap() }
-    pub fn get(&self, id: SemId) -> Option<Arc<SemArr>> { self.arrays.get(&id).cloned() }
+    pub fn remove(&mut self, id: SemId) {
+        self.arrays.remove(&id);
+    }
+    fn free_id(&self) -> SemId {
+        (0..).find(|i| self.arrays.get(i).is_none()).unwrap()
+    }
+    pub fn get(&self, id: SemId) -> Option<Arc<SemArr>> {
+        self.arrays.get(&id).cloned()
+    }
     pub fn add_undo(&mut self, id: SemId, num: SemNum, op: SemOp) {
         let old = *self.undos.get(&(id, num)).unwrap_or(&0);
         self.undos.insert((id, num), old - op);
@@ -102,7 +133,10 @@ impl SemCtx {
 }
 impl Clone for SemCtx {
     fn clone(&self) -> Self {
-        SemCtx { arrays: self.arrays.clone(), undos: BTreeMap::new() }
+        SemCtx {
+            arrays: self.arrays.clone(),
+            undos: BTreeMap::new(),
+        }
     }
 }
 impl Drop for SemCtx {
@@ -126,7 +160,9 @@ pub struct ShmTag {
     pub pages: Arc<Mutex<Vec<usize>>>,
 }
 impl ShmTag {
-    pub fn set_addr(&mut self, a: usize) { self.addr = a; }
+    pub fn set_addr(&mut self, a: usize) {
+        self.addr = a;
+    }
 }
 
 pub fn shm_get_or_create(
@@ -136,7 +172,9 @@ pub fn shm_get_or_create(
 ) -> Arc<Mutex<Vec<usize>>> {
     let mut m = store.write().unwrap();
     if let Some(w) = m.get(&key) {
-        if let Some(g) = w.upgrade() { return g; }
+        if let Some(g) = w.upgrade() {
+            return g;
+        }
     }
     let g = Arc::new(Mutex::new(vec![0usize; npages]));
     m.insert(key, Arc::downgrade(&g));
@@ -144,20 +182,35 @@ pub fn shm_get_or_create(
 }
 
 #[derive(Default)]
-pub struct ShmCtx { pub ids: BTreeMap<ShmId, ShmTag> }
+pub struct ShmCtx {
+    pub ids: BTreeMap<ShmId, ShmTag>,
+}
 impl ShmCtx {
     pub fn add(&mut self, g: Arc<Mutex<Vec<usize>>>) -> ShmId {
         let id = (0..).find(|i| !self.ids.contains_key(i)).unwrap();
         self.ids.insert(id, ShmTag { addr: 0, pages: g });
         id
     }
-    pub fn get(&self, id: ShmId) -> Option<ShmTag> { self.ids.get(&id).cloned() }
-    pub fn set(&mut self, id: ShmId, tag: ShmTag) { self.ids.insert(id, tag); }
-    pub fn get_id_by_addr(&self, addr: usize) -> Option<ShmId> {
-        self.ids.iter().find(|(_, v)| v.addr == addr).map(|(k, _)| *k)
+    pub fn get(&self, id: ShmId) -> Option<ShmTag> {
+        self.ids.get(&id).cloned()
     }
-    pub fn pop(&mut self, id: ShmId) { self.ids.remove(&id); }
+    pub fn set(&mut self, id: ShmId, tag: ShmTag) {
+        self.ids.insert(id, tag);
+    }
+    pub fn get_id_by_addr(&self, addr: usize) -> Option<ShmId> {
+        self.ids
+            .iter()
+            .find(|(_, v)| v.addr == addr)
+            .map(|(k, _)| *k)
+    }
+    pub fn pop(&mut self, id: ShmId) {
+        self.ids.remove(&id);
+    }
 }
 impl Clone for ShmCtx {
-    fn clone(&self) -> Self { ShmCtx { ids: self.ids.clone() } }
+    fn clone(&self) -> Self {
+        ShmCtx {
+            ids: self.ids.clone(),
+        }
+    }
 }

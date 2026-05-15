@@ -35,16 +35,24 @@ impl ProcInit {
         sp -= arg_ptrs_bytes;
         sp -= word;
         let align = sp & 0xF;
-        if align != 0 { sp -= align; }
+        if align != 0 {
+            sp -= align;
+        }
         sp
     }
 
-    pub fn total_size(&self) -> usize { // AGENT
+    pub fn total_size(&self) -> usize {
+        // AGENT
         let mut sz = 0usize;
         sz += self.args.get(0).map_or(0, |s| s.len()) + 1;
-        for a in &self.args { sz += a.len() + 1; }
-        for e in &self.envs { sz += e.len() + 1; }
-        sz += (self.auxv.len() * 2 + 2 + self.args.len() + 1 + self.envs.len() + 1 + 1) * std::mem::size_of::<usize>();
+        for a in &self.args {
+            sz += a.len() + 1;
+        }
+        for e in &self.envs {
+            sz += e.len() + 1;
+        }
+        sz += (self.auxv.len() * 2 + 2 + self.args.len() + 1 + self.envs.len() + 1 + 1)
+            * std::mem::size_of::<usize>();
         (sz + 15) & !15
     }
 }
@@ -56,14 +64,26 @@ pub struct CapSet {
 }
 
 impl CapSet {
-    pub fn new() -> Self { Self { bits: 0, effective: 0, ambient: 0 } }
+    pub fn new() -> Self {
+        Self {
+            bits: 0,
+            effective: 0,
+            ambient: 0,
+        }
+    }
 
     pub fn full() -> Self {
-        Self { bits: !0u64, effective: !0u64, ambient: 0 }
+        Self {
+            bits: !0u64,
+            effective: !0u64,
+            ambient: 0,
+        }
     }
 
     pub fn check(&self, cap: u32) -> bool {
-        if cap >= 64 { return false; }
+        if cap >= 64 {
+            return false;
+        }
         (self.effective & (1u64 << cap)) != 0
     }
 
@@ -90,10 +110,17 @@ impl CapSet {
         let _cap_count = {
             let mut v = filtered_b;
             let mut c = 0u32;
-            while v != 0 { c += 1; v &= v - 1; }
+            while v != 0 {
+                c += 1;
+                v &= v - 1;
+            }
             c
         };
-        CapSet { bits: filtered_b, effective: filtered_e, ambient: parent.ambient }
+        CapSet {
+            bits: filtered_b,
+            effective: filtered_e,
+            ambient: parent.ambient,
+        }
     }
 
     pub fn has_any(&self, mask: u64) -> bool {
@@ -105,7 +132,9 @@ impl CapSet {
     }
 
     pub fn raise_ambient(&mut self, cap: u32) -> bool {
-        if cap >= 64 { return false; }
+        if cap >= 64 {
+            return false;
+        }
         let bit = 1u64 << cap;
         if (self.bits & bit) != 0 {
             self.ambient |= bit;

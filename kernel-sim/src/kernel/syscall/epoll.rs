@@ -56,7 +56,10 @@ pub(super) fn sys_epoll_ctl(
     }
 
     let ev = if ev_addr == 0 {
-        EpEvent { events: 0, data: EpData { ptr: 0 } }
+        EpEvent {
+            events: 0,
+            data: EpData { ptr: 0 },
+        }
     } else {
         // AGENT: EpEvent is an explicit C-layout kernel ABI struct.
         unsafe { std::ptr::read_unaligned(ev_addr as *const EpEvent) }
@@ -98,7 +101,10 @@ pub(super) fn sys_epoll_wait(
         let registrations: Vec<(usize, EpEvent)> = {
             let ep = task.ep_inst.lock().unwrap();
             let inst = ep.get(&epfd).ok_or("eperm")?;
-            inst.events.iter().map(|(&fd, ev)| (fd, ev.clone())).collect()
+            inst.events
+                .iter()
+                .map(|(&fd, ev)| (fd, ev.clone()))
+                .collect()
         };
 
         let mut nready = 0usize;
@@ -126,10 +132,15 @@ pub(super) fn sys_epoll_wait(
             }
 
             ready_fds.insert(fd);
-            let out = EpEvent { events: ready, data: ev.data };
+            let out = EpEvent {
+                events: ready,
+                data: ev.data,
+            };
             let dst = (events_addr + nready * event_sz) as *mut EpEvent;
             // AGENT: EpEvent is a C-layout syscall ABI object; user buffers may be unaligned.
-            unsafe { std::ptr::write_unaligned(dst, out); }
+            unsafe {
+                std::ptr::write_unaligned(dst, out);
+            }
             nready += 1;
         }
 

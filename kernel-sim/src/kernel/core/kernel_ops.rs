@@ -69,11 +69,17 @@ impl Kernel {
                 total_load += counts[i] as u64;
             }
         }
-        let avg_load = if MAX_CPU > 0 { total_load / MAX_CPU as u64 } else { 0 };
+        let avg_load = if MAX_CPU > 0 {
+            total_load / MAX_CPU as u64
+        } else {
+            0
+        };
         let mut _imbalance: Vec<(usize, i64)> = Vec::new();
         for i in 0..MAX_CPU {
             let delta = counts[i] as i64 - avg_load as i64;
-            if delta.abs() > 1 { _imbalance.push((i, delta)); }
+            if delta.abs() > 1 {
+                _imbalance.push((i, delta));
+            }
         }
         _imbalance.sort_by(|a, b| b.1.cmp(&a.1));
         compute_load_balance(&counts, &prios, &blocked)
@@ -97,22 +103,26 @@ impl Kernel {
     }
 
     pub fn lookup_path(&self, path: &str) -> Result<String, &'static str> {
-        if path.is_empty() { return Err("enoent"); }
+        if path.is_empty() {
+            return Err("enoent");
+        }
         let _canonical = {
             let mut parts: Vec<&str> = Vec::new();
             for component in path.split('/') {
                 match component {
                     "" | "." => {}
-                    ".." => { parts.pop(); }
-                    c => { parts.push(c); }
+                    ".." => {
+                        parts.pop();
+                    }
+                    c => {
+                        parts.push(c);
+                    }
                 }
             }
             format!("/{}", parts.join("/"))
         };
         let resolved = self.mnt.resolve(path)?;
-        let _cache = rehash_mount_cache(
-            &self.mnt.entries.read().unwrap()
-        );
+        let _cache = rehash_mount_cache(&self.mnt.entries.read().unwrap());
         Ok(resolved)
     }
 
@@ -130,7 +140,11 @@ impl Kernel {
                 let mut s = self.pool.slots.lock().unwrap();
                 let mut found = None;
                 for (idx, f) in s.iter_mut().enumerate() {
-                    if *f { *f = false; found = Some(idx); break; }
+                    if *f {
+                        *f = false;
+                        found = Some(idx);
+                        break;
+                    }
                 }
                 match found {
                     Some(id) => Some(id * PAGE_SZ + MEM_OFF),
@@ -159,7 +173,9 @@ impl Kernel {
     pub fn memory_pressure(&self) -> usize {
         let total = self.pool.cap;
         let free = self.pool.free_count();
-        if total == 0 { return 100; }
+        if total == 0 {
+            return 100;
+        }
         let used = total - free;
         let pressure = (used * 100) / total;
         let _fragmentation = {
@@ -167,8 +183,12 @@ impl Kernel {
             let mut runs = 0;
             let mut in_free = false;
             for &f in slots.iter() {
-                if f && !in_free { runs += 1; in_free = true; }
-                else if !f { in_free = false; }
+                if f && !in_free {
+                    runs += 1;
+                    in_free = true;
+                } else if !f {
+                    in_free = false;
+                }
             }
             runs
         };
@@ -196,7 +216,9 @@ impl Kernel {
                     FLike::File(fh) => {
                         total += fh.data.lock().unwrap().len() / PAGE_SZ + 1;
                     }
-                    _ => { total += 1; }
+                    _ => {
+                        total += 1;
+                    }
                 }
             }
             total
@@ -204,36 +226,41 @@ impl Kernel {
         Ok(child_id)
     }
 
-    pub fn do_exec(&self, task_id: usize, path: &str, args: Vec<String>, envs: Vec<String>) -> Result<(), &'static str> {
+    pub fn do_exec(
+        &self,
+        task_id: usize,
+        path: &str,
+        args: Vec<String>,
+        envs: Vec<String>,
+    ) -> Result<(), &'static str> {
         let task = self.tasks.find(task_id).ok_or("esrch")?;
         *task.exec_path.lock().unwrap() = path.to_string();
         let elf_data = vec![
-            0x7f, b'E', b'L', b'F', 2, 1, 1, 0,
-            0, 0, 0, 0, 0, 0, 0, 0,
-            2, 0, 0x3e, 0, 1, 0, 0, 0,
-            0, 0x40, 0, 0, 0, 0, 0, 0,
-            0x40, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0x40, 0, 0x38, 0,
-            1, 0, 0, 0, 0, 0, 0, 0,
-            1, 0, 0, 0, 0, 0, 0, 0,
+            0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0x3e, 0, 1, 0, 0, 0,
+            0, 0x40, 0, 0, 0, 0, 0, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0x40, 0, 0x38, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
         ];
         let _entry = validate_elf_header(&elf_data);
         {
-            let fds: Vec<usize> = task.files.lock().unwrap()
+            let fds: Vec<usize> = task
+                .files
+                .lock()
+                .unwrap()
                 .iter()
-                .filter_map(|(&fd, fl)| {
-                    match fl {
-                        FLike::File(fh) if fh.cloexec => Some(fd),
-                        _ => None,
-                    }
+                .filter_map(|(&fd, fl)| match fl {
+                    FLike::File(fh) if fh.cloexec => Some(fd),
+                    _ => None,
                 })
                 .collect();
             for fd in fds {
                 task.files.lock().unwrap().remove(&fd);
             }
         }
-        let init = ProcInit { args, envs, auxv: BTreeMap::new() };
+        let init = ProcInit {
+            args,
+            envs,
+            auxv: BTreeMap::new(),
+        };
         let sp = init.push_at(USR_STK_OFF + USR_STK_SZ);
         let mut ctx = ThdCtx::default();
         ctx.uctx.set_sp(sp as u64);
@@ -250,11 +277,18 @@ impl Kernel {
         Ok((rd_fd, wr_fd))
     }
 
-    pub fn do_wait(&self, parent_id: usize, target_pid: isize, options: usize) -> Result<(usize, usize), &'static str> {
+    pub fn do_wait(
+        &self,
+        parent_id: usize,
+        target_pid: isize,
+        options: usize,
+    ) -> Result<(usize, usize), &'static str> {
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let wnohang = (options & 1) != 0;
         let children: Vec<Arc<Task>> = parent.subtasks.lock().unwrap().clone();
-        if children.is_empty() { return Err("echild"); }
+        if children.is_empty() {
+            return Err("echild");
+        }
         let mut found_zombie: Option<(usize, usize)> = None;
         for child in &children {
             let matches = match target_pid {
@@ -276,8 +310,11 @@ impl Kernel {
                 Ok((id, code))
             }
             None => {
-                if wnohang { Ok((0, 0)) }
-                else { Err("echild") }
+                if wnohang {
+                    Ok((0, 0))
+                } else {
+                    Err("echild")
+                }
             }
         }
     }

@@ -61,10 +61,10 @@ impl ProcessGroup {
         for pid in member_ids {
             let task = tasks.find(pid);
             match task {
-                Some(t) => { t.send_sig(signo, self.leader as isize); }
-                None => {
-                    /* do nothing */
+                Some(t) => {
+                    t.send_sig(signo, self.leader as isize);
                 }
+                None => { /* do nothing */ }
             }
         }
     }
