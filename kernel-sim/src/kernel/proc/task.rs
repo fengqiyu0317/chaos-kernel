@@ -77,7 +77,9 @@ pub struct Task {
     pub files: Mutex<BTreeMap<usize, FLike>>,
     pub cwd: Mutex<String>,
     pub exec_path: Mutex<String>,
-    pub futexes: Mutex<BTreeMap<usize, Arc<FutexBucket>>>,
+    // AGENT: one futex wait bucket per task; individual futex words are
+    // distinguished by FutexWaiter.addr inside the bucket.
+    pub futex: Arc<FutexBucket>,
     pub sem_ctx: Mutex<SemCtx>,
     pub shm_ctx: Mutex<ShmCtx>,
     pub pid: Mutex<Pid>,
@@ -109,7 +111,7 @@ impl Task {
             files: Mutex::new(BTreeMap::new()),
             cwd: Mutex::new("/".to_string()),
             exec_path: Mutex::new(String::new()),
-            futexes: Mutex::new(BTreeMap::new()),
+            futex: Arc::new(FutexBucket::new()),
             sem_ctx: Mutex::new(SemCtx::default()),
             shm_ctx: Mutex::new(ShmCtx::default()),
             pid: Mutex::new(Pid::new()),
@@ -180,12 +182,8 @@ impl Task {
     pub fn get_file(&self, fd: usize) -> Option<FLike> {
         self.files.lock().unwrap().get(&fd).cloned()
     }
-    pub fn get_futex(&self, uaddr: usize) -> Arc<FutexBucket> {
-        let mut fx = self.futexes.lock().unwrap();
-        if !fx.contains_key(&uaddr) {
-            fx.insert(uaddr, Arc::new(FutexBucket::new()));
-        }
-        fx.get(&uaddr).unwrap().clone()
+    pub fn get_futex(&self) -> Arc<FutexBucket> {
+        self.futex.clone()
     }
     pub fn exit_proc(&self, code: usize) {
         let fk: Vec<usize> = {
