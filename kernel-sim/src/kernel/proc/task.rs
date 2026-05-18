@@ -59,6 +59,8 @@ pub struct ThdCtx {
     pub uctx: Context,
     pub clear_tid: usize,
     pub smask: u64,
+    // AGENT: stack of interrupted contexts while simulated signal handlers run.
+    pub sig_frames: Vec<SigFrame>,
 }
 impl Default for ThdCtx {
     fn default() -> Self {
@@ -66,6 +68,7 @@ impl Default for ThdCtx {
             uctx: Context::new(),
             clear_tid: 0,
             smask: 0,
+            sig_frames: Vec::new(),
         }
     }
 }
@@ -271,6 +274,7 @@ impl Task {
                     },
                     clear_tid: ctx.clear_tid,
                     smask: ctx.smask,
+                    sig_frames: ctx.sig_frames,
                 };
                 r
             }
@@ -317,6 +321,34 @@ impl Task {
         drop(sq);
         // AGENT
         self.ev.lock().unwrap().set(EvFlag::RECV_SIG);
+    }
+
+    // AGENT: Task.sig_queue is the pending source of truth; SigSet stores dispositions.
+    pub fn take_deliverable_signal(&self) -> Option<PendingSignal> {
+        let mask = *self.sig_mask.lock().unwrap();
+        let picked = {
+            let mut sq = self.sig_queue.lock().unwrap();
+            let pos = sq.iter().position(|(sig, _)| {
+                *sig > 0 && (*sig as u32) < NSIG && (mask & (1u64 << (*sig as u64))) == 0
+            })?;
+            sq.remove(pos)
+        };
+        match picked {
+            Some((signo, sender_tid)) => {
+                let action = self
+                    .sig_state
+                    .lock()
+                    .unwrap()
+                    .get_action(signo as u32)
+                    .clone();
+                Some(PendingSignal {
+                    signo: signo as u32,
+                    sender_tid,
+                    action,
+                })
+            }
+            None => None,
+        }
     }
 
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {

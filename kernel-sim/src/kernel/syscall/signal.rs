@@ -25,7 +25,7 @@ pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
             return false;
         }
         if !t.done() && sig != 0 {
-            t.send_sig(sig as i32, -1);
+            kernel.send_signal_to_task(t, sig as i32, -1);
         }
         true
     };
@@ -194,5 +194,18 @@ pub(super) fn sys_sigprocmask(
             }
         }
     }
+    kernel.deliver_pending_signals(0);
+    Ok(0)
+}
+
+// AGENT: restore the last simulated signal frame.
+pub(super) fn sys_sigreturn(kernel: &Kernel) -> Result<usize, &'static str> {
+    let t = kernel.cur_task(0).ok_or("esrch")?;
+    let mut thd = t.thd_ctx.lock().unwrap();
+    let ctx = thd.as_mut().ok_or("einval")?;
+    let frame = ctx.sig_frames.pop().ok_or("einval")?;
+    ctx.uctx = frame.saved_ctx;
+    ctx.smask = frame.saved_mask;
+    *t.sig_mask.lock().unwrap() = frame.saved_mask;
     Ok(0)
 }

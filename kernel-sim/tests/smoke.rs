@@ -1,9 +1,21 @@
 // AGENT
-use kernel_sim::{Kernel, TaskRunState, N_FRAMES, SYS_EXIT, SYS_FUTEX, SYS_GETPID};
+use kernel_sim::{
+    Kernel, TaskRunState, N_FRAMES, SIGUSR1, SYS_EXIT, SYS_FUTEX, SYS_GETPID, SYS_KILL,
+    SYS_SIGACTION, SYS_SIGRETURN,
+};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserSigAction {
+    sa_handler: usize,
+    sa_sigaction: usize,
+    sa_mask: u64,
+    sa_flags: i32,
+}
 
 #[test]
 fn boot_kernel_in_standalone_runtime() {
@@ -17,6 +29,80 @@ fn boot_kernel_in_standalone_runtime() {
         .expect("getpid should succeed in standalone runtime");
 
     assert_eq!(pid, 1);
+}
+
+#[test]
+// AGENT
+fn default_signal_action_terminates_current_task() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let child = kernel.do_fork(1).expect("fork should create child task");
+
+    kernel
+        .dispatch_syscall(SYS_KILL, 1, SIGUSR1 as usize, 0, 0, 0, 0)
+        .expect("kill should enqueue and deliver the signal");
+
+    let init = kernel
+        .tasks
+        .find(1)
+        .expect("init task should still be reaped later");
+    assert!(init.done());
+    assert_eq!(*init.exit_code.lock().unwrap(), 128 + SIGUSR1 as usize);
+    assert_eq!(
+        kernel.cur_task(0).expect("child should be scheduled").id(),
+        child
+    );
+}
+
+#[test]
+// AGENT
+fn custom_signal_handler_updates_context_and_sigreturn_restores_it() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    {
+        let mut thd = task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_mut().expect("thread context should exist");
+        ctx.uctx.set_ip(0x1234);
+        ctx.uctx.r[3] = 0x7777;
+    }
+
+    let act = UserSigAction {
+        sa_handler: 0x5555,
+        sa_sigaction: 0,
+        sa_mask: 1u64 << SIGUSR1,
+        sa_flags: 0,
+    };
+    let act_addr = &act as *const UserSigAction as usize;
+    kernel
+        .dispatch_syscall(SYS_SIGACTION, SIGUSR1 as usize, act_addr, 0, 0, 0, 0)
+        .expect("sigaction should install handler");
+
+    kernel
+        .dispatch_syscall(SYS_KILL, 1, SIGUSR1 as usize, 0, 0, 0, 0)
+        .expect("kill should enter signal handler");
+
+    {
+        let thd = task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_ref().expect("thread context should exist");
+        assert_eq!(ctx.uctx.ip, 0x5555);
+        assert_eq!(ctx.uctx.r[0], SIGUSR1 as u64);
+        assert_eq!(ctx.uctx.r[1], u64::MAX);
+        assert_eq!(ctx.uctx.r[2], 0x1234);
+        assert_eq!(ctx.sig_frames.len(), 1);
+        assert_ne!(*task.sig_mask.lock().unwrap() & (1u64 << SIGUSR1), 0);
+    }
+
+    kernel
+        .dispatch_syscall(SYS_SIGRETURN, 0, 0, 0, 0, 0, 0)
+        .expect("sigreturn should restore interrupted context");
+
+    let thd = task.thd_ctx.lock().unwrap();
+    let ctx = thd.as_ref().expect("thread context should exist");
+    assert_eq!(ctx.uctx.ip, 0x1234);
+    assert_eq!(ctx.uctx.r[3], 0x7777);
+    assert_eq!(ctx.sig_frames.len(), 0);
+    assert_eq!(*task.sig_mask.lock().unwrap(), 0);
 }
 
 #[test]

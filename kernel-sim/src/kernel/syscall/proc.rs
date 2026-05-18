@@ -65,7 +65,7 @@ pub(super) fn sys_exit(kernel: &Kernel, a0: usize) -> Result<usize, &'static str
         kernel.run_queue.remove(t.id());
         let parent = t.parent.lock().unwrap();
         if let Some(p) = parent.as_ref() {
-            p.send_sig(SIGCHLD as i32, t.id() as isize);
+            kernel.send_signal_to_task(p, SIGCHLD as i32, t.id() as isize);
         }
         drop(parent);
         let children: Vec<Arc<Task>> = t.subtasks.lock().unwrap().clone();

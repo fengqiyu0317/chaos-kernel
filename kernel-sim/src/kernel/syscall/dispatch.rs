@@ -21,7 +21,7 @@ impl Kernel {
                 .find_map(|(i, slot)| slot.as_ref().map(|t| t.vm_token.load(Ordering::Relaxed)))
                 .unwrap_or(0)
         };
-        match nr {
+        let result = match nr {
             SYS_READ => sys_read(self, a0, a1, a2),
             SYS_WRITE => sys_write(self, a0, a1, a2),
             SYS_OPEN => sys_open(self, a0, a1, a2),
@@ -51,8 +51,13 @@ impl Kernel {
             SYS_CLOCK_GETTIME => sys_clock_gettime(self, a0, a1),
             SYS_SIGACTION => sys_sigaction(self, a0, a1, a2, a3, a4),
             SYS_SIGPROCMASK => sys_sigprocmask(self, a0, a1, a2),
+            SYS_SIGRETURN => sys_sigreturn(self),
             SYS_FUTEX => sys_futex(self, a0, a1, a2, a3, a4, a5),
             _ => Err("enosys"),
+        };
+        if result.is_ok() {
+            self.deliver_pending_signals(0);
         }
+        result
     }
 }

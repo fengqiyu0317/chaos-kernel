@@ -8,6 +8,23 @@ pub struct SigAction {
     pub mask: u64,
 }
 
+// AGENT: simulated userspace signal frame used by kernel-sim sigreturn.
+#[derive(Clone)]
+pub struct SigFrame {
+    pub saved_ctx: Context,
+    pub saved_mask: u64,
+    pub signo: u32,
+    pub sender_tid: isize,
+}
+
+// AGENT: signal selected from Task::sig_queue with its disposition snapshot.
+#[derive(Clone)]
+pub struct PendingSignal {
+    pub signo: u32,
+    pub sender_tid: isize,
+    pub action: SigAction,
+}
+
 #[derive(Clone)]
 pub struct SigSet {
     pub pending: u64,

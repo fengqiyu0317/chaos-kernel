@@ -2,6 +2,84 @@
 use super::*;
 
 impl Kernel {
+    // AGENT: central signal enqueue path so sleeping tasks can be made runnable.
+    pub fn send_signal_to_task(&self, task: &Arc<Task>, signo: i32, sender_tid: isize) {
+        task.send_sig(signo, sender_tid);
+        if task.done() {
+            return;
+        }
+        if task.sched_state() == TaskRunState::Sleeping {
+            task.set_sched_state(TaskRunState::Runnable);
+            self.run_queue.enqueue(task.id(), task.sched_policy());
+        }
+    }
+
+    // AGENT: deliver pending signals at simulator scheduling/syscall boundaries.
+    pub fn deliver_pending_signals(&self, cpu: usize) -> usize {
+        if cpu != 0 {
+            return 0;
+        }
+        let task = match self.cur_task(cpu) {
+            Some(task) => task,
+            None => return 0,
+        };
+        let mut delivered = 0usize;
+        while let Some(sig) = task.take_deliverable_signal() {
+            delivered += 1;
+            match sig.action.handler {
+                SIG_IGN => continue,
+                SIG_DFL => match sig.signo {
+                    SIGCHLD => continue,
+                    SIGSTOP => {
+                        task.set_sched_state(TaskRunState::Sleeping);
+                        self.run_queue.remove(task.id());
+                        self.run_queue.clear_current();
+                        self.set_cur(cpu, None);
+                        self.schedule_next_runnable(cpu);
+                        break;
+                    }
+                    _ => {
+                        task.exit_proc(128 + sig.signo as usize);
+                        task.set_sched_state(TaskRunState::Zombie);
+                        self.run_queue.remove(task.id());
+                        self.run_queue.clear_current();
+                        self.set_cur(cpu, None);
+                        self.schedule_next_runnable(cpu);
+                        break;
+                    }
+                },
+                handler => {
+                    let old_mask = *task.sig_mask.lock().unwrap();
+                    let mut thd = task.thd_ctx.lock().unwrap();
+                    let Some(ctx) = thd.as_mut() else {
+                        task.sig_queue
+                            .lock()
+                            .unwrap()
+                            .push_front((sig.signo as i32, sig.sender_tid));
+                        break;
+                    };
+                    let saved_ctx = ctx.uctx.clone();
+                    ctx.sig_frames.push(SigFrame {
+                        saved_ctx,
+                        saved_mask: old_mask,
+                        signo: sig.signo,
+                        sender_tid: sig.sender_tid,
+                    });
+                    let next_mask = (old_mask | sig.action.mask | (1u64 << sig.signo))
+                        & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
+                    *task.sig_mask.lock().unwrap() = next_mask;
+                    ctx.smask = next_mask;
+                    ctx.uctx.r[0] = sig.signo as u64;
+                    ctx.uctx.r[1] = sig.sender_tid as u64;
+                    ctx.uctx.r[2] = ctx.sig_frames.last().unwrap().saved_ctx.ip;
+                    ctx.uctx.set_ip(handler as u64);
+                    break;
+                }
+            }
+        }
+        delivered
+    }
+
     pub fn schedule_tick(&self, cpu: usize) {
         dtk(cpu);
         if cpu != 0 || !self.run_queue.preemptible() {
@@ -42,6 +120,7 @@ impl Kernel {
                     task.reset_slice();
                     self.set_cur(cpu, Some(task));
                     self.run_queue.set_current(id);
+                    self.deliver_pending_signals(cpu);
                     return true;
                 }
                 Some(task) if task.done() => {

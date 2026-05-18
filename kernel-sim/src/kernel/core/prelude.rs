@@ -145,6 +145,7 @@ pub const SYS_FSTAT: usize = 5;
 pub const SYS_MMAP: usize = 9;
 pub const SYS_MUNMAP: usize = 11;
 pub const SYS_BRK: usize = 12;
+pub const SYS_SIGRETURN: usize = 15;
 pub const SYS_IOCTL: usize = 16;
 pub const SYS_PIPE: usize = 22;
 pub const SYS_DUP: usize = 32;
