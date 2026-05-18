@@ -79,10 +79,11 @@ impl Channel {
                     drop(d);
                 } else {
                     drop(d);
+                    let token = WaitToken::current();
                     let mut wq = self.wq.q.lock().unwrap();
-                    wq.push_back(thread::current());
+                    wq.push_back(token.clone());
                     drop(wq);
-                    thread::park();
+                    token.wait(None);
                 }
             }
         }
@@ -185,8 +186,8 @@ impl Channel {
         if written > 0 {
             drop(ring);
             let mut wq = self.wq.q.lock().unwrap();
-            if let Some(t) = wq.pop_front() {
-                t.unpark();
+            if let Some(token) = wq.pop_front() {
+                token.wake();
             }
         }
         written

@@ -89,6 +89,7 @@ pub struct Task {
     pub exit_code: Mutex<usize>,
     pub sig_queue: Mutex<VecDeque<(i32, isize)>>,
     pub sig_mask: Mutex<u64>,
+    pub sig_state: Mutex<SigSet>,
     pub ep_inst: Mutex<BTreeMap<usize, EpInst>>,
     pub kstk: Mutex<Option<KStk>>,
     pub thd_ctx: Mutex<Option<ThdCtx>>,
@@ -121,6 +122,7 @@ impl Task {
             exit_code: Mutex::new(0),
             sig_queue: Mutex::new(VecDeque::new()),
             sig_mask: Mutex::new(0),
+            sig_state: Mutex::new(SigSet::new()),
             ep_inst: Mutex::new(BTreeMap::new()),
             kstk: Mutex::new(None),
             thd_ctx: Mutex::new(Some(ThdCtx::default())),
@@ -285,15 +287,10 @@ impl Task {
             return false;
         }
         let sm = *self.sig_mask.lock().unwrap();
-        let tid = self.id();
         let mut found = false;
-        for (sig, sender) in sq.iter() {
+        for (sig, _) in sq.iter() {
             let s = *sig;
-            let snd = *sender;
-            if snd != -1 && snd as usize != tid {
-                continue;
-            }
-            let bit = if s >= 0 && (s as u32) < 64 {
+            let bit = if s >= 0 && (s as u32) < NSIG {
                 1u64 << (s as u64)
             } else {
                 0
@@ -307,15 +304,18 @@ impl Task {
     }
 
     pub fn send_sig(&self, signo: i32, sender_tid: isize) {
+        if signo <= 0 || signo as u32 >= NSIG {
+            return;
+        }
         let mut sq = self.sig_queue.lock().unwrap();
-        let dup = sq.iter().any(|(s, t)| *s == signo && *t == sender_tid);
-        // HUMAN
+        let dup = sq.iter().any(|(s, _)| *s == signo);
+        // AGENT
         if dup {
             return;
         }
         sq.push_back((signo, sender_tid));
         drop(sq);
-        // HUMAN
+        // AGENT
         self.ev.lock().unwrap().set(EvFlag::RECV_SIG);
     }
 
@@ -502,6 +502,9 @@ impl TaskTable {
         *tgt.shm_ctx.lock().unwrap() = src.shm_ctx.lock().unwrap().clone();
         let smask = { *src.sig_mask.lock().unwrap() };
         *tgt.sig_mask.lock().unwrap() = smask;
+        // AGENT: child inherits signal dispositions from the parent process.
+        let sig_state = { src.sig_state.lock().unwrap().clone() };
+        *tgt.sig_state.lock().unwrap() = sig_state;
         *tgt.parent.lock().unwrap() = Some(src.clone());
         src.subtasks.lock().unwrap().push(tgt.clone());
         let p = Pid(nid);
@@ -524,6 +527,9 @@ impl TaskTable {
         ctx.uctx.set_tls(tls);
         ctx.clear_tid = clear_tid;
         ctx.smask = *src.sig_mask.lock().unwrap();
+        // AGENT: threads share the process-level signal dispositions at clone time.
+        let sig_state = { src.sig_state.lock().unwrap().clone() };
+        *t.sig_state.lock().unwrap() = sig_state;
         *t.thd_ctx.lock().unwrap() = Some(ctx);
         t.vm_token
             .store(src.vm_token.load(Ordering::Relaxed), Ordering::Relaxed);

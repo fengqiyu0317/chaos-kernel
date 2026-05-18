@@ -1,12 +1,14 @@
 // AGENT
 use super::*;
 
+#[derive(Clone)]
 pub struct SigAction {
     pub handler: usize,
     pub flags: u32,
     pub mask: u64,
 }
 
+#[derive(Clone)]
 pub struct SigSet {
     pub pending: u64,
     pub blocked: u64,
