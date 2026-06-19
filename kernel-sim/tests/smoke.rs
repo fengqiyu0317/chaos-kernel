@@ -1,11 +1,12 @@
 // AGENT
 use kernel_sim::{
-    EpData, EpEvent, FLike, Kernel, PgFrame, SchedulePolicy, TaskRunState, VmRegion, N_FRAMES,
-    N_PROC, O_CLOEXEC, PAGE_SZ, SIGUSR1, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXIT, SYS_FORK,
-    SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, VM_READ, VM_WRITE,
+    EpData, EpEvent, FLike, Kernel, PgFrame, SchedulePolicy, TaskRunState, TaskTable, VmRegion,
+    N_FRAMES, N_PROC, O_CLOEXEC, PAGE_SZ, SIGUSR1, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXIT,
+    SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, VM_READ,
+    VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -244,6 +245,44 @@ fn fork_returns_eagain_when_process_table_is_full() {
 
     assert_eq!(err, "eagain");
     assert_eq!(kernel.tasks.count(), N_PROC);
+}
+
+#[test]
+// AGENT
+fn concurrent_fork_respects_process_table_limit() {
+    let tasks = Arc::new(TaskTable::new());
+    let root = tasks.spawn_root();
+    for _ in tasks.count()..(N_PROC - 1) {
+        tasks.spawn("filler");
+    }
+
+    let workers = 8;
+    let barrier = Arc::new(Barrier::new(workers));
+    let handles: Vec<_> = (0..workers)
+        .map(|_| {
+            let tasks = tasks.clone();
+            let root = root.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                tasks.fork_task(&root).map(|task| task.id())
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("fork worker should not panic"))
+        .collect();
+    let successes = results.iter().filter(|result| result.is_ok()).count();
+
+    assert_eq!(successes, 1);
+    assert!(results
+        .iter()
+        .filter_map(|result| result.as_ref().err())
+        .all(|err| *err == "eagain"));
+    assert_eq!(tasks.count(), N_PROC);
+    assert_eq!(root.n_children(), 1);
 }
 
 #[test]

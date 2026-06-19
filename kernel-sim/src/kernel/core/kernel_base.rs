@@ -159,15 +159,4 @@ impl Kernel {
     pub fn get_shm(&self, key: usize, npages: usize) -> Arc<Mutex<Vec<usize>>> {
         shm_get_or_create(key, npages, &self.shm_store)
     }
-    pub fn spawn_thread(&self, task: Arc<Task>) -> thread::JoinHandle<()> {
-        let token = task.vm_token.load(Ordering::Relaxed);
-        thread::spawn(move || loop {
-            let mut tc = task.begin_run();
-            task.end_run(tc);
-            if task.done() {
-                break;
-            }
-            thread::yield_now();
-        })
-    }
 }

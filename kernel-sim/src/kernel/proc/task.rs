@@ -263,35 +263,6 @@ impl Task {
         let mut ep = self.ep_inst.lock().unwrap();
         ep.insert(fd, inst);
     }
-    pub fn begin_run(&self) -> ThdCtx {
-        let mut g = self.thd_ctx.lock().unwrap();
-        match g.take() {
-            Some(ctx) => {
-                let r = ThdCtx {
-                    uctx: Context {
-                        r: {
-                            let mut a = [0u64; N_REGS];
-                            for i in 0..N_REGS {
-                                a[i] = ctx.uctx.r[i];
-                            }
-                            a
-                        },
-                        ip: ctx.uctx.ip,
-                        flags: ctx.uctx.flags,
-                    },
-                    clear_tid: ctx.clear_tid,
-                    smask: ctx.smask,
-                    sig_frames: ctx.sig_frames,
-                };
-                r
-            }
-            None => ThdCtx::default(),
-        }
-    }
-    pub fn end_run(&self, cx: ThdCtx) {
-        let mut g = self.thd_ctx.lock().unwrap();
-        *g = Some(cx);
-    }
     pub fn has_sig(&self) -> bool {
         let sq = self.sig_queue.lock().unwrap();
         if sq.is_empty() {
@@ -432,6 +403,9 @@ pub struct TaskTable {
     pub map: RwLock<BTreeMap<usize, Arc<Task>>>,
     pub seq: AtomicUsize,
     pub root: Mutex<Option<Arc<Task>>>,
+    // AGENT: reserve capacity for forks in progress so concurrent fork callers
+    // cannot all pass the process-table limit check before registration.
+    fork_reservations: AtomicUsize,
 }
 impl TaskTable {
     pub fn new() -> Self {
@@ -439,6 +413,7 @@ impl TaskTable {
             map: RwLock::new(BTreeMap::new()),
             seq: AtomicUsize::new(1),
             root: Mutex::new(None),
+            fork_reservations: AtomicUsize::new(0),
         }
     }
     pub fn spawn(&self, tag: &str) -> Arc<Task> {
@@ -503,10 +478,27 @@ impl TaskTable {
     pub fn count(&self) -> usize {
         self.map.read().unwrap().len()
     }
-    pub fn fork_task(&self, src: &Arc<Task>) -> Result<Arc<Task>, &'static str> {
-        if self.count() >= N_PROC {
-            return Err("eagain");
+    fn reserve_fork_slot(&self) -> Result<ForkSlotReservation<'_>, &'static str> {
+        loop {
+            let live = self.count();
+            let reserved = self.fork_reservations.load(Ordering::SeqCst);
+            if live.saturating_add(reserved) >= N_PROC {
+                return Err("eagain");
+            }
+            if self
+                .fork_reservations
+                .compare_exchange(reserved, reserved + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Ok(ForkSlotReservation {
+                    table: self,
+                    active: true,
+                });
+            }
         }
+    }
+    pub fn fork_task(&self, src: &Arc<Task>) -> Result<Arc<Task>, &'static str> {
+        let fork_slot = self.reserve_fork_slot()?;
         let nid = self.seq.fetch_add(1, Ordering::SeqCst);
         let ns = src.tag();
         let child_addr_space = {
@@ -575,8 +567,9 @@ impl TaskTable {
         *tgt.parent.lock().unwrap() = Some(src.clone());
         src.subtasks.lock().unwrap().push(tgt.clone());
         let p = Pid(nid);
-        self.register(&tgt, p);
         tgt.threads.lock().unwrap().push(nid);
+        self.register(&tgt, p);
+        fork_slot.release();
         Ok(tgt)
     }
     pub fn clone_thread(
@@ -693,6 +686,30 @@ impl TaskTable {
             t.send_sig(signo, -1);
         }
         count
+    }
+}
+
+struct ForkSlotReservation<'a> {
+    table: &'a TaskTable,
+    active: bool,
+}
+
+impl ForkSlotReservation<'_> {
+    fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if self.active {
+            self.active = false;
+            self.table.fork_reservations.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for ForkSlotReservation<'_> {
+    fn drop(&mut self) {
+        self.release_inner();
     }
 }
 
