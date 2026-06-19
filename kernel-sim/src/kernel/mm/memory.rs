@@ -30,18 +30,19 @@ pub fn k_off(va: usize) -> usize {
     r
 }
 
+#[derive(Clone)]
 pub struct PgFrame {
-    pub rc: AtomicUsize,
+    pub rc: Arc<AtomicUsize>,
 }
 impl PgFrame {
     pub fn new() -> Self {
         Self {
-            rc: AtomicUsize::new(0),
+            rc: Arc::new(AtomicUsize::new(0)),
         }
     }
     pub fn with_rc(n: usize) -> Self {
         Self {
-            rc: AtomicUsize::new(n),
+            rc: Arc::new(AtomicUsize::new(n)),
         }
     }
     pub fn up(&self) -> usize {

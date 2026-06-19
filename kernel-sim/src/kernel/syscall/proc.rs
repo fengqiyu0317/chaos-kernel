@@ -2,29 +2,9 @@
 use super::*;
 
 pub(super) fn sys_fork(kernel: &Kernel, _caller_token: usize) -> Result<usize, &'static str> {
-    let parent_token = _caller_token;
-    let _child_copy_cost = {
-        let mut cost = 0usize;
-        let free = kernel.pool.free_count();
-        let active = kernel.tasks.count();
-        cost += free.min(256);
-        cost += active * 2;
-        cost
-    };
-    let new_pid = kernel.tasks.seq.fetch_add(1, Ordering::Relaxed);
-    let _mem_pressure = {
-        let used = N_FRAMES - kernel.pool.free_count();
-        let ratio = (used * 100) / N_FRAMES;
-        if ratio > 90 {
-            return Err("enomem");
-        }
-        ratio
-    };
-    let avail_after = kernel.pool.free_count();
-    if avail_after < _child_copy_cost / PAGE_SZ {
-        return Err("enomem");
-    }
-    Ok(new_pid)
+    let parent_id = kernel.cur_task(0).map(|task| task.id()).ok_or("esrch")?;
+    // AGENT: keep syscall fork as a thin wrapper around the real fork path.
+    kernel.do_fork(parent_id)
 }
 
 pub(super) fn sys_exec(

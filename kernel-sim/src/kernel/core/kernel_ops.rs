@@ -280,10 +280,8 @@ impl Kernel {
 
     pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> {
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
-        let child = self.tasks.fork_task(&parent);
+        let child = self.tasks.fork_task(&parent)?;
         let child_id = child.id();
-        let parent_vm_token = parent.vm_token.load(Ordering::Relaxed);
-        child.vm_token.store(parent_vm_token, Ordering::Relaxed);
         child.set_sched_state(TaskRunState::Runnable);
         child.reset_slice();
         self.run_queue.enqueue(child_id, child.sched_policy());

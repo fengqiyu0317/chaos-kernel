@@ -74,7 +74,10 @@ pub(super) fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize,
 pub(super) fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
     let new_brk = a0;
     if new_brk == 0 {
-        return Ok(0x0040_0000);
+        return Ok(kernel
+            .cur_task(0)
+            .map(|t| t.addr_space.lock().unwrap().vm_map.brk)
+            .unwrap_or(0x0040_0000));
     }
     if new_brk >= KERN_BASE {
         return Err("enomem");
@@ -82,7 +85,7 @@ pub(super) fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str>
     let aligned = (new_brk + PAGE_SZ - 1) & !(PAGE_SZ - 1);
     let cur = kernel.cur_task(0);
     if let Some(t) = cur {
-        let old_brk = t.vm_token.load(Ordering::Relaxed);
+        let old_brk = t.addr_space.lock().unwrap().vm_map.brk;
         if aligned < old_brk {
             let pages_freed = (old_brk - aligned) >> 12;
             for p in 0..pages_freed {
@@ -100,7 +103,7 @@ pub(super) fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str>
                 let _frame = frame_alloc(&kernel.pool);
             }
         }
-        t.vm_token.store(aligned, Ordering::Release);
+        t.addr_space.lock().unwrap().vm_map.brk = aligned;
     }
     Ok(aligned)
 }

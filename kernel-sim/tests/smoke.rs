@@ -1,7 +1,8 @@
 // AGENT
 use kernel_sim::{
-    Kernel, TaskRunState, N_FRAMES, SIGUSR1, SYS_EXIT, SYS_FUTEX, SYS_GETPID, SYS_KILL,
-    SYS_SIGACTION, SYS_SIGRETURN,
+    EpData, EpEvent, FLike, Kernel, PgFrame, SchedulePolicy, TaskRunState, VmRegion, N_FRAMES,
+    N_PROC, O_CLOEXEC, PAGE_SZ, SIGUSR1, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXIT, SYS_FORK,
+    SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, VM_READ, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -29,6 +30,220 @@ fn boot_kernel_in_standalone_runtime() {
         .expect("getpid should succeed in standalone runtime");
 
     assert_eq!(pid, 1);
+}
+
+#[test]
+// AGENT
+fn syscall_fork_creates_child_task_and_enqueues_it() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+
+    let child = kernel
+        .dispatch_syscall(SYS_FORK, 0, 0, 0, 0, 0, 0)
+        .expect("fork syscall should create child task");
+    let child_task = kernel
+        .tasks
+        .find(child)
+        .expect("fork syscall should register child task");
+
+    assert_eq!(kernel.tasks.count(), 2);
+    assert_eq!(
+        child_task
+            .parent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("child should remember parent")
+            .id(),
+        1
+    );
+    assert_eq!(child_task.sched_state(), TaskRunState::Runnable);
+    assert_eq!(kernel.run_queue.len(), 1);
+}
+
+#[test]
+// AGENT
+fn fork_copies_context_address_space_cwd_and_kernel_stack() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let parent = kernel.cur_task(0).expect("init should be current");
+    let parent_token = parent.vm_token.load(Ordering::Relaxed);
+    {
+        parent.info.lock().unwrap().fds = vec![String::from("fd:tracked")];
+        parent.sched.lock().unwrap().policy = SchedulePolicy::with_prio(-4);
+        parent.sig_state.lock().unwrap().sig_raise(SIGUSR1);
+        let mut thd = parent.thd_ctx.lock().unwrap();
+        let ctx = thd.as_mut().expect("parent context should exist");
+        ctx.uctx.set_ip(0x1234);
+        ctx.uctx.r[0] = 99;
+        ctx.uctx.r[3] = 0x7777;
+        ctx.clear_tid = 42;
+        ctx.smask = 0x55;
+    }
+    {
+        *parent.cwd.lock().unwrap() = String::from("caf\u{e9}/fork");
+        let mut addr_space = parent.addr_space.lock().unwrap();
+        addr_space.vm_map.brk = 0x0060_0000;
+        addr_space
+            .vm_map
+            .insert(VmRegion::new(0x5000_0000, PAGE_SZ, VM_READ | VM_WRITE))
+            .expect("test mapping should not overlap");
+        addr_space
+            .cow_pages
+            .lock()
+            .unwrap()
+            .insert(0x5000_0000, PgFrame::with_rc(1));
+    }
+
+    let child = kernel.do_fork(1).expect("fork should create child");
+    let child_task = kernel
+        .tasks
+        .find(child)
+        .expect("child should be registered");
+
+    assert_ne!(child_task.vm_token.load(Ordering::Relaxed), parent_token);
+    assert!(child_task.kstk.lock().unwrap().is_some());
+    assert_eq!(&*child_task.cwd.lock().unwrap(), "caf\u{e9}/fork");
+    assert_eq!(
+        child_task.info.lock().unwrap().fds,
+        vec![String::from("fd:tracked")]
+    );
+    {
+        let child_policy = child_task.sched_policy();
+        assert_eq!(child_policy.prio, -4);
+        assert_eq!(child_policy.nice, -4);
+    }
+    assert_eq!(child_task.sig_state.lock().unwrap().pending, 0);
+    {
+        let child_addr_space = child_task.addr_space.lock().unwrap();
+        assert_eq!(child_addr_space.vm_map.brk, 0x0060_0000);
+        assert!(child_addr_space.vm_map.find(0x5000_0000).is_some());
+        assert_eq!(
+            child_addr_space
+                .cow_pages
+                .lock()
+                .unwrap()
+                .get(&0x5000_0000)
+                .expect("child should share COW frame")
+                .count(),
+            2
+        );
+    }
+    {
+        let parent_addr_space = parent.addr_space.lock().unwrap();
+        assert_eq!(
+            parent_addr_space
+                .cow_pages
+                .lock()
+                .unwrap()
+                .get(&0x5000_0000)
+                .expect("parent should retain shared COW frame")
+                .count(),
+            2
+        );
+    }
+    {
+        parent.addr_space.lock().unwrap().vm_map.brk = 0x0070_0000;
+        let child_addr_space = child_task.addr_space.lock().unwrap();
+        assert_eq!(child_addr_space.vm_map.brk, 0x0060_0000);
+    }
+    {
+        let thd = child_task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_ref().expect("child context should exist");
+        assert_eq!(ctx.uctx.ip, 0x1234);
+        assert_eq!(ctx.uctx.r[0], 0);
+        assert_eq!(ctx.uctx.r[3], 0x7777);
+        assert_eq!(ctx.clear_tid, 42);
+        assert_eq!(ctx.smask, 0x55);
+    }
+    {
+        let thd = parent.thd_ctx.lock().unwrap();
+        let ctx = thd.as_ref().expect("parent context should still exist");
+        assert_eq!(ctx.uctx.r[0], 99);
+    }
+}
+
+#[test]
+// AGENT
+fn fork_preserves_cloexec_and_epoll_state() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let fd = kernel
+        .dispatch_syscall(SYS_OPEN, 0x1000, O_CLOEXEC, 0, 0, 0, 0)
+        .expect("open should create cloexec file");
+    let epfd = kernel
+        .dispatch_syscall(SYS_EPOLL_CREATE, 1, 0, 0, 0, 0, 0)
+        .expect("epoll_create should create epoll fd");
+    let ev = EpEvent {
+        events: EpEvent::IN,
+        data: EpData { ptr: 0x55 },
+    };
+    kernel
+        .dispatch_syscall(
+            SYS_EPOLL_CTL,
+            epfd,
+            1,
+            fd,
+            &ev as *const EpEvent as usize,
+            0,
+            0,
+        )
+        .expect("epoll_ctl should register fd");
+
+    let child = kernel.do_fork(1).expect("fork should create child");
+    let child_task = kernel
+        .tasks
+        .find(child)
+        .expect("child should be registered");
+
+    match child_task.get_file(fd).expect("child should inherit fd") {
+        FLike::File(f) => assert!(f.cloexec),
+        _ => panic!("expected inherited regular file"),
+    }
+    let modified_ev = EpEvent {
+        events: EpEvent::OUT,
+        data: EpData { ptr: 0xaa },
+    };
+    kernel
+        .dispatch_syscall(
+            SYS_EPOLL_CTL,
+            epfd,
+            3,
+            fd,
+            &modified_ev as *const EpEvent as usize,
+            0,
+            0,
+        )
+        .expect("parent epoll_ctl should update shared epoll instance");
+    let ep = child_task.ep_inst.lock().unwrap();
+    let inst = ep.get(&epfd).expect("child should inherit epoll instance");
+    assert_eq!(
+        inst.events
+            .lock()
+            .unwrap()
+            .get(&fd)
+            .expect("child epoll instance should share watched fd")
+            .data
+            .ptr,
+        0xaa
+    );
+}
+
+#[test]
+// AGENT
+fn fork_returns_eagain_when_process_table_is_full() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    for _ in kernel.tasks.count()..N_PROC {
+        kernel.tasks.spawn("filler");
+    }
+
+    let err = kernel
+        .do_fork(1)
+        .expect_err("fork should fail when process table is full");
+
+    assert_eq!(err, "eagain");
+    assert_eq!(kernel.tasks.count(), N_PROC);
 }
 
 #[test]

@@ -43,34 +43,35 @@ impl EpCtlOp {
 
 #[derive(Clone)]
 pub struct EpInst {
-    pub events: BTreeMap<usize, EpEvent>,
+    pub events: Arc<Mutex<BTreeMap<usize, EpEvent>>>,
     pub ready: Arc<Mutex<BTreeSet<usize>>>,
 }
 impl EpInst {
     pub fn new() -> Self {
         EpInst {
-            events: BTreeMap::new(),
+            events: Arc::new(Mutex::new(BTreeMap::new())),
             ready: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
     pub fn control(&mut self, op: i32, fd: usize, ev: &EpEvent) -> Result<(), &'static str> {
+        let mut events = self.events.lock().unwrap();
         match op {
             EpCtlOp::ADD => {
-                if self.events.contains_key(&fd) {
+                if events.contains_key(&fd) {
                     return Err("eexist");
                 }
-                self.events.insert(fd, ev.clone());
+                events.insert(fd, ev.clone());
                 Ok(())
             }
             EpCtlOp::MOD => {
-                if !self.events.contains_key(&fd) {
+                if !events.contains_key(&fd) {
                     return Err("enoent");
                 }
-                self.events.insert(fd, ev.clone());
+                events.insert(fd, ev.clone());
                 Ok(())
             }
             EpCtlOp::DEL => {
-                if self.events.remove(&fd).is_none() {
+                if events.remove(&fd).is_none() {
                     return Err("enoent");
                 }
                 self.ready.lock().unwrap().remove(&fd);

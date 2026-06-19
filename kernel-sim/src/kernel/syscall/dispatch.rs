@@ -14,6 +14,8 @@ impl Kernel {
     ) -> Result<usize, &'static str> {
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
         let _ts_enter = CLK.load(Ordering::Relaxed);
+        // AGENT TODO: use caller_token for user-memory access once vm_token has
+        // a single address-space meaning instead of the current placeholder flow.
         let _caller_token = {
             let cpus = self.cpus.lock().unwrap();
             cpus.iter()

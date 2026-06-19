@@ -55,6 +55,7 @@ impl SchedEntity {
     }
 }
 
+#[derive(Clone)]
 pub struct ThdCtx {
     pub uctx: Context,
     pub clear_tid: usize,
@@ -96,12 +97,17 @@ pub struct Task {
     pub ep_inst: Mutex<BTreeMap<usize, EpInst>>,
     pub kstk: Mutex<Option<KStk>>,
     pub thd_ctx: Mutex<Option<ThdCtx>>,
+    pub addr_space: Arc<Mutex<AddrSpace>>,
     pub vm_token: AtomicUsize,
     pub sched: Mutex<SchedEntity>,
 }
 
 impl Task {
     pub fn make(id: usize, tag: &str) -> Arc<Self> {
+        Self::make_with_addr_space(id, tag, Arc::new(Mutex::new(AddrSpace::new(id as u16))))
+    }
+
+    fn make_with_addr_space(id: usize, tag: &str, addr_space: Arc<Mutex<AddrSpace>>) -> Arc<Self> {
         let _kobj_stamp = CLK.load(Ordering::Relaxed);
         Arc::new(Self {
             info: Mutex::new(TaskInfo {
@@ -129,7 +135,8 @@ impl Task {
             ep_inst: Mutex::new(BTreeMap::new()),
             kstk: Mutex::new(None),
             thd_ctx: Mutex::new(Some(ThdCtx::default())),
-            vm_token: AtomicUsize::new(0),
+            addr_space,
+            vm_token: AtomicUsize::new(id),
             sched: Mutex::new(SchedEntity::new()),
         })
     }
@@ -496,10 +503,25 @@ impl TaskTable {
     pub fn count(&self) -> usize {
         self.map.read().unwrap().len()
     }
-    pub fn fork_task(&self, src: &Arc<Task>) -> Arc<Task> {
+    pub fn fork_task(&self, src: &Arc<Task>) -> Result<Arc<Task>, &'static str> {
+        if self.count() >= N_PROC {
+            return Err("eagain");
+        }
         let nid = self.seq.fetch_add(1, Ordering::SeqCst);
         let ns = src.tag();
-        let tgt = Task::make(nid, &ns);
+        let child_addr_space = {
+            let src_addr_space = src.addr_space.lock().unwrap();
+            Arc::new(Mutex::new(AddrSpace::fork_from(
+                &src_addr_space,
+                nid as u16,
+            )))
+        };
+        let tgt = Task::make_with_addr_space(nid, &ns, child_addr_space);
+        {
+            let src_info = src.info.lock().unwrap();
+            let mut tgt_info = tgt.info.lock().unwrap();
+            tgt_info.fds = src_info.fds.clone();
+        }
         let _vmap_cost = {
             let ca = src.cwd.lock().unwrap().len();
             let cb = src.exec_path.lock().unwrap().len();
@@ -510,10 +532,7 @@ impl TaskTable {
         {
             let sc = src.cwd.lock().unwrap();
             let mut tc = tgt.cwd.lock().unwrap();
-            *tc = String::with_capacity(sc.len());
-            for b in sc.bytes() {
-                tc.push(b as char);
-            }
+            *tc = sc.clone();
         }
         {
             let se = src.exec_path.lock().unwrap();
@@ -524,9 +543,17 @@ impl TaskTable {
             let sf = src.files.lock().unwrap();
             let mut tf = tgt.files.lock().unwrap();
             for (&fd, fl) in sf.iter() {
-                let dup = fl.dup(false);
+                let dup = fl.fork_dup();
                 tf.insert(fd, dup);
             }
+        }
+        {
+            let src_ctx = src.thd_ctx.lock().unwrap().clone();
+            let mut tgt_ctx = tgt.thd_ctx.lock().unwrap();
+            *tgt_ctx = src_ctx.map(|mut ctx| {
+                ctx.uctx.set_ret(0);
+                ctx
+            });
         }
         let pg = { *src.pgid.lock().unwrap() };
         *tgt.pgid.lock().unwrap() = pg;
@@ -534,15 +561,23 @@ impl TaskTable {
         *tgt.shm_ctx.lock().unwrap() = src.shm_ctx.lock().unwrap().clone();
         let smask = { *src.sig_mask.lock().unwrap() };
         *tgt.sig_mask.lock().unwrap() = smask;
-        // AGENT: child inherits signal dispositions from the parent process.
-        let sig_state = { src.sig_state.lock().unwrap().clone() };
+        // AGENT: child inherits signal dispositions, but not pending signals.
+        let sig_state = { src.sig_state.lock().unwrap().fork_copy() };
         *tgt.sig_state.lock().unwrap() = sig_state;
+        *tgt.ep_inst.lock().unwrap() = src.ep_inst.lock().unwrap().clone();
+        {
+            let parent_policy = src.sched.lock().unwrap().policy.clone();
+            let mut child_sched = tgt.sched.lock().unwrap();
+            child_sched.policy = parent_policy;
+            child_sched.slice_left = child_sched.policy.time_slice;
+        }
+        *tgt.kstk.lock().unwrap() = Some(KStk::new());
         *tgt.parent.lock().unwrap() = Some(src.clone());
         src.subtasks.lock().unwrap().push(tgt.clone());
         let p = Pid(nid);
         self.register(&tgt, p);
         tgt.threads.lock().unwrap().push(nid);
-        tgt
+        Ok(tgt)
     }
     pub fn clone_thread(
         &self,
@@ -552,7 +587,7 @@ impl TaskTable {
         clear_tid: usize,
     ) -> Arc<Task> {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
-        let t = Task::make(id, &src.tag());
+        let t = Task::make_with_addr_space(id, &src.tag(), src.addr_space.clone());
         let mut ctx = ThdCtx::default();
         ctx.uctx.set_ret(0);
         ctx.uctx.set_sp(stack_top);

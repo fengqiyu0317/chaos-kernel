@@ -13,7 +13,7 @@ impl AddrSpace {
     pub fn new(asid: u16) -> Self {
         Self {
             vm_map: VmMap::new(),
-            page_table_root: 0,
+            page_table_root: asid as usize,
             asid,
             ref_count: AtomicUsize::new(1),
             cow_pages: Mutex::new(BTreeMap::new()),
@@ -25,9 +25,18 @@ impl AddrSpace {
         child.vm_map.brk = parent.vm_map.brk;
         child.vm_map.mmap_base = parent.vm_map.mmap_base;
         for region in parent.vm_map.regions.iter() {
-            let new_region = VmRegion::new(region.base, region.len, region.flags);
-            new_region.ref_count.store(1, Ordering::Relaxed);
-            if region.flags & VM_WRITE != 0 {
+            if region.flags & VM_DONTCOPY != 0 {
+                continue;
+            }
+            let new_region = VmRegion {
+                base: region.base,
+                len: region.len,
+                flags: region.flags,
+                offset: region.offset,
+                tag: region.tag,
+                ref_count: AtomicUsize::new(1),
+            };
+            if region.flags & VM_WRITE != 0 && region.flags & VM_SHARED == 0 {
                 region.ref_up();
             }
             let _ = child.vm_map.insert(new_region);
@@ -37,12 +46,7 @@ impl AddrSpace {
             let mut child_cow = child.cow_pages.lock().unwrap();
             for (&addr, frame) in parent_cow.iter() {
                 frame.up();
-                child_cow.insert(addr, PgFrame::with_rc(frame.count()));
-            }
-        }
-        for region in parent.vm_map.regions.iter() {
-            if region.flags & VM_WRITE != 0 {
-                region.ref_up();
+                child_cow.insert(addr, frame.clone());
             }
         }
         child

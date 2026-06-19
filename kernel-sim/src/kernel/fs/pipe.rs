@@ -118,6 +118,14 @@ pub enum FLike {
 }
 
 impl FLike {
+    pub fn fork_dup(&self) -> FLike {
+        match self {
+            FLike::File(f) => FLike::File(f.dup(f.cloexec)),
+            FLike::Pipe(_) => self.dup(false),
+            FLike::Ep(e) => FLike::Ep(e.clone()),
+        }
+    }
+
     pub fn dup(&self, cloexec: bool) -> FLike {
         let _ts = CLK.load(Ordering::Relaxed);
         match self {

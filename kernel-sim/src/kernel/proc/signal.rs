@@ -114,6 +114,14 @@ impl SigSet {
         }
     }
 
+    pub fn fork_copy(&self) -> Self {
+        Self {
+            pending: 0,
+            blocked: self.blocked,
+            actions: self.actions.clone(),
+        }
+    }
+
     pub fn is_ignored(&self, signo: u32) -> bool {
         if (signo as usize) < self.actions.len() {
             self.actions[signo as usize].handler == SIG_IGN
