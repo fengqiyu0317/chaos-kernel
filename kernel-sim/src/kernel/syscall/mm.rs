@@ -38,8 +38,16 @@ pub(super) fn sys_mmap(
     if _map_shared {
         vm_flags |= VM_SHARED;
     }
+    let cur_task = kernel.cur_task(0);
     let result_addr = if addr != 0 && _map_fixed {
         addr
+    } else if let Some(task) = cur_task.as_ref() {
+        task.addr_space
+            .lock()
+            .unwrap()
+            .vm_map
+            .find_free(aligned_len, PAGE_SZ)
+            .ok_or("enomem")?
     } else {
         let base = 0x7000_0000usize;
         let slot =
@@ -54,6 +62,11 @@ pub(super) fn sys_mmap(
     if !_map_anon && aligned_off > aligned_len {
         return Err("einval");
     }
+    if let Some(task) = cur_task {
+        let mut addr_space = task.addr_space.lock().unwrap();
+        let region = VmRegion::with_offset(result_addr, aligned_len, vm_flags, aligned_off);
+        addr_space.map_region(region, &kernel.pool)?;
+    }
     Ok(result_addr)
 }
 
@@ -64,9 +77,11 @@ pub(super) fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize,
         return Err("einval");
     }
     let aligned_len = (len + PAGE_SZ - 1) & !(PAGE_SZ - 1);
-    let pages = aligned_len / PAGE_SZ;
-    for i in 0..pages {
-        let _va = addr + i * PAGE_SZ;
+    if let Some(task) = kernel.cur_task(0) {
+        task.addr_space
+            .lock()
+            .unwrap()
+            .unmap_range(addr, aligned_len);
     }
     Ok(0)
 }
@@ -85,25 +100,10 @@ pub(super) fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str>
     let aligned = (new_brk + PAGE_SZ - 1) & !(PAGE_SZ - 1);
     let cur = kernel.cur_task(0);
     if let Some(t) = cur {
-        let old_brk = t.addr_space.lock().unwrap().vm_map.brk;
-        if aligned < old_brk {
-            let pages_freed = (old_brk - aligned) >> 12;
-            for p in 0..pages_freed {
-                let va = aligned + p * PAGE_SZ;
-                let _pa = v2p(va);
-            }
-        } else if aligned > old_brk {
-            let pages_needed = (aligned - old_brk) / PAGE_SZ;
-            let free = kernel.pool.free_count();
-            if free < pages_needed {
-                return Err("enomem");
-            }
-            for p in 0..pages_needed {
-                let va = old_brk + p * PAGE_SZ;
-                let _frame = frame_alloc(&kernel.pool);
-            }
-        }
-        t.addr_space.lock().unwrap().vm_map.brk = aligned;
+        t.addr_space
+            .lock()
+            .unwrap()
+            .resize_brk(aligned, &kernel.pool)?;
     }
     Ok(aligned)
 }

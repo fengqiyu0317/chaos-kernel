@@ -53,8 +53,7 @@ cargo test --test pressure
 ## 未解决问题
 
 - 需要在 `chaos/` 中审查本次新增文件，然后执行 `git add`、`git commit`、`git push`。
-- 后续实际内核调试目标仍是 `chaos/kernel-sim/`，尚未开始本轮 bug 修复。
-- TODO: `kernel-sim` 的地址空间 fork 目前只是模拟 COW 效果，尚未实现完整页表级 COW；后续需要评估是否补真实 PTE 只读/COW 标记、写缺页复制物理页、更新页表，以及统一 `VmRegion.ref_count` 与 `cow_pages`/`PgFrame` 引用计数的语义。
+- 后续实际内核调试目标仍是 `chaos/kernel-sim/`；本轮已完成页表级 COW 重构，详见下方 2026-06-19 补充。
 - TODO: `kernel-sim` 的多线程 fork 边界尚不完整；如果 `src` 是 `clone_thread` 生成的线程 task，`fork_task` 可能从线程 task 的默认/局部字段复制 fd、cwd、IPC、epoll、信号等进程级资源，而不是从其所属进程复制进程级资源、从调用线程复制 `ThdCtx`/TLS/clear_tid/信号 mask 等线程上下文。
 - TODO: `kernel-sim` 尚未把 credentials、uid/gid、supplementary groups、capability sets、securebits、no_new_privs 等进程安全身份挂到 `Task`，因此 `fork_task` 也没有实现这些真实 Linux 属性的继承规则。
 - TODO: `kernel-sim` 的 fork 失败条件目前主要受全局 `N_PROC` 限制约束；尚未建模 `RLIMIT_NPROC`、系统线程数上限、`pid_max`、cgroup pids 限制、PID namespace init 退出、内存压力导致的 `ENOMEM` 等真实错误路径。
@@ -75,6 +74,61 @@ cargo test --test pressure
 - 对 `kernel-sim` 相关问题，只修改 `chaos/kernel-sim/`。
 - 不要移动、复制或删除 `chaos/.git`。
 - 不要把后续 Chaos 提交做在外层“操作系统”仓库里。
+
+## 2026-06-19 补充：kernel-sim 页表级 COW 重构
+
+### 目标
+
+将 `kernel-sim` 的 COW 模型重构为以 `page_table` 为唯一事实来源：所有映射创建 PTE，删除 `cow_pages`，`fork_from()` 不再补隐式 PTE，而是直接遍历页表做 COW。
+
+### 已完成修改
+
+- 删除 `AddrSpace::cow_pages` 和 `ensure_page_entry()` / `default_frame_id()`。
+- `fork_from()` 复制可继承 VMA 后，遍历父地址空间 PTE；私有可写映射标记 COW，共享映射保持 writable。
+- `handle_cow_fault()` 改为只处理已有 PTE，按 `PgFrame` 引用计数决定复制 frame 或直接恢复 writable。
+- `sys_mmap()` / `sys_brk()` 通过 `map_region()` / `resize_brk()` 创建 VMA 和 PTE。
+- COW 相关测试改为检查 PTE 状态，不再读取 `cow_pages`。
+
+### 关键文件
+
+- `kernel-sim/src/kernel/mm/address_space.rs`
+- `kernel-sim/src/kernel/syscall/mm.rs`
+- `kernel-sim/src/kernel/core/kernel_base.rs`
+- `kernel-sim/tests/smoke.rs`
+- `docs/ai-record.md`
+
+### 测试结果
+
+```bash
+cd kernel-sim
+cargo test --test smoke
+cargo fmt --check
+cargo test
+```
+
+结果：全部通过。完整 `cargo test` 中 `smoke.rs` 为 `22 passed; 0 failed`。
+
+补充运行：
+
+```bash
+cd chaos-tests
+cargo test --test basic
+cargo test --test advanced
+cargo test --test pressure
+```
+
+结果：`basic` 为 `22 passed; 11 failed`；`advanced` 和 `pressure` 因缺少 `tests/advanced/main.rs`、`tests/pressure/main.rs` 无法解析测试目标。
+
+### 未解决问题
+
+- 外部 `chaos-tests` 尚未通过，且其 `src/lib.rs` 是指向 `kernel/src/kernel.rs` 的符号链接；本轮按规则没有修改该禁改文件。
+- `unmap_range()` 仍只降低 `PgFrame` 引用计数，尚未把最后一个 frame id 归还 `FramePool`。
+
+### 不要改的部分
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- 对 `kernel-sim` 相关问题，只修改 `chaos/kernel-sim/` 和必要的项目内记录文件。
+- 不要移动、复制或删除 `chaos/.git`。
 
 ## 下一步建议
 

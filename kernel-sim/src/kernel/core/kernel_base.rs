@@ -122,7 +122,12 @@ impl Kernel {
         let pga = addr >> 12;
         let _off = addr & 0xFFF;
         if _access & 0x2 != 0 {
-            return self.handle_pgfault(addr);
+            let cur = self.cur_task(0);
+            if let Some(task) = cur {
+                let aspace = task.addr_space.lock().unwrap();
+                return aspace.handle_cow_fault(addr, &self.pool).is_ok();
+            }
+            return false;
         }
         self.handle_pgfault(addr)
     }

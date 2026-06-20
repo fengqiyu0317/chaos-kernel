@@ -1,9 +1,9 @@
 // AGENT
 use kernel_sim::{
-    EpData, EpEvent, FLike, Kernel, PgFrame, SchedulePolicy, TaskRunState, TaskTable, VmRegion,
-    N_FRAMES, N_PROC, O_CLOEXEC, PAGE_SZ, SIGUSR1, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXIT,
-    SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, VM_READ,
-    VM_WRITE,
+    EpData, EpEvent, FLike, Kernel, PageTableEntry, PgFrame, SchedulePolicy, TaskRunState,
+    TaskTable, VmRegion, N_FRAMES, N_PROC, O_CLOEXEC, PAGE_SZ, SIGUSR1, SYS_EPOLL_CREATE,
+    SYS_EPOLL_CTL, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_SIGACTION,
+    SYS_SIGRETURN, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
@@ -89,11 +89,10 @@ fn fork_copies_context_address_space_cwd_and_kernel_stack() {
             .vm_map
             .insert(VmRegion::new(0x5000_0000, PAGE_SZ, VM_READ | VM_WRITE))
             .expect("test mapping should not overlap");
-        addr_space
-            .cow_pages
-            .lock()
-            .unwrap()
-            .insert(0x5000_0000, PgFrame::with_rc(1));
+        addr_space.page_table.lock().unwrap().insert(
+            0x5000_0000,
+            PageTableEntry::new(17, PgFrame::with_rc(1), VM_READ | VM_WRITE),
+        );
     }
 
     let child = kernel.do_fork(1).expect("fork should create child");
@@ -119,29 +118,29 @@ fn fork_copies_context_address_space_cwd_and_kernel_stack() {
         let child_addr_space = child_task.addr_space.lock().unwrap();
         assert_eq!(child_addr_space.vm_map.brk, 0x0060_0000);
         assert!(child_addr_space.vm_map.find(0x5000_0000).is_some());
-        assert_eq!(
-            child_addr_space
-                .cow_pages
-                .lock()
-                .unwrap()
-                .get(&0x5000_0000)
-                .expect("child should share COW frame")
-                .count(),
-            2
-        );
+        let child_pte = child_addr_space
+            .page_table
+            .lock()
+            .unwrap()
+            .get(&0x5000_0000)
+            .expect("child should have a COW PTE")
+            .clone();
+        assert!(child_pte.cow);
+        assert!(!child_pte.writable);
+        assert_eq!(child_pte.frame.count(), 2);
     }
     {
         let parent_addr_space = parent.addr_space.lock().unwrap();
-        assert_eq!(
-            parent_addr_space
-                .cow_pages
-                .lock()
-                .unwrap()
-                .get(&0x5000_0000)
-                .expect("parent should retain shared COW frame")
-                .count(),
-            2
-        );
+        let parent_pte = parent_addr_space
+            .page_table
+            .lock()
+            .unwrap()
+            .get(&0x5000_0000)
+            .expect("parent should have a COW PTE")
+            .clone();
+        assert!(parent_pte.cow);
+        assert!(!parent_pte.writable);
+        assert_eq!(parent_pte.frame.count(), 2);
     }
     {
         parent.addr_space.lock().unwrap().vm_map.brk = 0x0070_0000;
@@ -162,6 +161,154 @@ fn fork_copies_context_address_space_cwd_and_kernel_stack() {
         let ctx = thd.as_ref().expect("parent context should still exist");
         assert_eq!(ctx.uctx.r[0], 99);
     }
+}
+
+#[test]
+// AGENT
+fn cow_write_fault_copies_child_page_and_keeps_parent_shared() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let parent = kernel.cur_task(0).expect("init should be current");
+    let page = 0x5100_0000;
+    {
+        let mut addr_space = parent.addr_space.lock().unwrap();
+        addr_space
+            .vm_map
+            .insert(VmRegion::new(page, PAGE_SZ, VM_READ | VM_WRITE))
+            .expect("test mapping should not overlap");
+        addr_space.page_table.lock().unwrap().insert(
+            page,
+            PageTableEntry::new(33, PgFrame::with_rc(1), VM_READ | VM_WRITE),
+        );
+    }
+
+    let child = kernel.do_fork(1).expect("fork should create child");
+    let child_task = kernel
+        .tasks
+        .find(child)
+        .expect("child should be registered");
+    kernel.set_cur(0, Some(child_task.clone()));
+
+    assert!(kernel.handle_pgfault_ext(page, 0x2));
+
+    let child_addr_space = child_task.addr_space.lock().unwrap();
+    let child_pte = child_addr_space
+        .page_table
+        .lock()
+        .unwrap()
+        .get(&page)
+        .expect("child should retain a mapped PTE")
+        .clone();
+    assert!(child_pte.writable);
+    assert!(!child_pte.cow);
+    assert_ne!(child_pte.frame_id, 33);
+    assert_eq!(child_pte.frame.count(), 1);
+    assert_eq!(child_addr_space.cow_sharers(), 0);
+    drop(child_addr_space);
+
+    let parent_addr_space = parent.addr_space.lock().unwrap();
+    let parent_pte = parent_addr_space
+        .page_table
+        .lock()
+        .unwrap()
+        .get(&page)
+        .expect("parent should keep the original PTE")
+        .clone();
+    assert_eq!(parent_pte.frame_id, 33);
+    assert!(parent_pte.cow);
+    assert!(!parent_pte.writable);
+    assert_eq!(parent_pte.frame.count(), 1);
+}
+
+#[test]
+// AGENT
+fn unmap_range_returns_unmapped_page_count_and_splits_region() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    let base = 0x5300_0000;
+    let frames = [60, 61, 62];
+    {
+        let mut addr_space = task.addr_space.lock().unwrap();
+        addr_space
+            .vm_map
+            .insert(VmRegion::new(base, PAGE_SZ * 3, VM_READ | VM_WRITE))
+            .expect("test mapping should not overlap");
+        let mut pt = addr_space.page_table.lock().unwrap();
+        for (idx, frame_id) in frames.into_iter().enumerate() {
+            pt.insert(
+                base + idx * PAGE_SZ,
+                PageTableEntry::new(frame_id, PgFrame::with_rc(1), VM_READ | VM_WRITE),
+            );
+        }
+    }
+
+    let unmapped = task
+        .addr_space
+        .lock()
+        .unwrap()
+        .unmap_range(base + PAGE_SZ, PAGE_SZ);
+
+    let addr_space = task.addr_space.lock().unwrap();
+    assert_eq!(unmapped, 1);
+    assert_eq!(addr_space.vm_map.regions.len(), 2);
+    assert!(addr_space.vm_map.find(base).is_some());
+    assert!(addr_space.vm_map.find(base + PAGE_SZ).is_none());
+    assert!(addr_space.vm_map.find(base + PAGE_SZ * 2).is_some());
+    let pt = addr_space.page_table.lock().unwrap();
+    assert!(pt.contains_key(&base));
+    assert!(!pt.contains_key(&(base + PAGE_SZ)));
+    assert!(pt.contains_key(&(base + PAGE_SZ * 2)));
+}
+
+#[test]
+// AGENT
+fn fork_keeps_shared_writable_mapping_without_cow() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let parent = kernel.cur_task(0).expect("init should be current");
+    let page = 0x5200_0000;
+    {
+        let mut addr_space = parent.addr_space.lock().unwrap();
+        addr_space
+            .vm_map
+            .insert(VmRegion::new(page, PAGE_SZ, VM_READ | VM_WRITE | VM_SHARED))
+            .expect("test mapping should not overlap");
+        addr_space.page_table.lock().unwrap().insert(
+            page,
+            PageTableEntry::new(44, PgFrame::with_rc(1), VM_READ | VM_WRITE | VM_SHARED),
+        );
+    }
+
+    let child = kernel.do_fork(1).expect("fork should create child");
+    let child_task = kernel
+        .tasks
+        .find(child)
+        .expect("child should be registered");
+
+    let child_addr_space = child_task.addr_space.lock().unwrap();
+    let child_pte = child_addr_space
+        .page_table
+        .lock()
+        .unwrap()
+        .get(&page)
+        .expect("child should inherit shared PTE")
+        .clone();
+    assert!(child_pte.writable);
+    assert!(!child_pte.cow);
+    assert_eq!(child_pte.frame.count(), 2);
+
+    let parent_addr_space = parent.addr_space.lock().unwrap();
+    let parent_pte = parent_addr_space
+        .page_table
+        .lock()
+        .unwrap()
+        .get(&page)
+        .expect("parent should keep shared PTE")
+        .clone();
+    assert!(parent_pte.writable);
+    assert!(!parent_pte.cow);
+    assert_eq!(parent_pte.frame.count(), 2);
 }
 
 #[test]

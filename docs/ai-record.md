@@ -136,6 +136,54 @@ git status
 
 当前 `docs/` 目录此前为空；本文件是在 2026-06-19 根据 Codex session JSONL 新建的项目日志。
 
+## 2026-06-19：kernel-sim 页表级 COW 收敛
+
+目标：按用户要求立即重构 `kernel-sim` 的 COW 内存模型，不再用 `cow_pages` 作为真实状态表，不再在 `fork_from()` 中用 `ensure_page_entry()` 补隐式 PTE，而是让所有映射入口创建 PTE，并由 `page_table` 直接驱动 fork COW。
+
+已完成修改：
+
+- 删除 `AddrSpace::cow_pages` 和 `ensure_page_entry()` / `default_frame_id()` 兼容层。
+- `AddrSpace::fork_from()` 先复制可继承 `VmRegion`，再遍历父进程 `page_table`；对私有可写页标记父子 PTE 为 COW，对共享映射保持 writable。
+- `AddrSpace::handle_cow_fault()` 只处理已存在 PTE；共享计数大于 1 时分配新 frame 并 resolve write，计数为 1 时直接恢复 writable。
+- `sys_mmap()` 通过 `AddrSpace::map_region()` 创建区域和对应 PTE。
+- `sys_brk()` 改为调用 `AddrSpace::resize_brk()`，堆增长时创建 heap `VmRegion` 和 PTE，避免 brk 页在 fork 页表遍历中丢失。
+- `rss_pages()` / `cow_sharers()` 改为从 `page_table` 派生统计。
+- `kernel-sim/tests/smoke.rs` 的 COW 测试改为断言 PTE 的 `cow`、`writable`、`frame.count()`，不再依赖 `cow_pages`。
+
+关键文件：
+
+- `kernel-sim/src/kernel/mm/address_space.rs`
+- `kernel-sim/src/kernel/syscall/mm.rs`
+- `kernel-sim/src/kernel/core/kernel_base.rs`
+- `kernel-sim/tests/smoke.rs`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo test --test smoke
+cargo fmt --check
+cargo test
+```
+
+结果：`cargo test --test smoke` 通过 `22 passed`；`cargo fmt --check` 通过；完整 `cargo test` 通过 `22 passed`。
+
+补充验证：
+
+```bash
+cd chaos-tests
+cargo test --test basic
+cargo test --test advanced
+cargo test --test pressure
+```
+
+结果：`basic` 为 `22 passed; 11 failed`。失败集中在 `group_01`、`group_02`、`group_03`、`group_06`、`group_09`、`group_10`、`group_11`，对应 `chaos-tests/src/lib.rs -> ../../kernel/src/kernel.rs` 的外部测试模拟内核路径；本轮未修改该禁改文件。`advanced` 和 `pressure` 因 `tests/advanced/main.rs`、`tests/pressure/main.rs` 不存在而无法解析测试目标。
+
+未解决问题：
+
+- 外部 `chaos-tests` 仍未通过；由于其 `src/lib.rs` 是指向 `kernel/src/kernel.rs` 的符号链接，本轮按规则未修改该文件。
+- `unmap_range()` 仍沿用当前模型，只降低 `PgFrame` 引用计数，没有把最后一个 frame id 归还 `FramePool`；如果后续压力测试覆盖反复 mmap/munmap，需要继续评估释放语义。
+
 ## 当前不要改的部分
 
 - 不要修改 `chaos/kernel/src/kernel.rs`。

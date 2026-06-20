@@ -95,7 +95,6 @@ pub struct VmRegion {
     pub flags: u32,
     pub offset: usize,
     pub tag: u16,
-    pub ref_count: AtomicUsize,
 }
 
 impl VmRegion {
@@ -106,7 +105,6 @@ impl VmRegion {
             flags,
             offset: 0,
             tag: 0,
-            ref_count: AtomicUsize::new(1),
         }
     }
 
@@ -117,7 +115,6 @@ impl VmRegion {
             flags,
             offset,
             tag: 0,
-            ref_count: AtomicUsize::new(1),
         }
     }
 
@@ -157,7 +154,6 @@ impl VmRegion {
             flags: lf,
             offset: lo,
             tag: self.tag,
-            ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed)),
         };
         let r = VmRegion {
             base: addr,
@@ -165,7 +161,6 @@ impl VmRegion {
             flags: rf,
             offset: ro,
             tag: self.tag,
-            ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed)),
         };
         Some((l, r))
     }
@@ -187,23 +182,8 @@ impl VmRegion {
             flags: self.flags,
             offset: self.offset,
             tag: self.tag,
-            ref_count: AtomicUsize::new(
-                self.ref_count
-                    .load(Ordering::Relaxed)
-                    .max(other.ref_count.load(Ordering::Relaxed)),
-            ),
         };
         Some(combined)
-    }
-
-    pub fn ref_up(&self) -> usize {
-        self.ref_count.fetch_add(1, Ordering::Relaxed)
-    }
-    pub fn ref_down(&self) -> usize {
-        self.ref_count.fetch_sub(1, Ordering::Relaxed)
-    }
-    pub fn ref_get(&self) -> usize {
-        self.ref_count.load(Ordering::Relaxed)
     }
 }
 
@@ -269,9 +249,8 @@ impl VmMap {
         None
     }
 
-    pub fn remove_range(&mut self, base: usize, len: usize) -> usize {
+    pub fn remove_range(&mut self, base: usize, len: usize) {
         let end = base.wrapping_add(len);
-        let before = self.regions.len();
         let mut i = 0;
         while i < self.regions.len() {
             let rb = self.regions[i].base;
@@ -308,7 +287,6 @@ impl VmMap {
                 }
             }
         }
-        before - self.regions.len()
     }
 
     pub fn find_free(&self, len: usize, align: usize) -> Option<usize> {
@@ -362,7 +340,6 @@ impl VmMap {
                 flags: r.flags,
                 offset: r.offset,
                 tag: r.tag,
-                ref_count: AtomicUsize::new(r.ref_count.load(Ordering::Relaxed)),
             };
             out.push(nr);
         }
