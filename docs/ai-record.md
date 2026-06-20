@@ -184,6 +184,45 @@ cargo test --test pressure
 - 外部 `chaos-tests` 仍未通过；由于其 `src/lib.rs` 是指向 `kernel/src/kernel.rs` 的符号链接，本轮按规则未修改该文件。
 - `unmap_range()` 仍沿用当前模型，只降低 `PgFrame` 引用计数，没有把最后一个 frame id 归还 `FramePool`；如果后续压力测试覆盖反复 mmap/munmap，需要继续评估释放语义。
 
+## 2026-06-20：kernel-sim 事务式 do_exec
+
+目标：修复 `Kernel::do_exec()` 直接修改当前 task 状态的问题，改为先准备完整的新 exec 映像，全部成功后再一次性提交，保证失败 exec 不破坏旧进程映像。
+
+已完成修改：
+
+- 新增 `PreparedExec` 准备结构，将 `exec_path`、临时 `AddrSpace`、新 `ThdCtx`、新 `vm_token` 和待关闭的 `FD_CLOEXEC` fd 先收集起来。
+- `Kernel::prepare_exec_image()` 先解析 ELF `PT_LOAD`，在临时地址空间映射 text 和用户栈，计算初始栈指针并创建新线程上下文。
+- `Kernel::commit_exec()` 只在准备全部成功后执行：关闭 close-on-exec fd，释放旧地址空间页，替换 `AddrSpace`、`exec_path`、`thd_ctx` 和 `vm_token`。
+- `validate_elf_header()` 保持原 API，同时新增 `parse_elf_load_segments()` 返回 entry 和 `ElfLoadSegment` 列表，供 exec 装载路径使用。
+- `AddrSpace::release_all_pages()` 用于 exec 回滚和提交替换时释放临时/旧映射占用的 frame。
+- 新增 `do_exec_commits_new_address_space_context_and_cloexec` 与 `do_exec_failure_preserves_old_image_and_cloexec_fds` 两个 smoke 回归。
+
+关键文件：
+
+- `kernel-sim/src/kernel/core/kernel_ops.rs`
+- `kernel-sim/src/kernel/fs/fs_misc.rs`
+- `kernel-sim/src/kernel/mm/address_space.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `25 passed`；完整 `cargo test` 通过 `25 passed`。
+
+未解决问题：
+
+- `do_exec()` 仍使用内置最小 ELF 占位数据作为可执行文件来源；真实 `path` 打开/读取 ELF 字节仍待实现。
+- 当前地址空间只建模页表和 frame 元数据，尚未提供按虚拟地址写入 ELF 段内容和用户栈 `argc/argv/envp/auxv` 的能力。
+- `sys_exec()` 仍未从用户地址空间搬运 path/argv/envp 并调用 `Kernel::do_exec()`。
+- 多线程 exec 语义仍待补齐。
+
 ## 当前不要改的部分
 
 - 不要修改 `chaos/kernel/src/kernel.rs`。

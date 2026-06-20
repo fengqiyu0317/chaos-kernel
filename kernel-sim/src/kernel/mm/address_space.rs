@@ -155,6 +155,31 @@ impl AddrSpace {
         pages_to_unmap.len()
     }
 
+    pub fn release_all_pages(&mut self, pool: &FramePool) -> usize {
+        self.vm_map.regions.clear();
+        let entries: Vec<PageTableEntry> = {
+            let mut pt = self.page_table.lock().unwrap();
+            let entries = pt.values().cloned().collect();
+            pt.clear();
+            entries
+        };
+        let mut released = 0;
+        for pte in entries {
+            if !pte.present {
+                continue;
+            }
+            if pte.frame.count() == 0 {
+                continue;
+            }
+            let prev = pte.frame.down();
+            if prev == 1 {
+                pool.put(pte.frame_id);
+                released += 1;
+            }
+        }
+        released
+    }
+
     pub fn protect(
         &mut self,
         start: usize,

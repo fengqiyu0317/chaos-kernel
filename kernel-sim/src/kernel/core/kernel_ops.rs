@@ -1,6 +1,14 @@
 // AGENT
 use super::*;
 
+struct PreparedExec {
+    exec_path: String,
+    addr_space: AddrSpace,
+    thd_ctx: ThdCtx,
+    vm_token: usize,
+    close_fds: Vec<usize>,
+}
+
 impl Kernel {
     // AGENT: central signal enqueue path so sleeping tasks can be made runnable.
     pub fn send_signal_to_task(&self, task: &Arc<Task>, signo: i32, sender_tid: isize) {
@@ -303,6 +311,89 @@ impl Kernel {
         Ok(child_id)
     }
 
+    fn prepare_exec_image(
+        &self,
+        task: &Arc<Task>,
+        path: &str,
+        args: Vec<String>,
+        envs: Vec<String>,
+    ) -> Result<PreparedExec, &'static str> {
+        let exec_path = self.lookup_path(path)?;
+        let elf_data = default_exec_elf();
+        let (entry, load_segments) = parse_elf_load_segments(&elf_data)?;
+        let old_token = task.vm_token.load(Ordering::Relaxed);
+        let vm_token = next_exec_vm_token(task.id(), old_token);
+        let mut addr_space = AddrSpace::new((vm_token & 0xffff) as u16);
+        addr_space.page_table_root = vm_token;
+        let mut image_end = 0usize;
+        for segment in load_segments {
+            let region = segment.vm_region()?;
+            image_end = max(image_end, region.end());
+            if let Err(err) = addr_space.map_region(region, &self.pool) {
+                addr_space.release_all_pages(&self.pool);
+                return Err(err);
+            }
+        }
+        let init = ProcInit {
+            args,
+            envs,
+            auxv: BTreeMap::from([(AT_PAGESZ, PAGE_SZ), (AT_ENTRY, entry)]),
+        };
+        if init.total_size() > USR_STK_SZ {
+            addr_space.release_all_pages(&self.pool);
+            return Err("e2big");
+        }
+        let sp = init.push_at(USR_STK_OFF + USR_STK_SZ);
+        if sp < USR_STK_OFF || sp > USR_STK_OFF + USR_STK_SZ {
+            addr_space.release_all_pages(&self.pool);
+            return Err("e2big");
+        }
+        let stack = VmRegion::new(USR_STK_OFF, USR_STK_SZ, VM_READ | VM_WRITE | VM_GROWSDOWN);
+        if let Err(err) = addr_space.map_region(stack, &self.pool) {
+            addr_space.release_all_pages(&self.pool);
+            return Err(err);
+        }
+        addr_space.vm_map.brk = (image_end + PAGE_SZ - 1) & !(PAGE_SZ - 1);
+        let mut ctx = ThdCtx::default();
+        ctx.uctx.set_sp(sp as u64);
+        ctx.uctx.set_ip(entry as u64);
+        ctx.smask = *task.sig_mask.lock().unwrap();
+        let close_fds = task
+            .files
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(&fd, fl)| match fl {
+                FLike::File(fh) if fh.cloexec => Some(fd),
+                _ => None,
+            })
+            .collect();
+        Ok(PreparedExec {
+            exec_path,
+            addr_space,
+            thd_ctx: ctx,
+            vm_token,
+            close_fds,
+        })
+    }
+
+    fn commit_exec(&self, task: &Arc<Task>, prepared: PreparedExec) {
+        {
+            let mut files = task.files.lock().unwrap();
+            for fd in prepared.close_fds {
+                files.remove(&fd);
+            }
+        }
+        {
+            let mut current_addr_space = task.addr_space.lock().unwrap();
+            current_addr_space.release_all_pages(&self.pool);
+            *current_addr_space = prepared.addr_space;
+        }
+        *task.exec_path.lock().unwrap() = prepared.exec_path;
+        *task.thd_ctx.lock().unwrap() = Some(prepared.thd_ctx);
+        task.vm_token.store(prepared.vm_token, Ordering::Relaxed);
+    }
+
     pub fn do_exec(
         &self,
         task_id: usize,
@@ -311,38 +402,8 @@ impl Kernel {
         envs: Vec<String>,
     ) -> Result<(), &'static str> {
         let task = self.tasks.find(task_id).ok_or("esrch")?;
-        *task.exec_path.lock().unwrap() = path.to_string();
-        let elf_data = vec![
-            0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0x3e, 0, 1, 0, 0, 0,
-            0, 0x40, 0, 0, 0, 0, 0, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0x40, 0, 0x38, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-        ];
-        let _entry = validate_elf_header(&elf_data);
-        {
-            let fds: Vec<usize> = task
-                .files
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(|(&fd, fl)| match fl {
-                    FLike::File(fh) if fh.cloexec => Some(fd),
-                    _ => None,
-                })
-                .collect();
-            for fd in fds {
-                task.files.lock().unwrap().remove(&fd);
-            }
-        }
-        let init = ProcInit {
-            args,
-            envs,
-            auxv: BTreeMap::new(),
-        };
-        let sp = init.push_at(USR_STK_OFF + USR_STK_SZ);
-        let mut ctx = ThdCtx::default();
-        ctx.uctx.set_sp(sp as u64);
-        ctx.uctx.set_ip(0x0040_0000u64);
-        *task.thd_ctx.lock().unwrap() = Some(ctx);
+        let prepared = self.prepare_exec_image(&task, path, args, envs)?;
+        self.commit_exec(&task, prepared);
         Ok(())
     }
 
@@ -395,4 +456,57 @@ impl Kernel {
             }
         }
     }
+}
+
+fn next_exec_vm_token(task_id: usize, old_token: usize) -> usize {
+    let next = old_token.wrapping_add(N_PROC);
+    if next == 0 || next == old_token {
+        task_id.saturating_add(N_PROC)
+    } else {
+        next
+    }
+}
+
+fn default_exec_elf() -> Vec<u8> {
+    // AGENT: placeholder executable bytes until path-backed ELF loading is wired.
+    let entry = 0x0040_0000usize;
+    let mut data = vec![0u8; 64 + 56];
+    data[0] = 0x7f;
+    data[1] = b'E';
+    data[2] = b'L';
+    data[3] = b'F';
+    data[4] = 2;
+    data[5] = 1;
+    data[6] = 1;
+    write_u16_le(&mut data, 16, 2);
+    write_u16_le(&mut data, 18, 0x3e);
+    write_u32_le(&mut data, 20, 1);
+    write_u64_le(&mut data, 24, entry as u64);
+    write_u64_le(&mut data, 32, 64);
+    write_u16_le(&mut data, 52, 64);
+    write_u16_le(&mut data, 54, 56);
+    write_u16_le(&mut data, 56, 1);
+
+    let ph = 64;
+    write_u32_le(&mut data, ph, 1);
+    write_u32_le(&mut data, ph + 4, 0x5);
+    write_u64_le(&mut data, ph + 8, 0);
+    write_u64_le(&mut data, ph + 16, entry as u64);
+    write_u64_le(&mut data, ph + 24, entry as u64);
+    write_u64_le(&mut data, ph + 32, 0);
+    write_u64_le(&mut data, ph + 40, PAGE_SZ as u64);
+    write_u64_le(&mut data, ph + 48, PAGE_SZ as u64);
+    data
+}
+
+fn write_u16_le(data: &mut [u8], off: usize, value: u16) {
+    data[off..off + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32_le(data: &mut [u8], off: usize, value: u32) {
+    data[off..off + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64_le(data: &mut [u8], off: usize, value: u64) {
+    data[off..off + 8].copy_from_slice(&value.to_le_bytes());
 }

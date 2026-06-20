@@ -207,7 +207,59 @@ impl SlabEntry {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ElfLoadSegment {
+    pub offset: usize,
+    pub vaddr: usize,
+    pub file_size: usize,
+    pub mem_size: usize,
+    pub flags: u32,
+}
+
+impl ElfLoadSegment {
+    pub fn vm_flags(&self) -> u32 {
+        let mut flags = 0;
+        if self.flags & 0x4 != 0 {
+            flags |= VM_READ;
+        }
+        if self.flags & 0x2 != 0 {
+            flags |= VM_WRITE;
+        }
+        if self.flags & 0x1 != 0 {
+            flags |= VM_EXEC;
+        }
+        if flags == 0 {
+            VM_READ
+        } else {
+            flags
+        }
+    }
+
+    pub fn vm_region(&self) -> Result<VmRegion, &'static str> {
+        let page_base = self.vaddr & !(PAGE_SZ - 1);
+        let page_off = self.vaddr - page_base;
+        let mapped_len = page_off
+            .checked_add(self.mem_size)
+            .and_then(|len| len.checked_add(PAGE_SZ - 1))
+            .map(|len| len & !(PAGE_SZ - 1))
+            .ok_or("ph_overflow")?;
+        if mapped_len == 0 || page_base.checked_add(mapped_len).is_none() {
+            return Err("ph_overflow");
+        }
+        Ok(VmRegion::with_offset(
+            page_base,
+            mapped_len,
+            self.vm_flags(),
+            self.offset.saturating_sub(page_off),
+        ))
+    }
+}
+
 pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {
+    parse_elf_load_segments(data).map(|(entry, _)| entry)
+}
+
+pub fn parse_elf_load_segments(data: &[u8]) -> Result<(usize, Vec<ElfLoadSegment>), &'static str> {
     if data.len() < 64 {
         return Err("too_short");
     }
@@ -226,58 +278,102 @@ pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {
     if ei_version != 1 {
         return Err("bad_version");
     }
-    let e_type = (data[17] as u16) << 8 | data[16] as u16;
+    let e_type = read_u16_le(data, 16)?;
     if e_type != 2 && e_type != 3 {
         return Err("not_exec");
     }
-    let e_machine = (data[19] as u16) << 8 | data[18] as u16;
+    let e_machine = read_u16_le(data, 18)?;
     if e_machine != 0x3E {
         return Err("bad_machine");
     } // AGENT: EM_X86_64
-    let e_entry = {
-        let mut v: u64 = 0;
-        for i in 0..8 {
-            v |= (data[24 + i] as u64) << (i * 8);
-        }
-        v as usize
-    };
-    let e_phoff = {
-        let mut v: u64 = 0;
-        for i in 0..8 {
-            v |= (data[32 + i] as u64) << (i * 8);
-        }
-        v as usize
-    };
-    let e_phentsize = (data[55] as u16) << 8 | data[54] as u16;
-    let e_phnum = (data[57] as u16) << 8 | data[56] as u16;
+    let e_entry = read_u64_le(data, 24)? as usize;
+    let e_phoff = read_u64_le(data, 32)? as usize;
+    let e_phentsize = read_u16_le(data, 54)?;
+    let e_phnum = read_u16_le(data, 56)?;
     if e_phnum == 0 {
         return Err("no_phdrs");
     }
-    let ph_end = e_phoff + (e_phentsize as usize) * (e_phnum as usize);
+    if e_phentsize < 56 {
+        return Err("bad_phent");
+    }
+    let ph_end = e_phoff
+        .checked_add((e_phentsize as usize).saturating_mul(e_phnum as usize))
+        .ok_or("ph_overflow")?;
     if ph_end > data.len() {
         return Err("ph_overflow");
     }
-    let mut load_count = 0;
-    let mut interp_found = false;
+    let mut load_segments = Vec::new();
     for idx in 0..e_phnum as usize {
         let base = e_phoff + idx * e_phentsize as usize;
-        if base + 4 > data.len() {
+        if base + 56 > data.len() {
             break;
         }
-        let p_type = (data[base + 3] as u32) << 24
-            | (data[base + 2] as u32) << 16
-            | (data[base + 1] as u32) << 8
-            | data[base] as u32;
-        match p_type {
-            1 => load_count += 1,
-            3 => interp_found = true,
-            _ => {}
+        let p_type = read_u32_le(data, base)?;
+        if p_type == 1 {
+            let flags = read_u32_le(data, base + 4)?;
+            let offset = read_u64_le(data, base + 8)? as usize;
+            let vaddr = read_u64_le(data, base + 16)? as usize;
+            let file_size = read_u64_le(data, base + 32)? as usize;
+            let mem_size = read_u64_le(data, base + 40)? as usize;
+            if file_size > mem_size {
+                return Err("bad_phdr");
+            }
+            if vaddr >= KERN_BASE || vaddr.checked_add(mem_size).is_none() {
+                return Err("bad_phdr");
+            }
+            if offset.checked_add(file_size).ok_or("ph_overflow")? > data.len() {
+                return Err("ph_overflow");
+            }
+            if mem_size > 0 {
+                load_segments.push(ElfLoadSegment {
+                    offset,
+                    vaddr,
+                    file_size,
+                    mem_size,
+                    flags,
+                });
+            }
         }
     }
-    if load_count == 0 {
+    if load_segments.is_empty() {
         return Err("no_load");
     }
-    Ok(e_entry)
+    Ok((e_entry, load_segments))
+}
+
+fn read_u16_le(data: &[u8], off: usize) -> Result<u16, &'static str> {
+    if off + 2 > data.len() {
+        return Err("too_short");
+    }
+    Ok(u16::from_le_bytes([data[off], data[off + 1]]))
+}
+
+fn read_u32_le(data: &[u8], off: usize) -> Result<u32, &'static str> {
+    if off + 4 > data.len() {
+        return Err("too_short");
+    }
+    Ok(u32::from_le_bytes([
+        data[off],
+        data[off + 1],
+        data[off + 2],
+        data[off + 3],
+    ]))
+}
+
+fn read_u64_le(data: &[u8], off: usize) -> Result<u64, &'static str> {
+    if off + 8 > data.len() {
+        return Err("too_short");
+    }
+    Ok(u64::from_le_bytes([
+        data[off],
+        data[off + 1],
+        data[off + 2],
+        data[off + 3],
+        data[off + 4],
+        data[off + 5],
+        data[off + 6],
+        data[off + 7],
+    ]))
 }
 
 pub fn compute_load_balance(

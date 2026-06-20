@@ -3,7 +3,7 @@ use kernel_sim::{
     EpData, EpEvent, FLike, Kernel, PageTableEntry, PgFrame, SchedulePolicy, TaskRunState,
     TaskTable, VmRegion, N_FRAMES, N_PROC, O_CLOEXEC, PAGE_SZ, SIGUSR1, SYS_EPOLL_CREATE,
     SYS_EPOLL_CTL, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_SIGACTION,
-    SYS_SIGRETURN, VM_READ, VM_SHARED, VM_WRITE,
+    SYS_SIGRETURN, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
@@ -375,6 +375,143 @@ fn fork_preserves_cloexec_and_epoll_state() {
             .ptr,
         0xaa
     );
+}
+
+#[test]
+// AGENT
+fn do_exec_commits_new_address_space_context_and_cloexec() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    let keep_fd = kernel
+        .dispatch_syscall(SYS_OPEN, 0x2000, 0, 0, 0, 0, 0)
+        .expect("open should create a non-cloexec fd");
+    let close_fd = kernel
+        .dispatch_syscall(SYS_OPEN, 0x3000, O_CLOEXEC, 0, 0, 0, 0)
+        .expect("open should create a cloexec fd");
+    let old_token = task.vm_token.load(Ordering::Relaxed);
+    {
+        let mut addr_space = task.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(0x5300_0000, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("old mapping should be created");
+    }
+    {
+        let mut thd = task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_mut().expect("thread context should exist");
+        ctx.uctx.set_ip(0x1111);
+        ctx.uctx.set_sp(0x2222);
+        ctx.clear_tid = 77;
+    }
+
+    kernel
+        .do_exec(
+            1,
+            "/bin/next",
+            vec![String::from("next")],
+            vec![String::from("A=B")],
+        )
+        .expect("exec should commit the prepared image");
+
+    assert_eq!(&*task.exec_path.lock().unwrap(), "/bin/next");
+    assert!(task.get_file(keep_fd).is_some());
+    assert!(task.get_file(close_fd).is_none());
+    assert_ne!(task.vm_token.load(Ordering::Relaxed), old_token);
+    {
+        let addr_space = task.addr_space.lock().unwrap();
+        assert!(addr_space.vm_map.find(0x5300_0000).is_none());
+        let text = addr_space
+            .vm_map
+            .find(0x0040_0000)
+            .expect("exec should map the text segment");
+        assert_ne!(text.flags & VM_EXEC, 0);
+        assert!(addr_space.vm_map.find(USR_STK_OFF).is_some());
+        assert!(addr_space
+            .vm_map
+            .find(USR_STK_OFF + USR_STK_SZ - 1)
+            .is_some());
+        assert_eq!(addr_space.vm_map.brk, 0x0040_1000);
+        assert!(addr_space
+            .page_table
+            .lock()
+            .unwrap()
+            .contains_key(&0x0040_0000));
+    }
+    {
+        let thd = task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_ref().expect("thread context should exist");
+        let sp = *ctx
+            .uctx
+            .r
+            .last()
+            .expect("context should have a stack register") as usize;
+        assert_eq!(ctx.uctx.ip, 0x0040_0000);
+        assert!(sp >= USR_STK_OFF && sp <= USR_STK_OFF + USR_STK_SZ);
+        assert_eq!(ctx.clear_tid, 0);
+        assert!(ctx.sig_frames.is_empty());
+    }
+}
+
+#[test]
+// AGENT
+fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    let close_fd = kernel
+        .dispatch_syscall(SYS_OPEN, 0x4000, O_CLOEXEC, 0, 0, 0, 0)
+        .expect("open should create a cloexec fd");
+    *task.exec_path.lock().unwrap() = String::from("/bin/old");
+    {
+        let mut addr_space = task.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(0x5400_0000, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("old mapping should be created");
+    }
+    {
+        let mut thd = task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_mut().expect("thread context should exist");
+        ctx.uctx.set_ip(0x1111);
+        ctx.uctx.set_sp(0x2222);
+        ctx.clear_tid = 123;
+    }
+    let old_token = task.vm_token.load(Ordering::Relaxed);
+    let free_before = kernel.pool.free_count();
+
+    let err = kernel
+        .do_exec(1, "/bin/too-big", vec!["x".repeat(USR_STK_SZ)], Vec::new())
+        .expect_err("oversized initial stack should fail before commit");
+
+    assert_eq!(err, "e2big");
+    assert_eq!(kernel.pool.free_count(), free_before);
+    assert_eq!(&*task.exec_path.lock().unwrap(), "/bin/old");
+    assert_eq!(task.vm_token.load(Ordering::Relaxed), old_token);
+    match task
+        .get_file(close_fd)
+        .expect("cloexec fd should survive failed exec")
+    {
+        FLike::File(f) => assert!(f.cloexec),
+        _ => panic!("expected regular file"),
+    }
+    {
+        let addr_space = task.addr_space.lock().unwrap();
+        assert!(addr_space.vm_map.find(0x5400_0000).is_some());
+        assert!(addr_space.vm_map.find(0x0040_0000).is_none());
+        assert_eq!(addr_space.rss_pages(), 1);
+    }
+    {
+        let thd = task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_ref().expect("thread context should exist");
+        assert_eq!(ctx.uctx.ip, 0x1111);
+        assert_eq!(*ctx.uctx.r.last().unwrap(), 0x2222);
+        assert_eq!(ctx.clear_tid, 123);
+    }
 }
 
 #[test]
