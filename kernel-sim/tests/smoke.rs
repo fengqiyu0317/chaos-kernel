@@ -2,8 +2,8 @@
 use kernel_sim::{
     EpData, EpEvent, FLike, Kernel, PageTableEntry, PgFrame, SchedulePolicy, TaskRunState,
     TaskTable, VmRegion, N_FRAMES, N_PROC, O_CLOEXEC, PAGE_SZ, SIGUSR1, SYS_EPOLL_CREATE,
-    SYS_EPOLL_CTL, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_SIGACTION,
-    SYS_SIGRETURN, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_OPEN,
+    SYS_SIGACTION, SYS_SIGRETURN, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
@@ -17,6 +17,14 @@ struct UserSigAction {
     sa_sigaction: usize,
     sa_mask: u64,
     sa_flags: i32,
+}
+
+fn usize_array_bytes(values: &[usize]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<usize>());
+    for value in values {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    bytes
 }
 
 #[test]
@@ -512,6 +520,85 @@ fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
         assert_eq!(*ctx.uctx.r.last().unwrap(), 0x2222);
         assert_eq!(ctx.clear_tid, 123);
     }
+}
+
+#[test]
+// AGENT
+fn syscall_exec_reads_user_memory_and_commits_do_exec() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    let close_fd = kernel
+        .dispatch_syscall(SYS_OPEN, 0x6000, O_CLOEXEC, 0, 0, 0, 0)
+        .expect("open should create a cloexec fd");
+    let old_token = task.vm_token.load(Ordering::Relaxed);
+
+    const USER_BASE: usize = 0x1000_0000;
+    const PATH: usize = USER_BASE;
+    const ARGV: usize = USER_BASE + 0x100;
+    const ENVP: usize = USER_BASE + 0x200;
+    const ARG0: usize = USER_BASE + PAGE_SZ;
+    const ARG1: usize = USER_BASE + PAGE_SZ + 0x100;
+    const ENV0: usize = USER_BASE + PAGE_SZ * 2;
+    {
+        let mut addr_space = task.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(USER_BASE, PAGE_SZ * 3, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("user argument region should map");
+        addr_space
+            .write_user_bytes(PATH, b"/bin/next\0", &kernel.pool)
+            .expect("path should be written");
+        addr_space
+            .write_user_bytes(ARG0, b"next\0", &kernel.pool)
+            .expect("argv[0] should be written");
+        addr_space
+            .write_user_bytes(ARG1, b"--flag\0", &kernel.pool)
+            .expect("argv[1] should be written");
+        addr_space
+            .write_user_bytes(ENV0, b"A=B\0", &kernel.pool)
+            .expect("envp[0] should be written");
+        addr_space
+            .write_user_bytes(ARGV, &usize_array_bytes(&[ARG0, ARG1, 0]), &kernel.pool)
+            .expect("argv vector should be written");
+        addr_space
+            .write_user_bytes(ENVP, &usize_array_bytes(&[ENV0, 0]), &kernel.pool)
+            .expect("envp vector should be written");
+    }
+
+    kernel
+        .dispatch_syscall(SYS_EXEC, PATH, ARGV, ENVP, 0, 0, 0)
+        .expect("exec syscall should commit via do_exec");
+
+    assert_eq!(&*task.exec_path.lock().unwrap(), "/bin/next");
+    assert!(task.get_file(close_fd).is_none());
+    assert_ne!(task.vm_token.load(Ordering::Relaxed), old_token);
+    {
+        let addr_space = task.addr_space.lock().unwrap();
+        assert!(addr_space.vm_map.find(USER_BASE).is_none());
+        assert!(addr_space.vm_map.find(0x0040_0000).is_some());
+        assert!(addr_space.vm_map.find(USR_STK_OFF).is_some());
+    }
+}
+
+#[test]
+// AGENT
+fn syscall_exec_faults_on_unmapped_user_path_without_commit() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    *task.exec_path.lock().unwrap() = String::from("/bin/old");
+    let old_token = task.vm_token.load(Ordering::Relaxed);
+
+    let err = kernel
+        .dispatch_syscall(SYS_EXEC, 0x2000_0000, 0, 0, 0, 0, 0)
+        .expect_err("unmapped user path should fault");
+
+    assert_eq!(err, "efault");
+    assert_eq!(&*task.exec_path.lock().unwrap(), "/bin/old");
+    assert_eq!(task.vm_token.load(Ordering::Relaxed), old_token);
 }
 
 #[test]

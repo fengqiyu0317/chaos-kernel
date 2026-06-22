@@ -219,8 +219,8 @@ cargo test
 未解决问题：
 
 - `do_exec()` 仍使用内置最小 ELF 占位数据作为可执行文件来源；真实 `path` 打开/读取 ELF 字节仍待实现。
-- 当前地址空间只建模页表和 frame 元数据，尚未提供按虚拟地址写入 ELF 段内容和用户栈 `argc/argv/envp/auxv` 的能力。
-- `sys_exec()` 仍未从用户地址空间搬运 path/argv/envp 并调用 `Kernel::do_exec()`。
+- 当时地址空间只建模页表和 frame 元数据；后续已新增基础用户内存读写接口，但 ELF 段内容和用户栈 `argc/argv/envp/auxv` 写入仍未接入 loader。
+- 当时 `sys_exec()` 仍未搬运用户参数；后续已接入从当前 task 地址空间读取 path/argv/envp 并调用 `Kernel::do_exec()` 的 syscall 路径。
 - 多线程 exec 语义仍待补齐。
 
 ## 当前不要改的部分
@@ -249,3 +249,43 @@ cargo test
 
 ### 来源
 ```
+
+## 2026-06-20：kernel-sim sys_exec 用户参数搬运
+
+目标：完成 `TASK.md` 中记录的 exec syscall 缺口，让 `sys_exec()` 从当前 task 地址空间读取用户态 `path`、`argv`、`envp`，并调用已有事务式 `Kernel::do_exec()`。
+
+已完成修改：
+
+- `AddrSpace` 的页表项新增模拟页内容，`map_region()` 创建零页内容，`fork_from()` 继续共享同一页内容，COW 写入时复制页内容。
+- 新增 `AddrSpace::read_user_bytes()`、`read_user_usize()`、`write_user_bytes()`，按 VMA/PTE 权限检查后读写模拟用户内存。
+- `sys_exec()` 删除旧的占位 ELF 校验，改为读取用户 C 字符串和空指针结尾的 `argv` / `envp` 指针数组，再调用 `Kernel::do_exec()`。
+- 新增 `syscall_exec_reads_user_memory_and_commits_do_exec` 和 `syscall_exec_faults_on_unmapped_user_path_without_commit` 两个 smoke 回归。
+
+关键文件：
+
+- `kernel-sim/src/kernel/mm/address_space.rs`
+- `kernel-sim/src/kernel/syscall/proc.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `27 passed`；完整 `cargo test` 通过 `27 passed`。
+
+未解决问题：
+
+- `prepare_exec_image()` 仍使用 `default_exec_elf()` 占位 ELF，尚未根据 path 读取真实可执行文件。
+- ELF `PT_LOAD` 文件内容、bss 清零和 `argc/argv/envp/auxv` 初始用户栈写入仍未接入 loader。
+- 多线程 exec 语义仍待补齐。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。

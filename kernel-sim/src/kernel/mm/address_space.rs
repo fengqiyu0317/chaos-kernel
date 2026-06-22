@@ -5,6 +5,7 @@ use super::*;
 pub struct PageTableEntry {
     pub frame_id: usize,
     pub frame: PgFrame,
+    pub data: Arc<Mutex<Vec<u8>>>,
     pub flags: u32,
     pub writable: bool,
     pub cow: bool,
@@ -16,6 +17,7 @@ impl PageTableEntry {
         Self {
             frame_id,
             frame,
+            data: Arc::new(Mutex::new(vec![0; PAGE_SZ])),
             flags,
             writable: flags & VM_WRITE != 0,
             cow: false,
@@ -28,9 +30,10 @@ impl PageTableEntry {
         self.cow = true;
     }
 
-    fn resolve_write(&mut self, frame_id: usize, frame: PgFrame) {
+    fn resolve_write(&mut self, frame_id: usize, frame: PgFrame, data: Vec<u8>) {
         self.frame_id = frame_id;
         self.frame = frame;
+        self.data = Arc::new(Mutex::new(data));
         self.writable = self.flags & VM_WRITE != 0;
         self.cow = false;
         self.present = true;
@@ -126,6 +129,7 @@ impl AddrSpace {
             return Err("segfault");
         }
 
+        let old_data = pte.data.lock().unwrap().clone();
         if pte.frame.count() <= 1 {
             pte.writable = pte.flags & VM_WRITE != 0;
             pte.cow = false;
@@ -134,8 +138,92 @@ impl AddrSpace {
 
         let new_frame_id = pool.get_inner().ok_or("oom")?;
         pte.frame.down();
-        pte.resolve_write(new_frame_id, PgFrame::with_rc(1));
+        pte.resolve_write(new_frame_id, PgFrame::with_rc(1), old_data);
         Ok(new_frame_id * PAGE_SZ + MEM_OFF)
+    }
+
+    fn checked_user_end(addr: usize, len: usize) -> Result<usize, &'static str> {
+        let end = addr.checked_add(len).ok_or("efault")?;
+        if end > KERN_BASE {
+            return Err("efault");
+        }
+        Ok(end)
+    }
+
+    pub fn read_user_bytes(&self, addr: usize, dst: &mut [u8]) -> Result<(), &'static str> {
+        let end = Self::checked_user_end(addr, dst.len())?;
+        let mut copied = 0usize;
+        while copied < dst.len() {
+            let cur = addr + copied;
+            let region = self.vm_map.find(cur).ok_or("efault")?;
+            if region.flags & VM_READ == 0 {
+                return Err("efault");
+            }
+            let page_addr = cur & !(PAGE_SZ - 1);
+            let page_off = cur & (PAGE_SZ - 1);
+            let chunk = min(end - cur, min(PAGE_SZ - page_off, region.end() - cur));
+            let page_data = {
+                let pt = self.page_table.lock().unwrap();
+                let pte = pt.get(&page_addr).ok_or("efault")?;
+                if !pte.present {
+                    return Err("efault");
+                }
+                pte.data.clone()
+            };
+            let page = page_data.lock().unwrap();
+            dst[copied..copied + chunk].copy_from_slice(&page[page_off..page_off + chunk]);
+            copied += chunk;
+        }
+        Ok(())
+    }
+
+    pub fn read_user_usize(&self, addr: usize) -> Result<usize, &'static str> {
+        let mut bytes = [0u8; std::mem::size_of::<usize>()];
+        self.read_user_bytes(addr, &mut bytes)?;
+        Ok(usize::from_ne_bytes(bytes))
+    }
+
+    pub fn write_user_bytes(
+        &mut self,
+        addr: usize,
+        src: &[u8],
+        pool: &FramePool,
+    ) -> Result<(), &'static str> {
+        let end = Self::checked_user_end(addr, src.len())?;
+        let mut written = 0usize;
+        while written < src.len() {
+            let cur = addr + written;
+            let region = self.vm_map.find(cur).ok_or("efault")?;
+            if region.flags & VM_WRITE == 0 {
+                return Err("efault");
+            }
+            let page_addr = cur & !(PAGE_SZ - 1);
+            let page_off = cur & (PAGE_SZ - 1);
+            let chunk = min(end - cur, min(PAGE_SZ - page_off, region.end() - cur));
+            let need_cow = {
+                let pt = self.page_table.lock().unwrap();
+                let pte = pt.get(&page_addr).ok_or("efault")?;
+                if !pte.present {
+                    return Err("efault");
+                }
+                !pte.writable && pte.cow
+            };
+            if need_cow {
+                self.handle_cow_fault(cur, pool).map_err(|_| "efault")?;
+            }
+            let page_data = {
+                let pt = self.page_table.lock().unwrap();
+                let pte = pt.get(&page_addr).ok_or("efault")?;
+                if !pte.present || !pte.writable {
+                    return Err("efault");
+                }
+                pte.data.clone()
+            };
+            let mut page = page_data.lock().unwrap();
+            page[page_off..page_off + chunk].copy_from_slice(&src[written..written + chunk]);
+            written += chunk;
+        }
+        Ok(())
     }
 
     pub fn unmap_range(&mut self, start: usize, len: usize) -> usize {

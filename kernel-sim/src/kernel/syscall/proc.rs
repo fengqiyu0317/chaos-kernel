@@ -16,24 +16,68 @@ pub(super) fn sys_exec(
     let path_addr = a0;
     let argv_addr = a1;
     let envp_addr = a2;
-    if path_addr == 0 {
-        return Err("efault");
-    }
-    if !check_access(path_addr, 4096) {
-        return Err("efault");
-    } // HUMAN
-    if argv_addr != 0 && !check_access(argv_addr, 8 * 64) {
-        return Err("efault");
-    }
-    if envp_addr != 0 && !check_access(envp_addr, 8 * 64) {
-        return Err("efault");
-    }
-    let _elf_result = validate_elf_header(&[
-        0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0x3e, 0, 1, 0, 0, 0, 0,
-        0x40, 0, 0, 0, 0, 0, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0x40, 0, 0x38, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-    ]);
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    let task_id = task.id();
+    let (path, args, envs) = {
+        let addr_space = task.addr_space.lock().unwrap();
+        let path = read_user_c_string(&addr_space, path_addr, 4096, "enametoolong")?;
+        let args = read_user_string_array(&addr_space, argv_addr, 64, 4096)?;
+        let envs = read_user_string_array(&addr_space, envp_addr, 64, 4096)?;
+        (path, args, envs)
+    };
+    kernel.do_exec(task_id, &path, args, envs)?;
     Ok(0)
+}
+
+fn read_user_c_string(
+    addr_space: &AddrSpace,
+    addr: usize,
+    max_len: usize,
+    too_long: &'static str,
+) -> Result<String, &'static str> {
+    if addr == 0 {
+        return Err("efault");
+    }
+    let mut bytes = Vec::new();
+    for offset in 0..max_len {
+        let cur = addr.checked_add(offset).ok_or("efault")?;
+        let mut byte = [0u8; 1];
+        addr_space.read_user_bytes(cur, &mut byte)?;
+        if byte[0] == 0 {
+            return String::from_utf8(bytes).map_err(|_| "einval");
+        }
+        bytes.push(byte[0]);
+    }
+    Err(too_long)
+}
+
+fn read_user_string_array(
+    addr_space: &AddrSpace,
+    array_addr: usize,
+    max_items: usize,
+    max_string_len: usize,
+) -> Result<Vec<String>, &'static str> {
+    if array_addr == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let word = std::mem::size_of::<usize>();
+    for idx in 0..max_items {
+        let ptr_addr = array_addr
+            .checked_add(idx.checked_mul(word).ok_or("efault")?)
+            .ok_or("efault")?;
+        let ptr = addr_space.read_user_usize(ptr_addr)?;
+        if ptr == 0 {
+            return Ok(out);
+        }
+        out.push(read_user_c_string(
+            addr_space,
+            ptr,
+            max_string_len,
+            "e2big",
+        )?);
+    }
+    Err("e2big")
 }
 
 pub(super) fn sys_exit(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {

@@ -19,6 +19,9 @@
 - 创建 `chaos/NOTES.md`，记录迁移说明、GitHub 仓库状态和后续工作约定。
 - 2026-06-20：`kernel-sim` 的 `Kernel::do_exec()` 已改为事务式准备/提交：先在临时 `AddrSpace` 中解析 ELF `PT_LOAD`、映射 text/stack、构造新 `ThdCtx` 并收集 `FD_CLOEXEC`，全部成功后再替换当前 task 状态。
 - 2026-06-20：新增 exec smoke 回归，覆盖成功 exec 后地址空间/PC/SP/`FD_CLOEXEC` 提交，以及失败 exec 不破坏旧映像、不关闭 `FD_CLOEXEC` fd、不泄漏临时 frame。
+- 2026-06-20：`kernel-sim` 的 `sys_exec()` 已接入 `Kernel::do_exec()`；syscall 层会从当前 task 的 `AddrSpace` 读取用户态 `path`、`argv`、`envp`，再调用事务式 exec 提交路径。
+- 2026-06-20：`AddrSpace` 新增模拟页内容和 `read_user_bytes()` / `read_user_usize()` / `write_user_bytes()`，为 syscall 参数搬运和后续 ELF/用户栈写入提供基础。
+- 2026-06-20：新增 exec syscall smoke 回归，覆盖从用户地址空间搬运参数后提交 exec，以及未映射用户 path 返回 `efault` 且不破坏旧进程映像。
 
 ## 关键文件
 
@@ -26,11 +29,23 @@
 - `chaos/TASK.md`：当前任务状态和交接摘要。
 - `chaos/NOTES.md`：迁移说明与工作约定。
 - `chaos/kernel-sim/`：后续修 bug、通过测试、重写提升质量的目标目录。
+- `chaos/kernel-sim/src/kernel/mm/address_space.rs`：模拟用户页内容和用户内存读写接口。
+- `chaos/kernel-sim/src/kernel/syscall/proc.rs`：`sys_exec()` 用户参数搬运和 `do_exec()` 调用。
+- `chaos/kernel-sim/tests/smoke.rs`：exec syscall 回归测试。
 - `chaos/kernel/src/kernel.rs`：禁止修改的原始内核文件。
 
 ## 测试结果
 
-本次只迁移项目记录和工作空间配置，没有修改 Rust 源码，未运行 `cargo test`。
+本次 `kernel-sim` exec syscall 修改后执行过：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `27 passed`；完整 `cargo test` 通过 `27 passed`。
 
 迁移前在 `chaos/` 中执行过：
 
@@ -70,18 +85,17 @@ cargo test --test pressure
 - TODO: `kernel-sim` 尚未建模 `pthread_atfork` handler、fork 后 child 在 `exec` 前只能调用 async-signal-safe 函数等用户态线程运行时约束。
 - TODO: `kernel-sim` 尚未建模 seccomp filters、ptrace relationship、LSM/security label、keyrings、namespace/cgroup membership 等安全和隔离上下文的 fork 继承或重置规则。
 - TODO: `kernel-sim/src/kernel/core/kernel_ops.rs` 的 `default_exec_elf()` 仍是占位 ELF；后续需要让 `prepare_exec_image()` 根据 `lookup_path(path)` 的结果打开/读取真实可执行文件，移除占位镜像数据源。
-- TODO: `kernel-sim` 的 ELF exec 装载还没有把 `PT_LOAD` 文件内容写入用户页；需要在 `AddrSpace` 层提供按虚拟地址写用户内存的接口，用 `map_region()` / `PageTableEntry` 映射 text/data/bss/stack，复制文件段并清零 bss。
+- TODO: `kernel-sim` 的 ELF exec 装载还没有把 `PT_LOAD` 文件内容写入用户页；已有 `AddrSpace::write_user_bytes()` 基础接口，后续还需要在 loader 中用它复制文件段并清零 bss。
 - TODO: `kernel-sim` 的 exec `brk` 初始化目前只按已映射镜像末尾页对齐；补齐真实 ELF 装载后，需要确认 data/bss、页内偏移、空洞段和 mmap 基址下的 `brk` 语义。
 - TODO: `kernel-sim/src/kernel/fs/fs_misc.rs` 的 ELF 解析尚未校验 `e_entry` 是否位于用户地址范围内、是否落在某个已映射且带执行权限的 `PT_LOAD` 段中；后续应拒绝入口地址未映射或不可执行的畸形 ELF。
 - TODO: `kernel-sim/src/kernel/fs/fs_misc.rs` 目前接受 `ET_DYN`，但没有实现 PIE/load bias、地址随机化、动态段解析或重定位；后续要么补齐 `ET_DYN` 装载语义，要么在未实现前只接受可直接映射的 `ET_EXEC`。
 - TODO: `kernel-sim` 的 exec ELF loader 尚未处理 `PT_INTERP`、动态链接器路径、`PT_DYNAMIC` 和重定位；动态链接 ELF 目前不能被视为完整支持。
 - TODO: `kernel-sim/src/kernel/fs/fs_misc.rs` 的 `ElfLoadSegment::vm_region()` 对页内偏移使用 `offset.saturating_sub(page_off)` 容错，尚未严格校验 `p_align` 以及 `p_offset % p_align == p_vaddr % p_align`；后续应补齐 ELF segment 对齐规则并对非法组合报错。
 - TODO: `kernel-sim` 的 ELF 段权限模型目前只把 `PF_R/PF_W/PF_X` 映射为 `VM_READ/VM_WRITE/VM_EXEC`；后续可补齐 W^X、RELRO、栈执行权限、私有/共享映射等更接近真实 exec 的权限语义。
-- TODO: `kernel-sim` 的 `ProcInit::push_at()` 目前只计算栈指针，没有把 `argc`、`argv`、`envp`、字符串区和 `auxv` 写入用户栈；exec 完整化时应改为真正构造用户初始栈，并至少写入 `AT_PAGESZ`、`AT_ENTRY` 等辅助向量。
+- TODO: `kernel-sim` 的 `ProcInit::push_at()` 目前只计算栈指针，没有把 `argc`、`argv`、`envp`、字符串区和 `auxv` 写入用户栈；已有 `AddrSpace::write_user_bytes()` 基础接口，exec 完整化时应改为真正构造用户初始栈，并至少写入 `AT_PAGESZ`、`AT_ENTRY` 等辅助向量。
 - TODO: `kernel-sim` 的 exec 状态提交边界仍需继续补齐多线程 exec 语义；当前 `commit_exec()` 已覆盖保留非 `FD_CLOEXEC` 文件描述符、关闭 close-on-exec fd、替换地址空间、重置入口 PC/SP、信号处理帧和 `clear_tid`。
 - TODO: `kernel-sim/src/kernel/core/kernel_ops.rs` 的 `next_exec_vm_token()` 目前只是用 `old_token + N_PROC` 生成新的模拟标识；后续应让 `vm_token` 由 `AddrSpace`/页表根/ASID 分配路径统一生成，保证同一进程线程共享、fork/exec 后语义明确，并避免跨 task token 碰撞。
-- TODO: `kernel-sim` 的 `sys_exec()` 尚未连接到 `Kernel::do_exec()`；需要先实现从当前 task 地址空间读取用户 path、argv、envp 的工具函数，再在 syscall 层完成参数搬运并调用 `do_exec()`。
-- TODO: `kernel-sim` 的 exec 回归测试还需覆盖 `sys_exec()` 到 `do_exec()` 的调用路径，以及真实 ELF 文件段复制、bss 清零、初始用户栈写入等路径；`do_exec()` 直接成功/失败事务语义已在 `kernel-sim/tests/smoke.rs` 覆盖。
+- TODO: `kernel-sim` 的 exec 回归测试还需继续覆盖真实 ELF 文件段复制、bss 清零、初始用户栈写入等路径；`sys_exec()` 到 `do_exec()` 的调用路径，以及 `do_exec()` 直接成功/失败事务语义已在 `kernel-sim/tests/smoke.rs` 覆盖。
 
 ## 不要改的部分
 
