@@ -23,6 +23,7 @@
 - 2026-06-20：`AddrSpace` 新增模拟页内容和 `read_user_bytes()` / `read_user_usize()` / `write_user_bytes()`，为 syscall 参数搬运和后续 ELF/用户栈写入提供基础。
 - 2026-06-20：新增 exec syscall smoke 回归，覆盖从用户地址空间搬运参数后提交 exec，以及未映射用户 path 返回 `efault` 且不破坏旧进程映像。
 - 2026-06-22：`kernel-sim` 的 `vm_token` 改为由 `AddrSpace` 统一分配和持有；删除 `Task.vm_token` 缓存字段，`fork`/`exec` 创建新地址空间时自然获得新 token，`clone_thread` 共享地址空间时通过 `Task::vm_token()` 读取同一 token。
+- 2026-06-22：`kernel-sim` 的 `ProcInit::push_at()` 已改为真正构造用户初始栈：写入 `argc`、`argv`、`envp`、字符串区和 auxv 终止项；`Kernel::prepare_exec_image()` 先映射用户栈再通过 `AddrSpace::write_user_bytes()` 写入，并继续在失败时释放临时地址空间；exec auxv 至少包含 `AT_PAGESZ` 和 `AT_ENTRY`。
 
 ## 关键文件
 
@@ -94,9 +95,8 @@ cargo test --test pressure
 - TODO: `kernel-sim` 的 exec ELF loader 尚未处理 `PT_INTERP`、动态链接器路径、`PT_DYNAMIC` 和重定位；动态链接 ELF 目前不能被视为完整支持。
 - TODO: `kernel-sim/src/kernel/fs/fs_misc.rs` 的 `ElfLoadSegment::vm_region()` 对页内偏移使用 `offset.saturating_sub(page_off)` 容错，尚未严格校验 `p_align` 以及 `p_offset % p_align == p_vaddr % p_align`；后续应补齐 ELF segment 对齐规则并对非法组合报错。
 - TODO: `kernel-sim` 的 ELF 段权限模型目前只把 `PF_R/PF_W/PF_X` 映射为 `VM_READ/VM_WRITE/VM_EXEC`；后续可补齐 W^X、RELRO、栈执行权限、私有/共享映射等更接近真实 exec 的权限语义。
-- TODO: `kernel-sim` 的 `ProcInit::push_at()` 目前只计算栈指针，没有把 `argc`、`argv`、`envp`、字符串区和 `auxv` 写入用户栈；已有 `AddrSpace::write_user_bytes()` 基础接口，exec 完整化时应改为真正构造用户初始栈，并至少写入 `AT_PAGESZ`、`AT_ENTRY` 等辅助向量。
 - TODO: `kernel-sim` 的 exec 状态提交边界仍需继续补齐多线程 exec 语义；当前 `commit_exec()` 已覆盖保留非 `FD_CLOEXEC` 文件描述符、关闭 close-on-exec fd、替换地址空间、重置入口 PC/SP、信号处理帧和 `clear_tid`。
-- TODO: `kernel-sim` 的 exec 回归测试还需继续覆盖真实 ELF 文件段复制、bss 清零、初始用户栈写入等路径；`sys_exec()` 到 `do_exec()` 的调用路径，以及 `do_exec()` 直接成功/失败事务语义已在 `kernel-sim/tests/smoke.rs` 覆盖。
+- TODO: `kernel-sim` 的 exec 回归测试还需继续覆盖真实 ELF 文件段复制、bss 清零等路径；`sys_exec()` 到 `do_exec()` 的调用路径、`do_exec()` 直接成功/失败事务语义，以及初始用户栈写入已在 `kernel-sim/tests/smoke.rs` 覆盖。
 
 ## 不要改的部分
 

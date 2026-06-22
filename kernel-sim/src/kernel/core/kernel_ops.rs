@@ -339,15 +339,21 @@ impl Kernel {
             addr_space.release_all_pages(&self.pool);
             return Err("e2big");
         }
-        let sp = init.push_at(USR_STK_OFF + USR_STK_SZ);
-        if sp < USR_STK_OFF || sp > USR_STK_OFF + USR_STK_SZ {
-            addr_space.release_all_pages(&self.pool);
-            return Err("e2big");
-        }
         let stack = VmRegion::new(USR_STK_OFF, USR_STK_SZ, VM_READ | VM_WRITE | VM_GROWSDOWN);
         if let Err(err) = addr_space.map_region(stack, &self.pool) {
             addr_space.release_all_pages(&self.pool);
             return Err(err);
+        }
+        let sp = match init.push_at(&mut addr_space, &self.pool, USR_STK_OFF + USR_STK_SZ) {
+            Ok(sp) => sp,
+            Err(err) => {
+                addr_space.release_all_pages(&self.pool);
+                return Err(err);
+            }
+        };
+        if sp < USR_STK_OFF || sp > USR_STK_OFF + USR_STK_SZ {
+            addr_space.release_all_pages(&self.pool);
+            return Err("e2big");
         }
         addr_space.vm_map.brk = (image_end + PAGE_SZ - 1) & !(PAGE_SZ - 1);
         let mut ctx = ThdCtx::default();

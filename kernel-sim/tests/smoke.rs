@@ -1,9 +1,10 @@
 // AGENT
 use kernel_sim::{
-    EpData, EpEvent, FLike, Kernel, PageTableEntry, PgFrame, SchedulePolicy, TaskRunState,
-    TaskTable, VmRegion, N_FRAMES, N_PROC, O_CLOEXEC, PAGE_SZ, SIGUSR1, SYS_EPOLL_CREATE,
-    SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_OPEN,
-    SYS_SIGACTION, SYS_SIGRETURN, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    AddrSpace, EpData, EpEvent, FLike, Kernel, PageTableEntry, PgFrame, SchedulePolicy,
+    TaskRunState, TaskTable, VmRegion, AT_ENTRY, AT_PAGESZ, N_FRAMES, N_PROC, O_CLOEXEC, PAGE_SZ,
+    SIGUSR1, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID,
+    SYS_KILL, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ,
+    VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
@@ -25,6 +26,21 @@ fn usize_array_bytes(values: &[usize]) -> Vec<u8> {
         bytes.extend_from_slice(&value.to_ne_bytes());
     }
     bytes
+}
+
+fn read_user_c_string(addr_space: &AddrSpace, addr: usize) -> String {
+    let mut bytes = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        addr_space
+            .read_user_bytes(addr + bytes.len(), &mut byte)
+            .expect("user string byte should be readable");
+        if byte[0] == 0 {
+            break;
+        }
+        bytes.push(byte[0]);
+    }
+    String::from_utf8(bytes).expect("user string should be utf-8")
 }
 
 #[test]
@@ -448,7 +464,7 @@ fn do_exec_commits_new_address_space_context_and_cloexec() {
             .unwrap()
             .contains_key(&0x0040_0000));
     }
-    {
+    let sp = {
         let thd = task.thd_ctx.lock().unwrap();
         let ctx = thd.as_ref().expect("thread context should exist");
         let sp = *ctx
@@ -460,6 +476,45 @@ fn do_exec_commits_new_address_space_context_and_cloexec() {
         assert!(sp >= USR_STK_OFF && sp <= USR_STK_OFF + USR_STK_SZ);
         assert_eq!(ctx.clear_tid, 0);
         assert!(ctx.sig_frames.is_empty());
+        sp
+    };
+    {
+        let addr_space = task.addr_space.lock().unwrap();
+        let word = std::mem::size_of::<usize>();
+        assert_eq!(sp & 0xF, 0);
+        assert_eq!(addr_space.read_user_usize(sp).unwrap(), 1);
+        let argv0 = addr_space.read_user_usize(sp + word).unwrap();
+        assert_eq!(read_user_c_string(&addr_space, argv0), "next");
+        assert_eq!(addr_space.read_user_usize(sp + word * 2).unwrap(), 0);
+        let env0 = addr_space.read_user_usize(sp + word * 3).unwrap();
+        assert_eq!(read_user_c_string(&addr_space, env0), "A=B");
+        assert_eq!(addr_space.read_user_usize(sp + word * 4).unwrap(), 0);
+
+        let mut aux_at = sp + word * 5;
+        let mut saw_pagesz = false;
+        let mut saw_entry = false;
+        loop {
+            let key = addr_space.read_user_usize(aux_at).unwrap();
+            let value = addr_space.read_user_usize(aux_at + word).unwrap();
+            aux_at += word * 2;
+            if key == 0 {
+                assert_eq!(value, 0);
+                break;
+            }
+            match key as u8 {
+                AT_PAGESZ => {
+                    assert_eq!(value, PAGE_SZ);
+                    saw_pagesz = true;
+                }
+                AT_ENTRY => {
+                    assert_eq!(value, 0x0040_0000);
+                    saw_entry = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_pagesz);
+        assert!(saw_entry);
     }
 }
 

@@ -228,6 +228,48 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-23：kernel-sim exec 初始用户栈写入
+
+目标：补齐 `ProcInit::push_at()` 的用户栈构造逻辑，使 `exec` 提交的新地址空间中包含可由用户态读取的 `argc`、`argv`、`envp` 和 auxv。
+
+已完成修改：
+
+- `ProcInit::push_at()` 改为接收 `AddrSpace` 和 `FramePool`，通过 `AddrSpace::write_user_bytes()` 写入用户栈内容，并在空间不足或写入失败时返回错误。
+- 用户栈现在写入参数字符串、环境变量字符串、`argc`、`argv` 指针数组、`envp` 指针数组和 auxv 终止项；`Kernel::prepare_exec_image()` 先映射用户栈，再构造初始栈。
+- `TaskTable::new_user_task()` 跟随新接口映射初始用户栈并写入启动栈。
+- `do_exec_commits_new_address_space_context_and_cloexec` smoke 回归新增对栈对齐、`argv[0]`、`envp[0]`、`AT_PAGESZ` 和 `AT_ENTRY` 的读取校验。
+- `TASK.md` 同步更新 exec 用户栈状态，删除已完成的用户栈 TODO。
+
+关键文件：
+
+- `kernel-sim/src/kernel/proc/process.rs`
+- `kernel-sim/src/kernel/core/kernel_ops.rs`
+- `kernel-sim/src/kernel/proc/task.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `28 passed`；完整 `cargo test` 通过 `28 passed`。
+
+未解决问题：
+
+- `prepare_exec_image()` 仍使用 `default_exec_elf()` 占位 ELF，尚未根据 path 读取真实可执行文件。
+- ELF `PT_LOAD` 文件内容复制和 bss 清零仍待接入真实 loader。
+- 多线程 exec 语义仍待补齐。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
 ## 2026-06-22：kernel-sim 地址空间 token 语义清理
 
 目标：修复 `TASK.md` 中记录的 `next_exec_vm_token()` 占位问题，采用长期做法让 `vm_token` 归属于 `AddrSpace`，并删除未接入的 `AddrSpace::ref_count` 死字段。

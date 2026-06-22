@@ -7,44 +7,63 @@ pub struct ProcInit {
     pub auxv: BTreeMap<u8, usize>,
 }
 impl ProcInit {
-    pub fn push_at(&self, top: usize) -> usize {
+    pub fn push_at(
+        &self,
+        addr_space: &mut AddrSpace,
+        pool: &FramePool,
+        top: usize,
+    ) -> Result<usize, &'static str> {
         let word = std::mem::size_of::<usize>();
         let mut sp = top;
-        let mut str_offsets: Vec<usize> = Vec::new();
-        let a0l = self.args.get(0).map_or(0, |s| s.as_bytes().len());
-        sp -= a0l + 1;
-        str_offsets.push(sp);
-        let mut env_locs = Vec::with_capacity(self.envs.len());
-        for e in self.envs.iter() {
-            let el = e.as_bytes().len();
-            sp = sp.wrapping_sub(el + 1);
-            env_locs.push(sp);
-        }
         let mut arg_locs = Vec::with_capacity(self.args.len());
-        for a in self.args.iter() {
-            let al = a.as_bytes().len();
-            sp = sp.wrapping_sub(al + 1);
+        let mut env_locs = Vec::with_capacity(self.envs.len());
+        for arg in self.args.iter().rev() {
+            let bytes = arg.as_bytes();
+            sp = sp.checked_sub(bytes.len() + 1).ok_or("e2big")?;
+            addr_space.write_user_bytes(sp, bytes, pool)?;
+            addr_space.write_user_bytes(sp + bytes.len(), &[0], pool)?;
             arg_locs.push(sp);
         }
-        let aux_pairs = self.auxv.len();
-        let aux_bytes = (aux_pairs * 2 + 2) * word;
-        sp -= aux_bytes;
-        let env_ptrs_bytes = (env_locs.len() + 1) * word;
-        sp -= env_ptrs_bytes;
-        let arg_ptrs_bytes = (arg_locs.len() + 1) * word;
-        sp -= arg_ptrs_bytes;
-        sp -= word;
+        arg_locs.reverse();
+        for env in self.envs.iter().rev() {
+            let bytes = env.as_bytes();
+            sp = sp.checked_sub(bytes.len() + 1).ok_or("e2big")?;
+            addr_space.write_user_bytes(sp, bytes, pool)?;
+            addr_space.write_user_bytes(sp + bytes.len(), &[0], pool)?;
+            env_locs.push(sp);
+        }
+        env_locs.reverse();
+
+        let ptr_bytes =
+            (1 + self.args.len() + 1 + self.envs.len() + 1 + self.auxv.len() * 2 + 2) * word;
+        sp = sp.checked_sub(ptr_bytes).ok_or("e2big")?;
         let align = sp & 0xF;
         if align != 0 {
-            sp -= align;
+            sp = sp.checked_sub(align).ok_or("e2big")?;
         }
-        sp
+        let stack_base = sp;
+        let mut cur = stack_base;
+        Self::write_usize(addr_space, pool, &mut cur, self.args.len())?;
+        for loc in arg_locs {
+            Self::write_usize(addr_space, pool, &mut cur, loc)?;
+        }
+        Self::write_usize(addr_space, pool, &mut cur, 0)?;
+        for loc in env_locs {
+            Self::write_usize(addr_space, pool, &mut cur, loc)?;
+        }
+        Self::write_usize(addr_space, pool, &mut cur, 0)?;
+        for (&key, &value) in &self.auxv {
+            Self::write_usize(addr_space, pool, &mut cur, key as usize)?;
+            Self::write_usize(addr_space, pool, &mut cur, value)?;
+        }
+        Self::write_usize(addr_space, pool, &mut cur, 0)?;
+        Self::write_usize(addr_space, pool, &mut cur, 0)?;
+        Ok(stack_base)
     }
 
     pub fn total_size(&self) -> usize {
         // AGENT
         let mut sz = 0usize;
-        sz += self.args.get(0).map_or(0, |s| s.len()) + 1;
         for a in &self.args {
             sz += a.len() + 1;
         }
@@ -54,6 +73,17 @@ impl ProcInit {
         sz += (self.auxv.len() * 2 + 2 + self.args.len() + 1 + self.envs.len() + 1 + 1)
             * std::mem::size_of::<usize>();
         (sz + 15) & !15
+    }
+
+    fn write_usize(
+        addr_space: &mut AddrSpace,
+        pool: &FramePool,
+        cur: &mut usize,
+        value: usize,
+    ) -> Result<(), &'static str> {
+        addr_space.write_user_bytes(*cur, &value.to_ne_bytes(), pool)?;
+        *cur += std::mem::size_of::<usize>();
+        Ok(())
     }
 }
 

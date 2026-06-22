@@ -593,7 +593,13 @@ impl TaskTable {
         src.threads.lock().unwrap().push(id);
         t
     }
-    pub fn new_user_task(&self, path: &str, args: Vec<String>, envs: Vec<String>) -> Arc<Task> {
+    pub fn new_user_task(
+        &self,
+        path: &str,
+        args: Vec<String>,
+        envs: Vec<String>,
+        pool: &FramePool,
+    ) -> Arc<Task> {
         let t = self.spawn(path);
         *t.exec_path.lock().unwrap() = path.to_string();
         let _elf_entry = validate_elf_header(&[
@@ -607,7 +613,20 @@ impl TaskTable {
             envs,
             auxv: BTreeMap::new(),
         };
-        let sp = init.push_at(USR_STK_OFF + USR_STK_SZ);
+        {
+            let mut addr_space = t.addr_space.lock().unwrap();
+            addr_space
+                .map_region(
+                    VmRegion::new(USR_STK_OFF, USR_STK_SZ, VM_READ | VM_WRITE | VM_GROWSDOWN),
+                    pool,
+                )
+                .expect("initial user stack should map");
+        }
+        let sp = {
+            let mut addr_space = t.addr_space.lock().unwrap();
+            init.push_at(&mut addr_space, pool, USR_STK_OFF + USR_STK_SZ)
+                .expect("initial user stack should be writable")
+        };
         ctx.uctx.set_sp(sp as u64);
         *t.thd_ctx.lock().unwrap() = Some(ctx);
         let fd0 = FHandle::new(
