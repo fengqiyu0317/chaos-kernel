@@ -14,13 +14,13 @@ impl Kernel {
     ) -> Result<usize, &'static str> {
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
         let _ts_enter = CLK.load(Ordering::Relaxed);
-        // AGENT TODO: use caller_token for user-memory access once vm_token has
-        // a single address-space meaning instead of the current placeholder flow.
+        // AGENT: caller_token mirrors the current address-space token for syscall
+        // entry bookkeeping; user-memory access is routed through Task.addr_space.
         let _caller_token = {
             let cpus = self.cpus.lock().unwrap();
             cpus.iter()
                 .enumerate()
-                .find_map(|(i, slot)| slot.as_ref().map(|t| t.vm_token.load(Ordering::Relaxed)))
+                .find_map(|(i, slot)| slot.as_ref().map(|t| t.vm_token()))
                 .unwrap_or(0)
         };
         let result = match nr {

@@ -112,7 +112,7 @@ impl Kernel {
         let ct = self.cur_task(0);
         match ct {
             Some(t) => {
-                let _vm = t.vm_token.load(Ordering::Relaxed);
+                let _vm = t.vm_token();
                 true
             }
             None => false,

@@ -49,23 +49,28 @@ pub struct AddrSpace {
     pub vm_map: VmMap,
     pub page_table_root: usize,
     pub asid: u16,
-    pub ref_count: AtomicUsize,
     pub page_table: Mutex<BTreeMap<usize, PageTableEntry>>,
 }
 
+static ADDR_SPACE_TOKEN_SEQ: AtomicUsize = AtomicUsize::new(1);
+
 impl AddrSpace {
-    pub fn new(asid: u16) -> Self {
+    pub fn new() -> Self {
+        let page_table_root = next_vm_token();
         Self {
             vm_map: VmMap::new(),
-            page_table_root: asid as usize,
-            asid,
-            ref_count: AtomicUsize::new(1),
+            page_table_root,
+            asid: asid_from_token(page_table_root),
             page_table: Mutex::new(BTreeMap::new()),
         }
     }
 
-    pub fn fork_from(parent: &AddrSpace, new_asid: u16) -> Self {
-        let mut child = Self::new(new_asid);
+    pub fn vm_token(&self) -> usize {
+        self.page_table_root
+    }
+
+    pub fn fork_from(parent: &AddrSpace) -> Self {
+        let mut child = Self::new();
         child.vm_map.brk = parent.vm_map.brk;
         child.vm_map.mmap_base = parent.vm_map.mmap_base;
         for region in parent.vm_map.regions.iter() {
@@ -370,4 +375,20 @@ fn page_range(base: usize, len: usize) -> impl Iterator<Item = usize> {
     let start = base & !(PAGE_SZ - 1);
     let end = (base + len + PAGE_SZ - 1) & !(PAGE_SZ - 1);
     (start..end).step_by(PAGE_SZ)
+}
+
+fn next_vm_token() -> usize {
+    // AGENT TODO: This is a simulation-only address-space token. A fuller MMU
+    // model should allocate a real page-table root/satp token and pair ASID
+    // reuse with generation tracking plus TLB invalidation.
+    ADDR_SPACE_TOKEN_SEQ
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+            token.checked_add(1)
+        })
+        .expect("address-space token exhausted")
+}
+
+fn asid_from_token(token: usize) -> u16 {
+    let max_asid = u16::MAX as usize;
+    ((token - 1) % max_asid + 1) as u16
 }

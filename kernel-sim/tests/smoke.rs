@@ -76,7 +76,7 @@ fn fork_copies_context_address_space_cwd_and_kernel_stack() {
     let kernel = Kernel::new(N_FRAMES);
     kernel.proc_init();
     let parent = kernel.cur_task(0).expect("init should be current");
-    let parent_token = parent.vm_token.load(Ordering::Relaxed);
+    let parent_token = parent.vm_token();
     {
         parent.info.lock().unwrap().fds = vec![String::from("fd:tracked")];
         parent.sched.lock().unwrap().policy = SchedulePolicy::with_prio(-4);
@@ -109,7 +109,7 @@ fn fork_copies_context_address_space_cwd_and_kernel_stack() {
         .find(child)
         .expect("child should be registered");
 
-    assert_ne!(child_task.vm_token.load(Ordering::Relaxed), parent_token);
+    assert_ne!(child_task.vm_token(), parent_token);
     assert!(child_task.kstk.lock().unwrap().is_some());
     assert_eq!(&*child_task.cwd.lock().unwrap(), "caf\u{e9}/fork");
     assert_eq!(
@@ -397,7 +397,7 @@ fn do_exec_commits_new_address_space_context_and_cloexec() {
     let close_fd = kernel
         .dispatch_syscall(SYS_OPEN, 0x3000, O_CLOEXEC, 0, 0, 0, 0)
         .expect("open should create a cloexec fd");
-    let old_token = task.vm_token.load(Ordering::Relaxed);
+    let old_token = task.vm_token();
     {
         let mut addr_space = task.addr_space.lock().unwrap();
         addr_space
@@ -427,7 +427,7 @@ fn do_exec_commits_new_address_space_context_and_cloexec() {
     assert_eq!(&*task.exec_path.lock().unwrap(), "/bin/next");
     assert!(task.get_file(keep_fd).is_some());
     assert!(task.get_file(close_fd).is_none());
-    assert_ne!(task.vm_token.load(Ordering::Relaxed), old_token);
+    assert_ne!(task.vm_token(), old_token);
     {
         let addr_space = task.addr_space.lock().unwrap();
         assert!(addr_space.vm_map.find(0x5300_0000).is_none());
@@ -465,6 +465,29 @@ fn do_exec_commits_new_address_space_context_and_cloexec() {
 
 #[test]
 // AGENT
+fn cloned_thread_observes_exec_token_from_shared_address_space() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    let old_token = task.vm_token();
+    let thread_task = kernel
+        .tasks
+        .clone_thread(&task, (USR_STK_OFF + USR_STK_SZ) as u64, 0xabc, 0);
+
+    assert!(Arc::ptr_eq(&task.addr_space, &thread_task.addr_space));
+    assert_eq!(thread_task.vm_token(), old_token);
+
+    kernel
+        .do_exec(1, "/bin/next", vec![String::from("next")], Vec::new())
+        .expect("exec should replace the shared address-space image");
+
+    let new_token = task.vm_token();
+    assert_ne!(new_token, old_token);
+    assert_eq!(thread_task.vm_token(), new_token);
+}
+
+#[test]
+// AGENT
 fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
     let kernel = Kernel::new(N_FRAMES);
     kernel.proc_init();
@@ -489,7 +512,7 @@ fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
         ctx.uctx.set_sp(0x2222);
         ctx.clear_tid = 123;
     }
-    let old_token = task.vm_token.load(Ordering::Relaxed);
+    let old_token = task.vm_token();
     let free_before = kernel.pool.free_count();
 
     let err = kernel
@@ -499,7 +522,7 @@ fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
     assert_eq!(err, "e2big");
     assert_eq!(kernel.pool.free_count(), free_before);
     assert_eq!(&*task.exec_path.lock().unwrap(), "/bin/old");
-    assert_eq!(task.vm_token.load(Ordering::Relaxed), old_token);
+    assert_eq!(task.vm_token(), old_token);
     match task
         .get_file(close_fd)
         .expect("cloexec fd should survive failed exec")
@@ -531,7 +554,7 @@ fn syscall_exec_reads_user_memory_and_commits_do_exec() {
     let close_fd = kernel
         .dispatch_syscall(SYS_OPEN, 0x6000, O_CLOEXEC, 0, 0, 0, 0)
         .expect("open should create a cloexec fd");
-    let old_token = task.vm_token.load(Ordering::Relaxed);
+    let old_token = task.vm_token();
 
     const USER_BASE: usize = 0x1000_0000;
     const PATH: usize = USER_BASE;
@@ -574,7 +597,7 @@ fn syscall_exec_reads_user_memory_and_commits_do_exec() {
 
     assert_eq!(&*task.exec_path.lock().unwrap(), "/bin/next");
     assert!(task.get_file(close_fd).is_none());
-    assert_ne!(task.vm_token.load(Ordering::Relaxed), old_token);
+    assert_ne!(task.vm_token(), old_token);
     {
         let addr_space = task.addr_space.lock().unwrap();
         assert!(addr_space.vm_map.find(USER_BASE).is_none());
@@ -590,7 +613,7 @@ fn syscall_exec_faults_on_unmapped_user_path_without_commit() {
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     *task.exec_path.lock().unwrap() = String::from("/bin/old");
-    let old_token = task.vm_token.load(Ordering::Relaxed);
+    let old_token = task.vm_token();
 
     let err = kernel
         .dispatch_syscall(SYS_EXEC, 0x2000_0000, 0, 0, 0, 0, 0)
@@ -598,7 +621,7 @@ fn syscall_exec_faults_on_unmapped_user_path_without_commit() {
 
     assert_eq!(err, "efault");
     assert_eq!(&*task.exec_path.lock().unwrap(), "/bin/old");
-    assert_eq!(task.vm_token.load(Ordering::Relaxed), old_token);
+    assert_eq!(task.vm_token(), old_token);
 }
 
 #[test]

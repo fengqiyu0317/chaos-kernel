@@ -1,6 +1,6 @@
 # Chaos 项目交接状态
 
-更新日期：2026-06-20
+更新日期：2026-06-22
 
 ## 目标
 
@@ -22,6 +22,7 @@
 - 2026-06-20：`kernel-sim` 的 `sys_exec()` 已接入 `Kernel::do_exec()`；syscall 层会从当前 task 的 `AddrSpace` 读取用户态 `path`、`argv`、`envp`，再调用事务式 exec 提交路径。
 - 2026-06-20：`AddrSpace` 新增模拟页内容和 `read_user_bytes()` / `read_user_usize()` / `write_user_bytes()`，为 syscall 参数搬运和后续 ELF/用户栈写入提供基础。
 - 2026-06-20：新增 exec syscall smoke 回归，覆盖从用户地址空间搬运参数后提交 exec，以及未映射用户 path 返回 `efault` 且不破坏旧进程映像。
+- 2026-06-22：`kernel-sim` 的 `vm_token` 改为由 `AddrSpace` 统一分配和持有；删除 `Task.vm_token` 缓存字段，`fork`/`exec` 创建新地址空间时自然获得新 token，`clone_thread` 共享地址空间时通过 `Task::vm_token()` 读取同一 token。
 
 ## 关键文件
 
@@ -84,6 +85,7 @@ cargo test --test pressure
 - TODO: `kernel-sim` 的 session / controlling TTY / job control 模型不完整；目前主要有简化 `pgid` 和 `setsid/setpgid`，尚未完整实现 session membership、foreground process group、TTY job-control signal 等 fork 相关行为。
 - TODO: `kernel-sim` 尚未建模 `pthread_atfork` handler、fork 后 child 在 `exec` 前只能调用 async-signal-safe 函数等用户态线程运行时约束。
 - TODO: `kernel-sim` 尚未建模 seccomp filters、ptrace relationship、LSM/security label、keyrings、namespace/cgroup membership 等安全和隔离上下文的 fork 继承或重置规则。
+- TODO: `kernel-sim/src/kernel/mm/address_space.rs` 的 `page_table_root` / `vm_token` 目前只是全局递增的模拟地址空间 token，`asid_from_token()` 也只是把 token 映射到非零 `u16`；尚未建模真实 `satp`/页表根、ASID generation、ASID 复用时的 TLB flush/shootdown 等完整 MMU 语义。
 - TODO: `kernel-sim/src/kernel/core/kernel_ops.rs` 的 `default_exec_elf()` 仍是占位 ELF；后续需要让 `prepare_exec_image()` 根据 `lookup_path(path)` 的结果打开/读取真实可执行文件，移除占位镜像数据源。
 - TODO: `kernel-sim` 的 ELF exec 装载还没有把 `PT_LOAD` 文件内容写入用户页；已有 `AddrSpace::write_user_bytes()` 基础接口，后续还需要在 loader 中用它复制文件段并清零 bss。
 - TODO: `kernel-sim` 的 exec `brk` 初始化目前只按已映射镜像末尾页对齐；补齐真实 ELF 装载后，需要确认 data/bss、页内偏移、空洞段和 mmap 基址下的 `brk` 语义。
@@ -94,7 +96,6 @@ cargo test --test pressure
 - TODO: `kernel-sim` 的 ELF 段权限模型目前只把 `PF_R/PF_W/PF_X` 映射为 `VM_READ/VM_WRITE/VM_EXEC`；后续可补齐 W^X、RELRO、栈执行权限、私有/共享映射等更接近真实 exec 的权限语义。
 - TODO: `kernel-sim` 的 `ProcInit::push_at()` 目前只计算栈指针，没有把 `argc`、`argv`、`envp`、字符串区和 `auxv` 写入用户栈；已有 `AddrSpace::write_user_bytes()` 基础接口，exec 完整化时应改为真正构造用户初始栈，并至少写入 `AT_PAGESZ`、`AT_ENTRY` 等辅助向量。
 - TODO: `kernel-sim` 的 exec 状态提交边界仍需继续补齐多线程 exec 语义；当前 `commit_exec()` 已覆盖保留非 `FD_CLOEXEC` 文件描述符、关闭 close-on-exec fd、替换地址空间、重置入口 PC/SP、信号处理帧和 `clear_tid`。
-- TODO: `kernel-sim/src/kernel/core/kernel_ops.rs` 的 `next_exec_vm_token()` 目前只是用 `old_token + N_PROC` 生成新的模拟标识；后续应让 `vm_token` 由 `AddrSpace`/页表根/ASID 分配路径统一生成，保证同一进程线程共享、fork/exec 后语义明确，并避免跨 task token 碰撞。
 - TODO: `kernel-sim` 的 exec 回归测试还需继续覆盖真实 ELF 文件段复制、bss 清零、初始用户栈写入等路径；`sys_exec()` 到 `do_exec()` 的调用路径，以及 `do_exec()` 直接成功/失败事务语义已在 `kernel-sim/tests/smoke.rs` 覆盖。
 
 ## 不要改的部分

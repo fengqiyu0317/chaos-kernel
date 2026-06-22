@@ -5,7 +5,6 @@ struct PreparedExec {
     exec_path: String,
     addr_space: AddrSpace,
     thd_ctx: ThdCtx,
-    vm_token: usize,
     close_fds: Vec<usize>,
 }
 
@@ -321,10 +320,7 @@ impl Kernel {
         let exec_path = self.lookup_path(path)?;
         let elf_data = default_exec_elf();
         let (entry, load_segments) = parse_elf_load_segments(&elf_data)?;
-        let old_token = task.vm_token.load(Ordering::Relaxed);
-        let vm_token = next_exec_vm_token(task.id(), old_token);
-        let mut addr_space = AddrSpace::new((vm_token & 0xffff) as u16);
-        addr_space.page_table_root = vm_token;
+        let mut addr_space = AddrSpace::new();
         let mut image_end = 0usize;
         for segment in load_segments {
             let region = segment.vm_region()?;
@@ -372,7 +368,6 @@ impl Kernel {
             exec_path,
             addr_space,
             thd_ctx: ctx,
-            vm_token,
             close_fds,
         })
     }
@@ -391,7 +386,6 @@ impl Kernel {
         }
         *task.exec_path.lock().unwrap() = prepared.exec_path;
         *task.thd_ctx.lock().unwrap() = Some(prepared.thd_ctx);
-        task.vm_token.store(prepared.vm_token, Ordering::Relaxed);
     }
 
     pub fn do_exec(
@@ -455,15 +449,6 @@ impl Kernel {
                 }
             }
         }
-    }
-}
-
-fn next_exec_vm_token(task_id: usize, old_token: usize) -> usize {
-    let next = old_token.wrapping_add(N_PROC);
-    if next == 0 || next == old_token {
-        task_id.saturating_add(N_PROC)
-    } else {
-        next
     }
 }
 

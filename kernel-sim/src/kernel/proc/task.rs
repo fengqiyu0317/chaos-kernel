@@ -98,13 +98,12 @@ pub struct Task {
     pub kstk: Mutex<Option<KStk>>,
     pub thd_ctx: Mutex<Option<ThdCtx>>,
     pub addr_space: Arc<Mutex<AddrSpace>>,
-    pub vm_token: AtomicUsize,
     pub sched: Mutex<SchedEntity>,
 }
 
 impl Task {
     pub fn make(id: usize, tag: &str) -> Arc<Self> {
-        Self::make_with_addr_space(id, tag, Arc::new(Mutex::new(AddrSpace::new(id as u16))))
+        Self::make_with_addr_space(id, tag, Arc::new(Mutex::new(AddrSpace::new())))
     }
 
     fn make_with_addr_space(id: usize, tag: &str, addr_space: Arc<Mutex<AddrSpace>>) -> Arc<Self> {
@@ -136,12 +135,14 @@ impl Task {
             kstk: Mutex::new(None),
             thd_ctx: Mutex::new(Some(ThdCtx::default())),
             addr_space,
-            vm_token: AtomicUsize::new(id),
             sched: Mutex::new(SchedEntity::new()),
         })
     }
     pub fn id(&self) -> usize {
         self.info.lock().unwrap().id
+    }
+    pub fn vm_token(&self) -> usize {
+        self.addr_space.lock().unwrap().vm_token()
     }
     pub fn tag(&self) -> String {
         self.info.lock().unwrap().tag.clone()
@@ -503,10 +504,7 @@ impl TaskTable {
         let ns = src.tag();
         let child_addr_space = {
             let src_addr_space = src.addr_space.lock().unwrap();
-            Arc::new(Mutex::new(AddrSpace::fork_from(
-                &src_addr_space,
-                nid as u16,
-            )))
+            Arc::new(Mutex::new(AddrSpace::fork_from(&src_addr_space)))
         };
         let tgt = Task::make_with_addr_space(nid, &ns, child_addr_space);
         {
@@ -591,8 +589,6 @@ impl TaskTable {
         let sig_state = { src.sig_state.lock().unwrap().clone() };
         *t.sig_state.lock().unwrap() = sig_state;
         *t.thd_ctx.lock().unwrap() = Some(ctx);
-        t.vm_token
-            .store(src.vm_token.load(Ordering::Relaxed), Ordering::Relaxed);
         self.map.write().unwrap().insert(id, t.clone());
         src.threads.lock().unwrap().push(id);
         t

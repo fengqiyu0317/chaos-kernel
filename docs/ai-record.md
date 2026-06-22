@@ -227,6 +227,51 @@ cargo test
 
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
+## 2026-06-22：kernel-sim 地址空间 token 语义清理
+
+目标：修复 `TASK.md` 中记录的 `next_exec_vm_token()` 占位问题，采用长期做法让 `vm_token` 归属于 `AddrSpace`，并删除未接入的 `AddrSpace::ref_count` 死字段。
+
+已完成修改：
+
+- `AddrSpace::new()` 统一分配模拟地址空间 token，并从 token 派生非零 `asid`。
+- 删除 `Task.vm_token` 缓存字段，新增 `Task::vm_token()` 从共享 `AddrSpace` 读取 token。
+- `fork_task()` 通过 `AddrSpace::fork_from()` 创建新地址空间，`clone_thread()` 继续共享同一 `Arc<Mutex<AddrSpace>>`。
+- `prepare_exec_image()` 删除 `old_token + N_PROC` / `next_exec_vm_token()` 占位生成逻辑，exec 新映像直接创建新的 `AddrSpace`。
+- 删除未使用的 `AddrSpace::ref_count`，避免和 `Arc<Mutex<AddrSpace>>` / `PgFrame` 引用计数混淆。
+- 新增 smoke 回归，确认 cloned thread 在 exec 后通过共享地址空间观察到新的 token。
+
+关键文件：
+
+- `kernel-sim/src/kernel/mm/address_space.rs`
+- `kernel-sim/src/kernel/proc/task.rs`
+- `kernel-sim/src/kernel/core/kernel_ops.rs`
+- `kernel-sim/src/kernel/syscall/dispatch.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `28 passed`；完整 `cargo test` 通过 `28 passed`。
+
+未解决问题：
+
+- `page_table_root` / `vm_token` 仍是模拟 token，尚未建模真实 `satp`、页表根、ASID generation、ASID 复用和 TLB flush/shootdown。
+- `prepare_exec_image()` 仍使用 `default_exec_elf()` 占位 ELF，尚未根据 path 读取真实可执行文件。
+- ELF `PT_LOAD` 文件内容、bss 清零和 `argc/argv/envp/auxv` 初始用户栈写入仍未接入 loader。
+- 多线程 exec 语义仍待补齐。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 - 不要移动、复制或删除 `chaos/.git`。
 - 后续 Chaos 的 Git 提交应在 `chaos/` 仓库内完成，不要在外层“操作系统”仓库中提交 `chaos/` 目录。
 
