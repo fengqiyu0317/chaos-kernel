@@ -80,34 +80,9 @@ fn read_user_string_array(
     Err("e2big")
 }
 
-pub(super) fn sys_exit(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
-    // AGENT TODO: this is still a minimal simulator exit path. It does not yet
-    // provide the full exit/wait/reap lifecycle: wait-status writeback, child
-    // list draining/reparenting, address-space teardown, or thread-group exit
-    // semantics are tracked in repo-root TASK.md.
-    let status = a0;
-    let _normalized = (status & 0xFF) << 8;
-    let cur = kernel.cur_task(0);
-    if let Some(t) = cur {
-        t.exit_proc(status);
-        kernel.run_queue.remove(t.id());
-        let parent = t.process.parent.lock().unwrap();
-        if let Some(p) = parent.as_ref() {
-            kernel.send_signal_to_task(p, SIGCHLD as i32, t.id() as isize);
-        }
-        drop(parent);
-        let children: Vec<Arc<Task>> = t.process.subtasks.lock().unwrap().clone();
-        for child in children {
-            let init = kernel.tasks.find(1);
-            if let Some(ref init_task) = init {
-                *child.process.parent.lock().unwrap() = Some(init_task.clone());
-                init_task.process.subtasks.lock().unwrap().push(child);
-            }
-        }
-        kernel.set_cur(0, None);
-        kernel.schedule_next_runnable(0);
-    }
-    Ok(0)
+pub(super) fn sys_exit(kernel: &Kernel, a0: usize) -> Result<SyscallOutcome, &'static str> {
+    kernel.do_exit_current(0, a0)?;
+    Ok(SyscallOutcome::NoReturn)
 }
 
 pub(super) fn sys_wait4(
@@ -121,112 +96,24 @@ pub(super) fn sys_wait4(
     let status_addr = a1;
     let options = a2;
     let rusage_addr = a3;
-    if status_addr != 0 && !check_access(status_addr, 4) {
+    if status_addr != 0 && !check_access_rw(status_addr, 4, true) {
         return Err("efault");
     }
-    if rusage_addr != 0 && !check_access(rusage_addr, 144) {
+    if rusage_addr != 0 && !check_access_rw(rusage_addr, 144, true) {
         return Err("efault");
     }
-    let _wnohang = (options & 1) != 0;
-    let _wuntraced = (options & 2) != 0;
-    let _wcontinued = (options & 8) != 0;
-    let _wall = (options & 0x40000000) != 0;
-    match pid {
-        -1 => {
-            let zombies = kernel.tasks.zombie_tasks();
-            if zombies.is_empty() {
-                if _wnohang {
-                    return Ok(0);
-                }
-                return Err("echild");
-            }
-            let chosen = zombies[0];
-            let exit_status = {
-                match kernel.tasks.find(chosen) {
-                    Some(t) => {
-                        let code = *t.process.exit_code.lock().unwrap();
-                        (code & 0xFF) << 8
-                    }
-                    None => 0,
-                }
-            };
-            Ok(chosen)
-        }
-        0 => {
-            let cur = kernel.cur_task(0);
-            if let Some(t) = cur {
-                let my_pgid = *t.process.pgid.lock().unwrap();
-                let group = kernel.tasks.pgid_group(my_pgid);
-                let mut found = None;
-                for task in group {
-                    let tid = task.id();
-                    if let Some(child) = kernel.tasks.find(tid) {
-                        if child.done() {
-                            found = Some(tid);
-                            break;
-                        }
-                    }
-                }
-                match found {
-                    Some(id) => Ok(id),
-                    None => {
-                        if _wnohang {
-                            Ok(0)
-                        } else {
-                            Err("echild")
-                        }
-                    }
-                }
-            } else {
-                Err("echild")
-            }
-        }
-        p if p > 0 => {
-            let target = p as usize;
-            match kernel.tasks.find(target) {
-                Some(t) => {
-                    if t.done() {
-                        let code = *t.process.exit_code.lock().unwrap();
-                        let _status = ((code & 0xFF) << 8) | (code & 0x7F);
-                        Ok(target)
-                    } else if _wnohang {
-                        Ok(0)
-                    } else {
-                        Err("echild")
-                    }
-                }
-                None => Err("echild"),
-            }
-        }
-        _ => {
-            let raw_pgid = -pid;
-            let pgid = raw_pgid as Pgid;
-            let group = kernel.tasks.pgid_group(pgid);
-            if group.is_empty() {
-                return Err("echild");
-            }
-            let mut zombie_found = None;
-            for task in group {
-                let tid = task.id();
-                if let Some(t) = kernel.tasks.find(tid) {
-                    if t.done() {
-                        zombie_found = Some(tid);
-                        break;
-                    }
-                }
-            }
-            match zombie_found {
-                Some(id) => Ok(id),
-                None => {
-                    if _wnohang {
-                        Ok(0)
-                    } else {
-                        Err("echild")
-                    }
-                }
-            }
-        }
+    let current = kernel.cur_task(0).ok_or("echild")?;
+    let (pid, wait_status) = kernel.do_wait(current.id(), pid, options)?;
+    if pid != 0 && status_addr != 0 {
+        let status = (wait_status as u32).to_ne_bytes();
+        current
+            .process
+            .addr_space
+            .lock()
+            .unwrap()
+            .write_user_bytes(status_addr, &status, &kernel.pool)?;
     }
+    Ok(pid)
 }
 
 pub(super) fn sys_getpid(kernel: &Kernel) -> Result<usize, &'static str> {

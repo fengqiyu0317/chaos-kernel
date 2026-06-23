@@ -1,10 +1,10 @@
 // AGENT
 use kernel_sim::{
-    AddrSpace, EpData, EpEvent, FLike, Kernel, PageTableEntry, PgFrame, SchedulePolicy,
+    AddrSpace, EpData, EpEvent, ExitReason, FLike, Kernel, PageTableEntry, PgFrame, SchedulePolicy,
     TaskRunState, TaskTable, VmRegion, AT_ENTRY, AT_PAGESZ, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC,
     PAGE_SZ, SIGUSR1, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX,
-    SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, USR_STK_OFF, USR_STK_SZ, VM_EXEC,
-    VM_READ, VM_SHARED, VM_WRITE,
+    SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, USR_STK_OFF,
+    USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
@@ -1031,8 +1031,8 @@ fn default_signal_action_terminates_current_task() {
         .expect("init task should still be reaped later");
     assert!(init.done());
     assert_eq!(
-        *init.process.exit_code.lock().unwrap(),
-        128 + SIGUSR1 as usize
+        *init.process.exit_reason.lock().unwrap(),
+        Some(ExitReason::Signal(SIGUSR1 as u8))
     );
     assert_eq!(
         kernel.cur_task(0).expect("child should be scheduled").id(),
@@ -1142,6 +1142,97 @@ fn exiting_current_task_switches_to_next_runnable_task() {
         .expect("child should run after init exits");
     assert_eq!(current.id(), child);
     assert_eq!(current.sched_state(), TaskRunState::Running);
+}
+
+#[test]
+// AGENT
+fn exit_without_current_task_returns_esrch() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    kernel.set_cur(0, None);
+    kernel.run_queue.clear_current();
+
+    let err = kernel
+        .dispatch_syscall(SYS_EXIT, 0, 0, 0, 0, 0, 0)
+        .expect_err("exit without a current task should fail explicitly");
+
+    assert_eq!(err, "esrch");
+}
+
+#[test]
+// AGENT
+fn wait4_reaps_child_and_writes_exit_status() {
+    const STATUS_ADDR: usize = 0x7000;
+
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let parent = kernel.cur_task(0).expect("init should be current");
+    let child_id = kernel
+        .do_fork(parent.id())
+        .expect("fork should create child");
+    let child = kernel
+        .tasks
+        .find(child_id)
+        .expect("child should be registered");
+
+    kernel.run_queue.remove(child_id);
+    kernel.run_queue.set_current(child_id);
+    kernel.set_cur(0, Some(child.clone()));
+    kernel
+        .dispatch_syscall(SYS_EXIT, 7, 0, 0, 0, 0, 0)
+        .expect("child exit should succeed");
+
+    {
+        let mut addr_space = parent.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(STATUS_ADDR, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("status page should map");
+    }
+    kernel.run_queue.set_current(parent.id());
+    kernel.set_cur(0, Some(parent.clone()));
+
+    let waited = kernel
+        .dispatch_syscall(SYS_WAIT4, child_id, STATUS_ADDR, 0, 0, 0, 0)
+        .expect("wait4 should reap the exited child");
+
+    assert_eq!(waited, child_id);
+    assert!(kernel.tasks.find(child_id).is_none());
+    assert!(!parent
+        .process
+        .subtasks
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|task| task.id() == child_id));
+
+    let mut status = [0u8; 4];
+    parent
+        .process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(STATUS_ADDR, &mut status)
+        .expect("wait status should be readable");
+    assert_eq!(u32::from_ne_bytes(status), 7 << 8);
+}
+
+#[test]
+// AGENT
+fn wait4_ignores_unrelated_zombies() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let orphan = kernel.tasks.spawn("orphan");
+    orphan.exit_proc(ExitReason::Code(3));
+
+    let err = kernel
+        .dispatch_syscall(SYS_WAIT4, usize::MAX, 0, 1, 0, 0, 0)
+        .expect_err("wait4 should not reap a task that is not our child");
+
+    assert_eq!(err, "echild");
+    assert!(kernel.tasks.find(orphan.id()).is_some());
 }
 
 #[test]

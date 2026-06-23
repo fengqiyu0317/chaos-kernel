@@ -18,3 +18,8 @@ pub(crate) use self::proc::*;
 pub(crate) use self::signal::*;
 pub(crate) use self::sync::*;
 pub(crate) use self::time::*;
+
+pub(crate) enum SyscallOutcome {
+    Return(usize),
+    NoReturn,
+}

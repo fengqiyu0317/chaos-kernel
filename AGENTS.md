@@ -38,11 +38,12 @@ chaos/
 - 一定不要修改 `chaos/kernel/src/kernel.rs`
 - 对 `kernel-sim` 相关问题，修改目标是 `chaos/kernel-sim/`，不要改 `chaos/kernel/`
 - 修改后要保留 AI 对话日志作为提交材料
-- 代码中需要标注 `// HUMAN` 和 `// AGENT` 区分人写/AI 生成
+- 代码中需要标注 `// HUMAN` 和 `// AGENT` 区分人写/AI 生成，注意 `// AGENT` 不能只写在一个文件开头，而是在每个修改的函数或结构体等块结构前写上 `// AGENT` 以及修改的内容
 
 ### 长任务交接
 - 如果任务很长、对话上下文即将不足，或继续在同一对话中追加会降低稳定性，Codex 必须先更新 handoff summary / 当前状态总结。
 - 总结应写入 `TASK.md`、`NOTES.md`，或对应的 issue/comment；优先使用当前任务已经在维护的文件，没有则创建或补充 `TASK.md`。
+- 每次 github 更新后应当把进度更新到 `docs/ai-record.md` 中。
 - handoff summary 至少包括：
   - 目标：当前要完成什么，成功标准是什么
   - 已完成修改：已经改了哪些行为、接口或实现

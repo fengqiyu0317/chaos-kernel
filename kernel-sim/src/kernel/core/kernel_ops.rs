@@ -46,12 +46,7 @@ impl Kernel {
                         break;
                     }
                     _ => {
-                        task.exit_proc(128 + sig.signo as usize);
-                        task.set_sched_state(TaskRunState::Zombie);
-                        self.run_queue.remove(task.id());
-                        self.run_queue.clear_current();
-                        self.set_cur(cpu, None);
-                        self.schedule_next_runnable(cpu);
+                        self.exit_task(cpu, &task, ExitReason::Signal(sig.signo as u8));
                         break;
                     }
                 },
@@ -140,6 +135,37 @@ impl Kernel {
         self.set_cur(cpu, None);
         self.run_queue.clear_current();
         false
+    }
+
+    pub fn do_exit_current(&self, cpu: usize, code: usize) -> Result<(), &'static str> {
+        let task = self.cur_task(cpu).ok_or("esrch")?;
+        self.exit_task(cpu, &task, ExitReason::Code((code & 0xFF) as u8));
+        Ok(())
+    }
+
+    pub(crate) fn exit_task(&self, cpu: usize, task: &Arc<Task>, reason: ExitReason) {
+        if task.done() {
+            return;
+        }
+        let parent = task.process.parent.lock().unwrap().clone();
+        task.exit_proc(reason);
+        self.tasks.reparent_children_to_init(task);
+        self.run_queue.remove(task.id());
+
+        if cpu == 0
+            && self
+                .cur_task(cpu)
+                .as_ref()
+                .is_some_and(|current| current.id() == task.id())
+        {
+            self.run_queue.clear_current();
+            self.set_cur(cpu, None);
+            self.schedule_next_runnable(cpu);
+        }
+
+        if let Some(parent) = parent {
+            self.send_signal_to_task(&parent, SIGCHLD as i32, task.id() as isize);
+        }
     }
 
     pub fn balance_load(&self) -> usize {
@@ -475,6 +501,7 @@ impl Kernel {
         if children.is_empty() {
             return Err("echild");
         }
+        let mut matched_child = false;
         let mut found_zombie: Option<(usize, usize)> = None;
         for child in &children {
             let matches = match target_pid {
@@ -483,19 +510,22 @@ impl Kernel {
                 p if p > 0 => child.id() == p as usize,
                 p => *child.process.pgid.lock().unwrap() == (-p) as Pgid,
             };
+            matched_child |= matches;
             if matches && child.done() {
-                let code = *child.process.exit_code.lock().unwrap();
-                found_zombie = Some((child.id(), code));
+                found_zombie = Some((child.id(), child.wait_status()));
                 break;
             }
         }
         match found_zombie {
-            Some((id, code)) => {
+            Some((id, status)) => {
                 self.run_queue.remove(id);
                 self.tasks.reap(id);
-                Ok((id, code))
+                Ok((id, status))
             }
             None => {
+                if !matched_child {
+                    return Err("echild");
+                }
                 if wnohang {
                     Ok((0, 0))
                 } else {

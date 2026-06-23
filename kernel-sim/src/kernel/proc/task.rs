@@ -57,7 +57,6 @@ pub struct ProcessState {
     // AGENT: debug-only descriptor names used by smoke tests; real descriptors
     // live in ProcessState::files below.
     pub debug_fds: Mutex<Vec<String>>,
-    pub status: Mutex<Option<i32>>,
     pub parent: Mutex<Option<Arc<Task>>>,
     pub subtasks: Mutex<Vec<Arc<Task>>>,
     pub files: Mutex<BTreeMap<usize, FLike>>,
@@ -72,7 +71,7 @@ pub struct ProcessState {
     pub pgid: Mutex<Pgid>,
     pub threads: Mutex<Vec<Tid>>,
     pub ev: Arc<Mutex<EvBus>>,
-    pub exit_code: Mutex<usize>,
+    pub exit_reason: Mutex<Option<ExitReason>>,
     pub sig_queue: Mutex<VecDeque<(i32, isize)>>,
     pub sig_state: Mutex<SigSet>,
     pub ep_inst: Mutex<BTreeMap<usize, EpInst>>,
@@ -83,7 +82,6 @@ impl ProcessState {
     pub fn new(addr_space: Arc<Mutex<AddrSpace>>) -> Self {
         Self {
             debug_fds: Mutex::new(Vec::new()),
-            status: Mutex::new(None),
             parent: Mutex::new(None),
             subtasks: Mutex::new(Vec::new()),
             files: Mutex::new(BTreeMap::new()),
@@ -96,7 +94,7 @@ impl ProcessState {
             pgid: Mutex::new(0),
             threads: Mutex::new(Vec::new()),
             ev: EvBus::make(),
-            exit_code: Mutex::new(0),
+            exit_reason: Mutex::new(None),
             sig_queue: Mutex::new(VecDeque::new()),
             sig_state: Mutex::new(SigSet::new()),
             ep_inst: Mutex::new(BTreeMap::new()),
@@ -110,6 +108,21 @@ impl ProcessState {
 
     pub fn new_with_addr_space(addr_space: Arc<Mutex<AddrSpace>>) -> Arc<Self> {
         Arc::new(Self::new(addr_space))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitReason {
+    Code(u8),
+    Signal(u8),
+}
+
+impl ExitReason {
+    pub fn wait_status(self) -> usize {
+        match self {
+            ExitReason::Code(code) => (code as usize) << 8,
+            ExitReason::Signal(sig) => (sig as usize) & 0x7f,
+        }
     }
 }
 
@@ -183,7 +196,7 @@ impl Task {
         self.process.subtasks.lock().unwrap().push(c.clone());
     }
     pub fn done(&self) -> bool {
-        self.process.status.lock().unwrap().is_some()
+        self.process.exit_reason.lock().unwrap().is_some()
     }
     pub fn n_children(&self) -> usize {
         self.process.subtasks.lock().unwrap().len()
@@ -227,7 +240,7 @@ impl Task {
     pub fn get_futex(&self) -> Arc<FutexBucket> {
         self.process.futex.clone()
     }
-    pub fn exit_proc(&self, code: usize) {
+    pub fn exit_proc(&self, reason: ExitReason) {
         let fk: Vec<usize> = {
             let g = self.process.files.lock().unwrap();
             g.keys().cloned().collect()
@@ -267,16 +280,19 @@ impl Task {
                 p.process.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
             } // AGENT: use EvBus::set instead of manual inline
         }
-        let mut ec = self.process.exit_code.lock().unwrap();
-        *ec = (code & 0xFF) | ((code >> 8) << 8);
-        drop(ec);
+        *self.process.exit_reason.lock().unwrap() = Some(reason);
         self.process.threads.lock().unwrap().clear();
-        *self.process.status.lock().unwrap() = Some((code & 0xFF) as i32);
         self.set_sched_state(TaskRunState::Zombie);
+    }
+    pub fn wait_status(&self) -> usize {
+        match *self.process.exit_reason.lock().unwrap() {
+            Some(reason) => reason.wait_status(),
+            None => 0,
+        }
     }
     pub fn exited(&self) -> bool {
         let t = self.process.threads.lock().unwrap();
-        t.is_empty() || self.process.status.lock().unwrap().is_some()
+        t.is_empty() || self.process.exit_reason.lock().unwrap().is_some()
     }
     // AGENT: expose mutation through a closure so callers update the real EpInst,
     // not a cloned copy that would need to be written back.
@@ -497,16 +513,47 @@ impl TaskTable {
     pub fn reap(&self, id: usize) {
         let t = { self.map.read().unwrap().get(&id).cloned() };
         if let Some(t) = t {
-            *t.process.status.lock().unwrap() = Some(0);
+            if let Some(parent) = t.process.parent.lock().unwrap().clone() {
+                parent
+                    .process
+                    .subtasks
+                    .lock()
+                    .unwrap()
+                    .retain(|child| child.id() != id);
+            }
             let ch: Vec<Arc<Task>> = t.process.subtasks.lock().unwrap().drain(..).collect();
             let rt = self.root.lock().unwrap().clone();
             if let Some(ref r) = rt {
                 for c in ch {
-                    c.link_parent(r);
-                    r.link_child(&c);
+                    if r.id() == id {
+                        *c.process.parent.lock().unwrap() = None;
+                    } else {
+                        c.link_parent(r);
+                        r.link_child(&c);
+                    }
                 }
             }
             self.map.write().unwrap().remove(&id);
+        }
+    }
+    pub fn reparent_children_to_init(&self, task: &Arc<Task>) {
+        let children: Vec<Arc<Task>> = task.process.subtasks.lock().unwrap().drain(..).collect();
+        if children.is_empty() {
+            return;
+        }
+        let init = self.root.lock().unwrap().clone();
+        match init {
+            Some(init_task) if init_task.id() != task.id() => {
+                for child in children {
+                    child.link_parent(&init_task);
+                    init_task.link_child(&child);
+                }
+            }
+            _ => {
+                for child in children {
+                    *child.process.parent.lock().unwrap() = None;
+                }
+            }
         }
     }
     pub fn count(&self) -> usize {
@@ -700,7 +747,7 @@ impl TaskTable {
     pub fn terminate_and_collect(&self, id: usize, code: usize) -> bool {
         let t = { self.map.read().unwrap().get(&id).cloned() };
         if let Some(t) = t {
-            t.exit_proc(code);
+            t.exit_proc(ExitReason::Code((code & 0xFF) as u8));
             self.reap(id);
             true
         } else {

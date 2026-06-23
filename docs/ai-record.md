@@ -228,6 +228,52 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-23：kernel-sim exit/wait/reap 统一路径
+
+目标：把 `kernel-sim` 中分散的退出和等待逻辑收敛到统一路径，保证 `exit` 不再被系统调用分发层当作普通成功返回处理，并让 `wait4` 按父子关系回收 zombie、写回 wait status。
+
+已完成修改：
+
+- 新增 `ExitReason`，统一保存正常退出码和信号终止原因，并通过 `wait_status()` 编码 wait status。
+- `Kernel::do_exit_current()` / `exit_task()` 负责当前任务退出、SIGCHLD 通知、子进程重挂和调度切换。
+- `dispatch_syscall()` 引入 `SyscallOutcome::{Return, NoReturn}`，普通 syscall 成功后递送 pending signal，`SYS_EXIT` 成功后跳过普通返回后置逻辑。
+- `sys_wait4()` 改为复用 `Kernel::do_wait()`，只等待当前进程的子进程，成功时写回用户态 status 并 reap 目标 task。
+- 新增/更新 smoke 回归，覆盖无 current task 的 exit 错误、wait4 写 status 并回收子进程、wait4 不回收无关 zombie、信号终止原因记录。
+
+关键文件：
+
+- `kernel-sim/src/kernel/core/kernel_ops.rs`
+- `kernel-sim/src/kernel/proc/task.rs`
+- `kernel-sim/src/kernel/syscall/dispatch.rs`
+- `kernel-sim/src/kernel/syscall/mod.rs`
+- `kernel-sim/src/kernel/syscall/proc.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+- `AGENTS.md`
+- `docs/ai-record.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `34 passed`；完整 `cargo test` 通过 `37 passed`。
+
+未解决问题：
+
+- `kernel-sim` 的退出资源释放仍未完整建模用户地址空间页、内核栈、线程上下文、IPC/定时器/信号等真实生命周期。
+- 线程退出语义仍是简化模型，尚未区分 `exit`、`exit_group`、单线程退出、`clear_child_tid` futex 唤醒和 robust futex owner 退出。
+- `wait4` 仍未维护或写出真实 `rusage`。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
 ## 2026-06-23：kernel-sim 进程/线程状态边界重构
 
 目标：修复 `clone_thread` 后再由线程执行 `fork` 时的资源来源问题，把进程级状态和线程级状态从 `Task` 中拆清楚。
