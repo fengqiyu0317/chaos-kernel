@@ -100,7 +100,7 @@ pub(super) fn sys_epoll_wait(
     loop {
         let registrations: Vec<(usize, EpEvent)> = {
             let events = {
-                let ep = task.ep_inst.lock().unwrap();
+                let ep = task.process.ep_inst.lock().unwrap();
                 let inst = ep.get(&epfd).ok_or("eperm")?;
                 inst.events.clone()
             };
@@ -151,7 +151,7 @@ pub(super) fn sys_epoll_wait(
         }
 
         {
-            let ep = task.ep_inst.lock().unwrap();
+            let ep = task.process.ep_inst.lock().unwrap();
             let inst = ep.get(&epfd).ok_or("eperm")?;
             let mut ready = inst.ready.lock().unwrap();
             *ready = ready_fds;

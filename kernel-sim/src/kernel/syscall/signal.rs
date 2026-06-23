@@ -49,7 +49,7 @@ pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
         0 => {
             let cur = kernel.cur_task(0);
             if let Some(t) = cur {
-                let pgid = *t.pgid.lock().unwrap();
+                let pgid = *t.process.pgid.lock().unwrap();
                 finish_many(kernel.tasks.pgid_group(pgid))
             } else {
                 Err("esrch")
@@ -112,7 +112,7 @@ pub(super) fn sys_sigaction(
 
     if oldact_addr != 0 {
         let action = {
-            let sig_state = cur.sig_state.lock().unwrap();
+            let sig_state = cur.process.sig_state.lock().unwrap();
             sig_state.get_action(signo).clone()
         };
         let old = UserSigAction {
@@ -135,7 +135,7 @@ pub(super) fn sys_sigaction(
         } else {
             act.sa_handler
         };
-        let mut sig_state = cur.sig_state.lock().unwrap();
+        let mut sig_state = cur.process.sig_state.lock().unwrap();
         sig_state.set_action(
             signo,
             SigAction {

@@ -126,7 +126,7 @@ impl Kernel {
         if _access & 0x2 != 0 {
             let cur = self.cur_task(0);
             if let Some(task) = cur {
-                let aspace = task.addr_space.lock().unwrap();
+                let aspace = task.process.addr_space.lock().unwrap();
                 return aspace.handle_cow_fault(addr, &self.pool).is_ok();
             }
             return false;
@@ -136,7 +136,7 @@ impl Kernel {
     pub fn proc_init(&self) {
         let root = self.tasks.spawn_root();
         let rid = root.id();
-        root.threads.lock().unwrap().push(rid);
+        root.process.threads.lock().unwrap().push(rid);
         let _kstk = KStk::new();
         *root.kstk.lock().unwrap() = Some(_kstk);
         root.set_sched_state(TaskRunState::Running);

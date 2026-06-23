@@ -26,6 +26,7 @@
 - 2026-06-22：`kernel-sim` 的 `ProcInit::push_at()` 已改为真正构造用户初始栈：写入 `argc`、`argv`、`envp`、字符串区和 auxv 终止项；`Kernel::prepare_exec_image()` 先映射用户栈再通过 `AddrSpace::write_user_bytes()` 写入，并继续在失败时释放临时地址空间；exec auxv 至少包含 `AT_PAGESZ` 和 `AT_ENTRY`。
 - 2026-06-23：`kernel-sim/src/kernel/fs/fs_misc.rs` 的 ELF `PT_LOAD` 解析已补齐 `p_align` 校验，拒绝非 2 的幂、`p_offset % p_align != p_vaddr % p_align` 以及页内偏移不一致的段；`ElfLoadSegment::vm_region()` 不再用 `saturating_sub()` 容错非法 offset。
 - 2026-06-23：`kernel-sim` 的 exec loader 已移除 `default_exec_elf()` 占位数据源；`Kernel::prepare_exec_image()` 改为从注册的路径 ELF bytes 读取镜像，映射 `PT_LOAD` 后复制文件段到用户页并恢复段权限，新增 smoke 回归覆盖跨页段复制和 bss 零填充。
+- 2026-06-23：已用共享 `ProcessState` 重构 `kernel-sim` 的进程/线程边界；`clone_thread` 复用进程级状态，`fork_task` 为子进程复制新的 `ProcessState` 并从调用线程复制 `ThdCtx`/TLS/`clear_tid`/signal mask。回归测试：`fork_from_cloned_thread_uses_shared_process_state_and_thread_context`。
 
 ## 关键文件
 
@@ -128,7 +129,12 @@ cargo test --test pressure
 - TODO: `kernel-sim` 的 exec `brk` 初始化目前只按已映射镜像末尾页对齐；补齐真实 ELF 装载后，需要确认 data/bss、页内偏移、空洞段和 mmap 基址下的 `brk` 语义。
 - TODO: `kernel-sim/src/kernel/fs/fs_misc.rs` 的 ELF 解析尚未校验 `e_entry` 是否位于用户地址范围内、是否落在某个已映射且带执行权限的 `PT_LOAD` 段中；后续应拒绝入口地址未映射或不可执行的畸形 ELF。
 - TODO: `kernel-sim` 尚未维护每进程 resource usage / CPU time counters / page fault / I/O 统计；`wait4` 只做地址检查，没有写出真实 `rusage`，fork 后子进程统计清零语义也未完整实现。
-- TODO: `kernel-sim` 的多线程 fork 边界尚不完整；如果 `src` 是 `clone_thread` 生成的线程 task，`fork_task` 可能从线程 task 的默认/局部字段复制 fd、cwd、IPC、epoll、信号等进程级资源，而不是从其所属进程复制进程级资源、从调用线程复制 `ThdCtx`/TLS/clear_tid/信号 mask 等线程上下文。
+- TODO: `kernel-sim/src/kernel/syscall/proc.rs` 的 `sys_exit()` 目前只是把当前任务标记为 zombie、移出 run queue 并调度下一个 runnable task；后续应抽出统一的进程退出路径，保证退出 syscall 不表现为普通返回，并明确无 current task 等异常状态的处理。
+- TODO: `kernel-sim` 的 exit/wait 状态 ABI 尚未贯通；`sys_exit()` 计算的 `_normalized` 没有使用，`sys_wait4()` 也只计算 `_status`/`exit_status` 而未写回用户 `wstatus`，后续应统一保存原始退出原因、按 wait status ABI 编码并通过当前任务 `AddrSpace` 写回用户内存。
+- TODO: `kernel-sim` 的 zombie wait/reap 闭环不完整；`sys_wait4()` 没有复用 `Kernel::do_wait()`，多个分支会在未检查目标是否为当前进程子进程、未写 status、未真正 `reap` 的情况下返回 pid，后续应按 parent/child 关系筛选并在 wait 成功后回收 task。
+- TODO: `kernel-sim` 的 `sys_exit()` 重挂子进程时只 clone `subtasks` 并 push 到 init，未从退出任务的 child list 中 drain，可能和后续 `TaskTable::reap()` 的重挂逻辑重复；后续应统一 reparent 位置并保持父子链表一致。
+- TODO: `kernel-sim` 的退出资源释放还不完整；`Task::exit_proc()` 已关闭 fd、设置事件、记录退出码并置 zombie，但没有释放用户地址空间页、内核栈、线程上下文、IPC/定时器/信号等进程私有状态，后续应把资源释放边界拆清楚：exit 时释放可立即释放的资源，wait/reap 时删除 zombie 保留记录。
+- TODO: `kernel-sim` 的线程退出语义仍是简化模型；`exit_proc()` 直接清空 `threads`，尚未区分 `exit`、`exit_group`、单线程退出、`clear_child_tid` futex 唤醒、robust futex owner 退出等真实线程组语义。
 
 ## 不要改的部分
 

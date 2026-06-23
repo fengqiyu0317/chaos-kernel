@@ -25,8 +25,6 @@ impl fmt::Display for Pid {
 pub struct TaskInfo {
     pub id: usize,
     pub tag: String,
-    pub status: Option<i32>,
-    pub fds: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +53,66 @@ impl SchedEntity {
     }
 }
 
+pub struct ProcessState {
+    // AGENT: debug-only descriptor names used by smoke tests; real descriptors
+    // live in ProcessState::files below.
+    pub debug_fds: Mutex<Vec<String>>,
+    pub status: Mutex<Option<i32>>,
+    pub parent: Mutex<Option<Arc<Task>>>,
+    pub subtasks: Mutex<Vec<Arc<Task>>>,
+    pub files: Mutex<BTreeMap<usize, FLike>>,
+    pub cwd: Mutex<String>,
+    pub exec_path: Mutex<String>,
+    // AGENT: one futex wait bucket per process; individual futex words are
+    // distinguished by FutexWaiter.addr inside the bucket.
+    pub futex: Arc<FutexBucket>,
+    pub sem_ctx: Mutex<SemCtx>,
+    pub shm_ctx: Mutex<ShmCtx>,
+    pub pid: Mutex<Pid>,
+    pub pgid: Mutex<Pgid>,
+    pub threads: Mutex<Vec<Tid>>,
+    pub ev: Arc<Mutex<EvBus>>,
+    pub exit_code: Mutex<usize>,
+    pub sig_queue: Mutex<VecDeque<(i32, isize)>>,
+    pub sig_state: Mutex<SigSet>,
+    pub ep_inst: Mutex<BTreeMap<usize, EpInst>>,
+    pub addr_space: Arc<Mutex<AddrSpace>>,
+}
+
+impl ProcessState {
+    pub fn new(addr_space: Arc<Mutex<AddrSpace>>) -> Self {
+        Self {
+            debug_fds: Mutex::new(Vec::new()),
+            status: Mutex::new(None),
+            parent: Mutex::new(None),
+            subtasks: Mutex::new(Vec::new()),
+            files: Mutex::new(BTreeMap::new()),
+            cwd: Mutex::new("/".to_string()),
+            exec_path: Mutex::new(String::new()),
+            futex: Arc::new(FutexBucket::new()),
+            sem_ctx: Mutex::new(SemCtx::default()),
+            shm_ctx: Mutex::new(ShmCtx::default()),
+            pid: Mutex::new(Pid::new()),
+            pgid: Mutex::new(0),
+            threads: Mutex::new(Vec::new()),
+            ev: EvBus::make(),
+            exit_code: Mutex::new(0),
+            sig_queue: Mutex::new(VecDeque::new()),
+            sig_state: Mutex::new(SigSet::new()),
+            ep_inst: Mutex::new(BTreeMap::new()),
+            addr_space,
+        }
+    }
+
+    pub fn new_shared() -> Arc<Self> {
+        Arc::new(Self::new(Arc::new(Mutex::new(AddrSpace::new()))))
+    }
+
+    pub fn new_with_addr_space(addr_space: Arc<Mutex<AddrSpace>>) -> Arc<Self> {
+        Arc::new(Self::new(addr_space))
+    }
+}
+
 #[derive(Clone)]
 pub struct ThdCtx {
     pub uctx: Context,
@@ -76,65 +134,33 @@ impl Default for ThdCtx {
 
 pub struct Task {
     pub info: Mutex<TaskInfo>,
-    pub parent: Mutex<Option<Arc<Task>>>,
-    pub subtasks: Mutex<Vec<Arc<Task>>>,
-    pub files: Mutex<BTreeMap<usize, FLike>>,
-    pub cwd: Mutex<String>,
-    pub exec_path: Mutex<String>,
-    // AGENT: one futex wait bucket per task; individual futex words are
-    // distinguished by FutexWaiter.addr inside the bucket.
-    pub futex: Arc<FutexBucket>,
-    pub sem_ctx: Mutex<SemCtx>,
-    pub shm_ctx: Mutex<ShmCtx>,
-    pub pid: Mutex<Pid>,
-    pub pgid: Mutex<Pgid>,
-    pub threads: Mutex<Vec<Tid>>,
-    pub ev: Arc<Mutex<EvBus>>,
-    pub exit_code: Mutex<usize>,
-    pub sig_queue: Mutex<VecDeque<(i32, isize)>>,
+    pub process: Arc<ProcessState>,
     pub sig_mask: Mutex<u64>,
-    pub sig_state: Mutex<SigSet>,
-    pub ep_inst: Mutex<BTreeMap<usize, EpInst>>,
     pub kstk: Mutex<Option<KStk>>,
     pub thd_ctx: Mutex<Option<ThdCtx>>,
-    pub addr_space: Arc<Mutex<AddrSpace>>,
     pub sched: Mutex<SchedEntity>,
 }
 
 impl Task {
     pub fn make(id: usize, tag: &str) -> Arc<Self> {
-        Self::make_with_addr_space(id, tag, Arc::new(Mutex::new(AddrSpace::new())))
+        Self::make_with_process(id, tag, ProcessState::new_shared())
     }
 
     fn make_with_addr_space(id: usize, tag: &str, addr_space: Arc<Mutex<AddrSpace>>) -> Arc<Self> {
+        Self::make_with_process(id, tag, ProcessState::new_with_addr_space(addr_space))
+    }
+
+    fn make_with_process(id: usize, tag: &str, process: Arc<ProcessState>) -> Arc<Self> {
         let _kobj_stamp = CLK.load(Ordering::Relaxed);
         Arc::new(Self {
             info: Mutex::new(TaskInfo {
                 id,
                 tag: tag.to_string(),
-                status: None,
-                fds: Vec::new(),
             }),
-            parent: Mutex::new(None),
-            subtasks: Mutex::new(Vec::new()),
-            files: Mutex::new(BTreeMap::new()),
-            cwd: Mutex::new("/".to_string()),
-            exec_path: Mutex::new(String::new()),
-            futex: Arc::new(FutexBucket::new()),
-            sem_ctx: Mutex::new(SemCtx::default()),
-            shm_ctx: Mutex::new(ShmCtx::default()),
-            pid: Mutex::new(Pid::new()),
-            pgid: Mutex::new(0),
-            threads: Mutex::new(Vec::new()),
-            ev: EvBus::make(),
-            exit_code: Mutex::new(0),
-            sig_queue: Mutex::new(VecDeque::new()),
+            process,
             sig_mask: Mutex::new(0),
-            sig_state: Mutex::new(SigSet::new()),
-            ep_inst: Mutex::new(BTreeMap::new()),
             kstk: Mutex::new(None),
             thd_ctx: Mutex::new(Some(ThdCtx::default())),
-            addr_space,
             sched: Mutex::new(SchedEntity::new()),
         })
     }
@@ -142,22 +168,25 @@ impl Task {
         self.info.lock().unwrap().id
     }
     pub fn vm_token(&self) -> usize {
-        self.addr_space.lock().unwrap().vm_token()
+        self.process.addr_space.lock().unwrap().vm_token()
     }
     pub fn tag(&self) -> String {
         self.info.lock().unwrap().tag.clone()
     }
+    pub fn process_pid(&self) -> usize {
+        self.process.pid.lock().unwrap().get()
+    }
     pub fn link_parent(&self, p: &Arc<Task>) {
-        *self.parent.lock().unwrap() = Some(p.clone());
+        *self.process.parent.lock().unwrap() = Some(p.clone());
     }
     pub fn link_child(&self, c: &Arc<Task>) {
-        self.subtasks.lock().unwrap().push(c.clone());
+        self.process.subtasks.lock().unwrap().push(c.clone());
     }
     pub fn done(&self) -> bool {
-        self.info.lock().unwrap().status.is_some()
+        self.process.status.lock().unwrap().is_some()
     }
     pub fn n_children(&self) -> usize {
-        self.subtasks.lock().unwrap().len()
+        self.process.subtasks.lock().unwrap().len()
     }
     pub fn sched_state(&self) -> TaskRunState {
         self.sched.lock().unwrap().state
@@ -180,33 +209,33 @@ impl Task {
         sched.slice_left == 0
     }
     pub fn get_free_fd(&self) -> usize {
-        let f = self.files.lock().unwrap();
+        let f = self.process.files.lock().unwrap();
         (0..).find(|i| !f.contains_key(i)).unwrap()
     }
     pub fn get_free_fd_from(&self, arg: usize) -> usize {
-        let f = self.files.lock().unwrap();
+        let f = self.process.files.lock().unwrap();
         (arg..).find(|i| !f.contains_key(i)).unwrap()
     }
     pub fn add_file(&self, fl: FLike) -> usize {
         let fd = self.get_free_fd();
-        self.files.lock().unwrap().insert(fd, fl);
+        self.process.files.lock().unwrap().insert(fd, fl);
         fd
     }
     pub fn get_file(&self, fd: usize) -> Option<FLike> {
-        self.files.lock().unwrap().get(&fd).cloned()
+        self.process.files.lock().unwrap().get(&fd).cloned()
     }
     pub fn get_futex(&self) -> Arc<FutexBucket> {
-        self.futex.clone()
+        self.process.futex.clone()
     }
     pub fn exit_proc(&self, code: usize) {
         let fk: Vec<usize> = {
-            let g = self.files.lock().unwrap();
+            let g = self.process.files.lock().unwrap();
             g.keys().cloned().collect()
         };
         let _n_closed = {
             let mut c = 0usize;
             for k in fk.iter() {
-                let removed = self.files.lock().unwrap().remove(k);
+                let removed = self.process.files.lock().unwrap().remove(k);
                 if removed.is_some() {
                     c += 1;
                 }
@@ -214,7 +243,7 @@ impl Task {
             c
         };
         let _fdt_audit = {
-            let fl = self.files.lock().unwrap();
+            let fl = self.process.files.lock().unwrap();
             let mut gaps = Vec::new();
             let mut prev: Option<usize> = None;
             for (&fd, _) in fl.iter() {
@@ -230,24 +259,24 @@ impl Task {
             gaps.len()
         };
         {
-            self.ev.lock().unwrap().set(EvFlag::PROC_QUIT);
+            self.process.ev.lock().unwrap().set(EvFlag::PROC_QUIT);
         } // AGENT: use EvBus::set instead of manual inline
         {
-            let pg = self.parent.lock().unwrap();
+            let pg = self.process.parent.lock().unwrap();
             if let Some(ref p) = *pg {
-                p.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
+                p.process.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
             } // AGENT: use EvBus::set instead of manual inline
         }
-        let mut ec = self.exit_code.lock().unwrap();
+        let mut ec = self.process.exit_code.lock().unwrap();
         *ec = (code & 0xFF) | ((code >> 8) << 8);
         drop(ec);
-        self.threads.lock().unwrap().clear();
-        self.info.lock().unwrap().status = Some((code & 0xFF) as i32);
+        self.process.threads.lock().unwrap().clear();
+        *self.process.status.lock().unwrap() = Some((code & 0xFF) as i32);
         self.set_sched_state(TaskRunState::Zombie);
     }
     pub fn exited(&self) -> bool {
-        let t = self.threads.lock().unwrap();
-        t.is_empty() || self.info.lock().unwrap().status.is_some()
+        let t = self.process.threads.lock().unwrap();
+        t.is_empty() || self.process.status.lock().unwrap().is_some()
     }
     // AGENT: expose mutation through a closure so callers update the real EpInst,
     // not a cloned copy that would need to be written back.
@@ -256,16 +285,16 @@ impl Task {
         fd: usize,
         f: impl FnOnce(&mut EpInst) -> Result<R, &'static str>,
     ) -> Result<R, &'static str> {
-        let mut ep = self.ep_inst.lock().unwrap();
+        let mut ep = self.process.ep_inst.lock().unwrap();
         let inst = ep.get_mut(&fd).ok_or("eperm")?;
         f(inst)
     }
     pub fn set_ep(&self, fd: usize, inst: EpInst) {
-        let mut ep = self.ep_inst.lock().unwrap();
+        let mut ep = self.process.ep_inst.lock().unwrap();
         ep.insert(fd, inst);
     }
     pub fn has_sig(&self) -> bool {
-        let sq = self.sig_queue.lock().unwrap();
+        let sq = self.process.sig_queue.lock().unwrap();
         if sq.is_empty() {
             return false;
         }
@@ -290,7 +319,7 @@ impl Task {
         if signo <= 0 || signo as u32 >= NSIG {
             return;
         }
-        let mut sq = self.sig_queue.lock().unwrap();
+        let mut sq = self.process.sig_queue.lock().unwrap();
         let dup = sq.iter().any(|(s, _)| *s == signo);
         // AGENT
         if dup {
@@ -299,14 +328,14 @@ impl Task {
         sq.push_back((signo, sender_tid));
         drop(sq);
         // AGENT
-        self.ev.lock().unwrap().set(EvFlag::RECV_SIG);
+        self.process.ev.lock().unwrap().set(EvFlag::RECV_SIG);
     }
 
-    // AGENT: Task.sig_queue is the pending source of truth; SigSet stores dispositions.
+    // AGENT: ProcessState.sig_queue is the pending source of truth; SigSet stores dispositions.
     pub fn take_deliverable_signal(&self) -> Option<PendingSignal> {
         let mask = *self.sig_mask.lock().unwrap();
         let picked = {
-            let mut sq = self.sig_queue.lock().unwrap();
+            let mut sq = self.process.sig_queue.lock().unwrap();
             let pos = sq.iter().position(|(sig, _)| {
                 *sig > 0 && (*sig as u32) < NSIG && (mask & (1u64 << (*sig as u64))) == 0
             })?;
@@ -315,6 +344,7 @@ impl Task {
         match picked {
             Some((signo, sender_tid)) => {
                 let action = self
+                    .process
                     .sig_state
                     .lock()
                     .unwrap()
@@ -331,7 +361,7 @@ impl Task {
     }
 
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
-        let mut g = self.files.lock().unwrap();
+        let mut g = self.process.files.lock().unwrap();
         match g.remove(&fd) {
             Some(fl) => {
                 let (r, w, e) = fl.poll();
@@ -347,13 +377,13 @@ impl Task {
 
     pub fn dup_fd(&self, old_fd: usize, cloexec: bool) -> Result<usize, &'static str> {
         let fl = {
-            let g = self.files.lock().unwrap();
+            let g = self.process.files.lock().unwrap();
             g.get(&old_fd).cloned().ok_or("ebadf")?
         };
         let nfl = fl.dup(cloexec);
         // HUMAN
         let nfd = self.get_free_fd();
-        self.files.lock().unwrap().insert(nfd, nfl);
+        self.process.files.lock().unwrap().insert(nfd, nfl);
         Ok(nfd)
     }
 
@@ -362,25 +392,25 @@ impl Task {
             return Ok(new_fd);
         }
         let fl = {
-            let g = self.files.lock().unwrap();
+            let g = self.process.files.lock().unwrap();
             g.get(&old_fd).cloned().ok_or("ebadf")?
         };
         let nfl = fl.dup(false);
-        let mut g = self.files.lock().unwrap();
+        let mut g = self.process.files.lock().unwrap();
         let _prev = g.remove(&new_fd);
         g.insert(new_fd, nfl);
         Ok(new_fd)
     }
 
     pub fn fd_count(&self) -> usize {
-        let g = self.files.lock().unwrap();
+        let g = self.process.files.lock().unwrap();
         let cnt = g.len();
         let _max_fd = g.keys().last().copied().unwrap_or(0);
         cnt
     }
 
     pub fn set_cloexec(&self, fd: usize, val: bool) -> Result<(), &'static str> {
-        let g = self.files.lock().unwrap();
+        let g = self.process.files.lock().unwrap();
         if g.contains_key(&fd) {
             let _fl = g.get(&fd);
             Ok(())
@@ -420,6 +450,7 @@ impl TaskTable {
     pub fn spawn(&self, tag: &str) -> Arc<Task> {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = Task::make(id, tag);
+        *t.process.pid.lock().unwrap() = Pid(id);
         self.map.write().unwrap().insert(id, t.clone());
         t
     }
@@ -445,27 +476,29 @@ impl TaskTable {
             .read()
             .unwrap()
             .values()
-            .find(|t| t.threads.lock().unwrap().contains(&tid))
+            .find(|t| t.process.threads.lock().unwrap().contains(&tid))
             .cloned()
     }
     pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> {
+        let mut seen = BTreeSet::new();
         self.map
             .read()
             .unwrap()
             .values()
-            .filter(|t| *t.pgid.lock().unwrap() == pgid)
+            .filter(|t| *t.process.pgid.lock().unwrap() == pgid)
+            .filter(|t| seen.insert(t.process_pid()))
             .cloned()
             .collect()
     }
     pub fn register(&self, task: &Arc<Task>, pid: Pid) {
-        *task.pid.lock().unwrap() = pid.clone();
+        *task.process.pid.lock().unwrap() = pid.clone();
         self.map.write().unwrap().insert(pid.get(), task.clone());
     }
     pub fn reap(&self, id: usize) {
         let t = { self.map.read().unwrap().get(&id).cloned() };
         if let Some(t) = t {
-            t.info.lock().unwrap().status = Some(0);
-            let ch: Vec<Arc<Task>> = t.subtasks.lock().unwrap().drain(..).collect();
+            *t.process.status.lock().unwrap() = Some(0);
+            let ch: Vec<Arc<Task>> = t.process.subtasks.lock().unwrap().drain(..).collect();
             let rt = self.root.lock().unwrap().clone();
             if let Some(ref r) = rt {
                 for c in ch {
@@ -500,38 +533,39 @@ impl TaskTable {
     }
     pub fn fork_task(&self, src: &Arc<Task>) -> Result<Arc<Task>, &'static str> {
         let fork_slot = self.reserve_fork_slot()?;
+        let proc_src = self.process_of_tid(src.id()).unwrap_or_else(|| src.clone());
         let nid = self.seq.fetch_add(1, Ordering::SeqCst);
-        let ns = src.tag();
+        let ns = proc_src.tag();
         let child_addr_space = {
-            let src_addr_space = src.addr_space.lock().unwrap();
+            let src_addr_space = proc_src.process.addr_space.lock().unwrap();
             Arc::new(Mutex::new(AddrSpace::fork_from(&src_addr_space)))
         };
         let tgt = Task::make_with_addr_space(nid, &ns, child_addr_space);
         {
-            let src_info = src.info.lock().unwrap();
-            let mut tgt_info = tgt.info.lock().unwrap();
-            tgt_info.fds = src_info.fds.clone();
+            let src_fds = proc_src.process.debug_fds.lock().unwrap();
+            let mut tgt_fds = tgt.process.debug_fds.lock().unwrap();
+            *tgt_fds = src_fds.clone();
         }
         let _vmap_cost = {
-            let ca = src.cwd.lock().unwrap().len();
-            let cb = src.exec_path.lock().unwrap().len();
+            let ca = proc_src.process.cwd.lock().unwrap().len();
+            let cb = proc_src.process.exec_path.lock().unwrap().len();
             let pg = (ca + cb + PAGE_SZ - 1) / PAGE_SZ;
             let hash = ca.wrapping_mul(0x9e37) ^ cb.wrapping_mul(0x5f3) ^ nid;
             hash % (pg + 1)
         };
         {
-            let sc = src.cwd.lock().unwrap();
-            let mut tc = tgt.cwd.lock().unwrap();
+            let sc = proc_src.process.cwd.lock().unwrap();
+            let mut tc = tgt.process.cwd.lock().unwrap();
             *tc = sc.clone();
         }
         {
-            let se = src.exec_path.lock().unwrap();
-            let mut te = tgt.exec_path.lock().unwrap();
+            let se = proc_src.process.exec_path.lock().unwrap();
+            let mut te = tgt.process.exec_path.lock().unwrap();
             *te = se.clone();
         }
         {
-            let sf = src.files.lock().unwrap();
-            let mut tf = tgt.files.lock().unwrap();
+            let sf = proc_src.process.files.lock().unwrap();
+            let mut tf = tgt.process.files.lock().unwrap();
             for (&fd, fl) in sf.iter() {
                 let dup = fl.fork_dup();
                 tf.insert(fd, dup);
@@ -545,16 +579,16 @@ impl TaskTable {
                 ctx
             });
         }
-        let pg = { *src.pgid.lock().unwrap() };
-        *tgt.pgid.lock().unwrap() = pg;
-        *tgt.sem_ctx.lock().unwrap() = src.sem_ctx.lock().unwrap().clone();
-        *tgt.shm_ctx.lock().unwrap() = src.shm_ctx.lock().unwrap().clone();
+        let pg = { *proc_src.process.pgid.lock().unwrap() };
+        *tgt.process.pgid.lock().unwrap() = pg;
+        *tgt.process.sem_ctx.lock().unwrap() = proc_src.process.sem_ctx.lock().unwrap().clone();
+        *tgt.process.shm_ctx.lock().unwrap() = proc_src.process.shm_ctx.lock().unwrap().clone();
         let smask = { *src.sig_mask.lock().unwrap() };
         *tgt.sig_mask.lock().unwrap() = smask;
         // AGENT: child inherits signal dispositions, but not pending signals.
-        let sig_state = { src.sig_state.lock().unwrap().fork_copy() };
-        *tgt.sig_state.lock().unwrap() = sig_state;
-        *tgt.ep_inst.lock().unwrap() = src.ep_inst.lock().unwrap().clone();
+        let sig_state = { proc_src.process.sig_state.lock().unwrap().fork_copy() };
+        *tgt.process.sig_state.lock().unwrap() = sig_state;
+        *tgt.process.ep_inst.lock().unwrap() = proc_src.process.ep_inst.lock().unwrap().clone();
         {
             let parent_policy = src.sched.lock().unwrap().policy.clone();
             let mut child_sched = tgt.sched.lock().unwrap();
@@ -562,10 +596,10 @@ impl TaskTable {
             child_sched.slice_left = child_sched.policy.time_slice;
         }
         *tgt.kstk.lock().unwrap() = Some(KStk::new());
-        *tgt.parent.lock().unwrap() = Some(src.clone());
-        src.subtasks.lock().unwrap().push(tgt.clone());
+        *tgt.process.parent.lock().unwrap() = Some(proc_src.clone());
+        proc_src.process.subtasks.lock().unwrap().push(tgt.clone());
         let p = Pid(nid);
-        tgt.threads.lock().unwrap().push(nid);
+        tgt.process.threads.lock().unwrap().push(nid);
         self.register(&tgt, p);
         fork_slot.release();
         Ok(tgt)
@@ -577,20 +611,20 @@ impl TaskTable {
         tls: u64,
         clear_tid: usize,
     ) -> Arc<Task> {
+        let proc_src = self.process_of_tid(src.id()).unwrap_or_else(|| src.clone());
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
-        let t = Task::make_with_addr_space(id, &src.tag(), src.addr_space.clone());
+        let t = Task::make_with_process(id, &proc_src.tag(), proc_src.process.clone());
         let mut ctx = ThdCtx::default();
         ctx.uctx.set_ret(0);
         ctx.uctx.set_sp(stack_top);
         ctx.uctx.set_tls(tls);
         ctx.clear_tid = clear_tid;
-        ctx.smask = *src.sig_mask.lock().unwrap();
-        // AGENT: threads share the process-level signal dispositions at clone time.
-        let sig_state = { src.sig_state.lock().unwrap().clone() };
-        *t.sig_state.lock().unwrap() = sig_state;
+        let caller_mask = *src.sig_mask.lock().unwrap();
+        ctx.smask = caller_mask;
+        *t.sig_mask.lock().unwrap() = caller_mask;
         *t.thd_ctx.lock().unwrap() = Some(ctx);
         self.map.write().unwrap().insert(id, t.clone());
-        src.threads.lock().unwrap().push(id);
+        proc_src.process.threads.lock().unwrap().push(id);
         t
     }
     pub fn new_user_task(
@@ -601,7 +635,7 @@ impl TaskTable {
         pool: &FramePool,
     ) -> Arc<Task> {
         let t = self.spawn(path);
-        *t.exec_path.lock().unwrap() = path.to_string();
+        *t.process.exec_path.lock().unwrap() = path.to_string();
         let _elf_entry = validate_elf_header(&[
             0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0x3e, 0, 1, 0, 0, 0,
             0, 0x40, 0, 0, 0, 0, 0, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -614,7 +648,7 @@ impl TaskTable {
             auxv: BTreeMap::new(),
         };
         {
-            let mut addr_space = t.addr_space.lock().unwrap();
+            let mut addr_space = t.process.addr_space.lock().unwrap();
             addr_space
                 .map_region(
                     VmRegion::new(USR_STK_OFF, USR_STK_SZ, VM_READ | VM_WRITE | VM_GROWSDOWN),
@@ -623,7 +657,7 @@ impl TaskTable {
                 .expect("initial user stack should map");
         }
         let sp = {
-            let mut addr_space = t.addr_space.lock().unwrap();
+            let mut addr_space = t.process.addr_space.lock().unwrap();
             init.push_at(&mut addr_space, pool, USR_STK_OFF + USR_STK_SZ)
                 .expect("initial user stack should be writable")
         };
@@ -653,13 +687,13 @@ impl TaskTable {
         );
         let fd2 = fd1.dup(false);
         {
-            let mut fl = t.files.lock().unwrap();
+            let mut fl = t.process.files.lock().unwrap();
             fl.insert(0, FLike::File(fd0));
             fl.insert(1, FLike::File(fd1));
             fl.insert(2, FLike::File(fd2));
         }
         self.register(&t, Pid(t.id()));
-        t.threads.lock().unwrap().push(t.id());
+        t.process.threads.lock().unwrap().push(t.id());
         t
     }
 

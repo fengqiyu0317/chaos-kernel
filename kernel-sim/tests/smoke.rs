@@ -1,10 +1,10 @@
 // AGENT
 use kernel_sim::{
     AddrSpace, EpData, EpEvent, FLike, Kernel, PageTableEntry, PgFrame, SchedulePolicy,
-    TaskRunState, TaskTable, VmRegion, AT_ENTRY, AT_PAGESZ, N_FRAMES, N_PROC, O_CLOEXEC, PAGE_SZ,
-    SIGUSR1, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID,
-    SYS_KILL, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ,
-    VM_SHARED, VM_WRITE,
+    TaskRunState, TaskTable, VmRegion, AT_ENTRY, AT_PAGESZ, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC,
+    PAGE_SZ, SIGUSR1, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX,
+    SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, USR_STK_OFF, USR_STK_SZ, VM_EXEC,
+    VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
@@ -145,6 +145,7 @@ fn syscall_fork_creates_child_task_and_enqueues_it() {
     assert_eq!(kernel.tasks.count(), 2);
     assert_eq!(
         child_task
+            .process
             .parent
             .lock()
             .unwrap()
@@ -165,9 +166,9 @@ fn fork_copies_context_address_space_cwd_and_kernel_stack() {
     let parent = kernel.cur_task(0).expect("init should be current");
     let parent_token = parent.vm_token();
     {
-        parent.info.lock().unwrap().fds = vec![String::from("fd:tracked")];
+        *parent.process.debug_fds.lock().unwrap() = vec![String::from("fd:tracked")];
         parent.sched.lock().unwrap().policy = SchedulePolicy::with_prio(-4);
-        parent.sig_state.lock().unwrap().sig_raise(SIGUSR1);
+        parent.process.sig_state.lock().unwrap().sig_raise(SIGUSR1);
         let mut thd = parent.thd_ctx.lock().unwrap();
         let ctx = thd.as_mut().expect("parent context should exist");
         ctx.uctx.set_ip(0x1234);
@@ -177,8 +178,8 @@ fn fork_copies_context_address_space_cwd_and_kernel_stack() {
         ctx.smask = 0x55;
     }
     {
-        *parent.cwd.lock().unwrap() = String::from("caf\u{e9}/fork");
-        let mut addr_space = parent.addr_space.lock().unwrap();
+        *parent.process.cwd.lock().unwrap() = String::from("caf\u{e9}/fork");
+        let mut addr_space = parent.process.addr_space.lock().unwrap();
         addr_space.vm_map.brk = 0x0060_0000;
         addr_space
             .vm_map
@@ -198,19 +199,19 @@ fn fork_copies_context_address_space_cwd_and_kernel_stack() {
 
     assert_ne!(child_task.vm_token(), parent_token);
     assert!(child_task.kstk.lock().unwrap().is_some());
-    assert_eq!(&*child_task.cwd.lock().unwrap(), "caf\u{e9}/fork");
+    assert_eq!(&*child_task.process.cwd.lock().unwrap(), "caf\u{e9}/fork");
     assert_eq!(
-        child_task.info.lock().unwrap().fds,
-        vec![String::from("fd:tracked")]
+        child_task.process.debug_fds.lock().unwrap().as_slice(),
+        &[String::from("fd:tracked")]
     );
     {
         let child_policy = child_task.sched_policy();
         assert_eq!(child_policy.prio, -4);
         assert_eq!(child_policy.nice, -4);
     }
-    assert_eq!(child_task.sig_state.lock().unwrap().pending, 0);
+    assert_eq!(child_task.process.sig_state.lock().unwrap().pending, 0);
     {
-        let child_addr_space = child_task.addr_space.lock().unwrap();
+        let child_addr_space = child_task.process.addr_space.lock().unwrap();
         assert_eq!(child_addr_space.vm_map.brk, 0x0060_0000);
         assert!(child_addr_space.vm_map.find(0x5000_0000).is_some());
         let child_pte = child_addr_space
@@ -225,7 +226,7 @@ fn fork_copies_context_address_space_cwd_and_kernel_stack() {
         assert_eq!(child_pte.frame.count(), 2);
     }
     {
-        let parent_addr_space = parent.addr_space.lock().unwrap();
+        let parent_addr_space = parent.process.addr_space.lock().unwrap();
         let parent_pte = parent_addr_space
             .page_table
             .lock()
@@ -238,8 +239,8 @@ fn fork_copies_context_address_space_cwd_and_kernel_stack() {
         assert_eq!(parent_pte.frame.count(), 2);
     }
     {
-        parent.addr_space.lock().unwrap().vm_map.brk = 0x0070_0000;
-        let child_addr_space = child_task.addr_space.lock().unwrap();
+        parent.process.addr_space.lock().unwrap().vm_map.brk = 0x0070_0000;
+        let child_addr_space = child_task.process.addr_space.lock().unwrap();
         assert_eq!(child_addr_space.vm_map.brk, 0x0060_0000);
     }
     {
@@ -266,7 +267,7 @@ fn cow_write_fault_copies_child_page_and_keeps_parent_shared() {
     let parent = kernel.cur_task(0).expect("init should be current");
     let page = 0x5100_0000;
     {
-        let mut addr_space = parent.addr_space.lock().unwrap();
+        let mut addr_space = parent.process.addr_space.lock().unwrap();
         addr_space
             .vm_map
             .insert(VmRegion::new(page, PAGE_SZ, VM_READ | VM_WRITE))
@@ -286,7 +287,7 @@ fn cow_write_fault_copies_child_page_and_keeps_parent_shared() {
 
     assert!(kernel.handle_pgfault_ext(page, 0x2));
 
-    let child_addr_space = child_task.addr_space.lock().unwrap();
+    let child_addr_space = child_task.process.addr_space.lock().unwrap();
     let child_pte = child_addr_space
         .page_table
         .lock()
@@ -301,7 +302,7 @@ fn cow_write_fault_copies_child_page_and_keeps_parent_shared() {
     assert_eq!(child_addr_space.cow_sharers(), 0);
     drop(child_addr_space);
 
-    let parent_addr_space = parent.addr_space.lock().unwrap();
+    let parent_addr_space = parent.process.addr_space.lock().unwrap();
     let parent_pte = parent_addr_space
         .page_table
         .lock()
@@ -324,7 +325,7 @@ fn unmap_range_returns_unmapped_page_count_and_splits_region() {
     let base = 0x5300_0000;
     let frames = [60, 61, 62];
     {
-        let mut addr_space = task.addr_space.lock().unwrap();
+        let mut addr_space = task.process.addr_space.lock().unwrap();
         addr_space
             .vm_map
             .insert(VmRegion::new(base, PAGE_SZ * 3, VM_READ | VM_WRITE))
@@ -339,12 +340,13 @@ fn unmap_range_returns_unmapped_page_count_and_splits_region() {
     }
 
     let unmapped = task
+        .process
         .addr_space
         .lock()
         .unwrap()
         .unmap_range(base + PAGE_SZ, PAGE_SZ);
 
-    let addr_space = task.addr_space.lock().unwrap();
+    let addr_space = task.process.addr_space.lock().unwrap();
     assert_eq!(unmapped, 1);
     assert_eq!(addr_space.vm_map.regions.len(), 2);
     assert!(addr_space.vm_map.find(base).is_some());
@@ -364,7 +366,7 @@ fn fork_keeps_shared_writable_mapping_without_cow() {
     let parent = kernel.cur_task(0).expect("init should be current");
     let page = 0x5200_0000;
     {
-        let mut addr_space = parent.addr_space.lock().unwrap();
+        let mut addr_space = parent.process.addr_space.lock().unwrap();
         addr_space
             .vm_map
             .insert(VmRegion::new(page, PAGE_SZ, VM_READ | VM_WRITE | VM_SHARED))
@@ -381,7 +383,7 @@ fn fork_keeps_shared_writable_mapping_without_cow() {
         .find(child)
         .expect("child should be registered");
 
-    let child_addr_space = child_task.addr_space.lock().unwrap();
+    let child_addr_space = child_task.process.addr_space.lock().unwrap();
     let child_pte = child_addr_space
         .page_table
         .lock()
@@ -393,7 +395,7 @@ fn fork_keeps_shared_writable_mapping_without_cow() {
     assert!(!child_pte.cow);
     assert_eq!(child_pte.frame.count(), 2);
 
-    let parent_addr_space = parent.addr_space.lock().unwrap();
+    let parent_addr_space = parent.process.addr_space.lock().unwrap();
     let parent_pte = parent_addr_space
         .page_table
         .lock()
@@ -458,7 +460,7 @@ fn fork_preserves_cloexec_and_epoll_state() {
             0,
         )
         .expect("parent epoll_ctl should update shared epoll instance");
-    let ep = child_task.ep_inst.lock().unwrap();
+    let ep = child_task.process.ep_inst.lock().unwrap();
     let inst = ep.get(&epfd).expect("child should inherit epoll instance");
     assert_eq!(
         inst.events
@@ -487,7 +489,7 @@ fn do_exec_commits_new_address_space_context_and_cloexec() {
         .expect("open should create a cloexec fd");
     let old_token = task.vm_token();
     {
-        let mut addr_space = task.addr_space.lock().unwrap();
+        let mut addr_space = task.process.addr_space.lock().unwrap();
         addr_space
             .map_region(
                 VmRegion::new(0x5300_0000, PAGE_SZ, VM_READ | VM_WRITE),
@@ -512,12 +514,12 @@ fn do_exec_commits_new_address_space_context_and_cloexec() {
         )
         .expect("exec should commit the prepared image");
 
-    assert_eq!(&*task.exec_path.lock().unwrap(), "/bin/next");
+    assert_eq!(&*task.process.exec_path.lock().unwrap(), "/bin/next");
     assert!(task.get_file(keep_fd).is_some());
     assert!(task.get_file(close_fd).is_none());
     assert_ne!(task.vm_token(), old_token);
     {
-        let addr_space = task.addr_space.lock().unwrap();
+        let addr_space = task.process.addr_space.lock().unwrap();
         assert!(addr_space.vm_map.find(0x5300_0000).is_none());
         let text = addr_space
             .vm_map
@@ -556,7 +558,7 @@ fn do_exec_commits_new_address_space_context_and_cloexec() {
         sp
     };
     {
-        let addr_space = task.addr_space.lock().unwrap();
+        let addr_space = task.process.addr_space.lock().unwrap();
         let word = std::mem::size_of::<usize>();
         assert_eq!(sp & 0xF, 0);
         assert_eq!(addr_space.read_user_usize(sp).unwrap(), 1);
@@ -624,7 +626,7 @@ fn do_exec_loads_registered_elf_segment_bytes_and_zeroes_bss() {
         .expect("exec should load registered ELF bytes");
 
     {
-        let addr_space = task.addr_space.lock().unwrap();
+        let addr_space = task.process.addr_space.lock().unwrap();
         let text = addr_space
             .vm_map
             .find(vaddr)
@@ -664,7 +666,10 @@ fn cloned_thread_observes_exec_token_from_shared_address_space() {
         .tasks
         .clone_thread(&task, (USR_STK_OFF + USR_STK_SZ) as u64, 0xabc, 0);
 
-    assert!(Arc::ptr_eq(&task.addr_space, &thread_task.addr_space));
+    assert!(Arc::ptr_eq(
+        &task.process.addr_space,
+        &thread_task.process.addr_space
+    ));
     assert_eq!(thread_task.vm_token(), old_token);
 
     kernel
@@ -678,6 +683,114 @@ fn cloned_thread_observes_exec_token_from_shared_address_space() {
 
 #[test]
 // AGENT
+fn fork_from_cloned_thread_uses_shared_process_state_and_thread_context() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    let thread_task = kernel
+        .tasks
+        .clone_thread(&task, (USR_STK_OFF + USR_STK_SZ) as u64, 0xabc, 0);
+
+    *task.process.cwd.lock().unwrap() = String::from("/leader/after-clone");
+    task.process
+        .debug_fds
+        .lock()
+        .unwrap()
+        .push(String::from("leader-fd"));
+    let fd = kernel
+        .dispatch_syscall(SYS_OPEN, 0x5600, 0, 0, 0, 0, 0)
+        .expect("open should add a process-shared fd");
+    let epfd = kernel
+        .dispatch_syscall(SYS_EPOLL_CREATE, 4, 0, 0, 0, 0, 0)
+        .expect("epoll_create should add a process-shared epoll instance");
+    let act = UserSigAction {
+        sa_handler: 0x7777,
+        sa_sigaction: 0,
+        sa_mask: 0,
+        sa_flags: 0,
+    };
+    kernel
+        .dispatch_syscall(
+            SYS_SIGACTION,
+            SIGUSR1 as usize,
+            &act as *const UserSigAction as usize,
+            0,
+            0,
+            0,
+            0,
+        )
+        .expect("sigaction should update process-shared dispositions");
+
+    {
+        let mut thd = thread_task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_mut().expect("thread context should exist");
+        ctx.uctx.set_ip(0x4444);
+        ctx.uctx.r[3] = 0x9999;
+        ctx.clear_tid = 0x3333;
+        ctx.smask = 1u64 << SIGUSR1;
+    }
+    *thread_task.sig_mask.lock().unwrap() = 1u64 << SIGUSR1;
+
+    let child = kernel
+        .do_fork(thread_task.id())
+        .expect("fork from cloned thread should create a child process");
+    let child_task = kernel
+        .tasks
+        .find(child)
+        .expect("child should be registered");
+
+    assert!(!Arc::ptr_eq(&task.process, &child_task.process));
+    assert_eq!(
+        child_task
+            .process
+            .parent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("child should be parented to process leader")
+            .id(),
+        task.id()
+    );
+    assert_eq!(
+        &*child_task.process.cwd.lock().unwrap(),
+        "/leader/after-clone"
+    );
+    assert_eq!(
+        child_task.process.debug_fds.lock().unwrap().as_slice(),
+        &[String::from("leader-fd")]
+    );
+    assert!(child_task.get_file(fd).is_some());
+    assert!(child_task
+        .process
+        .ep_inst
+        .lock()
+        .unwrap()
+        .contains_key(&epfd));
+    assert_eq!(
+        child_task
+            .process
+            .sig_state
+            .lock()
+            .unwrap()
+            .get_action(SIGUSR1)
+            .handler,
+        0x7777
+    );
+    assert_eq!(*child_task.sig_mask.lock().unwrap(), 1u64 << SIGUSR1);
+    {
+        let thd = child_task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_ref().expect("child context should exist");
+        assert_eq!(ctx.uctx.ip, 0x4444);
+        assert_eq!(ctx.uctx.r[0], 0);
+        assert_eq!(ctx.uctx.r[3], 0x9999);
+        assert_eq!(ctx.uctx.r[N_REGS - 2], 0xabc);
+        assert_eq!(ctx.clear_tid, 0x3333);
+        assert_eq!(ctx.smask, 1u64 << SIGUSR1);
+    }
+}
+
+#[test]
+// AGENT
 fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
     let kernel = Kernel::new(N_FRAMES);
     kernel.proc_init();
@@ -686,9 +799,9 @@ fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
     let close_fd = kernel
         .dispatch_syscall(SYS_OPEN, 0x4000, O_CLOEXEC, 0, 0, 0, 0)
         .expect("open should create a cloexec fd");
-    *task.exec_path.lock().unwrap() = String::from("/bin/old");
+    *task.process.exec_path.lock().unwrap() = String::from("/bin/old");
     {
-        let mut addr_space = task.addr_space.lock().unwrap();
+        let mut addr_space = task.process.addr_space.lock().unwrap();
         addr_space
             .map_region(
                 VmRegion::new(0x5400_0000, PAGE_SZ, VM_READ | VM_WRITE),
@@ -712,7 +825,7 @@ fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
 
     assert_eq!(err, "e2big");
     assert_eq!(kernel.pool.free_count(), free_before);
-    assert_eq!(&*task.exec_path.lock().unwrap(), "/bin/old");
+    assert_eq!(&*task.process.exec_path.lock().unwrap(), "/bin/old");
     assert_eq!(task.vm_token(), old_token);
     match task
         .get_file(close_fd)
@@ -722,7 +835,7 @@ fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
         _ => panic!("expected regular file"),
     }
     {
-        let addr_space = task.addr_space.lock().unwrap();
+        let addr_space = task.process.addr_space.lock().unwrap();
         assert!(addr_space.vm_map.find(0x5400_0000).is_some());
         assert!(addr_space.vm_map.find(0x0040_0000).is_none());
         assert_eq!(addr_space.rss_pages(), 1);
@@ -742,10 +855,10 @@ fn do_exec_rejects_unregistered_exec_file_without_commit() {
     let kernel = Kernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
-    *task.exec_path.lock().unwrap() = String::from("/bin/old");
+    *task.process.exec_path.lock().unwrap() = String::from("/bin/old");
     let old_token = task.vm_token();
     {
-        let mut addr_space = task.addr_space.lock().unwrap();
+        let mut addr_space = task.process.addr_space.lock().unwrap();
         addr_space
             .map_region(
                 VmRegion::new(0x5500_0000, PAGE_SZ, VM_READ | VM_WRITE),
@@ -759,9 +872,9 @@ fn do_exec_rejects_unregistered_exec_file_without_commit() {
         .expect_err("unregistered exec image should fail");
 
     assert_eq!(err, "enoent");
-    assert_eq!(&*task.exec_path.lock().unwrap(), "/bin/old");
+    assert_eq!(&*task.process.exec_path.lock().unwrap(), "/bin/old");
     assert_eq!(task.vm_token(), old_token);
-    let addr_space = task.addr_space.lock().unwrap();
+    let addr_space = task.process.addr_space.lock().unwrap();
     assert!(addr_space.vm_map.find(0x5500_0000).is_some());
     assert!(addr_space.vm_map.find(TEST_EXEC_ENTRY).is_none());
 }
@@ -786,7 +899,7 @@ fn syscall_exec_reads_user_memory_and_commits_do_exec() {
     const ARG1: usize = USER_BASE + PAGE_SZ + 0x100;
     const ENV0: usize = USER_BASE + PAGE_SZ * 2;
     {
-        let mut addr_space = task.addr_space.lock().unwrap();
+        let mut addr_space = task.process.addr_space.lock().unwrap();
         addr_space
             .map_region(
                 VmRegion::new(USER_BASE, PAGE_SZ * 3, VM_READ | VM_WRITE),
@@ -817,11 +930,11 @@ fn syscall_exec_reads_user_memory_and_commits_do_exec() {
         .dispatch_syscall(SYS_EXEC, PATH, ARGV, ENVP, 0, 0, 0)
         .expect("exec syscall should commit via do_exec");
 
-    assert_eq!(&*task.exec_path.lock().unwrap(), "/bin/next");
+    assert_eq!(&*task.process.exec_path.lock().unwrap(), "/bin/next");
     assert!(task.get_file(close_fd).is_none());
     assert_ne!(task.vm_token(), old_token);
     {
-        let addr_space = task.addr_space.lock().unwrap();
+        let addr_space = task.process.addr_space.lock().unwrap();
         assert!(addr_space.vm_map.find(USER_BASE).is_none());
         assert!(addr_space.vm_map.find(0x0040_0000).is_some());
         assert!(addr_space.vm_map.find(USR_STK_OFF).is_some());
@@ -834,7 +947,7 @@ fn syscall_exec_faults_on_unmapped_user_path_without_commit() {
     let kernel = Kernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
-    *task.exec_path.lock().unwrap() = String::from("/bin/old");
+    *task.process.exec_path.lock().unwrap() = String::from("/bin/old");
     let old_token = task.vm_token();
 
     let err = kernel
@@ -842,7 +955,7 @@ fn syscall_exec_faults_on_unmapped_user_path_without_commit() {
         .expect_err("unmapped user path should fault");
 
     assert_eq!(err, "efault");
-    assert_eq!(&*task.exec_path.lock().unwrap(), "/bin/old");
+    assert_eq!(&*task.process.exec_path.lock().unwrap(), "/bin/old");
     assert_eq!(task.vm_token(), old_token);
 }
 
@@ -917,7 +1030,10 @@ fn default_signal_action_terminates_current_task() {
         .find(1)
         .expect("init task should still be reaped later");
     assert!(init.done());
-    assert_eq!(*init.exit_code.lock().unwrap(), 128 + SIGUSR1 as usize);
+    assert_eq!(
+        *init.process.exit_code.lock().unwrap(),
+        128 + SIGUSR1 as usize
+    );
     assert_eq!(
         kernel.cur_task(0).expect("child should be scheduled").id(),
         child

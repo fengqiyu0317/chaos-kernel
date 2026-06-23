@@ -228,6 +228,48 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-23：kernel-sim 进程/线程状态边界重构
+
+目标：修复 `clone_thread` 后再由线程执行 `fork` 时的资源来源问题，把进程级状态和线程级状态从 `Task` 中拆清楚。
+
+已完成修改：
+
+- 新增 `ProcessState`，集中保存 fd 表、cwd、exec path、地址空间、进程信号 disposition、pending signal、epoll、futex、IPC、父子关系、pid/pgid 和线程列表等进程级状态。
+- `Task` 保留线程级状态：调度实体、内核栈、线程上下文和 per-thread signal mask。
+- `clone_thread()` 改为共享同一个 `Arc<ProcessState>`，新线程只复制调用线程的上下文、TLS、`clear_tid` 和 signal mask。
+- `fork_task()` 改为从调用线程所属进程复制进程级状态，同时从调用线程复制 `ThdCtx`/TLS/`clear_tid`/signal mask。
+- 相关 syscall 和 MM 路径迁移到 `task.process.*`，并补充 `fork_from_cloned_thread_uses_shared_process_state_and_thread_context` 回归测试。
+
+关键文件：
+
+- `kernel-sim/src/kernel/proc/task.rs`
+- `kernel-sim/src/kernel/core/kernel_ops.rs`
+- `kernel-sim/src/kernel/syscall/`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test smoke
+cargo test
+git diff --check
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `31 passed`；完整 `cargo test` 通过 `31 smoke + 3 elf passed`；`git diff --check` 通过。
+
+未解决问题：
+
+- `ProcessState::debug_fds` 仍是 smoke 测试使用的调试字段，真实 fd 语义走 `ProcessState::files`；后续可以删除该辅助状态并把测试改成直接断言真实 fd 表。
+- exit/wait 语义仍待补齐：`sys_exit()`、`sys_wait4()`、`Task::exit_proc()` 和 `TaskTable::reap()` 的状态 ABI、reparent、资源释放边界还没有完整统一。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
 ## 2026-06-23：kernel-sim exec ELF loader 文件段复制
 
 目标：修复 `TASK.md` 中 `kernel-sim` exec 回归测试仍缺少真实 ELF 文件段复制和 bss 清零覆盖的问题，移除 `default_exec_elf()` 占位执行镜像。

@@ -148,7 +148,7 @@ pub(super) fn sys_open(
         fh.cloexec = _cloexec;
         let fd = t.add_file(FLike::File(fh));
         if _truncate && wr {
-            let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
+            let _ = t.process.files.lock().unwrap().get(&fd).map(|fl| {
                 if let FLike::File(ref f) = fl {
                     let _ = f.set_len(0);
                 }
@@ -190,7 +190,7 @@ pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static st
     // AGENT: remove fd from process file table so it can be reused
     if let Some(t) = kernel.cur_task(0) {
         if fd >= 3 {
-            if t.files.lock().unwrap().remove(&fd).is_none() {
+            if t.process.files.lock().unwrap().remove(&fd).is_none() {
                 return Err("ebadf");
             }
         }
@@ -314,7 +314,7 @@ pub(super) fn sys_dup(kernel: &Kernel, a0: usize) -> Result<usize, &'static str>
     }
     let cur = kernel.cur_task(0);
     let new_fd = if let Some(t) = cur {
-        let mut fds = t.files.lock().unwrap();
+        let mut fds = t.process.files.lock().unwrap();
         let fl = match fds.get(&old_fd).cloned() {
             Some(f) => f,
             None => return Err("ebadf"),
@@ -346,7 +346,7 @@ pub(super) fn sys_dup2(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
     }
     let cur = kernel.cur_task(0);
     if let Some(t) = cur {
-        let mut fds = t.files.lock().unwrap();
+        let mut fds = t.process.files.lock().unwrap();
         let _closed_prev = fds.remove(&new_fd);
         if let Some(fl) = fds.get(&old_fd).cloned() {
             let dup = fl.dup(false);

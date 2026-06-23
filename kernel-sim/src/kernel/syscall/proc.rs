@@ -19,7 +19,7 @@ pub(super) fn sys_exec(
     let task = kernel.cur_task(0).ok_or("esrch")?;
     let task_id = task.id();
     let (path, args, envs) = {
-        let addr_space = task.addr_space.lock().unwrap();
+        let addr_space = task.process.addr_space.lock().unwrap();
         let path = read_user_c_string(&addr_space, path_addr, 4096, "enametoolong")?;
         let args = read_user_string_array(&addr_space, argv_addr, 64, 4096)?;
         let envs = read_user_string_array(&addr_space, envp_addr, 64, 4096)?;
@@ -81,23 +81,27 @@ fn read_user_string_array(
 }
 
 pub(super) fn sys_exit(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
+    // AGENT TODO: this is still a minimal simulator exit path. It does not yet
+    // provide the full exit/wait/reap lifecycle: wait-status writeback, child
+    // list draining/reparenting, address-space teardown, or thread-group exit
+    // semantics are tracked in repo-root TASK.md.
     let status = a0;
     let _normalized = (status & 0xFF) << 8;
     let cur = kernel.cur_task(0);
     if let Some(t) = cur {
         t.exit_proc(status);
         kernel.run_queue.remove(t.id());
-        let parent = t.parent.lock().unwrap();
+        let parent = t.process.parent.lock().unwrap();
         if let Some(p) = parent.as_ref() {
             kernel.send_signal_to_task(p, SIGCHLD as i32, t.id() as isize);
         }
         drop(parent);
-        let children: Vec<Arc<Task>> = t.subtasks.lock().unwrap().clone();
+        let children: Vec<Arc<Task>> = t.process.subtasks.lock().unwrap().clone();
         for child in children {
             let init = kernel.tasks.find(1);
             if let Some(ref init_task) = init {
-                *child.parent.lock().unwrap() = Some(init_task.clone());
-                init_task.subtasks.lock().unwrap().push(child);
+                *child.process.parent.lock().unwrap() = Some(init_task.clone());
+                init_task.process.subtasks.lock().unwrap().push(child);
             }
         }
         kernel.set_cur(0, None);
@@ -140,7 +144,7 @@ pub(super) fn sys_wait4(
             let exit_status = {
                 match kernel.tasks.find(chosen) {
                     Some(t) => {
-                        let code = *t.exit_code.lock().unwrap();
+                        let code = *t.process.exit_code.lock().unwrap();
                         (code & 0xFF) << 8
                     }
                     None => 0,
@@ -151,7 +155,7 @@ pub(super) fn sys_wait4(
         0 => {
             let cur = kernel.cur_task(0);
             if let Some(t) = cur {
-                let my_pgid = *t.pgid.lock().unwrap();
+                let my_pgid = *t.process.pgid.lock().unwrap();
                 let group = kernel.tasks.pgid_group(my_pgid);
                 let mut found = None;
                 for task in group {
@@ -182,7 +186,7 @@ pub(super) fn sys_wait4(
             match kernel.tasks.find(target) {
                 Some(t) => {
                     if t.done() {
-                        let code = *t.exit_code.lock().unwrap();
+                        let code = *t.process.exit_code.lock().unwrap();
                         let _status = ((code & 0xFF) << 8) | (code & 0x7F);
                         Ok(target)
                     } else if _wnohang {
@@ -228,7 +232,7 @@ pub(super) fn sys_wait4(
 pub(super) fn sys_getpid(kernel: &Kernel) -> Result<usize, &'static str> {
     let cur = kernel.cur_task(0);
     match cur {
-        Some(t) => Ok(t.id()),
+        Some(t) => Ok(t.process_pid()),
         None => Ok(1),
     }
 }
@@ -237,9 +241,9 @@ pub(super) fn sys_getppid(kernel: &Kernel) -> Result<usize, &'static str> {
     let cur = kernel.cur_task(0);
     match cur {
         Some(t) => {
-            let parent = t.parent.lock().unwrap();
+            let parent = t.process.parent.lock().unwrap();
             match parent.as_ref() {
-                Some(p) => Ok(p.id()),
+                Some(p) => Ok(p.process_pid()),
                 None => Ok(0),
             }
         }
@@ -251,17 +255,17 @@ pub(super) fn sys_setpgid(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize
     let pid = a0;
     let pgid = a1;
     let cur = kernel.cur_task(0);
-    let caller_pid = cur.as_ref().map(|t| t.id()).unwrap_or(1);
+    let caller_pid = cur.as_ref().map(|t| t.process_pid()).unwrap_or(1);
     let target_pid = if pid == 0 { caller_pid } else { pid };
     let new_pgid = if pgid == 0 { target_pid } else { pgid };
     if target_pid != caller_pid {
         let target = kernel.tasks.find(target_pid);
         match target {
             Some(t) => {
-                let parent = t.parent.lock().unwrap();
+                let parent = t.process.parent.lock().unwrap();
                 let is_child = parent
                     .as_ref()
-                    .map(|p| p.id() == caller_pid)
+                    .map(|p| p.process_pid() == caller_pid)
                     .unwrap_or(false);
                 drop(parent);
                 if !is_child {
@@ -272,7 +276,7 @@ pub(super) fn sys_setpgid(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize
         }
     }
     if let Some(t) = kernel.tasks.find(target_pid) {
-        *t.pgid.lock().unwrap() = new_pgid as Pgid;
+        *t.process.pgid.lock().unwrap() = new_pgid as Pgid;
     }
     Ok(0)
 }
@@ -281,7 +285,7 @@ pub(super) fn sys_getpgid(kernel: &Kernel, a0: usize) -> Result<usize, &'static 
     let pid = a0;
     let cur = kernel.cur_task(0);
     let target = if pid == 0 {
-        cur.as_ref().map(|t| t.id()).unwrap_or(0)
+        cur.as_ref().map(|t| t.process_pid()).unwrap_or(0)
     } else {
         pid
     };
@@ -289,7 +293,7 @@ pub(super) fn sys_getpgid(kernel: &Kernel, a0: usize) -> Result<usize, &'static 
         return Err("esrch");
     }
     match kernel.tasks.find(target) {
-        Some(t) => Ok(*t.pgid.lock().unwrap() as usize),
+        Some(t) => Ok(*t.process.pgid.lock().unwrap() as usize),
         None => Err("esrch"),
     }
 }
@@ -297,13 +301,13 @@ pub(super) fn sys_getpgid(kernel: &Kernel, a0: usize) -> Result<usize, &'static 
 pub(super) fn sys_setsid(kernel: &Kernel) -> Result<usize, &'static str> {
     let cur = kernel.cur_task(0);
     if let Some(t) = cur {
-        let tid = t.id();
-        let pgid = *t.pgid.lock().unwrap();
-        if pgid as usize == tid {
+        let pid = t.process_pid();
+        let pgid = *t.process.pgid.lock().unwrap();
+        if pgid as usize == pid {
             return Err("eperm");
         }
-        *t.pgid.lock().unwrap() = tid as Pgid;
-        Ok(tid)
+        *t.process.pgid.lock().unwrap() = pid as Pgid;
+        Ok(pid)
     } else {
         Err("esrch")
     }

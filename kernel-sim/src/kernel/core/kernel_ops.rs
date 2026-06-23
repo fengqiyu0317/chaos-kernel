@@ -59,7 +59,8 @@ impl Kernel {
                     let old_mask = *task.sig_mask.lock().unwrap();
                     let mut thd = task.thd_ctx.lock().unwrap();
                     let Some(ctx) = thd.as_mut() else {
-                        task.sig_queue
+                        task.process
+                            .sig_queue
                             .lock()
                             .unwrap()
                             .push_front((sig.signo as i32, sig.sender_tid));
@@ -150,7 +151,7 @@ impl Kernel {
         for (i, slot) in cpus.iter().enumerate() {
             if let Some(ref t) = slot {
                 counts[i] = t.n_children() + 1;
-                prios[i] = *t.pgid.lock().unwrap();
+                prios[i] = *t.process.pgid.lock().unwrap();
                 blocked[i] = t.done();
                 total_load += counts[i] as u64;
             }
@@ -308,7 +309,7 @@ impl Kernel {
         child.reset_slice();
         self.run_queue.enqueue(child_id, child.sched_policy());
         let _est_pages = {
-            let files = parent.files.lock().unwrap();
+            let files = parent.process.files.lock().unwrap();
             let mut total = 0usize;
             for (_, fl) in files.iter() {
                 match fl {
@@ -407,6 +408,7 @@ impl Kernel {
         ctx.uctx.set_ip(entry as u64);
         ctx.smask = *task.sig_mask.lock().unwrap();
         let close_fds = task
+            .process
             .files
             .lock()
             .unwrap()
@@ -426,17 +428,17 @@ impl Kernel {
 
     fn commit_exec(&self, task: &Arc<Task>, prepared: PreparedExec) {
         {
-            let mut files = task.files.lock().unwrap();
+            let mut files = task.process.files.lock().unwrap();
             for fd in prepared.close_fds {
                 files.remove(&fd);
             }
         }
         {
-            let mut current_addr_space = task.addr_space.lock().unwrap();
+            let mut current_addr_space = task.process.addr_space.lock().unwrap();
             current_addr_space.release_all_pages(&self.pool);
             *current_addr_space = prepared.addr_space;
         }
-        *task.exec_path.lock().unwrap() = prepared.exec_path;
+        *task.process.exec_path.lock().unwrap() = prepared.exec_path;
         *task.thd_ctx.lock().unwrap() = Some(prepared.thd_ctx);
     }
 
@@ -469,7 +471,7 @@ impl Kernel {
     ) -> Result<(usize, usize), &'static str> {
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let wnohang = (options & 1) != 0;
-        let children: Vec<Arc<Task>> = parent.subtasks.lock().unwrap().clone();
+        let children: Vec<Arc<Task>> = parent.process.subtasks.lock().unwrap().clone();
         if children.is_empty() {
             return Err("echild");
         }
@@ -477,12 +479,12 @@ impl Kernel {
         for child in &children {
             let matches = match target_pid {
                 -1 => true,
-                0 => *child.pgid.lock().unwrap() == *parent.pgid.lock().unwrap(),
+                0 => *child.process.pgid.lock().unwrap() == *parent.process.pgid.lock().unwrap(),
                 p if p > 0 => child.id() == p as usize,
-                p => *child.pgid.lock().unwrap() == (-p) as Pgid,
+                p => *child.process.pgid.lock().unwrap() == (-p) as Pgid,
             };
             if matches && child.done() {
-                let code = *child.exit_code.lock().unwrap();
+                let code = *child.process.exit_code.lock().unwrap();
                 found_zombie = Some((child.id(), code));
                 break;
             }

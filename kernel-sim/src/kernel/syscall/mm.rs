@@ -42,7 +42,8 @@ pub(super) fn sys_mmap(
     let result_addr = if addr != 0 && _map_fixed {
         addr
     } else if let Some(task) = cur_task.as_ref() {
-        task.addr_space
+        task.process
+            .addr_space
             .lock()
             .unwrap()
             .vm_map
@@ -63,7 +64,7 @@ pub(super) fn sys_mmap(
         return Err("einval");
     }
     if let Some(task) = cur_task {
-        let mut addr_space = task.addr_space.lock().unwrap();
+        let mut addr_space = task.process.addr_space.lock().unwrap();
         let region = VmRegion::with_offset(result_addr, aligned_len, vm_flags, aligned_off);
         addr_space.map_region(region, &kernel.pool)?;
     }
@@ -78,7 +79,8 @@ pub(super) fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize,
     }
     let aligned_len = (len + PAGE_SZ - 1) & !(PAGE_SZ - 1);
     if let Some(task) = kernel.cur_task(0) {
-        task.addr_space
+        task.process
+            .addr_space
             .lock()
             .unwrap()
             .unmap_range(addr, aligned_len);
@@ -91,7 +93,7 @@ pub(super) fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str>
     if new_brk == 0 {
         return Ok(kernel
             .cur_task(0)
-            .map(|t| t.addr_space.lock().unwrap().vm_map.brk)
+            .map(|t| t.process.addr_space.lock().unwrap().vm_map.brk)
             .unwrap_or(0x0040_0000));
     }
     if new_brk >= KERN_BASE {
@@ -100,7 +102,8 @@ pub(super) fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str>
     let aligned = (new_brk + PAGE_SZ - 1) & !(PAGE_SZ - 1);
     let cur = kernel.cur_task(0);
     if let Some(t) = cur {
-        t.addr_space
+        t.process
+            .addr_space
             .lock()
             .unwrap()
             .resize_brk(aligned, &kernel.pool)?;
