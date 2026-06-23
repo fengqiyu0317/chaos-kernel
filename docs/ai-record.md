@@ -228,6 +228,52 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-23：kernel-sim exec 文件来源重构
+
+### 目标
+
+把 `kernel-sim` 的 exec ELF 来源从专用 `Kernel.exec_files` 表迁移到统一路径文件节点，让普通文件安装/写入和 exec 读取共享同一份 `FileNode` 数据，并补齐失败路径回归。
+
+### 已完成修改
+
+- `Kernel` 的 exec 专用表改为 `file_nodes: RwLock<BTreeMap<String, Arc<FileNode>>>`。
+- 新增 `FileKind` / `FileNode`，`FHandle` 改为只保存 fd-local 状态并共享底层文件节点数据。
+- 新增 `Kernel::install_file()`、`install_directory()`、`write_file_at()` 和 `read_file_for_exec()`；`install_exec_file()` 保留为安装 executable regular file 的兼容 helper。
+- `prepare_exec_image()` 改为通过 `read_file_for_exec()` 读取 ELF 快照，并区分缺失路径、目录、无执行权限和非法 ELF。
+- `smoke.rs` 新增 exec 文件来源回归：同一路径写入新 ELF 后 exec 加载更新 payload；非 executable、目录、缺失路径、非法 ELF 失败时保留旧地址空间、线程上下文、`FD_CLOEXEC` fd 和 frame 计数。
+- `TASK.md` 已更新当前状态，并把剩余文件 I/O 问题收敛到 syscall 层 `sys_open` / `sys_read` / `sys_write` 尚未完整接入统一路径文件表。
+
+### 关键文件
+
+- `kernel-sim/src/kernel/core/kernel_base.rs`
+- `kernel-sim/src/kernel/core/kernel_ops.rs`
+- `kernel-sim/src/kernel/fs/fd.rs`
+- `kernel-sim/src/kernel/fs/pipe.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+
+### 测试结果
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `38 passed`；完整 `cargo test` 通过 `tests/elf.rs` 的 `3 passed` 和 `tests/smoke.rs` 的 `38 passed`。
+
+### 未解决问题
+
+- `sys_open` / `sys_read` / `sys_write` 仍未完整从用户地址空间读取 path 并按 fd 搬运真实文件数据；当前统一 `FileNode` 主要服务内核 helper 和 exec 读取路径。
+- ELF 解析仍未校验 `e_entry` 是否落在可执行 `PT_LOAD` 段内。
+- exec 仍未处理 `PT_INTERP`、动态链接器、`PT_DYNAMIC` 和重定位。
+
+### 不要改的部分
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
 ## 2026-06-23：kernel-sim exit/wait/reap 统一路径
 
 目标：把 `kernel-sim` 中分散的退出和等待逻辑收敛到统一路径，保证 `exit` 不再被系统调用分发层当作普通成功返回处理，并让 `wait4` 按父子关系回收 zombie、写回 wait status。

@@ -239,19 +239,80 @@ impl Kernel {
         Ok(resolved)
     }
 
-    pub fn install_exec_file(&self, path: &str, data: Vec<u8>) -> Result<(), &'static str> {
+    // AGENT: install a regular path-backed file used by both file handles and exec.
+    pub fn install_file(
+        &self,
+        path: &str,
+        data: Vec<u8>,
+        executable: bool,
+    ) -> Result<(), &'static str> {
         let resolved = self.lookup_path(path)?;
-        self.exec_files.write().unwrap().insert(resolved, data);
+        self.file_nodes
+            .write()
+            .unwrap()
+            .insert(resolved, Arc::new(FileNode::regular(data, executable)));
         Ok(())
     }
 
-    fn read_exec_file(&self, path: &str) -> Result<Vec<u8>, &'static str> {
-        self.exec_files
+    // AGENT: keep existing exec-test helper as an executable regular file install.
+    pub fn install_exec_file(&self, path: &str, data: Vec<u8>) -> Result<(), &'static str> {
+        self.install_file(path, data, true)
+    }
+
+    // AGENT: install a directory node so exec can distinguish directories.
+    pub fn install_directory(&self, path: &str) -> Result<(), &'static str> {
+        let resolved = self.lookup_path(path)?;
+        self.file_nodes
+            .write()
+            .unwrap()
+            .insert(resolved, Arc::new(FileNode::directory()));
+        Ok(())
+    }
+
+    // AGENT: write into the shared path file contents visible to later exec.
+    pub fn write_file_at(
+        &self,
+        path: &str,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<usize, &'static str> {
+        let resolved = self.lookup_path(path)?;
+        let node = self
+            .file_nodes
+            .read()
+            .unwrap()
+            .get(&resolved)
+            .cloned()
+            .ok_or("enoent")?;
+        if node.kind == FileKind::Directory {
+            return Err("eisdir");
+        }
+        let mut contents = node.data.lock().unwrap();
+        let end = offset.checked_add(data.len()).ok_or("efbig")?;
+        if end > contents.len() {
+            contents.resize(end, 0);
+        }
+        contents[offset..end].copy_from_slice(data);
+        Ok(data.len())
+    }
+
+    // AGENT: read a stable executable snapshot from the unified path file table.
+    fn read_file_for_exec(&self, path: &str) -> Result<Vec<u8>, &'static str> {
+        let node = self
+            .file_nodes
             .read()
             .unwrap()
             .get(path)
             .cloned()
-            .ok_or("enoent")
+            .ok_or("enoent")?;
+        if node.kind != FileKind::Regular {
+            return Err("eisdir");
+        }
+        if !node.executable.load(Ordering::Relaxed) {
+            return Err("eacces");
+        }
+        let snapshot = node.data.lock().unwrap().clone();
+        Ok(snapshot)
     }
 
     pub fn alloc_pages(&self, count: usize) -> Vec<usize> {
@@ -327,6 +388,7 @@ impl Kernel {
         (self.cache.total_entries(), self.cache.dirty_count())
     }
 
+    // AGENT: fork keeps descriptor state while estimating shared file-node pressure.
     pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> {
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let child = self.tasks.fork_task(&parent)?;
@@ -340,7 +402,7 @@ impl Kernel {
             for (_, fl) in files.iter() {
                 match fl {
                     FLike::File(fh) => {
-                        total += fh.data.lock().unwrap().len() / PAGE_SZ + 1;
+                        total += fh.metadata_sz() / PAGE_SZ + 1;
                     }
                     _ => {
                         total += 1;
@@ -352,6 +414,7 @@ impl Kernel {
         Ok(child_id)
     }
 
+    // AGENT: prepare exec from a path-backed executable file snapshot.
     fn prepare_exec_image(
         &self,
         task: &Arc<Task>,
@@ -360,7 +423,7 @@ impl Kernel {
         envs: Vec<String>,
     ) -> Result<PreparedExec, &'static str> {
         let exec_path = self.lookup_path(path)?;
-        let elf_data = self.read_exec_file(&exec_path)?;
+        let elf_data = self.read_file_for_exec(&exec_path)?;
         let (entry, load_segments) = parse_elf_load_segments(&elf_data)?;
         let mut addr_space = AddrSpace::new();
         let mut image_end = 0usize;

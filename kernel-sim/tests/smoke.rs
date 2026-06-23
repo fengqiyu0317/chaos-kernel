@@ -1,10 +1,10 @@
 // AGENT
 use kernel_sim::{
     AddrSpace, EpData, EpEvent, ExitReason, FLike, Kernel, PageTableEntry, PgFrame, SchedulePolicy,
-    TaskRunState, TaskTable, VmRegion, AT_ENTRY, AT_PAGESZ, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC,
-    PAGE_SZ, SIGUSR1, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX,
-    SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, USR_STK_OFF,
-    USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    Task, TaskRunState, TaskTable, VmRegion, AT_ENTRY, AT_PAGESZ, N_FRAMES, N_PROC, N_REGS,
+    O_CLOEXEC, PAGE_SZ, SIGUSR1, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK,
+    SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4,
+    USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
@@ -53,6 +53,68 @@ fn install_test_exec(kernel: &Kernel, path: &str) {
     kernel
         .install_exec_file(path, test_exec_elf())
         .expect("test exec file should install");
+}
+
+// AGENT: seed live process state that must survive failed exec preparation.
+fn seed_failed_exec_state(
+    kernel: &Kernel,
+    task: &Arc<Task>,
+    old_mapping: usize,
+) -> (usize, usize, usize) {
+    let close_fd = kernel
+        .dispatch_syscall(SYS_OPEN, old_mapping, O_CLOEXEC, 0, 0, 0, 0)
+        .expect("open should create a cloexec fd");
+    *task.process.exec_path.lock().unwrap() = String::from("/bin/old");
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(old_mapping, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("old mapping should be created");
+    }
+    {
+        let mut thd = task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_mut().expect("thread context should exist");
+        ctx.uctx.set_ip(0x1111);
+        ctx.uctx.set_sp(0x2222);
+        ctx.clear_tid = 123;
+    }
+    (close_fd, task.vm_token(), kernel.pool.free_count())
+}
+
+// AGENT: verify failed exec left address space, context, fd table, and frames intact.
+fn assert_failed_exec_state_preserved(
+    kernel: &Kernel,
+    task: &Arc<Task>,
+    close_fd: usize,
+    old_token: usize,
+    free_before: usize,
+    old_mapping: usize,
+) {
+    assert_eq!(kernel.pool.free_count(), free_before);
+    assert_eq!(&*task.process.exec_path.lock().unwrap(), "/bin/old");
+    assert_eq!(task.vm_token(), old_token);
+    match task
+        .get_file(close_fd)
+        .expect("cloexec fd should survive failed exec")
+    {
+        FLike::File(f) => assert!(f.cloexec),
+        _ => panic!("expected regular file"),
+    }
+    {
+        let addr_space = task.process.addr_space.lock().unwrap();
+        assert!(addr_space.vm_map.find(old_mapping).is_some());
+        assert!(addr_space.vm_map.find(TEST_EXEC_ENTRY).is_none());
+    }
+    {
+        let thd = task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_ref().expect("thread context should exist");
+        assert_eq!(ctx.uctx.ip, 0x1111);
+        assert_eq!(*ctx.uctx.r.last().unwrap(), 0x2222);
+        assert_eq!(ctx.clear_tid, 123);
+    }
 }
 
 fn test_exec_elf() -> Vec<u8> {
@@ -656,6 +718,48 @@ fn do_exec_loads_registered_elf_segment_bytes_and_zeroes_bss() {
 
 #[test]
 // AGENT
+fn do_exec_loads_updated_regular_file_contents() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let old_payload = b"old path-backed payload";
+    let new_payload = b"updated path-backed payload";
+    let old_elf = elf_with_load_payload(
+        TEST_EXEC_LOAD_OFFSET,
+        TEST_EXEC_ENTRY,
+        old_payload,
+        PAGE_SZ,
+        0x5,
+    );
+    let new_elf = elf_with_load_payload(
+        TEST_EXEC_LOAD_OFFSET,
+        TEST_EXEC_ENTRY,
+        new_payload,
+        PAGE_SZ,
+        0x5,
+    );
+    kernel
+        .install_file("/bin/live", old_elf, true)
+        .expect("regular executable file should install");
+    kernel
+        .write_file_at("/bin/live", 0, &new_elf)
+        .expect("regular file write should update shared contents");
+    let task = kernel.cur_task(0).expect("init should be current");
+
+    kernel
+        .do_exec(1, "/bin/live", vec![String::from("live")], Vec::new())
+        .expect("exec should load the updated regular file");
+
+    let addr_space = task.process.addr_space.lock().unwrap();
+    let mut loaded = vec![0u8; new_payload.len()];
+    addr_space
+        .read_user_bytes(TEST_EXEC_ENTRY, &mut loaded)
+        .expect("updated payload should be readable");
+    assert_eq!(loaded, new_payload);
+    assert_ne!(loaded, old_payload);
+}
+
+#[test]
+// AGENT
 fn cloned_thread_observes_exec_token_from_shared_address_space() {
     let kernel = Kernel::new(N_FRAMES);
     kernel.proc_init();
@@ -855,28 +959,99 @@ fn do_exec_rejects_unregistered_exec_file_without_commit() {
     let kernel = Kernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
-    *task.process.exec_path.lock().unwrap() = String::from("/bin/old");
-    let old_token = task.vm_token();
-    {
-        let mut addr_space = task.process.addr_space.lock().unwrap();
-        addr_space
-            .map_region(
-                VmRegion::new(0x5500_0000, PAGE_SZ, VM_READ | VM_WRITE),
-                &kernel.pool,
-            )
-            .expect("old mapping should be created");
-    }
+    let (close_fd, old_token, free_before) = seed_failed_exec_state(&kernel, &task, 0x5500_0000);
 
     let err = kernel
         .do_exec(1, "/bin/missing", vec![String::from("missing")], Vec::new())
         .expect_err("unregistered exec image should fail");
 
     assert_eq!(err, "enoent");
-    assert_eq!(&*task.process.exec_path.lock().unwrap(), "/bin/old");
-    assert_eq!(task.vm_token(), old_token);
-    let addr_space = task.process.addr_space.lock().unwrap();
-    assert!(addr_space.vm_map.find(0x5500_0000).is_some());
-    assert!(addr_space.vm_map.find(TEST_EXEC_ENTRY).is_none());
+    assert_failed_exec_state_preserved(
+        &kernel,
+        &task,
+        close_fd,
+        old_token,
+        free_before,
+        0x5500_0000,
+    );
+}
+
+#[test]
+// AGENT
+fn do_exec_rejects_non_executable_file_without_commit() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    kernel
+        .install_file("/bin/plain", test_exec_elf(), false)
+        .expect("plain file should install");
+    let task = kernel.cur_task(0).expect("init should be current");
+    let (close_fd, old_token, free_before) = seed_failed_exec_state(&kernel, &task, 0x5600_0000);
+
+    let err = kernel
+        .do_exec(1, "/bin/plain", vec![String::from("plain")], Vec::new())
+        .expect_err("non-executable regular file should fail");
+
+    assert_eq!(err, "eacces");
+    assert_failed_exec_state_preserved(
+        &kernel,
+        &task,
+        close_fd,
+        old_token,
+        free_before,
+        0x5600_0000,
+    );
+}
+
+#[test]
+// AGENT
+fn do_exec_rejects_directory_without_commit() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    kernel
+        .install_directory("/bin/dir")
+        .expect("directory node should install");
+    let task = kernel.cur_task(0).expect("init should be current");
+    let (close_fd, old_token, free_before) = seed_failed_exec_state(&kernel, &task, 0x5700_0000);
+
+    let err = kernel
+        .do_exec(1, "/bin/dir", vec![String::from("dir")], Vec::new())
+        .expect_err("directory exec should fail");
+
+    assert_eq!(err, "eisdir");
+    assert_failed_exec_state_preserved(
+        &kernel,
+        &task,
+        close_fd,
+        old_token,
+        free_before,
+        0x5700_0000,
+    );
+}
+
+#[test]
+// AGENT
+fn do_exec_rejects_invalid_elf_without_commit() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    kernel
+        .install_file("/bin/bad", vec![0; 64], true)
+        .expect("invalid executable file should install");
+    let task = kernel.cur_task(0).expect("init should be current");
+    let (close_fd, old_token, free_before) = seed_failed_exec_state(&kernel, &task, 0x5800_0000);
+
+    let err = kernel
+        .do_exec(1, "/bin/bad", vec![String::from("bad")], Vec::new())
+        .expect_err("invalid ELF should fail");
+
+    assert_eq!(err, "bad_magic");
+    assert_failed_exec_state_preserved(
+        &kernel,
+        &task,
+        close_fd,
+        old_token,
+        free_before,
+        0x5800_0000,
+    );
 }
 
 #[test]

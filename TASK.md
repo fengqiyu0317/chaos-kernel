@@ -28,6 +28,7 @@
 - 2026-06-23：`kernel-sim` 的 exec loader 已移除 `default_exec_elf()` 占位数据源；`Kernel::prepare_exec_image()` 改为从注册的路径 ELF bytes 读取镜像，映射 `PT_LOAD` 后复制文件段到用户页并恢复段权限，新增 smoke 回归覆盖跨页段复制和 bss 零填充。
 - 2026-06-23：已用共享 `ProcessState` 重构 `kernel-sim` 的进程/线程边界；`clone_thread` 复用进程级状态，`fork_task` 为子进程复制新的 `ProcessState` 并从调用线程复制 `ThdCtx`/TLS/`clear_tid`/signal mask。回归测试：`fork_from_cloned_thread_uses_shared_process_state_and_thread_context`。
 - 2026-06-23：`kernel-sim` 已抽出统一进程退出路径：`sys_exit()` 委托 `Kernel::do_exit_current()`，分发层用 `SyscallOutcome::NoReturn` 避免把 exit 当普通成功返回处理；`ExitReason` 统一保存退出码/信号原因，`sys_wait4()` 复用 `Kernel::do_wait()`、按子进程关系筛选 zombie、写回 wait status 并完成 reap/reparent 闭环。
+- 2026-06-23：`kernel-sim` 的 exec 文件来源已从专用 `exec_files` 表改为共享 `FileNode` 路径文件表；`FHandle` 只保存 fd 状态并共享底层文件节点，`Kernel::read_file_for_exec()` 会检查 regular file、execute 权限并返回 ELF bytes 快照，新增 smoke 回归覆盖同一路径普通文件写入后 exec 加载更新内容，以及非 executable、目录、缺失路径、非法 ELF 失败时不破坏旧地址空间和 fd 表。
 
 ## 关键文件
 
@@ -36,7 +37,8 @@
 - `chaos/NOTES.md`：迁移说明与工作约定。
 - `chaos/kernel-sim/`：后续修 bug、通过测试、重写提升质量的目标目录。
 - `chaos/kernel-sim/src/kernel/mm/address_space.rs`：模拟用户页内容和用户内存读写接口。
-- `chaos/kernel-sim/src/kernel/core/kernel_base.rs`：`Kernel` 状态，包括测试可注册的 exec 镜像表。
+- `chaos/kernel-sim/src/kernel/core/kernel_base.rs`：`Kernel` 状态，包括统一路径文件节点表。
+- `chaos/kernel-sim/src/kernel/fs/fd.rs`：`FileNode` / `FHandle`，共享文件内容和 fd-local 状态。
 - `chaos/kernel-sim/src/kernel/fs/fs_misc.rs`：ELF header / `PT_LOAD` 解析和映射区域生成。
 - `chaos/kernel-sim/src/kernel/syscall/proc.rs`：`sys_exec()` 用户参数搬运、`sys_exit()`/`sys_wait4()` syscall 包装。
 - `chaos/kernel-sim/src/kernel/core/kernel_ops.rs`：`do_exec()`、统一退出路径、`do_wait()`。
@@ -93,6 +95,17 @@ cargo test
 
 结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `34 passed`；完整 `cargo test` 通过 `37 passed`。
 
+本次 exec 文件来源重构后执行过：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `38 passed`；完整 `cargo test` 通过 `tests/elf.rs` 的 `3 passed` 和 `tests/smoke.rs` 的 `38 passed`。
+
 迁移前在 `chaos/` 中执行过：
 
 ```bash
@@ -134,15 +147,12 @@ cargo test --test pressure
 - TODO: `kernel-sim` 的 exec ELF loader 尚未处理 `PT_INTERP`、动态链接器路径、`PT_DYNAMIC` 和重定位；动态链接 ELF 目前不能被视为完整支持。
 - TODO: `kernel-sim` 的 ELF 段权限模型目前只把 `PF_R/PF_W/PF_X` 映射为 `VM_READ/VM_WRITE/VM_EXEC`；后续可补齐 W^X、RELRO、栈执行权限、私有/共享映射等更接近真实 exec 的权限语义。
 - TODO: `kernel-sim` 的 exec 状态提交边界仍需继续补齐多线程 exec 语义；当前 `commit_exec()` 已覆盖保留非 `FD_CLOEXEC` 文件描述符、关闭 close-on-exec fd、替换地址空间、重置入口 PC/SP、信号处理帧和 `clear_tid`。
+- TODO: `kernel-sim` 的 exec `brk` 初始化目前只按已映射镜像末尾页对齐；补齐真实 ELF 装载后，需要确认 data/bss、页内偏移、空洞段和 mmap 基址下的 `brk` 语义。
+- TODO: `kernel-sim` 尚未维护每进程 resource usage / CPU time counters / page fault / I/O 统计；`wait4` 只做地址检查，没有写出真实 `rusage`，fork 后子进程统计清零语义也未完整实现。
 
 ### important
-- TODO: `kernel-sim` 的 exec 镜像来源目前仍是 `Kernel.exec_files: RwLock<BTreeMap<String, Vec<u8>>>` 这种专用可执行文件表；后续应改为统一的路径文件对象/VFS 存储，让 `open/read/write/exec` 共享同一份 `FileNode`/inode 数据，而不是为 exec 维护单独 registry。
-- TODO: `kernel-sim` 的 `FHandle` 目前每个 handle 持有自己的 `Arc<Mutex<Vec<u8>>>` 数据；后续应重构为 fd 只保存 offset/options/close-on-exec 等描述符状态，文件内容和元数据由共享 `FileNode`/inode 持有，从而让同一路径的普通文件访问和 exec 看到一致内容。
-- TODO: `kernel-sim` 后续应新增内核内部的 exec 文件读取入口，例如 `read_file_for_exec(path)`：复用 `lookup_path()` 和统一文件表，检查 regular file、execute 权限和必要元数据，返回稳定的 ELF bytes 快照；`prepare_exec_image()` 不应直接依赖 syscall 层的 `sys_open/sys_read`。
-- TODO: `kernel-sim` 的 exec 文件来源重构后需要补充回归测试：普通文件安装/写入后 `exec` 同一路径能加载更新内容，非 executable 文件返回权限错误，目录/缺失路径/非法 ELF 走对应错误路径，并确认所有失败路径不破坏旧地址空间和 fd 表。
-- TODO: `kernel-sim` 的 exec `brk` 初始化目前只按已映射镜像末尾页对齐；补齐真实 ELF 装载后，需要确认 data/bss、页内偏移、空洞段和 mmap 基址下的 `brk` 语义。
+- TODO: `kernel-sim` 的 syscall 层 `sys_open` / `sys_read` / `sys_write` 仍未完整接入用户地址空间路径解析和真实 fd 数据搬运；当前统一 `FileNode` 已服务内核内部 `install_file()` / `write_file_at()` / `read_file_for_exec()` 和 `FHandle` 共享节点，后续可继续把 syscall 文件 I/O 接到同一套路径文件表。
 - TODO: `kernel-sim/src/kernel/fs/fs_misc.rs` 的 ELF 解析尚未校验 `e_entry` 是否位于用户地址范围内、是否落在某个已映射且带执行权限的 `PT_LOAD` 段中；后续应拒绝入口地址未映射或不可执行的畸形 ELF。
-- TODO: `kernel-sim` 尚未维护每进程 resource usage / CPU time counters / page fault / I/O 统计；`wait4` 只做地址检查，没有写出真实 `rusage`，fork 后子进程统计清零语义也未完整实现。
 - TODO: `kernel-sim` 的退出资源释放还不完整；`Task::exit_proc()` 已关闭 fd、设置事件、记录退出码并置 zombie，但没有释放用户地址空间页、内核栈、线程上下文、IPC/定时器/信号等进程私有状态，后续应把资源释放边界拆清楚：exit 时释放可立即释放的资源，wait/reap 时删除 zombie 保留记录。
 - TODO: `kernel-sim` 的线程退出语义仍是简化模型；`exit_proc()` 直接清空 `threads`，尚未区分 `exit`、`exit_group`、单线程退出、`clear_child_tid` futex 唤醒、robust futex owner 退出等真实线程组语义。
 

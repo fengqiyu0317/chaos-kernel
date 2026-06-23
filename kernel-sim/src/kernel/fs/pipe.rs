@@ -200,9 +200,8 @@ impl FLike {
         let _pages = (end - start + PAGE_SZ - 1) / PAGE_SZ;
         match self {
             FLike::File(f) => {
-                let d = f.data.lock().unwrap();
-                let _file_pages = (d.len() + PAGE_SZ - 1) / PAGE_SZ;
-                drop(d);
+                // AGENT: file mmap observes shared FileNode metadata.
+                let _file_pages = (f.metadata_sz() + PAGE_SZ - 1) / PAGE_SZ;
                 f.mmap(start, end, off)
             }
             _ => Err("enosys"),

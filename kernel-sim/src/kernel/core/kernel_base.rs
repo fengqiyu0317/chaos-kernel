@@ -8,7 +8,8 @@ pub struct Kernel {
     pub pool: FramePool,
     pub cpus: Mutex<[Option<Arc<Task>>; MAX_CPU]>,
     pub mnt: MountTable,
-    pub exec_files: RwLock<BTreeMap<String, Vec<u8>>>,
+    // AGENT: unified path-backed file table shared by open-like handles and exec.
+    pub file_nodes: RwLock<BTreeMap<String, Arc<FileNode>>>,
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
     pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
     pub tty_buf: Mutex<VecDeque<u8>>,
@@ -22,7 +23,7 @@ impl Kernel {
             pool: FramePool::new(nf),
             cpus: Mutex::new([None, None, None, None, None, None, None, None]),
             mnt: MountTable::new(),
-            exec_files: RwLock::new(BTreeMap::new()),
+            file_nodes: RwLock::new(BTreeMap::new()),
             sem_store: RwLock::new(BTreeMap::new()),
             shm_store: RwLock::new(BTreeMap::new()),
             tty_buf: Mutex::new(VecDeque::new()),
