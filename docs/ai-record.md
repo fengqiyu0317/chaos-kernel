@@ -228,6 +228,49 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-23：kernel-sim ELF segment alignment 校验
+
+目标：补齐 `TASK.md` 中记录的 ELF `PT_LOAD` 对齐规则，避免 `ElfLoadSegment::vm_region()` 用 `saturating_sub()` 容错畸形 program header。
+
+已完成修改：
+
+- `parse_elf_load_segments()` 读取 `p_align`，并拒绝非 2 的幂、`p_offset % p_align != p_vaddr % p_align` 的 `PT_LOAD` 段。
+- 新增页内偏移一致性校验，要求 `p_offset % PAGE_SZ == p_vaddr % PAGE_SZ`。
+- `ElfLoadSegment::vm_region()` 改用 `checked_sub()` 计算页对齐文件 offset，并拒绝非页对齐结果。
+- 新增 `kernel-sim/tests/elf.rs`，覆盖非法 `p_align`、非法文件/虚拟地址同余关系，以及合法页内偏移映射结果。
+- `TASK.md` 同步删除已完成的 ELF segment alignment TODO，并记录本轮验证结果。
+
+关键文件：
+
+- `kernel-sim/src/kernel/fs/fs_misc.rs`
+- `kernel-sim/tests/elf.rs`
+- `TASK.md`
+- `docs/ai-record.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test elf
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test elf` 通过 `3 passed`；`cargo test --test smoke` 通过 `28 passed`；完整 `cargo test` 通过 `31 passed`。
+
+未解决问题：
+
+- `prepare_exec_image()` 仍使用 `default_exec_elf()` 占位 ELF，尚未根据 path 读取真实可执行文件。
+- ELF `PT_LOAD` 文件内容复制和 bss 清零仍待接入真实 loader。
+- ELF `e_entry` 尚未校验是否落在可执行 `PT_LOAD` 映射内。
+- 多线程 exec 语义仍待补齐。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
 ## 2026-06-23：kernel-sim exec 初始用户栈写入
 
 目标：补齐 `ProcInit::push_at()` 的用户栈构造逻辑，使 `exec` 提交的新地址空间中包含可由用户态读取的 `argc`、`argv`、`envp` 和 auxv。

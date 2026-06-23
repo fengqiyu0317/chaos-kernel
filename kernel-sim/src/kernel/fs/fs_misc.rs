@@ -238,6 +238,10 @@ impl ElfLoadSegment {
     pub fn vm_region(&self) -> Result<VmRegion, &'static str> {
         let page_base = self.vaddr & !(PAGE_SZ - 1);
         let page_off = self.vaddr - page_base;
+        let file_page_offset = self.offset.checked_sub(page_off).ok_or("bad_phdr")?;
+        if file_page_offset % PAGE_SZ != 0 {
+            return Err("bad_phdr");
+        }
         let mapped_len = page_off
             .checked_add(self.mem_size)
             .and_then(|len| len.checked_add(PAGE_SZ - 1))
@@ -250,7 +254,7 @@ impl ElfLoadSegment {
             page_base,
             mapped_len,
             self.vm_flags(),
-            self.offset.saturating_sub(page_off),
+            file_page_offset,
         ))
     }
 }
@@ -315,9 +319,11 @@ pub fn parse_elf_load_segments(data: &[u8]) -> Result<(usize, Vec<ElfLoadSegment
             let vaddr = read_u64_le(data, base + 16)? as usize;
             let file_size = read_u64_le(data, base + 32)? as usize;
             let mem_size = read_u64_le(data, base + 40)? as usize;
+            let align = read_u64_le(data, base + 48)? as usize;
             if file_size > mem_size {
                 return Err("bad_phdr");
             }
+            validate_load_segment_alignment(offset, vaddr, align)?;
             if vaddr >= KERN_BASE || vaddr.checked_add(mem_size).is_none() {
                 return Err("bad_phdr");
             }
@@ -339,6 +345,26 @@ pub fn parse_elf_load_segments(data: &[u8]) -> Result<(usize, Vec<ElfLoadSegment
         return Err("no_load");
     }
     Ok((e_entry, load_segments))
+}
+
+fn validate_load_segment_alignment(
+    offset: usize,
+    vaddr: usize,
+    align: usize,
+) -> Result<(), &'static str> {
+    // AGENT: ELF PT_LOAD segments must be congruent in-file and in-memory.
+    if align > 1 {
+        if !align.is_power_of_two() {
+            return Err("bad_phdr");
+        }
+        if offset % align != vaddr % align {
+            return Err("bad_phdr");
+        }
+    }
+    if offset % PAGE_SZ != vaddr % PAGE_SZ {
+        return Err("bad_phdr");
+    }
+    Ok(())
 }
 
 fn read_u16_le(data: &[u8], off: usize) -> Result<u16, &'static str> {
