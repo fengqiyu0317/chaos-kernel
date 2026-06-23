@@ -228,6 +228,49 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-23：kernel-sim exec ELF loader 文件段复制
+
+目标：修复 `TASK.md` 中 `kernel-sim` exec 回归测试仍缺少真实 ELF 文件段复制和 bss 清零覆盖的问题，移除 `default_exec_elf()` 占位执行镜像。
+
+已完成修改：
+
+- `Kernel` 新增测试可注册的 exec 镜像表，`install_exec_file(path, data)` 会按 `lookup_path(path)` 的结果保存 ELF bytes。
+- `Kernel::prepare_exec_image()` 改为从注册路径读取 ELF bytes，不再使用 `default_exec_elf()`。
+- exec loader 在映射每个 `PT_LOAD` 时临时加入写权限，将 `p_offset..p_offset+p_filesz` 的文件内容复制到 `p_vaddr`，然后恢复 ELF 段权限。
+- 新增 smoke 回归 `do_exec_loads_registered_elf_segment_bytes_and_zeroes_bss`，覆盖跨页文件段复制、bss 零填充和 text 段最终不可写。
+- 既有 exec 成功/失败/syscall 回归改为显式注册测试 ELF，避免未提供真实镜像时仍依赖占位数据源成功。
+
+关键文件：
+
+- `kernel-sim/src/kernel/core/kernel_base.rs`
+- `kernel-sim/src/kernel/core/kernel_ops.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test elf
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test elf` 通过 `3 passed`；`cargo test --test smoke` 通过 `30 passed`；完整 `cargo test` 通过 `33 passed`。
+
+未解决问题：
+
+- `fs_misc.rs` 尚未校验 `e_entry` 是否落在用户态、已映射且可执行的 `PT_LOAD` 段中。
+- `ET_DYN`/PIE、`PT_INTERP`、动态链接器、`PT_DYNAMIC` 和重定位仍未实现。
+- `brk` 初始化仍只按映像末尾页对齐，后续还需确认 data/bss、页内偏移、空洞段和 mmap 基址语义。
+- 多线程 exec 语义仍待补齐。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
 ## 2026-06-23：kernel-sim ELF segment alignment 校验
 
 目标：补齐 `TASK.md` 中记录的 ELF `PT_LOAD` 对齐规则，避免 `ElfLoadSegment::vm_region()` 用 `saturating_sub()` 容错畸形 program header。

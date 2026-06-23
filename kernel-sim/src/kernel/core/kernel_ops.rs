@@ -212,6 +212,21 @@ impl Kernel {
         Ok(resolved)
     }
 
+    pub fn install_exec_file(&self, path: &str, data: Vec<u8>) -> Result<(), &'static str> {
+        let resolved = self.lookup_path(path)?;
+        self.exec_files.write().unwrap().insert(resolved, data);
+        Ok(())
+    }
+
+    fn read_exec_file(&self, path: &str) -> Result<Vec<u8>, &'static str> {
+        self.exec_files
+            .read()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .ok_or("enoent")
+    }
+
     pub fn alloc_pages(&self, count: usize) -> Vec<usize> {
         let mut pages = Vec::with_capacity(count);
         let free_before = self.pool.free_count();
@@ -318,14 +333,45 @@ impl Kernel {
         envs: Vec<String>,
     ) -> Result<PreparedExec, &'static str> {
         let exec_path = self.lookup_path(path)?;
-        let elf_data = default_exec_elf();
+        let elf_data = self.read_exec_file(&exec_path)?;
         let (entry, load_segments) = parse_elf_load_segments(&elf_data)?;
         let mut addr_space = AddrSpace::new();
         let mut image_end = 0usize;
         for segment in load_segments {
             let region = segment.vm_region()?;
-            image_end = max(image_end, region.end());
-            if let Err(err) = addr_space.map_region(region, &self.pool) {
+            let region_base = region.base;
+            let region_len = region.len;
+            let region_flags = region.flags;
+            let region_end = region.end();
+            let load_region = VmRegion {
+                flags: region_flags | VM_WRITE,
+                ..region
+            };
+            image_end = max(image_end, region_end);
+            if let Err(err) = addr_space.map_region(load_region, &self.pool) {
+                addr_space.release_all_pages(&self.pool);
+                return Err(err);
+            }
+            let file_end = match segment.offset.checked_add(segment.file_size) {
+                Some(end) => end,
+                None => {
+                    addr_space.release_all_pages(&self.pool);
+                    return Err("ph_overflow");
+                }
+            };
+            if file_end > elf_data.len() {
+                addr_space.release_all_pages(&self.pool);
+                return Err("ph_overflow");
+            }
+            if let Err(err) = addr_space.write_user_bytes(
+                segment.vaddr,
+                &elf_data[segment.offset..file_end],
+                &self.pool,
+            ) {
+                addr_space.release_all_pages(&self.pool);
+                return Err(err);
+            }
+            if let Err(err) = addr_space.protect(region_base, region_len, region_flags) {
                 addr_space.release_all_pages(&self.pool);
                 return Err(err);
             }
@@ -456,48 +502,4 @@ impl Kernel {
             }
         }
     }
-}
-
-fn default_exec_elf() -> Vec<u8> {
-    // AGENT: placeholder executable bytes until path-backed ELF loading is wired.
-    let entry = 0x0040_0000usize;
-    let mut data = vec![0u8; 64 + 56];
-    data[0] = 0x7f;
-    data[1] = b'E';
-    data[2] = b'L';
-    data[3] = b'F';
-    data[4] = 2;
-    data[5] = 1;
-    data[6] = 1;
-    write_u16_le(&mut data, 16, 2);
-    write_u16_le(&mut data, 18, 0x3e);
-    write_u32_le(&mut data, 20, 1);
-    write_u64_le(&mut data, 24, entry as u64);
-    write_u64_le(&mut data, 32, 64);
-    write_u16_le(&mut data, 52, 64);
-    write_u16_le(&mut data, 54, 56);
-    write_u16_le(&mut data, 56, 1);
-
-    let ph = 64;
-    write_u32_le(&mut data, ph, 1);
-    write_u32_le(&mut data, ph + 4, 0x5);
-    write_u64_le(&mut data, ph + 8, 0);
-    write_u64_le(&mut data, ph + 16, entry as u64);
-    write_u64_le(&mut data, ph + 24, entry as u64);
-    write_u64_le(&mut data, ph + 32, 0);
-    write_u64_le(&mut data, ph + 40, PAGE_SZ as u64);
-    write_u64_le(&mut data, ph + 48, PAGE_SZ as u64);
-    data
-}
-
-fn write_u16_le(data: &mut [u8], off: usize, value: u16) {
-    data[off..off + 2].copy_from_slice(&value.to_le_bytes());
-}
-
-fn write_u32_le(data: &mut [u8], off: usize, value: u32) {
-    data[off..off + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn write_u64_le(data: &mut [u8], off: usize, value: u64) {
-    data[off..off + 8].copy_from_slice(&value.to_le_bytes());
 }

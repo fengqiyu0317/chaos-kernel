@@ -1,6 +1,6 @@
 # Chaos 项目交接状态
 
-更新日期：2026-06-22
+更新日期：2026-06-23
 
 ## 目标
 
@@ -25,6 +25,7 @@
 - 2026-06-22：`kernel-sim` 的 `vm_token` 改为由 `AddrSpace` 统一分配和持有；删除 `Task.vm_token` 缓存字段，`fork`/`exec` 创建新地址空间时自然获得新 token，`clone_thread` 共享地址空间时通过 `Task::vm_token()` 读取同一 token。
 - 2026-06-22：`kernel-sim` 的 `ProcInit::push_at()` 已改为真正构造用户初始栈：写入 `argc`、`argv`、`envp`、字符串区和 auxv 终止项；`Kernel::prepare_exec_image()` 先映射用户栈再通过 `AddrSpace::write_user_bytes()` 写入，并继续在失败时释放临时地址空间；exec auxv 至少包含 `AT_PAGESZ` 和 `AT_ENTRY`。
 - 2026-06-23：`kernel-sim/src/kernel/fs/fs_misc.rs` 的 ELF `PT_LOAD` 解析已补齐 `p_align` 校验，拒绝非 2 的幂、`p_offset % p_align != p_vaddr % p_align` 以及页内偏移不一致的段；`ElfLoadSegment::vm_region()` 不再用 `saturating_sub()` 容错非法 offset。
+- 2026-06-23：`kernel-sim` 的 exec loader 已移除 `default_exec_elf()` 占位数据源；`Kernel::prepare_exec_image()` 改为从注册的路径 ELF bytes 读取镜像，映射 `PT_LOAD` 后复制文件段到用户页并恢复段权限，新增 smoke 回归覆盖跨页段复制和 bss 零填充。
 
 ## 关键文件
 
@@ -33,6 +34,7 @@
 - `chaos/NOTES.md`：迁移说明与工作约定。
 - `chaos/kernel-sim/`：后续修 bug、通过测试、重写提升质量的目标目录。
 - `chaos/kernel-sim/src/kernel/mm/address_space.rs`：模拟用户页内容和用户内存读写接口。
+- `chaos/kernel-sim/src/kernel/core/kernel_base.rs`：`Kernel` 状态，包括测试可注册的 exec 镜像表。
 - `chaos/kernel-sim/src/kernel/fs/fs_misc.rs`：ELF header / `PT_LOAD` 解析和映射区域生成。
 - `chaos/kernel-sim/src/kernel/syscall/proc.rs`：`sys_exec()` 用户参数搬运和 `do_exec()` 调用。
 - `chaos/kernel-sim/tests/smoke.rs`：exec syscall 回归测试。
@@ -64,6 +66,18 @@ cargo test
 
 结果：`cargo fmt --check` 通过；`cargo test --test elf` 通过 `3 passed`；`cargo test --test smoke` 通过 `28 passed`；完整 `cargo test` 通过 `31 passed`。
 
+本次 exec ELF loader 修改后执行过：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test elf
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test elf` 通过 `3 passed`；`cargo test --test smoke` 通过 `30 passed`；完整 `cargo test` 通过 `33 passed`。
+
 迁移前在 `chaos/` 中执行过：
 
 ```bash
@@ -86,12 +100,11 @@ cargo test --test pressure
 
 ## 未解决问题
 
+### not very important
 - 需要在 `chaos/` 中审查本次新增文件，然后执行 `git add`、`git commit`、`git push`。
 - 后续实际内核调试目标仍是 `chaos/kernel-sim/`；本轮已完成页表级 COW 重构，详见下方 2026-06-19 补充。
-- TODO: `kernel-sim` 的多线程 fork 边界尚不完整；如果 `src` 是 `clone_thread` 生成的线程 task，`fork_task` 可能从线程 task 的默认/局部字段复制 fd、cwd、IPC、epoll、信号等进程级资源，而不是从其所属进程复制进程级资源、从调用线程复制 `ThdCtx`/TLS/clear_tid/信号 mask 等线程上下文。
 - TODO: `kernel-sim` 尚未把 credentials、uid/gid、supplementary groups、capability sets、securebits、no_new_privs 等进程安全身份挂到 `Task`，因此 `fork_task` 也没有实现这些真实 Linux 属性的继承规则。
 - TODO: `kernel-sim` 的 fork 失败条件目前主要受全局 `N_PROC` 限制约束；尚未建模 `RLIMIT_NPROC`、系统线程数上限、`pid_max`、cgroup pids 限制、PID namespace init 退出、内存压力导致的 `ENOMEM` 等真实错误路径。
-- TODO: `kernel-sim` 尚未维护每进程 resource usage / CPU time counters / page fault / I/O 统计；`wait4` 只做地址检查，没有写出真实 `rusage`，fork 后子进程统计清零语义也未完整实现。
 - TODO: `kernel-sim` 尚未建模 per-task `alarm`、`setitimer`、POSIX timer 等计时器集合；真实 fork 中 child 不继承 parent timers，目前只有全局/通用 timer wheel 和 `clock_gettime` 级别的时间读取。
 - TODO: `kernel-sim` 尚未建模 `mlock/mlockall` 内存锁状态、`MADV_WIPEONFORK` 清零语义，以及完整 `madvise` fork 标志；已有 `VM_DONTCOPY` 只覆盖了 DONTFORK 类似行为的一部分。
 - TODO: `kernel-sim` 的 futex 模型尚未覆盖真实 Linux 的 shared futex key、priority-inheritance futex、robust futex list、`OWNER_DIED` 标记和 owner 退出时唤醒等待者等语义。
@@ -102,15 +115,20 @@ cargo test --test pressure
 - TODO: `kernel-sim` 尚未建模 `pthread_atfork` handler、fork 后 child 在 `exec` 前只能调用 async-signal-safe 函数等用户态线程运行时约束。
 - TODO: `kernel-sim` 尚未建模 seccomp filters、ptrace relationship、LSM/security label、keyrings、namespace/cgroup membership 等安全和隔离上下文的 fork 继承或重置规则。
 - TODO: `kernel-sim/src/kernel/mm/address_space.rs` 的 `page_table_root` / `vm_token` 目前只是全局递增的模拟地址空间 token，`asid_from_token()` 也只是把 token 映射到非零 `u16`；尚未建模真实 `satp`/页表根、ASID generation、ASID 复用时的 TLB flush/shootdown 等完整 MMU 语义。
-- TODO: `kernel-sim/src/kernel/core/kernel_ops.rs` 的 `default_exec_elf()` 仍是占位 ELF；后续需要让 `prepare_exec_image()` 根据 `lookup_path(path)` 的结果打开/读取真实可执行文件，移除占位镜像数据源。
-- TODO: `kernel-sim` 的 ELF exec 装载还没有把 `PT_LOAD` 文件内容写入用户页；已有 `AddrSpace::write_user_bytes()` 基础接口，后续还需要在 loader 中用它复制文件段并清零 bss。
-- TODO: `kernel-sim` 的 exec `brk` 初始化目前只按已映射镜像末尾页对齐；补齐真实 ELF 装载后，需要确认 data/bss、页内偏移、空洞段和 mmap 基址下的 `brk` 语义。
-- TODO: `kernel-sim/src/kernel/fs/fs_misc.rs` 的 ELF 解析尚未校验 `e_entry` 是否位于用户地址范围内、是否落在某个已映射且带执行权限的 `PT_LOAD` 段中；后续应拒绝入口地址未映射或不可执行的畸形 ELF。
 - TODO: `kernel-sim/src/kernel/fs/fs_misc.rs` 目前接受 `ET_DYN`，但没有实现 PIE/load bias、地址随机化、动态段解析或重定位；后续要么补齐 `ET_DYN` 装载语义，要么在未实现前只接受可直接映射的 `ET_EXEC`。
 - TODO: `kernel-sim` 的 exec ELF loader 尚未处理 `PT_INTERP`、动态链接器路径、`PT_DYNAMIC` 和重定位；动态链接 ELF 目前不能被视为完整支持。
 - TODO: `kernel-sim` 的 ELF 段权限模型目前只把 `PF_R/PF_W/PF_X` 映射为 `VM_READ/VM_WRITE/VM_EXEC`；后续可补齐 W^X、RELRO、栈执行权限、私有/共享映射等更接近真实 exec 的权限语义。
 - TODO: `kernel-sim` 的 exec 状态提交边界仍需继续补齐多线程 exec 语义；当前 `commit_exec()` 已覆盖保留非 `FD_CLOEXEC` 文件描述符、关闭 close-on-exec fd、替换地址空间、重置入口 PC/SP、信号处理帧和 `clear_tid`。
-- TODO: `kernel-sim` 的 exec 回归测试还需继续覆盖真实 ELF 文件段复制、bss 清零等路径；`sys_exec()` 到 `do_exec()` 的调用路径、`do_exec()` 直接成功/失败事务语义，以及初始用户栈写入已在 `kernel-sim/tests/smoke.rs` 覆盖。
+
+### important
+- TODO: `kernel-sim` 的 exec 镜像来源目前仍是 `Kernel.exec_files: RwLock<BTreeMap<String, Vec<u8>>>` 这种专用可执行文件表；后续应改为统一的路径文件对象/VFS 存储，让 `open/read/write/exec` 共享同一份 `FileNode`/inode 数据，而不是为 exec 维护单独 registry。
+- TODO: `kernel-sim` 的 `FHandle` 目前每个 handle 持有自己的 `Arc<Mutex<Vec<u8>>>` 数据；后续应重构为 fd 只保存 offset/options/close-on-exec 等描述符状态，文件内容和元数据由共享 `FileNode`/inode 持有，从而让同一路径的普通文件访问和 exec 看到一致内容。
+- TODO: `kernel-sim` 后续应新增内核内部的 exec 文件读取入口，例如 `read_file_for_exec(path)`：复用 `lookup_path()` 和统一文件表，检查 regular file、execute 权限和必要元数据，返回稳定的 ELF bytes 快照；`prepare_exec_image()` 不应直接依赖 syscall 层的 `sys_open/sys_read`。
+- TODO: `kernel-sim` 的 exec 文件来源重构后需要补充回归测试：普通文件安装/写入后 `exec` 同一路径能加载更新内容，非 executable 文件返回权限错误，目录/缺失路径/非法 ELF 走对应错误路径，并确认所有失败路径不破坏旧地址空间和 fd 表。
+- TODO: `kernel-sim` 的 exec `brk` 初始化目前只按已映射镜像末尾页对齐；补齐真实 ELF 装载后，需要确认 data/bss、页内偏移、空洞段和 mmap 基址下的 `brk` 语义。
+- TODO: `kernel-sim/src/kernel/fs/fs_misc.rs` 的 ELF 解析尚未校验 `e_entry` 是否位于用户地址范围内、是否落在某个已映射且带执行权限的 `PT_LOAD` 段中；后续应拒绝入口地址未映射或不可执行的畸形 ELF。
+- TODO: `kernel-sim` 尚未维护每进程 resource usage / CPU time counters / page fault / I/O 统计；`wait4` 只做地址检查，没有写出真实 `rusage`，fork 后子进程统计清零语义也未完整实现。
+- TODO: `kernel-sim` 的多线程 fork 边界尚不完整；如果 `src` 是 `clone_thread` 生成的线程 task，`fork_task` 可能从线程 task 的默认/局部字段复制 fd、cwd、IPC、epoll、信号等进程级资源，而不是从其所属进程复制进程级资源、从调用线程复制 `ThdCtx`/TLS/clear_tid/信号 mask 等线程上下文。
 
 ## 不要改的部分
 

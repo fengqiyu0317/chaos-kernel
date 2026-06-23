@@ -11,6 +11,12 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
+const TEST_EXEC_ENTRY: usize = 0x0040_0000;
+const TEST_EXEC_LOAD_OFFSET: usize = PAGE_SZ;
+const ELF_PH_OFF: usize = 64;
+const ELF_PH_SIZE: usize = 56;
+const TEST_EXEC_PAYLOAD: &[u8] = b"kernel-sim exec payload";
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UserSigAction {
@@ -41,6 +47,71 @@ fn read_user_c_string(addr_space: &AddrSpace, addr: usize) -> String {
         bytes.push(byte[0]);
     }
     String::from_utf8(bytes).expect("user string should be utf-8")
+}
+
+fn install_test_exec(kernel: &Kernel, path: &str) {
+    kernel
+        .install_exec_file(path, test_exec_elf())
+        .expect("test exec file should install");
+}
+
+fn test_exec_elf() -> Vec<u8> {
+    elf_with_load_payload(
+        TEST_EXEC_LOAD_OFFSET,
+        TEST_EXEC_ENTRY,
+        TEST_EXEC_PAYLOAD,
+        PAGE_SZ,
+        0x5,
+    )
+}
+
+fn elf_with_load_payload(
+    offset: usize,
+    vaddr: usize,
+    payload: &[u8],
+    mem_size: usize,
+    flags: u32,
+) -> Vec<u8> {
+    let file_size = payload.len();
+    let mut data = vec![0u8; (ELF_PH_OFF + ELF_PH_SIZE).max(offset + file_size)];
+    data[0] = 0x7f;
+    data[1] = b'E';
+    data[2] = b'L';
+    data[3] = b'F';
+    data[4] = 2;
+    data[5] = 1;
+    data[6] = 1;
+    write_u16_le(&mut data, 16, 2);
+    write_u16_le(&mut data, 18, 0x3e);
+    write_u32_le(&mut data, 20, 1);
+    write_u64_le(&mut data, 24, vaddr as u64);
+    write_u64_le(&mut data, 32, ELF_PH_OFF as u64);
+    write_u16_le(&mut data, 52, 64);
+    write_u16_le(&mut data, 54, ELF_PH_SIZE as u16);
+    write_u16_le(&mut data, 56, 1);
+
+    write_u32_le(&mut data, ELF_PH_OFF, 1);
+    write_u32_le(&mut data, ELF_PH_OFF + 4, flags);
+    write_u64_le(&mut data, ELF_PH_OFF + 8, offset as u64);
+    write_u64_le(&mut data, ELF_PH_OFF + 16, vaddr as u64);
+    write_u64_le(&mut data, ELF_PH_OFF + 24, vaddr as u64);
+    write_u64_le(&mut data, ELF_PH_OFF + 32, file_size as u64);
+    write_u64_le(&mut data, ELF_PH_OFF + 40, mem_size as u64);
+    write_u64_le(&mut data, ELF_PH_OFF + 48, PAGE_SZ as u64);
+    data[offset..offset + file_size].copy_from_slice(payload);
+    data
+}
+
+fn write_u16_le(data: &mut [u8], off: usize, value: u16) {
+    data[off..off + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32_le(data: &mut [u8], off: usize, value: u32) {
+    data[off..off + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64_le(data: &mut [u8], off: usize, value: u64) {
+    data[off..off + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 #[test]
@@ -406,6 +477,7 @@ fn fork_preserves_cloexec_and_epoll_state() {
 fn do_exec_commits_new_address_space_context_and_cloexec() {
     let kernel = Kernel::new(N_FRAMES);
     kernel.proc_init();
+    install_test_exec(&kernel, "/bin/next");
     let task = kernel.cur_task(0).expect("init should be current");
     let keep_fd = kernel
         .dispatch_syscall(SYS_OPEN, 0x2000, 0, 0, 0, 0, 0)
@@ -463,6 +535,11 @@ fn do_exec_commits_new_address_space_context_and_cloexec() {
             .lock()
             .unwrap()
             .contains_key(&0x0040_0000));
+        let mut payload = vec![0u8; TEST_EXEC_PAYLOAD.len()];
+        addr_space
+            .read_user_bytes(TEST_EXEC_ENTRY, &mut payload)
+            .expect("exec payload should be readable");
+        assert_eq!(payload, TEST_EXEC_PAYLOAD);
     }
     let sp = {
         let thd = task.thd_ctx.lock().unwrap();
@@ -520,9 +597,67 @@ fn do_exec_commits_new_address_space_context_and_cloexec() {
 
 #[test]
 // AGENT
+fn do_exec_loads_registered_elf_segment_bytes_and_zeroes_bss() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let payload = b"segment-bytes-cross-page";
+    let vaddr = TEST_EXEC_ENTRY + PAGE_SZ - 8;
+    let elf = elf_with_load_payload(
+        TEST_EXEC_LOAD_OFFSET + PAGE_SZ - 8,
+        vaddr,
+        payload,
+        payload.len() + 32,
+        0x5,
+    );
+    kernel
+        .install_exec_file("/bin/cross-page", elf)
+        .expect("test exec file should install");
+    let task = kernel.cur_task(0).expect("init should be current");
+
+    kernel
+        .do_exec(
+            1,
+            "/bin/cross-page",
+            vec![String::from("cross-page")],
+            Vec::new(),
+        )
+        .expect("exec should load registered ELF bytes");
+
+    {
+        let addr_space = task.addr_space.lock().unwrap();
+        let text = addr_space
+            .vm_map
+            .find(vaddr)
+            .expect("exec should map cross-page load segment");
+        assert_eq!(text.flags & VM_WRITE, 0);
+        assert_eq!(text.flags & VM_READ, VM_READ);
+        assert_eq!(text.flags & VM_EXEC, VM_EXEC);
+
+        let mut loaded = vec![0u8; payload.len()];
+        addr_space
+            .read_user_bytes(vaddr, &mut loaded)
+            .expect("loaded segment bytes should be readable");
+        assert_eq!(loaded, payload);
+
+        let mut bss = [0xffu8; 16];
+        addr_space
+            .read_user_bytes(vaddr + payload.len(), &mut bss)
+            .expect("bss tail should be readable");
+        assert_eq!(bss, [0u8; 16]);
+    }
+    {
+        let thd = task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_ref().expect("thread context should exist");
+        assert_eq!(ctx.uctx.ip, vaddr as u64);
+    }
+}
+
+#[test]
+// AGENT
 fn cloned_thread_observes_exec_token_from_shared_address_space() {
     let kernel = Kernel::new(N_FRAMES);
     kernel.proc_init();
+    install_test_exec(&kernel, "/bin/next");
     let task = kernel.cur_task(0).expect("init should be current");
     let old_token = task.vm_token();
     let thread_task = kernel
@@ -546,6 +681,7 @@ fn cloned_thread_observes_exec_token_from_shared_address_space() {
 fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
     let kernel = Kernel::new(N_FRAMES);
     kernel.proc_init();
+    install_test_exec(&kernel, "/bin/too-big");
     let task = kernel.cur_task(0).expect("init should be current");
     let close_fd = kernel
         .dispatch_syscall(SYS_OPEN, 0x4000, O_CLOEXEC, 0, 0, 0, 0)
@@ -602,9 +738,40 @@ fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
 
 #[test]
 // AGENT
+fn do_exec_rejects_unregistered_exec_file_without_commit() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    *task.exec_path.lock().unwrap() = String::from("/bin/old");
+    let old_token = task.vm_token();
+    {
+        let mut addr_space = task.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(0x5500_0000, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("old mapping should be created");
+    }
+
+    let err = kernel
+        .do_exec(1, "/bin/missing", vec![String::from("missing")], Vec::new())
+        .expect_err("unregistered exec image should fail");
+
+    assert_eq!(err, "enoent");
+    assert_eq!(&*task.exec_path.lock().unwrap(), "/bin/old");
+    assert_eq!(task.vm_token(), old_token);
+    let addr_space = task.addr_space.lock().unwrap();
+    assert!(addr_space.vm_map.find(0x5500_0000).is_some());
+    assert!(addr_space.vm_map.find(TEST_EXEC_ENTRY).is_none());
+}
+
+#[test]
+// AGENT
 fn syscall_exec_reads_user_memory_and_commits_do_exec() {
     let kernel = Kernel::new(N_FRAMES);
     kernel.proc_init();
+    install_test_exec(&kernel, "/bin/next");
     let task = kernel.cur_task(0).expect("init should be current");
     let close_fd = kernel
         .dispatch_syscall(SYS_OPEN, 0x6000, O_CLOEXEC, 0, 0, 0, 0)
