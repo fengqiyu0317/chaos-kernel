@@ -320,6 +320,47 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-23：kernel-sim exit 资源释放 RAII 化清理
+
+目标：在已拆分 exit/wait/reap 路径的基础上，降低手写字段清理列表的维护风险，让进程级退出资源释放更靠近 `ProcessState` 这个资源拥有者。
+
+已完成修改：
+
+- 新增 `ProcessState::release_exit_resources()`，集中释放进程级资源。
+- 对 `debug_fds`、`files`、`ep_inst`、`sig_queue`、`sem_ctx`、`shm_ctx` 使用 `mem::take`，对 `sig_state` 使用 `mem::replace`，让旧资源离开 `Mutex` 后再 drop。
+- `Task::release_process_exit_resources()` 保留为调用入口，但改为委托给 `ProcessState`。
+- 保留退出时 `futex.wake_all()` 和 `AddrSpace::release_all_pages()` 这两个必须显式触发的语义动作。
+- 已有 smoke 回归继续覆盖 exit 后 wait 前释放 fd、epoll、信号、IPC、futex waiter、用户页、线程上下文，并保留 zombie wait status。
+
+关键文件：
+
+- `kernel-sim/src/kernel/proc/task.rs`
+- `kernel-sim/src/kernel/core/kernel_ops.rs`
+- `kernel-sim/src/kernel/core/sync.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `39 passed`；完整 `cargo test` 通过 `tests/elf.rs` 的 `3 passed` 和 `tests/smoke.rs` 的 `39 passed`。
+
+未解决问题：
+
+- 当前 `sys_exit()` 仍等价于进程级退出，尚未区分单线程 `exit`、`exit_group`、`clear_child_tid` futex 写零/唤醒、robust futex owner 退出和线程组 leader wait 语义。
+- `kernel-sim` 尚未建模 per-process timer 集合，因此 exit 资源释放还没有取消 alarm / interval timer / POSIX timer。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
 ## 2026-06-23：kernel-sim 进程/线程状态边界重构
 
 目标：修复 `clone_thread` 后再由线程执行 `fork` 时的资源来源问题，把进程级状态和线程级状态从 `Task` 中拆清楚。

@@ -144,11 +144,22 @@ impl Kernel {
     }
 
     pub(crate) fn exit_task(&self, cpu: usize, task: &Arc<Task>, reason: ExitReason) {
-        if task.done() {
+        let thread_ids = task.process.threads.lock().unwrap().clone();
+        if !task.exit_proc(reason) {
             return;
         }
         let parent = task.process.parent.lock().unwrap().clone();
-        task.exit_proc(reason);
+        let process_owner = task.process.clone();
+        for tid in thread_ids {
+            if let Some(thread) = self.tasks.find(tid) {
+                if Arc::ptr_eq(&thread.process, &process_owner) {
+                    thread.release_thread_exit_resources();
+                    self.run_queue.remove(thread.id());
+                }
+            }
+        }
+        task.release_thread_exit_resources();
+        let _released_pages = task.release_process_exit_resources(&self.pool);
         self.tasks.reparent_children_to_init(task);
         self.run_queue.remove(task.id());
 

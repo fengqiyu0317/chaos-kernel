@@ -109,6 +109,38 @@ impl ProcessState {
     pub fn new_with_addr_space(addr_space: Arc<Mutex<AddrSpace>>) -> Arc<Self> {
         Arc::new(Self::new(addr_space))
     }
+
+    // AGENT: centralize process-owned teardown and take droppable values out of
+    // mutexes before releasing them.
+    pub fn release_exit_resources(&self, pool: &FramePool) -> usize {
+        let old_resources = (
+            take_mutex_default(&self.debug_fds),
+            take_mutex_default(&self.files),
+            take_mutex_default(&self.ep_inst),
+            take_mutex_default(&self.sig_queue),
+            replace_mutex_value(&self.sig_state, SigSet::new()),
+            take_mutex_default(&self.sem_ctx),
+            take_mutex_default(&self.shm_ctx),
+        );
+        let _woken_futex_waiters = self.futex.wake_all();
+        let released_pages = self.addr_space.lock().unwrap().release_all_pages(pool);
+        drop(old_resources);
+        released_pages
+    }
+}
+
+// AGENT: move an owned resource out from behind a Mutex so its Drop runs without
+// holding the mutex guard.
+fn take_mutex_default<T: Default>(slot: &Mutex<T>) -> T {
+    let mut guard = slot.lock().unwrap();
+    std::mem::take(&mut *guard)
+}
+
+// AGENT: replace a non-Default mutex value while still dropping the old value
+// outside the mutex guard.
+fn replace_mutex_value<T>(slot: &Mutex<T>, value: T) -> T {
+    let mut guard = slot.lock().unwrap();
+    std::mem::replace(&mut *guard, value)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,37 +272,15 @@ impl Task {
     pub fn get_futex(&self) -> Arc<FutexBucket> {
         self.process.futex.clone()
     }
-    pub fn exit_proc(&self, reason: ExitReason) {
-        let fk: Vec<usize> = {
-            let g = self.process.files.lock().unwrap();
-            g.keys().cloned().collect()
-        };
-        let _n_closed = {
-            let mut c = 0usize;
-            for k in fk.iter() {
-                let removed = self.process.files.lock().unwrap().remove(k);
-                if removed.is_some() {
-                    c += 1;
-                }
+    // AGENT: record process death once; resource teardown is driven by Kernel::exit_task.
+    pub fn exit_proc(&self, reason: ExitReason) -> bool {
+        {
+            let mut exit_reason = self.process.exit_reason.lock().unwrap();
+            if exit_reason.is_some() {
+                return false;
             }
-            c
-        };
-        let _fdt_audit = {
-            let fl = self.process.files.lock().unwrap();
-            let mut gaps = Vec::new();
-            let mut prev: Option<usize> = None;
-            for (&fd, _) in fl.iter() {
-                if let Some(p) = prev {
-                    if fd > p + 1 {
-                        for g in (p + 1)..fd {
-                            gaps.push(g);
-                        }
-                    }
-                }
-                prev = Some(fd);
-            }
-            gaps.len()
-        };
+            *exit_reason = Some(reason);
+        }
         {
             self.process.ev.lock().unwrap().set(EvFlag::PROC_QUIT);
         } // AGENT: use EvBus::set instead of manual inline
@@ -280,8 +290,18 @@ impl Task {
                 p.process.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
             } // AGENT: use EvBus::set instead of manual inline
         }
-        *self.process.exit_reason.lock().unwrap() = Some(reason);
-        self.process.threads.lock().unwrap().clear();
+        self.set_sched_state(TaskRunState::Zombie);
+        true
+    }
+    // AGENT: release per-process resources that no later wait status needs.
+    pub fn release_process_exit_resources(&self, pool: &FramePool) -> usize {
+        self.process.release_exit_resources(pool)
+    }
+    // AGENT: drop thread-private execution resources once the process is dead.
+    pub fn release_thread_exit_resources(&self) {
+        *self.sig_mask.lock().unwrap() = 0;
+        self.kstk.lock().unwrap().take();
+        self.thd_ctx.lock().unwrap().take();
         self.set_sched_state(TaskRunState::Zombie);
     }
     pub fn wait_status(&self) -> usize {
@@ -533,7 +553,17 @@ impl TaskTable {
                     }
                 }
             }
-            self.map.write().unwrap().remove(&id);
+            let thread_ids: Vec<usize> = t.process.threads.lock().unwrap().drain(..).collect();
+            let mut map = self.map.write().unwrap();
+            for tid in thread_ids {
+                let same_process = map
+                    .get(&tid)
+                    .is_some_and(|thread| Arc::ptr_eq(&thread.process, &t.process));
+                if same_process {
+                    map.remove(&tid);
+                }
+            }
+            map.remove(&id);
         }
     }
     pub fn reparent_children_to_init(&self, task: &Arc<Task>) {

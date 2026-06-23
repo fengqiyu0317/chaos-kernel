@@ -29,6 +29,7 @@
 - 2026-06-23：已用共享 `ProcessState` 重构 `kernel-sim` 的进程/线程边界；`clone_thread` 复用进程级状态，`fork_task` 为子进程复制新的 `ProcessState` 并从调用线程复制 `ThdCtx`/TLS/`clear_tid`/signal mask。回归测试：`fork_from_cloned_thread_uses_shared_process_state_and_thread_context`。
 - 2026-06-23：`kernel-sim` 已抽出统一进程退出路径：`sys_exit()` 委托 `Kernel::do_exit_current()`，分发层用 `SyscallOutcome::NoReturn` 避免把 exit 当普通成功返回处理；`ExitReason` 统一保存退出码/信号原因，`sys_wait4()` 复用 `Kernel::do_wait()`、按子进程关系筛选 zombie、写回 wait status 并完成 reap/reparent 闭环。
 - 2026-06-23：`kernel-sim` 的 exec 文件来源已从专用 `exec_files` 表改为共享 `FileNode` 路径文件表；`FHandle` 只保存 fd 状态并共享底层文件节点，`Kernel::read_file_for_exec()` 会检查 regular file、execute 权限并返回 ELF bytes 快照，新增 smoke 回归覆盖同一路径普通文件写入后 exec 加载更新内容，以及非 executable、目录、缺失路径、非法 ELF 失败时不破坏旧地址空间和 fd 表。
+- 2026-06-23：`kernel-sim` 的进程退出资源释放边界已拆开并收敛到资源拥有者：`Task::exit_proc()` 只负责首次记录退出原因、通知事件并置 zombie；`ProcessState::release_exit_resources()` 用 `mem::take` / `mem::replace` 取出 fd、epoll、pending signal、signal dispositions、IPC context 等进程资源并在锁外 drop，`Kernel::exit_task()` 在 wait 前释放用户地址空间页、futex waiters、内核栈和线程上下文；`TaskTable::reap()` 保留为 wait/reap 阶段删除 zombie 记录和同进程线程表项。
 
 ## 关键文件
 
@@ -42,7 +43,8 @@
 - `chaos/kernel-sim/src/kernel/fs/fs_misc.rs`：ELF header / `PT_LOAD` 解析和映射区域生成。
 - `chaos/kernel-sim/src/kernel/syscall/proc.rs`：`sys_exec()` 用户参数搬运、`sys_exit()`/`sys_wait4()` syscall 包装。
 - `chaos/kernel-sim/src/kernel/core/kernel_ops.rs`：`do_exec()`、统一退出路径、`do_wait()`。
-- `chaos/kernel-sim/src/kernel/proc/task.rs`：进程状态、退出原因、reap/reparent 辅助。
+- `chaos/kernel-sim/src/kernel/core/sync.rs`：futex wait queue 和进程退出时的 waiters 唤醒。
+- `chaos/kernel-sim/src/kernel/proc/task.rs`：进程状态、退出原因、进程/线程退出资源释放、reap/reparent 辅助。
 - `chaos/kernel-sim/tests/smoke.rs`：exec syscall、exit/wait 回归测试。
 - `chaos/kernel-sim/tests/elf.rs`：ELF segment alignment 回归测试。
 - `chaos/kernel/src/kernel.rs`：禁止修改的原始内核文件。
@@ -106,6 +108,17 @@ cargo test
 
 结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `38 passed`；完整 `cargo test` 通过 `tests/elf.rs` 的 `3 passed` 和 `tests/smoke.rs` 的 `38 passed`。
 
+本次 exit 资源释放边界拆分后执行过：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `39 passed`；完整 `cargo test` 通过 `tests/elf.rs` 的 `3 passed` 和 `tests/smoke.rs` 的 `39 passed`。
+
 迁移前在 `chaos/` 中执行过：
 
 ```bash
@@ -153,8 +166,8 @@ cargo test --test pressure
 ### important
 - TODO: `kernel-sim` 的 syscall 层 `sys_open` / `sys_read` / `sys_write` 仍未完整接入用户地址空间路径解析和真实 fd 数据搬运；当前统一 `FileNode` 已服务内核内部 `install_file()` / `write_file_at()` / `read_file_for_exec()` 和 `FHandle` 共享节点，后续可继续把 syscall 文件 I/O 接到同一套路径文件表。
 - TODO: `kernel-sim/src/kernel/fs/fs_misc.rs` 的 ELF 解析尚未校验 `e_entry` 是否位于用户地址范围内、是否落在某个已映射且带执行权限的 `PT_LOAD` 段中；后续应拒绝入口地址未映射或不可执行的畸形 ELF。
-- TODO: `kernel-sim` 的退出资源释放还不完整；`Task::exit_proc()` 已关闭 fd、设置事件、记录退出码并置 zombie，但没有释放用户地址空间页、内核栈、线程上下文、IPC/定时器/信号等进程私有状态，后续应把资源释放边界拆清楚：exit 时释放可立即释放的资源，wait/reap 时删除 zombie 保留记录。
-- TODO: `kernel-sim` 的线程退出语义仍是简化模型；`exit_proc()` 直接清空 `threads`，尚未区分 `exit`、`exit_group`、单线程退出、`clear_child_tid` futex 唤醒、robust futex owner 退出等真实线程组语义。
+- TODO: `kernel-sim` 的真实进程/线程退出语义仍是简化模型；当前 `sys_exit()` 等价于进程级退出并释放整组资源，尚未区分单线程 `exit`、`exit_group`、`clear_child_tid` futex 写零/唤醒、robust futex owner 退出、线程组 leader 与非 leader 的 wait 语义。
+- TODO: `kernel-sim` 尚未建模每进程 timer 集合，因此 exit 资源释放目前没有取消 per-process alarm / interval timer / POSIX timer；等 timer 状态挂到 `ProcessState` 后，需要纳入 `release_process_exit_resources()`。
 
 ## 不要改的部分
 

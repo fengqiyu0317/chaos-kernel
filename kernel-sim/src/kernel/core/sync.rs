@@ -606,6 +606,15 @@ impl FutexBucket {
         let mut w = self.waiters.lock().unwrap();
         Self::wake_locked(&mut w, addr, count)
     }
+    // AGENT: process exit wakes and removes every futex waiter owned by this bucket.
+    pub fn wake_all(&self) -> usize {
+        let mut w = self.waiters.lock().unwrap();
+        let count = w.len();
+        for waiter in w.drain(..) {
+            waiter.token.wake();
+        }
+        count
+    }
     pub fn wake_op(
         &self,
         addr: usize,

@@ -9,7 +9,7 @@ use kernel_sim::{
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TEST_EXEC_ENTRY: usize = 0x0040_0000;
 const TEST_EXEC_LOAD_OFFSET: usize = PAGE_SZ;
@@ -1392,6 +1392,147 @@ fn wait4_reaps_child_and_writes_exit_status() {
         .read_user_bytes(STATUS_ADDR, &mut status)
         .expect("wait status should be readable");
     assert_eq!(u32::from_ne_bytes(status), 7 << 8);
+}
+
+#[test]
+// AGENT
+fn exit_releases_process_resources_before_wait_reaps_zombie() {
+    const STATUS_ADDR: usize = 0x8000;
+    const CHILD_MAPPING: usize = 0x5900_0000;
+
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let parent = kernel.cur_task(0).expect("init should be current");
+    let child_id = kernel
+        .do_fork(parent.id())
+        .expect("fork should create child");
+    let child = kernel
+        .tasks
+        .find(child_id)
+        .expect("child should be registered");
+    let thread_task =
+        kernel
+            .tasks
+            .clone_thread(&child, (USR_STK_OFF + USR_STK_SZ) as u64, 0xabc, 0xdead);
+    let thread_id = thread_task.id();
+
+    {
+        let mut addr_space = child.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(CHILD_MAPPING, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("child mapping should be created");
+    }
+    child
+        .process
+        .debug_fds
+        .lock()
+        .unwrap()
+        .push(String::from("debug-fd"));
+    let sem = kernel
+        .get_sem(0x5150, 1, 0)
+        .expect("semaphore should be created");
+    child.process.sem_ctx.lock().unwrap().add(sem);
+    child
+        .process
+        .shm_ctx
+        .lock()
+        .unwrap()
+        .add(kernel.get_shm(0x6160, 1));
+
+    kernel.run_queue.remove(child_id);
+    kernel.run_queue.set_current(child_id);
+    kernel.set_cur(0, Some(child.clone()));
+    let _fd = kernel
+        .dispatch_syscall(SYS_OPEN, CHILD_MAPPING, 0, 0, 0, 0, 0)
+        .expect("child open should create a file descriptor");
+    let _epfd = kernel
+        .dispatch_syscall(SYS_EPOLL_CREATE, 4, 0, 0, 0, 0, 0)
+        .expect("child epoll instance should be created");
+    child.process.sig_state.lock().unwrap().sig_raise(SIGUSR1);
+    child.send_sig(SIGUSR1 as i32, -1);
+
+    let futex = child.get_futex();
+    let futex_word = Arc::new(AtomicU32::new(1));
+    let uaddr = futex_word.as_ref() as *const AtomicU32 as usize;
+    let waiter_futex = futex.clone();
+    let waiter_word = futex_word.clone();
+    let waiter = thread::spawn(move || {
+        waiter_futex.wait(uaddr, 1, waiter_word.as_ref(), Some(Duration::from_secs(5)))
+    });
+    let wait_until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < wait_until {
+        if futex.pending_at(uaddr) == 1 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(futex.pending_at(uaddr), 1);
+
+    let rss_before_exit = child.process.addr_space.lock().unwrap().rss_pages();
+    let free_before_exit = kernel.pool.free_count();
+    assert!(rss_before_exit > 0);
+    assert!(child.kstk.lock().unwrap().is_some());
+    assert!(child.thd_ctx.lock().unwrap().is_some());
+    assert!(thread_task.thd_ctx.lock().unwrap().is_some());
+
+    kernel
+        .dispatch_syscall(SYS_EXIT, 11, 0, 0, 0, 0, 0)
+        .expect("child exit should succeed");
+
+    assert!(waiter
+        .join()
+        .expect("futex waiter should not panic")
+        .is_ok());
+    assert!(child.done());
+    assert_eq!(child.wait_status(), 11 << 8);
+    assert_eq!(child.process.addr_space.lock().unwrap().rss_pages(), 0);
+    assert_eq!(kernel.pool.free_count(), free_before_exit + rss_before_exit);
+    assert!(child.process.debug_fds.lock().unwrap().is_empty());
+    assert!(child.process.files.lock().unwrap().is_empty());
+    assert!(child.process.ep_inst.lock().unwrap().is_empty());
+    assert!(child.process.sig_queue.lock().unwrap().is_empty());
+    assert_eq!(child.process.sig_state.lock().unwrap().pending, 0);
+    assert!(child.process.sem_ctx.lock().unwrap().arrays.is_empty());
+    assert!(child.process.shm_ctx.lock().unwrap().ids.is_empty());
+    assert_eq!(*child.sig_mask.lock().unwrap(), 0);
+    assert!(child.kstk.lock().unwrap().is_none());
+    assert!(child.thd_ctx.lock().unwrap().is_none());
+    assert!(thread_task.thd_ctx.lock().unwrap().is_none());
+    assert_eq!(futex.pending_at(uaddr), 0);
+    assert!(kernel.tasks.find(child_id).is_some());
+    assert!(kernel.tasks.find(thread_id).is_some());
+
+    {
+        let mut addr_space = parent.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(STATUS_ADDR, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("status page should map");
+    }
+    kernel.run_queue.set_current(parent.id());
+    kernel.set_cur(0, Some(parent.clone()));
+
+    let waited = kernel
+        .dispatch_syscall(SYS_WAIT4, child_id, STATUS_ADDR, 0, 0, 0, 0)
+        .expect("wait4 should reap the exited child");
+
+    assert_eq!(waited, child_id);
+    assert!(kernel.tasks.find(child_id).is_none());
+    assert!(kernel.tasks.find(thread_id).is_none());
+    let mut status = [0u8; 4];
+    parent
+        .process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(STATUS_ADDR, &mut status)
+        .expect("wait status should be readable");
+    assert_eq!(u32::from_ne_bytes(status), 11 << 8);
 }
 
 #[test]
