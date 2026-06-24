@@ -1,14 +1,15 @@
 // AGENT
 use kernel_sim::{
-    AddrSpace, EpData, EpEvent, ExitReason, FHandle, FLike, FdOpt, Kernel, PageTableEntry, PgFrame,
-    SchedulePolicy, Task, TaskRunState, TaskTable, VmRegion, AT_ENTRY, AT_PAGESZ, KERN_BASE,
-    MAP_PRIVATE, MAP_SHARED, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, PAGE_SZ, PROT_READ, PROT_WRITE,
-    SIGUSR1, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID,
-    SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, USR_STK_OFF,
-    USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    AddrSpace, EpData, EpEvent, ExitReason, FHandle, FLike, FdOpt, Kernel, PageBacking,
+    PageTableEntry, PgFrame, SchedulePolicy, Task, TaskRunState, TaskTable, VmRegion, AT_ENTRY,
+    AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, N_FRAMES, N_PROC, N_REGS,
+    O_CLOEXEC, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK, SYS_EPOLL_CREATE, SYS_EPOLL_CTL,
+    SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN,
+    SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED,
+    VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -598,6 +599,120 @@ fn munmap_rounds_length_up_to_pages() {
 }
 
 #[test]
+// AGENT: munmap releases last-reference resident pages back to the frame pool.
+fn munmap_returns_frames_to_pool() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    let free_before = kernel.pool.free_count();
+
+    let addr = kernel
+        .dispatch_syscall(
+            SYS_MMAP,
+            0,
+            PAGE_SZ * 2,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            0,
+            0,
+        )
+        .expect("anonymous mmap should allocate two pages");
+    assert_eq!(kernel.pool.free_count(), free_before - 2);
+
+    kernel
+        .dispatch_syscall(SYS_MUNMAP, addr, PAGE_SZ * 2, 0, 0, 0, 0)
+        .expect("munmap should release mapped pages");
+
+    assert_eq!(kernel.pool.free_count(), free_before);
+    assert!(task
+        .process
+        .addr_space
+        .lock()
+        .unwrap()
+        .vm_map
+        .find(addr)
+        .is_none());
+}
+
+#[test]
+// AGENT: failed MAP_SHARED writeback reports an error and leaves mappings intact.
+fn munmap_propagates_shared_writeback_error_without_unmapping() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    let base = 0x5600_0000;
+    let file_data = Arc::new(Mutex::new(vec![0; PAGE_SZ]));
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .vm_map
+            .insert(VmRegion::new(base, PAGE_SZ, VM_READ | VM_WRITE | VM_SHARED))
+            .expect("test mapping should not overlap");
+        let pte = PageTableEntry::with_backing(
+            70,
+            PgFrame::with_rc(1),
+            VM_READ | VM_WRITE | VM_SHARED,
+            PageBacking::File {
+                data: file_data,
+                offset: usize::MAX,
+                valid_len: PAGE_SZ,
+                shared: true,
+            },
+        );
+        pte.data.lock().unwrap()[0] = 1;
+        addr_space.page_table.lock().unwrap().insert(base, pte);
+    }
+
+    let err = kernel
+        .dispatch_syscall(SYS_MUNMAP, base, PAGE_SZ, 0, 0, 0, 0)
+        .expect_err("writeback overflow should fail munmap");
+
+    assert_eq!(err, "efault");
+    let addr_space = task.process.addr_space.lock().unwrap();
+    assert!(addr_space.vm_map.find(base).is_some());
+    let pte = addr_space
+        .page_table
+        .lock()
+        .unwrap()
+        .get(&base)
+        .expect("failed munmap should keep the PTE")
+        .clone();
+    assert_eq!(pte.frame.count(), 1);
+}
+
+#[test]
+// AGENT: shrinking brk uses unmap_range and returns heap pages to FramePool.
+fn brk_shrink_returns_frames_to_pool() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    let initial_brk = task.process.addr_space.lock().unwrap().vm_map.brk;
+    let free_before = kernel.pool.free_count();
+
+    let grown = kernel
+        .dispatch_syscall(SYS_BRK, initial_brk + PAGE_SZ * 2, 0, 0, 0, 0, 0)
+        .expect("brk should grow by two pages");
+    assert_eq!(grown, initial_brk + PAGE_SZ * 2);
+    assert_eq!(kernel.pool.free_count(), free_before - 2);
+
+    let shrunk = kernel
+        .dispatch_syscall(SYS_BRK, initial_brk + PAGE_SZ, 0, 0, 0, 0, 0)
+        .expect("brk should shrink by one page");
+    assert_eq!(shrunk, initial_brk + PAGE_SZ);
+    assert_eq!(kernel.pool.free_count(), free_before - 1);
+
+    let reset = kernel
+        .dispatch_syscall(SYS_BRK, initial_brk, 0, 0, 0, 0, 0)
+        .expect("brk should shrink back to the original break");
+    assert_eq!(reset, initial_brk);
+    assert_eq!(kernel.pool.free_count(), free_before);
+    assert_eq!(
+        task.process.addr_space.lock().unwrap().vm_map.brk,
+        initial_brk
+    );
+}
+
+#[test]
 // AGENT
 fn unmap_range_returns_unmapped_page_count_and_splits_region() {
     let kernel = Kernel::new(N_FRAMES);
@@ -625,7 +740,8 @@ fn unmap_range_returns_unmapped_page_count_and_splits_region() {
         .addr_space
         .lock()
         .unwrap()
-        .unmap_range(base + PAGE_SZ, PAGE_SZ);
+        .unmap_range(base + PAGE_SZ, PAGE_SZ, &kernel.pool)
+        .expect("direct unmap should succeed");
 
     let addr_space = task.process.addr_space.lock().unwrap();
     assert_eq!(unmapped, 1);

@@ -33,6 +33,7 @@
 - 2026-06-24：`kernel-sim` 的 `sys_mmap()` 已补齐基础 eager 文件映射：从 fd 文件内容装入页，区分 `MAP_PRIVATE` / `MAP_SHARED`，共享映射写回 `FileNode`，私有映射不写回，文件页尾零填充，并校验 fd、offset、prot/flags 与共享写权限。
 - 2026-06-24：`kernel-sim` 的文件映射路径已接到 `ProcessState.files` / `FHandle` / `FileNode`：`VmRegion::offset` 现在参与文件页内容来源，`PageTableEntry` 保存 file backing 元数据，`AddrSpace::write_user_bytes()` 会同步共享文件页。
 - 2026-06-24: `kernel-sim/src/kernel/syscall/mm.rs` 的 `sys_munmap()` 已补齐入口参数校验：`len == 0` 返回 `einval`，`len + PAGE_SZ - 1` 和 `addr + aligned_len` 使用 checked arithmetic，拒绝超过 `KERN_BASE` 的用户地址范围，并在无当前 task 时返回 `esrch`。
+- 2026-06-24：`kernel-sim` 的 `AddrSpace::unmap_range()` 已改为返回 `Result` 并接收 `FramePool`：先传播 `MAP_SHARED` 文件页 flush 错误，成功后再删除 VMA/PTE；最后一个 `PgFrame` 引用释放时归还 frame，`sys_munmap()`、`MAP_FIXED` 覆盖和 `brk` 收缩都复用该路径。新增 smoke 回归覆盖 munmap frame 回收、共享文件页写回错误传播、brk 收缩回收。
 
 ## 关键文件
 
@@ -184,6 +185,8 @@ cargo test --test pressure
 - TODO: `kernel-sim/src/kernel/syscall/proc.rs` 的 `sys_getpid()` / `sys_getppid()` 已返回 `ProcessState` 级 pid/parent pid，但无当前 task 时的兜底返回值仍是模拟器行为；后续若追求真实 syscall 语义，应去掉这种正常运行中不可达的 fallback，并配套覆盖 reparent、subreaper、PID namespace 等父进程语义。
 - TODO: `kernel-sim/src/kernel/syscall/proc.rs` 的 `sys_setpgid()` / `sys_getpgid()` 目前只维护单个 `ProcessState.pgid`，能支撑简化 `wait4`/`kill` 分组路径，但尚未校验同一 session、目标进程是否已 exec、pgid 是否对应合法进程组、完整 `EINVAL`/`EACCES`/`EPERM` 错误条件等真实 POSIX 规则。
 - TODO: `kernel-sim/src/kernel/syscall/proc.rs` 的 `sys_setsid()` 目前只是拒绝已有 process-group leader 后把 `pgid` 设为自身 pid；尚未引入权威 `sid/session` 字段、session leader 状态、控制终端脱离和 foreground process group 交互，因此不能视为完整 `setsid` 语义。
+- TODO: `kernel-sim` 的 `sys_mmap()` 参数校验仍可继续贴近真实 syscall：当前已校验非匿名映射 offset 页对齐、flags/prot 基本组合、`prot` 与文件打开权限、`len + addr` 溢出；后续仍需决定匿名映射 fd 兼容规则和更多 Linux mmap flags。
+- TODO: `kernel-sim` 的 `mmap` 目前仍是 eager 模型：匿名 `map_region()` 和文件 `map_file_region()` 都会立即为整个区间分配物理页；如果要靠近真实语义，需要改成先登记 VMA、缺页时再分配/装入页面，并配套覆盖 `fork` COW、`munmap`、文件共享页和 frame 回收测试。
 
 ### important
 - TODO: `kernel-sim` 的 syscall 层 `sys_open` / `sys_read` / `sys_write` 仍未完整接入用户地址空间路径解析和真实 fd 数据搬运；当前统一 `FileNode` 已服务内核内部 `install_file()` / `write_file_at()` / `read_file_for_exec()` 和 `FHandle` 共享节点，后续可继续把 syscall 文件 I/O 接到同一套路径文件表。
@@ -192,15 +195,10 @@ cargo test --test pressure
 - TODO: `sys_read()` 后续应把实际读到的字节通过当前进程 `AddrSpace::write_user_bytes()` 写入用户缓冲区，校验缓冲区是已映射且可写的用户页；不能只依赖 `check_access()` 的 `KERN_BASE` 粗略边界检查。
 - TODO: 为 `sys_read()` 增加 smoke 回归：覆盖 regular file 真实内容复制、offset 推进、EOF 返回 0、无效 fd 返回 `ebadf`、只写 fd 读返回 `ebadf`、未映射/只读用户缓冲区返回 `efault`、pipe 空读 / nonblock 路径和跨页 short read。
 - TODO: `kernel-sim` 的 `MAP_FIXED` / 重叠映射语义仍需继续完善；当前已支持页对齐 fixed 地址先拆除旧映射再建立新映射，但尚未区分 `MAP_FIXED_NOREPLACE`，也未实现失败回滚等完整真实语义。
-- TODO: `kernel-sim` 的 `sys_mmap()` 参数校验仍可继续贴近真实 syscall：当前已校验非匿名映射 offset 页对齐、flags/prot 基本组合、`prot` 与文件打开权限、`len + addr` 溢出；后续仍需决定匿名映射 fd 兼容规则和更多 Linux mmap flags。
-- TODO: `kernel-sim` 的 `mmap` 目前仍是 eager 模型：匿名 `map_region()` 和文件 `map_file_region()` 都会立即为整个区间分配物理页；如果要靠近真实语义，需要改成先登记 VMA、缺页时再分配/装入页面，并配套覆盖 `fork` COW、`munmap`、文件共享页和 frame 回收测试。
 - TODO: `kernel-sim/src/kernel/syscall/mm.rs` 的 `sys_brk()` 目前把请求地址向上页对齐后直接保存并返回；真实语义应区分字节级 program break 和页对齐的 heap 映射范围，`brk(0)`/成功返回也应反映未页对齐的当前 break。
 - TODO: `kernel-sim` 的 `brk` 失败返回仍是简化 `Err("enomem")` 模型；若模拟 raw Linux `brk` syscall，应在失败时返回原 current break，若模拟 libc `brk()` 包装，则需要明确转换为 `0/-1` 与 errno 的边界。
 - TODO: `kernel-sim` 尚未维护 `start_brk`/最小 break 与完整 heap VMA 边界；后续应防止 `brk` 收缩误删 ELF text/data/bss 或其他非 heap 映射，并处理 heap 与 mmap/stack/resource limit 冲突时的失败回滚。
-- TODO: `kernel-sim` 的 `brk` 增长目前通过 `resize_brk()` / `map_region()` eager 分配整段物理页；若贴近真实内核，应先登记 heap VMA、缺页时再分配页面，并增加未对齐增长/收缩、失败保持原 break、低于最小 break、与 mmap 碰撞、frame 回收的 smoke 回归。
-- TODO: `kernel-sim` 的 `munmap` 错误传播仍是简化模型；当前 `AddrSpace::unmap_range()` 只返回解除的 PTE 页数，`sys_munmap()` 丢弃该结果，`MAP_SHARED` 文件页 flush 错误也被吞掉，后续应让 unmap/writeback 失败能按 syscall 语义返回错误。
-- TODO: `kernel-sim/src/kernel/mm/address_space.rs` 的 `AddrSpace::unmap_range()` 删除 PTE 时只执行 `PgFrame::down()`，尚未在最后一个引用释放时把 frame 归还 `FramePool`；后续应补齐 `munmap`/`brk` 缩小时的物理页回收，并增加 `free_count` 回归覆盖。
-- TODO: 为 `sys_munmap()` 增加后续 smoke 回归：覆盖 `MAP_SHARED` 文件写回错误传播，以及 frame 回收到 `FramePool`。
+- TODO: `kernel-sim` 的 `brk` 增长目前通过 `resize_brk()` / `map_region()` eager 分配整段物理页；若贴近真实内核，应先登记 heap VMA、缺页时再分配页面，并增加未对齐增长/收缩、失败保持原 break、低于最小 break、与 mmap 碰撞等 smoke 回归。
 - TODO: `kernel-sim/src/kernel/fs/fs_misc.rs` 的 ELF 解析尚未校验 `e_entry` 是否位于用户地址范围内、是否落在某个已映射且带执行权限的 `PT_LOAD` 段中；后续应拒绝入口地址未映射或不可执行的畸形 ELF。
 - TODO: `kernel-sim` 的真实进程/线程退出语义仍是简化模型；当前 `sys_exit()` 等价于进程级退出并释放整组资源，尚未区分单线程 `exit`、`exit_group`、`clear_child_tid` futex 写零/唤醒、robust futex owner 退出、线程组 leader 与非 leader 的 wait 语义。
 - TODO: `kernel-sim` 的 `wait4` 仍是简化语义：无 `WNOHANG` 且存在匹配但未退出子进程时目前直接返回 `echild`，尚未实现阻塞等待、被信号中断返回、等待队列唤醒等真实行为。
@@ -259,7 +257,6 @@ cargo test --test pressure
 ### 未解决问题
 
 - 外部 `chaos-tests` 尚未通过，且其 `src/lib.rs` 是指向 `kernel/src/kernel.rs` 的符号链接；本轮按规则没有修改该禁改文件。
-- `unmap_range()` 仍只降低 `PgFrame` 引用计数，尚未把最后一个 frame id 归还 `FramePool`。
 
 ### 不要改的部分
 

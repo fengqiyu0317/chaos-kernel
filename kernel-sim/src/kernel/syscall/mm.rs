@@ -101,7 +101,7 @@ pub(super) fn sys_mmap(
     {
         let mut addr_space = task.process.addr_space.lock().unwrap();
         if map_fixed {
-            addr_space.unmap_range(result_addr, aligned_len);
+            addr_space.unmap_range(result_addr, aligned_len, &kernel.pool)?;
         }
         let region_offset = if map_anon { 0 } else { offset };
         let region = VmRegion::with_offset(result_addr, aligned_len, vm_flags, region_offset);
@@ -114,9 +114,8 @@ pub(super) fn sys_mmap(
     Ok(result_addr)
 }
 
-// AGENT: reject invalid munmap parameters before mutating address-space state.
-// AGENT TODO: propagate writeback/unmap errors and release last-reference
-// frames through FramePool.
+// AGENT: reject invalid munmap parameters before mutating address-space state,
+// then propagate unmap/writeback failures from the address-space layer.
 pub(super) fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let addr = a0;
     let len = a1;
@@ -133,7 +132,7 @@ pub(super) fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize,
         .addr_space
         .lock()
         .unwrap()
-        .unmap_range(addr, aligned_len);
+        .unmap_range(addr, aligned_len, &kernel.pool)?;
     Ok(0)
 }
 

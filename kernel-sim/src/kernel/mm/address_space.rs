@@ -102,6 +102,20 @@ impl PageTableEntry {
         let page = self.data.lock().unwrap();
         self.backing.flush_range(&page, 0, PAGE_SZ)
     }
+
+    // AGENT: drop one resident mapping reference and return the frame when it
+    // is no longer shared by another PTE.
+    fn release_frame_ref(&self, pool: &FramePool) -> bool {
+        if self.frame.count() == 0 {
+            return false;
+        }
+        let prev = self.frame.down();
+        if prev == 1 {
+            pool.put(self.frame_id);
+            return true;
+        }
+        false
+    }
 }
 
 pub struct AddrSpace {
@@ -292,10 +306,15 @@ impl AddrSpace {
         Ok(())
     }
 
-    // AGENT: unmapping flushes resident shared file-backed pages before removal.
-    pub fn unmap_range(&mut self, start: usize, len: usize) -> usize {
-        let end = start + len;
-        self.vm_map.remove_range(start, len);
+    // AGENT: unmapping flushes resident shared file-backed pages before
+    // removing mappings, and returns last-reference frames to FramePool.
+    pub fn unmap_range(
+        &mut self,
+        start: usize,
+        len: usize,
+        pool: &FramePool,
+    ) -> Result<usize, &'static str> {
+        let end = start.checked_add(len).ok_or("efault")?;
         let mut pt = self.page_table.lock().unwrap();
         let pages_to_unmap: Vec<usize> = pt
             .keys()
@@ -303,12 +322,17 @@ impl AddrSpace {
             .copied()
             .collect();
         for addr in &pages_to_unmap {
-            if let Some(pte) = pt.remove(addr) {
-                let _ = pte.flush_shared_file_page();
-                pte.frame.down();
+            if let Some(pte) = pt.get(addr) {
+                pte.flush_shared_file_page()?;
             }
         }
-        pages_to_unmap.len()
+        self.vm_map.remove_range(start, len);
+        for addr in &pages_to_unmap {
+            if let Some(pte) = pt.remove(addr) {
+                pte.release_frame_ref(pool);
+            }
+        }
+        Ok(pages_to_unmap.len())
     }
 
     // AGENT: process teardown flushes shared file-backed pages before dropping frames.
@@ -326,12 +350,7 @@ impl AddrSpace {
                 continue;
             }
             let _ = pte.flush_shared_file_page();
-            if pte.frame.count() == 0 {
-                continue;
-            }
-            let prev = pte.frame.down();
-            if prev == 1 {
-                pool.put(pte.frame_id);
+            if pte.release_frame_ref(pool) {
                 released += 1;
             }
         }
@@ -495,7 +514,7 @@ impl AddrSpace {
     pub fn resize_brk(&mut self, new_brk: usize, pool: &FramePool) -> Result<(), &'static str> {
         let old_brk = self.vm_map.brk;
         if new_brk < old_brk {
-            self.unmap_range(new_brk, old_brk - new_brk);
+            self.unmap_range(new_brk, old_brk - new_brk, pool)?;
         } else if new_brk > old_brk {
             let heap = VmRegion::new(old_brk, new_brk - old_brk, VM_READ | VM_WRITE);
             self.map_region(heap, pool)?;

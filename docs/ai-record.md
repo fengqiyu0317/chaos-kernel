@@ -228,6 +228,62 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-24：kernel-sim munmap 回收与错误传播
+
+### 目标
+
+补齐 `kernel-sim` 中 `munmap` / `unmap_range` 的资源释放语义：解除映射时不再只降低 `PgFrame` 引用计数，而是在最后一个引用释放时归还 `FramePool`；同时让 `MAP_SHARED` 文件页写回错误能向 syscall 层传播，避免失败时已经删除 VMA/PTE。
+
+### 已完成修改
+
+- `PageTableEntry` 新增释放 resident frame 引用的辅助路径，最后一个引用释放时调用 `FramePool::put()` 回收 frame。
+- `AddrSpace::unmap_range()` 改为接收 `FramePool` 并返回 `Result<usize, &'static str>`：先 flush 共享文件页，全部成功后再删除 VMA/PTE 并回收 frame。
+- `sys_munmap()`、`MAP_FIXED` 覆盖路径和 `resize_brk()` 收缩路径都改为传播 `unmap_range()` 的错误结果。
+- 新增 smoke 回归覆盖 `munmap` frame 回收、共享文件页写回错误不删除映射、`brk` 收缩归还 heap page。
+- `TASK.md` 已把完成项移入“已完成修改”，并保留 eager mmap、更多 flags、brk 真实语义等后续 TODO。
+
+### 关键文件
+
+- `kernel-sim/src/kernel/mm/address_space.rs`
+- `kernel-sim/src/kernel/syscall/mm.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+- `docs/ai-record.md`
+
+### 测试结果
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `48 passed`；完整 `cargo test` 通过，其中 `tests/elf.rs` 为 `3 passed`，`tests/smoke.rs` 为 `48 passed`。
+
+补充检查：
+
+```bash
+git diff --check
+```
+
+结果：通过。
+
+### 未解决问题
+
+- `mmap` / `brk` 仍是 eager 分配模型，尚未实现真实内核式 VMA 先登记、缺页时再分配或装入页面。
+- `MAP_FIXED_NOREPLACE`、更多 Linux mmap flags、匿名映射 fd 兼容规则等仍在 `TASK.md` 中作为后续 TODO。
+- 外部 `chaos-tests` 仍指向禁改的 `kernel/src/kernel.rs`，本轮未修改该路径。
+
+### 不要改的部分
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
+### 来源
+
+- 当前 Codex 对话与本轮实际 `git diff` / 测试输出。
+
 ## 2026-06-24：kernel-sim mmap 文件映射基础语义
 
 目标：补齐 `kernel-sim` 中 `sys_mmap()` 的基础文件映射行为，让 mmap 能从 fd 对应的普通文件装入页内容，并区分 `MAP_PRIVATE` 与 `MAP_SHARED` 的写回语义。
