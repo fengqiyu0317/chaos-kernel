@@ -89,6 +89,16 @@ pub const VM_DONTCOPY: u32 = 0x20;
 pub const VM_HUGETLB: u32 = 0x40;
 pub const VM_PFNMAP: u32 = 0x80;
 
+// AGENT: mmap/prot constants used by syscall validation and tests.
+pub const PROT_READ: usize = 0x1;
+pub const PROT_WRITE: usize = 0x2;
+pub const PROT_EXEC: usize = 0x4;
+pub const MAP_SHARED: usize = 0x01;
+pub const MAP_PRIVATE: usize = 0x02;
+pub const MAP_FIXED: usize = 0x10;
+pub const MAP_ANONYMOUS: usize = 0x20;
+pub const MAP_ANON: usize = MAP_ANONYMOUS;
+
 pub const CAP_CHOWN: u32 = 0;
 pub const CAP_KILL: u32 = 5;
 pub const CAP_SETUID: u32 = 7;

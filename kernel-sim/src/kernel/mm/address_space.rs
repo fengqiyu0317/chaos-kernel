@@ -1,11 +1,57 @@
 // AGENT
 use super::*;
 
+// AGENT: record whether a resident user page is anonymous or backed by a file.
+#[derive(Clone)]
+pub enum PageBacking {
+    Anonymous,
+    File {
+        data: Arc<Mutex<Vec<u8>>>,
+        offset: usize,
+        valid_len: usize,
+        shared: bool,
+    },
+}
+
+impl PageBacking {
+    // AGENT: flush MAP_SHARED page bytes back into the valid file-backed range.
+    fn flush_range(&self, page: &[u8], page_off: usize, len: usize) -> Result<(), &'static str> {
+        let PageBacking::File {
+            data,
+            offset,
+            valid_len,
+            shared,
+        } = self
+        else {
+            return Ok(());
+        };
+        if !*shared || page_off >= *valid_len || page_off >= PAGE_SZ {
+            return Ok(());
+        }
+        let page_end = min(PAGE_SZ, page_off.checked_add(len).ok_or("efault")?);
+        let valid_end = min(*valid_len, page_end);
+        if valid_end <= page_off {
+            return Ok(());
+        }
+        let copy_len = valid_end - page_off;
+        let file_start = offset.checked_add(page_off).ok_or("efault")?;
+        let file_end = file_start.checked_add(copy_len).ok_or("efault")?;
+        let mut file = data.lock().unwrap();
+        if file_end > file.len() {
+            file.resize(file_end, 0);
+        }
+        file[file_start..file_end].copy_from_slice(&page[page_off..valid_end]);
+        Ok(())
+    }
+}
+
+// AGENT: page-table entries now carry backing metadata for mmap writeback.
 #[derive(Clone)]
 pub struct PageTableEntry {
     pub frame_id: usize,
     pub frame: PgFrame,
     pub data: Arc<Mutex<Vec<u8>>>,
+    pub backing: PageBacking,
     pub flags: u32,
     pub writable: bool,
     pub cow: bool,
@@ -13,11 +59,18 @@ pub struct PageTableEntry {
 }
 
 impl PageTableEntry {
+    // AGENT: default page-table entries are anonymous zero-filled pages.
     pub fn new(frame_id: usize, frame: PgFrame, flags: u32) -> Self {
+        Self::with_backing(frame_id, frame, flags, PageBacking::Anonymous)
+    }
+
+    // AGENT: allow mmap to seed resident pages with file backing metadata.
+    pub fn with_backing(frame_id: usize, frame: PgFrame, flags: u32, backing: PageBacking) -> Self {
         Self {
             frame_id,
             frame,
             data: Arc::new(Mutex::new(vec![0; PAGE_SZ])),
+            backing,
             flags,
             writable: flags & VM_WRITE != 0,
             cow: false,
@@ -42,6 +95,12 @@ impl PageTableEntry {
     fn set_flags(&mut self, flags: u32) {
         self.flags = flags;
         self.writable = flags & VM_WRITE != 0 && !self.cow;
+    }
+
+    // AGENT: flush a full resident page before unmap or address-space teardown.
+    fn flush_shared_file_page(&self) -> Result<(), &'static str> {
+        let page = self.data.lock().unwrap();
+        self.backing.flush_range(&page, 0, PAGE_SZ)
     }
 }
 
@@ -188,6 +247,7 @@ impl AddrSpace {
         Ok(usize::from_ne_bytes(bytes))
     }
 
+    // AGENT: user writes to MAP_SHARED file pages are reflected in FileNode data.
     pub fn write_user_bytes(
         &mut self,
         addr: usize,
@@ -216,21 +276,23 @@ impl AddrSpace {
             if need_cow {
                 self.handle_cow_fault(cur, pool).map_err(|_| "efault")?;
             }
-            let page_data = {
+            let (page_data, backing) = {
                 let pt = self.page_table.lock().unwrap();
                 let pte = pt.get(&page_addr).ok_or("efault")?;
                 if !pte.present || !pte.writable {
                     return Err("efault");
                 }
-                pte.data.clone()
+                (pte.data.clone(), pte.backing.clone())
             };
             let mut page = page_data.lock().unwrap();
             page[page_off..page_off + chunk].copy_from_slice(&src[written..written + chunk]);
+            backing.flush_range(&page, page_off, chunk)?;
             written += chunk;
         }
         Ok(())
     }
 
+    // AGENT: unmapping flushes resident shared file-backed pages before removal.
     pub fn unmap_range(&mut self, start: usize, len: usize) -> usize {
         let end = start + len;
         self.vm_map.remove_range(start, len);
@@ -242,12 +304,14 @@ impl AddrSpace {
             .collect();
         for addr in &pages_to_unmap {
             if let Some(pte) = pt.remove(addr) {
+                let _ = pte.flush_shared_file_page();
                 pte.frame.down();
             }
         }
         pages_to_unmap.len()
     }
 
+    // AGENT: process teardown flushes shared file-backed pages before dropping frames.
     pub fn release_all_pages(&mut self, pool: &FramePool) -> usize {
         self.vm_map.regions.clear();
         let entries: Vec<PageTableEntry> = {
@@ -261,6 +325,7 @@ impl AddrSpace {
             if !pte.present {
                 continue;
             }
+            let _ = pte.flush_shared_file_page();
             if pte.frame.count() == 0 {
                 continue;
             }
@@ -354,6 +419,75 @@ impl AddrSpace {
                 page_addr,
                 PageTableEntry::new(frame_id, PgFrame::with_rc(1), flags),
             );
+        }
+        Ok(())
+    }
+
+    // AGENT: create resident file-backed mmap pages, preserving private snapshots
+    // and shared writeback metadata for each page.
+    pub fn map_file_region(
+        &mut self,
+        region: VmRegion,
+        file_data: Arc<Mutex<Vec<u8>>>,
+        shared: bool,
+        pool: &FramePool,
+    ) -> Result<(), &'static str> {
+        if region.base % PAGE_SZ != 0 || region.len % PAGE_SZ != 0 || region.offset % PAGE_SZ != 0 {
+            return Err("einval");
+        }
+        let flags = region.flags;
+        let file_base = region.offset;
+        let pages: Vec<usize> = page_range(region.base, region.len).collect();
+        let mut file_offsets = Vec::with_capacity(pages.len());
+        for idx in 0..pages.len() {
+            let delta = idx.checked_mul(PAGE_SZ).ok_or("einval")?;
+            file_offsets.push(file_base.checked_add(delta).ok_or("einval")?);
+        }
+
+        let mut allocated = Vec::with_capacity(pages.len());
+        for _ in pages.iter() {
+            match pool.get_inner() {
+                Some(frame_id) => allocated.push(frame_id),
+                None => {
+                    for frame_id in allocated {
+                        pool.put(frame_id);
+                    }
+                    return Err("enomem");
+                }
+            }
+        }
+
+        let file_snapshot = file_data.lock().unwrap().clone();
+        if let Err(err) = self.vm_map.insert(region) {
+            for frame_id in allocated {
+                pool.put(frame_id);
+            }
+            return Err(err);
+        }
+
+        let mut pt = self.page_table.lock().unwrap();
+        for ((page_addr, frame_id), file_offset) in pages
+            .into_iter()
+            .zip(allocated.into_iter())
+            .zip(file_offsets.into_iter())
+        {
+            let valid_len = if file_offset < file_snapshot.len() {
+                min(PAGE_SZ, file_snapshot.len() - file_offset)
+            } else {
+                0
+            };
+            let backing = PageBacking::File {
+                data: file_data.clone(),
+                offset: file_offset,
+                valid_len,
+                shared,
+            };
+            let pte = PageTableEntry::with_backing(frame_id, PgFrame::with_rc(1), flags, backing);
+            if valid_len > 0 {
+                pte.data.lock().unwrap()[..valid_len]
+                    .copy_from_slice(&file_snapshot[file_offset..file_offset + valid_len]);
+            }
+            pt.insert(page_addr, pte);
         }
         Ok(())
     }

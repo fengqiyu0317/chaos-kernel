@@ -1,6 +1,6 @@
 # Chaos AI 工作日志
 
-更新时间：2026-06-19
+更新时间：2026-06-24
 
 ## 维护约定
 
@@ -227,6 +227,52 @@ cargo test
 
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
+## 2026-06-24：kernel-sim mmap 文件映射基础语义
+
+目标：补齐 `kernel-sim` 中 `sys_mmap()` 的基础文件映射行为，让 mmap 能从 fd 对应的普通文件装入页内容，并区分 `MAP_PRIVATE` 与 `MAP_SHARED` 的写回语义。
+
+已完成修改：
+
+- `sys_mmap()` 校验 `prot` / `flags`、页对齐 offset、`MAP_SHARED` 与 `MAP_PRIVATE` 互斥、`MAP_FIXED` 地址合法性和用户地址空间上界。
+- `FHandle::mmap()` 增加 regular file mmap 准入检查，拒绝非法范围、非普通文件、pipe 和不可读 fd。
+- `AddrSpace` 新增文件页 backing 元数据，`map_file_region()` 创建 eager 文件映射页并保存文件偏移、有效长度和 shared/private 属性。
+- `write_user_bytes()`、`unmap_range()`、`release_all_pages()` 会把 `MAP_SHARED` 文件页的有效文件范围写回底层 `FileNode`；`MAP_PRIVATE` 映射只保留私有快照，不写回文件。
+- 新增 smoke 回归覆盖私有文件映射不写回、共享文件映射写回且不扩展 EOF 后页尾、offset 对齐和 shared writable fd 权限检查。
+
+关键文件：
+
+- `kernel-sim/src/kernel/syscall/mm.rs`
+- `kernel-sim/src/kernel/mm/address_space.rs`
+- `kernel-sim/src/kernel/fs/fd.rs`
+- `kernel-sim/src/kernel/core/prelude.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+git diff --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`git diff --check` 通过；`cargo test --test smoke` 通过 `42 passed`；完整 `cargo test` 通过 `tests/elf.rs` 的 `3 passed` 和 `tests/smoke.rs` 的 `42 passed`。
+
+未解决问题：
+
+- `mmap` 仍是 eager 模型，尚未改成真实系统常见的 VMA 登记加缺页装入。
+- `MAP_FIXED_NOREPLACE`、失败回滚、更多 Linux mmap flags 和匿名映射 fd 兼容规则仍待完善。
+- `sys_read()` 等 syscall 文件 I/O 仍未完整接入 `ProcessState.files` 与用户缓冲区真实拷贝。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
+来源：当前 Codex 会话、`git diff` 和本轮本地测试结果。
 
 ## 2026-06-23：kernel-sim exec 文件来源重构
 

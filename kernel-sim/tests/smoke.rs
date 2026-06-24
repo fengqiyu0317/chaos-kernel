@@ -1,10 +1,11 @@
 // AGENT
 use kernel_sim::{
-    AddrSpace, EpData, EpEvent, ExitReason, FLike, Kernel, PageTableEntry, PgFrame, SchedulePolicy,
-    Task, TaskRunState, TaskTable, VmRegion, AT_ENTRY, AT_PAGESZ, N_FRAMES, N_PROC, N_REGS,
-    O_CLOEXEC, PAGE_SZ, SIGUSR1, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK,
-    SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4,
-    USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    AddrSpace, EpData, EpEvent, ExitReason, FHandle, FLike, FdOpt, Kernel, PageTableEntry, PgFrame,
+    SchedulePolicy, Task, TaskRunState, TaskTable, VmRegion, AT_ENTRY, AT_PAGESZ, MAP_PRIVATE,
+    MAP_SHARED, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1,
+    SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL,
+    SYS_MMAP, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, USR_STK_OFF, USR_STK_SZ, VM_EXEC,
+    VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
@@ -376,6 +377,144 @@ fn cow_write_fault_copies_child_page_and_keeps_parent_shared() {
     assert!(parent_pte.cow);
     assert!(!parent_pte.writable);
     assert_eq!(parent_pte.frame.count(), 1);
+}
+
+#[test]
+// AGENT: MAP_PRIVATE file mmap loads file bytes but does not write changes back.
+fn mmap_private_file_mapping_does_not_write_back() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    let handle = FHandle::with_data(
+        "private-map",
+        FdOpt {
+            rd: true,
+            wr: false,
+            ap: false,
+            nb: false,
+        },
+        b"abcdef".to_vec(),
+    );
+    let file_data = handle.inode_ref();
+    let fd = task.add_file(FLike::File(handle));
+
+    let addr = kernel
+        .dispatch_syscall(
+            SYS_MMAP,
+            0,
+            PAGE_SZ,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE,
+            fd,
+            0,
+        )
+        .expect("private file mmap should succeed with a readable fd");
+    {
+        let addr_space = task.process.addr_space.lock().unwrap();
+        let mut loaded = [0u8; 8];
+        addr_space
+            .read_user_bytes(addr, &mut loaded)
+            .expect("mapped private bytes should be readable");
+        assert_eq!(&loaded[..6], b"abcdef");
+        assert_eq!(&loaded[6..], &[0, 0]);
+    }
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .write_user_bytes(addr + 1, b"ZZ", &kernel.pool)
+            .expect("private mapping should be writable");
+    }
+
+    assert_eq!(&*file_data.lock().unwrap(), b"abcdef");
+}
+
+#[test]
+// AGENT: MAP_SHARED file mmap writes through only the file-backed part of pages.
+fn mmap_shared_file_mapping_writes_back_without_extending_tail() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    let handle = FHandle::with_data(
+        "shared-map",
+        FdOpt {
+            rd: true,
+            wr: true,
+            ap: false,
+            nb: false,
+        },
+        b"abcde".to_vec(),
+    );
+    let file_data = handle.inode_ref();
+    let fd = task.add_file(FLike::File(handle));
+
+    let addr = kernel
+        .dispatch_syscall(
+            SYS_MMAP,
+            0,
+            PAGE_SZ * 2,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            fd,
+            0,
+        )
+        .expect("shared writable file mmap should succeed with an rdwr fd");
+    {
+        let addr_space = task.process.addr_space.lock().unwrap();
+        let mut loaded = [0xFFu8; 8];
+        addr_space
+            .read_user_bytes(addr, &mut loaded)
+            .expect("shared mapping should be readable");
+        assert_eq!(&loaded[..5], b"abcde");
+        assert_eq!(&loaded[5..], &[0, 0, 0]);
+    }
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .write_user_bytes(addr + 1, b"YY", &kernel.pool)
+            .expect("shared mapping should write back inside file");
+        addr_space
+            .write_user_bytes(addr + PAGE_SZ, b"tail", &kernel.pool)
+            .expect("zero-filled page beyond EOF stays writable in memory");
+    }
+
+    assert_eq!(&*file_data.lock().unwrap(), b"aYYde");
+}
+
+#[test]
+// AGENT: file mmap rejects unaligned offsets and shared writable mappings on read-only fds.
+fn mmap_file_mapping_validates_offset_and_shared_write_permissions() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    let handle = FHandle::with_data(
+        "readonly-map",
+        FdOpt {
+            rd: true,
+            wr: false,
+            ap: false,
+            nb: false,
+        },
+        b"page".to_vec(),
+    );
+    let fd = task.add_file(FLike::File(handle));
+
+    let bad_offset = kernel
+        .dispatch_syscall(SYS_MMAP, 0, PAGE_SZ, PROT_READ, MAP_PRIVATE, fd, 1)
+        .expect_err("file mmap offset must be page-aligned");
+    assert_eq!(bad_offset, "einval");
+
+    let bad_write = kernel
+        .dispatch_syscall(
+            SYS_MMAP,
+            0,
+            PAGE_SZ,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            fd,
+            0,
+        )
+        .expect_err("shared writable mmap requires a writable fd");
+    assert_eq!(bad_write, "eacces");
 }
 
 #[test]

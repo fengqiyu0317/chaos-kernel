@@ -1,6 +1,7 @@
 // AGENT
 use super::*;
 
+// AGENT: validate mmap flags/protections and route anonymous versus file-backed mappings.
 pub(super) fn sys_mmap(
     kernel: &Kernel,
     a0: usize,
@@ -19,29 +20,44 @@ pub(super) fn sys_mmap(
     if len == 0 {
         return Err("einval");
     }
-    let aligned_len = (len + PAGE_SZ - 1) & !(PAGE_SZ - 1);
-    let aligned_off = offset & !(PAGE_SZ - 1);
-    let _map_anon = (flags & 0x20) != 0;
-    let _map_fixed = (flags & 0x10) != 0;
-    let _map_private = (flags & 0x01) != 0;
-    let _map_shared = (flags & 0x02) != 0;
+    let aligned_len = len.checked_add(PAGE_SZ - 1).ok_or("enomem")? & !(PAGE_SZ - 1);
+    let known_prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+    if prot & !known_prot != 0 {
+        return Err("einval");
+    }
+    let known_flags = MAP_SHARED | MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS;
+    if flags & !known_flags != 0 {
+        return Err("einval");
+    }
+    let map_anon = (flags & MAP_ANONYMOUS) != 0;
+    let map_fixed = (flags & MAP_FIXED) != 0;
+    let map_shared = (flags & MAP_SHARED) != 0;
+    let map_private = (flags & MAP_PRIVATE) != 0;
+    if map_shared && map_private {
+        return Err("einval");
+    }
+    let effective_shared = map_shared;
     let mut vm_flags: u32 = 0;
-    if prot & 0x1 != 0 {
+    if prot & PROT_READ != 0 {
         vm_flags |= VM_READ;
     }
-    if prot & 0x2 != 0 {
+    if prot & PROT_WRITE != 0 {
         vm_flags |= VM_WRITE;
     }
-    if prot & 0x4 != 0 {
+    if prot & PROT_EXEC != 0 {
         vm_flags |= VM_EXEC;
     }
-    if _map_shared {
+    if effective_shared {
         vm_flags |= VM_SHARED;
     }
-    let cur_task = kernel.cur_task(0);
-    let result_addr = if addr != 0 && _map_fixed {
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    let result_addr = if map_fixed {
+        if addr == 0 || addr % PAGE_SZ != 0 {
+            return Err("einval");
+        }
+        addr.checked_add(aligned_len).ok_or("enomem")?;
         addr
-    } else if let Some(task) = cur_task.as_ref() {
+    } else {
         task.process
             .addr_space
             .lock()
@@ -49,24 +65,51 @@ pub(super) fn sys_mmap(
             .vm_map
             .find_free(aligned_len, PAGE_SZ)
             .ok_or("enomem")?
-    } else {
-        let base = 0x7000_0000usize;
-        let slot =
-            (CLK.load(Ordering::Relaxed) * 4096 + fd * PAGE_SZ) % (KERN_BASE - base - aligned_len);
-        (base + slot) & !(PAGE_SZ - 1)
     };
+    let result_end = result_addr.checked_add(aligned_len).ok_or("enomem")?;
+    if result_end > KERN_BASE {
+        return Err("enomem");
+    }
     let pages_needed = aligned_len / PAGE_SZ;
     let _avail = kernel.pool.free_count();
     if _avail < pages_needed {
         return Err("enomem");
     }
-    if !_map_anon && aligned_off > aligned_len {
-        return Err("einval");
-    }
-    if let Some(task) = cur_task {
+    let file_backing = if map_anon {
+        if offset != 0 {
+            return Err("einval");
+        }
+        None
+    } else {
+        if offset % PAGE_SZ != 0 {
+            return Err("einval");
+        }
+        let fl = task.get_file(fd).ok_or("ebadf")?;
+        let FLike::File(fh) = fl else {
+            return Err("enodev");
+        };
+        fh.mmap(result_addr, result_end, offset)?;
+        let opt = fh.get_opt();
+        if !opt.rd {
+            return Err("eacces");
+        }
+        if effective_shared && (prot & PROT_WRITE != 0) && !opt.wr {
+            return Err("eacces");
+        }
+        Some(fh)
+    };
+    {
         let mut addr_space = task.process.addr_space.lock().unwrap();
-        let region = VmRegion::with_offset(result_addr, aligned_len, vm_flags, aligned_off);
-        addr_space.map_region(region, &kernel.pool)?;
+        if map_fixed {
+            addr_space.unmap_range(result_addr, aligned_len);
+        }
+        let region_offset = if map_anon { 0 } else { offset };
+        let region = VmRegion::with_offset(result_addr, aligned_len, vm_flags, region_offset);
+        if let Some(fh) = file_backing {
+            addr_space.map_file_region(region, fh.inode_ref(), effective_shared, &kernel.pool)?;
+        } else {
+            addr_space.map_region(region, &kernel.pool)?;
+        }
     }
     Ok(result_addr)
 }
