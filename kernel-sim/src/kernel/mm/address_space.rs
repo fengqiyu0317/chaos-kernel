@@ -255,6 +255,74 @@ impl AddrSpace {
         Ok(())
     }
 
+    // AGENT: report the contiguous readable prefix of a user buffer so syscalls
+    // can return short I/O instead of faulting after partial progress.
+    pub fn readable_user_prefix_len(&self, addr: usize, len: usize) -> Result<usize, &'static str> {
+        self.accessible_user_prefix_len(addr, len, VM_READ)
+    }
+
+    // AGENT: report the contiguous writable prefix of a user buffer; COW pages
+    // count as writable because write_user_bytes can resolve them later.
+    pub fn writable_user_prefix_len(&self, addr: usize, len: usize) -> Result<usize, &'static str> {
+        self.accessible_user_prefix_len(addr, len, VM_WRITE)
+    }
+
+    // AGENT: shared prefix scanner for syscall copy-in/copy-out validation.
+    fn accessible_user_prefix_len(
+        &self,
+        addr: usize,
+        len: usize,
+        required: u32,
+    ) -> Result<usize, &'static str> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let end = Self::checked_user_end(addr, len)?;
+        let mut checked = 0usize;
+        while checked < len {
+            let cur = addr + checked;
+            let Some(region) = self.vm_map.find(cur) else {
+                return if checked == 0 {
+                    Err("efault")
+                } else {
+                    Ok(checked)
+                };
+            };
+            if region.flags & required == 0 {
+                return if checked == 0 {
+                    Err("efault")
+                } else {
+                    Ok(checked)
+                };
+            }
+            let page_addr = cur & !(PAGE_SZ - 1);
+            let page_off = cur & (PAGE_SZ - 1);
+            let chunk = min(end - cur, min(PAGE_SZ - page_off, region.end() - cur));
+            let page_accessible = {
+                let pt = self.page_table.lock().unwrap();
+                match pt.get(&page_addr) {
+                    Some(pte) if pte.present => {
+                        if required & VM_WRITE != 0 {
+                            pte.writable || pte.cow
+                        } else {
+                            true
+                        }
+                    }
+                    _ => false,
+                }
+            };
+            if !page_accessible {
+                return if checked == 0 {
+                    Err("efault")
+                } else {
+                    Ok(checked)
+                };
+            }
+            checked += chunk;
+        }
+        Ok(checked)
+    }
+
     pub fn read_user_usize(&self, addr: usize) -> Result<usize, &'static str> {
         let mut bytes = [0u8; std::mem::size_of::<usize>()];
         self.read_user_bytes(addr, &mut bytes)?;

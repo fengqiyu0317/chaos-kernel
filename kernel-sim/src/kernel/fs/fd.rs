@@ -34,6 +34,155 @@ impl FdState {
     }
 }
 
+// AGENT: fd flags that belong to one descriptor entry, not to the shared open
+// file description.
+#[derive(Clone)]
+pub struct FdEntry {
+    desc: Arc<OpenFileDescription>,
+    cloexec: bool,
+}
+
+// AGENT: shared open-file description; dup/fork clone FdEntry while sharing
+// this object, so offset/status state and pipe endpoint lifetime remain shared.
+pub struct OpenFileDescription {
+    file: FLike,
+    status: RwLock<FdOpt>,
+}
+
+impl OpenFileDescription {
+    // AGENT: build an open-file description around a concrete file object.
+    pub fn new(file: FLike) -> Self {
+        let status = file.status_flags();
+        Self {
+            file,
+            status: RwLock::new(status),
+        }
+    }
+
+    pub fn file(&self) -> &FLike {
+        &self.file
+    }
+
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+        self.file.read(buf)
+    }
+
+    pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
+        self.file.write(buf)
+    }
+
+    pub fn poll(&self) -> (bool, bool, bool) {
+        self.file.poll()
+    }
+
+    pub fn io_ctl(&self, req: usize, arg: usize) -> Result<usize, &'static str> {
+        self.file.io_ctl(req, arg)
+    }
+
+    pub fn status_flags(&self) -> FdOpt {
+        *self.status.read().unwrap()
+    }
+
+    pub fn set_status_flags(&self, flags: usize) -> Result<(), &'static str> {
+        self.file.set_status_flags(flags)?;
+        let mut status = self.status.write().unwrap();
+        status.nb = (flags & O_NONBLOCK) != 0;
+        status.ap = (flags & O_APPEND) != 0;
+        Ok(())
+    }
+
+    pub fn regular_handle(&self) -> Option<FHandle> {
+        match &self.file {
+            FLike::File(f) => Some(f.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn metadata_pages(&self) -> usize {
+        match &self.file {
+            FLike::File(f) => f.metadata_sz() / PAGE_SZ + 1,
+            _ => 1,
+        }
+    }
+}
+
+impl FdEntry {
+    // AGENT: create a descriptor entry over a fresh open-file description.
+    pub fn new(file: FLike) -> Self {
+        Self::with_cloexec(file, false)
+    }
+
+    // AGENT: create a descriptor entry with per-fd close-on-exec state.
+    pub fn with_cloexec(file: FLike, cloexec: bool) -> Self {
+        Self {
+            desc: Arc::new(OpenFileDescription::new(file)),
+            cloexec,
+        }
+    }
+
+    // AGENT: duplicate one fd entry while sharing its open-file description.
+    pub fn dup(&self, cloexec: bool) -> Self {
+        Self {
+            desc: self.desc.clone(),
+            cloexec,
+        }
+    }
+
+    // AGENT: fork preserves each fd entry's own FD_CLOEXEC flag.
+    pub fn fork_dup(&self) -> Self {
+        self.dup(self.cloexec)
+    }
+
+    pub fn is_cloexec(&self) -> bool {
+        self.cloexec
+    }
+
+    pub fn set_cloexec(&mut self, val: bool) {
+        self.cloexec = val;
+    }
+
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+        self.desc.read(buf)
+    }
+
+    pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
+        self.desc.write(buf)
+    }
+
+    pub fn poll(&self) -> (bool, bool, bool) {
+        self.desc.poll()
+    }
+
+    pub fn io_ctl(&self, req: usize, arg: usize) -> Result<usize, &'static str> {
+        self.desc.io_ctl(req, arg)
+    }
+
+    pub fn status_flags(&self) -> FdOpt {
+        self.desc.status_flags()
+    }
+
+    pub fn set_status_flags(&self, flags: usize) -> Result<(), &'static str> {
+        self.desc.set_status_flags(flags)
+    }
+
+    pub fn regular_handle(&self) -> Option<FHandle> {
+        self.desc.regular_handle()
+    }
+
+    pub fn metadata_pages(&self) -> usize {
+        self.desc.metadata_pages()
+    }
+
+    // AGENT: compatibility view for older tests and helpers that inspect FLike.
+    pub fn as_flike(&self) -> FLike {
+        let mut file = self.desc.file().clone();
+        if let FLike::File(ref mut f) = file {
+            f.cloexec = self.cloexec;
+        }
+        file
+    }
+}
+
 // AGENT: distinguish regular path files from directory nodes for exec checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
@@ -136,20 +285,33 @@ impl FHandle {
             cloexec,
         }
     }
-    pub fn set_opt(&self, arg: usize) {
-        let mut d = self.desc.write().unwrap();
-        d.opt.nb = (arg & O_NONBLOCK) != 0;
-    }
     pub fn get_opt(&self) -> FdOpt {
         self.desc.read().unwrap().opt
     }
 
+    // AGENT: fcntl(F_SETFL) changes status flags while preserving access mode.
+    pub fn set_status_flags(&self, flags: usize) {
+        let mut d = self.desc.write().unwrap();
+        d.opt.nb = (flags & O_NONBLOCK) != 0;
+        d.opt.ap = (flags & O_APPEND) != 0;
+    }
+
+    // AGENT: advance the shared open-file-description offset while holding the
+    // descriptor state write lock.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        let off = self.desc.read().unwrap().off as usize;
-        let len = self.read_at(off, buf)?;
-        // HUMAN
-        self.desc.write().unwrap().off = (off + len) as u64;
-        Ok(len)
+        let mut desc = self.desc.write().unwrap();
+        if !desc.opt.rd {
+            return Err("ebadf");
+        }
+        let off = desc.off as usize;
+        let d = self.node.data.lock().unwrap();
+        if off >= d.len() {
+            return Ok(0);
+        }
+        let n = min(buf.len(), d.len() - off);
+        buf[..n].copy_from_slice(&d[off..off + n]);
+        desc.off = (off + n) as u64;
+        Ok(n)
     }
     pub fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
         if !self.desc.read().unwrap().opt.rd {
@@ -172,19 +334,26 @@ impl FHandle {
         buf[..n].copy_from_slice(&d[off..off + n]);
         Ok(n)
     }
+    // AGENT: append/offset selection and offset advancement happen under one
+    // shared descriptor state write lock.
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        let off = {
-            let d = self.desc.read().unwrap();
-            if d.opt.ap {
-                self.node.data.lock().unwrap().len() as u64
-            } else {
-                d.off
-            }
-        } as usize;
-        let len = self.write_at(off, buf)?;
-        // HUMAN
-        self.desc.write().unwrap().off = (off + len) as u64;
-        Ok(len)
+        let mut desc = self.desc.write().unwrap();
+        if !desc.opt.wr {
+            return Err("ebadf");
+        }
+        let mut d = self.node.data.lock().unwrap();
+        let off = if desc.opt.ap {
+            d.len()
+        } else {
+            desc.off as usize
+        };
+        let end = off.checked_add(buf.len()).ok_or("efbig")?;
+        if end > d.len() {
+            d.resize(end, 0);
+        }
+        d[off..end].copy_from_slice(buf);
+        desc.off = end as u64;
+        Ok(buf.len())
     }
     pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
         if !self.desc.read().unwrap().opt.wr {

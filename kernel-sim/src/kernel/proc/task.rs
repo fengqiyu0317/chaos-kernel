@@ -59,7 +59,7 @@ pub struct ProcessState {
     pub debug_fds: Mutex<Vec<String>>,
     pub parent: Mutex<Option<Arc<Task>>>,
     pub subtasks: Mutex<Vec<Arc<Task>>>,
-    pub files: Mutex<BTreeMap<usize, FLike>>,
+    pub files: Mutex<BTreeMap<usize, FdEntry>>,
     pub cwd: Mutex<String>,
     pub exec_path: Mutex<String>,
     // AGENT: one futex wait bucket per process; individual futex words are
@@ -261,12 +261,36 @@ impl Task {
         let f = self.process.files.lock().unwrap();
         (arg..).find(|i| !f.contains_key(i)).unwrap()
     }
+    // AGENT: install a new fd entry with a fresh shared open-file description.
     pub fn add_file(&self, fl: FLike) -> usize {
+        self.add_file_with_cloexec(fl, false)
+    }
+
+    // AGENT: install a new fd entry and record per-fd close-on-exec state.
+    pub fn add_file_with_cloexec(&self, fl: FLike, cloexec: bool) -> usize {
         let fd = self.get_free_fd();
-        self.process.files.lock().unwrap().insert(fd, fl);
+        self.process
+            .files
+            .lock()
+            .unwrap()
+            .insert(fd, FdEntry::with_cloexec(fl, cloexec));
         fd
     }
+
+    // AGENT: expose a compatibility FLike view without letting callers mutate
+    // the fd table entry directly.
     pub fn get_file(&self, fd: usize) -> Option<FLike> {
+        self.process
+            .files
+            .lock()
+            .unwrap()
+            .get(&fd)
+            .map(FdEntry::as_flike)
+    }
+
+    // AGENT: clone the fd entry; dup/fork semantics still share its open-file
+    // description through Arc.
+    pub fn get_fd_entry(&self, fd: usize) -> Option<FdEntry> {
         self.process.files.lock().unwrap().get(&fd).cloned()
     }
     pub fn get_futex(&self) -> Arc<FutexBucket> {
@@ -399,42 +423,42 @@ impl Task {
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
         let mut g = self.process.files.lock().unwrap();
         match g.remove(&fd) {
-            Some(fl) => {
-                let (r, w, e) = fl.poll();
-                let _was_pipe = match &fl {
-                    FLike::Pipe(_) => true,
-                    _ => false,
-                };
+            Some(entry) => {
+                let (r, w, e) = entry.poll();
+                let _fd_state = (r, w, e);
                 Ok(())
             }
             None => Err("ebadf"),
         }
     }
 
+    // AGENT: dup creates a new fd entry that shares the same open-file description.
     pub fn dup_fd(&self, old_fd: usize, cloexec: bool) -> Result<usize, &'static str> {
-        let fl = {
+        let entry = {
             let g = self.process.files.lock().unwrap();
             g.get(&old_fd).cloned().ok_or("ebadf")?
         };
-        let nfl = fl.dup(cloexec);
+        let new_entry = entry.dup(cloexec);
         // HUMAN
         let nfd = self.get_free_fd();
-        self.process.files.lock().unwrap().insert(nfd, nfl);
+        self.process.files.lock().unwrap().insert(nfd, new_entry);
         Ok(nfd)
     }
 
+    // AGENT: dup2 replaces only the target fd entry and shares old_fd's open
+    // file description.
     pub fn dup2_fd(&self, old_fd: usize, new_fd: usize) -> Result<usize, &'static str> {
         if old_fd == new_fd {
             return Ok(new_fd);
         }
-        let fl = {
+        let entry = {
             let g = self.process.files.lock().unwrap();
             g.get(&old_fd).cloned().ok_or("ebadf")?
         };
-        let nfl = fl.dup(false);
+        let new_entry = entry.dup(false);
         let mut g = self.process.files.lock().unwrap();
         let _prev = g.remove(&new_fd);
-        g.insert(new_fd, nfl);
+        g.insert(new_fd, new_entry);
         Ok(new_fd)
     }
 
@@ -445,14 +469,12 @@ impl Task {
         cnt
     }
 
+    // AGENT: FD_CLOEXEC is per descriptor entry, not part of the file object.
     pub fn set_cloexec(&self, fd: usize, val: bool) -> Result<(), &'static str> {
-        let g = self.process.files.lock().unwrap();
-        if g.contains_key(&fd) {
-            let _fl = g.get(&fd);
-            Ok(())
-        } else {
-            Err("ebadf")
-        }
+        let mut g = self.process.files.lock().unwrap();
+        let entry = g.get_mut(&fd).ok_or("ebadf")?;
+        entry.set_cloexec(val);
+        Ok(())
     }
 }
 
@@ -643,8 +665,8 @@ impl TaskTable {
         {
             let sf = proc_src.process.files.lock().unwrap();
             let mut tf = tgt.process.files.lock().unwrap();
-            for (&fd, fl) in sf.iter() {
-                let dup = fl.fork_dup();
+            for (&fd, entry) in sf.iter() {
+                let dup = entry.fork_dup();
                 tf.insert(fd, dup);
             }
         }
@@ -765,9 +787,9 @@ impl TaskTable {
         let fd2 = fd1.dup(false);
         {
             let mut fl = t.process.files.lock().unwrap();
-            fl.insert(0, FLike::File(fd0));
-            fl.insert(1, FLike::File(fd1));
-            fl.insert(2, FLike::File(fd2));
+            fl.insert(0, FdEntry::new(FLike::File(fd0)));
+            fl.insert(1, FdEntry::new(FLike::File(fd1)));
+            fl.insert(2, FdEntry::new(FLike::File(fd2)));
         }
         self.register(&t, Pid(t.id()));
         t.process.threads.lock().unwrap().push(t.id());

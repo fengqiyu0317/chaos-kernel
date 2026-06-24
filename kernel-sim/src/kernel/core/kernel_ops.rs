@@ -410,15 +410,8 @@ impl Kernel {
         let _est_pages = {
             let files = parent.process.files.lock().unwrap();
             let mut total = 0usize;
-            for (_, fl) in files.iter() {
-                match fl {
-                    FLike::File(fh) => {
-                        total += fh.metadata_sz() / PAGE_SZ + 1;
-                    }
-                    _ => {
-                        total += 1;
-                    }
-                }
+            for (_, entry) in files.iter() {
+                total += entry.metadata_pages();
             }
             total
         };
@@ -513,10 +506,7 @@ impl Kernel {
             .lock()
             .unwrap()
             .iter()
-            .filter_map(|(&fd, fl)| match fl {
-                FLike::File(fh) if fh.cloexec => Some(fd),
-                _ => None,
-            })
+            .filter_map(|(&fd, entry)| entry.is_cloexec().then_some(fd))
             .collect();
         Ok(PreparedExec {
             exec_path,

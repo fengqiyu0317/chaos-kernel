@@ -1,6 +1,42 @@
 // AGENT
 use super::*;
 
+const MAX_RW_COUNT: usize = PAGE_SZ * 16;
+
+// AGENT: read a NUL-terminated path from the current user address space.
+fn read_user_path(task: &Task, addr: usize) -> Result<String, &'static str> {
+    if addr == 0 {
+        return Err("efault");
+    }
+    let addr_space = task.process.addr_space.lock().unwrap();
+    let mut bytes = Vec::new();
+    for offset in 0..4096 {
+        let cur = addr.checked_add(offset).ok_or("efault")?;
+        let mut byte = [0u8; 1];
+        addr_space.read_user_bytes(cur, &mut byte)?;
+        if byte[0] == 0 {
+            return String::from_utf8(bytes).map_err(|_| "einval");
+        }
+        bytes.push(byte[0]);
+    }
+    Err("enametoolong")
+}
+
+fn fdopt_to_open_flags(opt: FdOpt) -> usize {
+    let mut flags = match (opt.rd, opt.wr) {
+        (true, true) => 2,
+        (false, true) => 1,
+        _ => 0,
+    };
+    if opt.nb {
+        flags |= O_NONBLOCK;
+    }
+    if opt.ap {
+        flags |= O_APPEND;
+    }
+    flags
+}
+
 pub(super) fn sys_read(
     kernel: &Kernel,
     a0: usize,
@@ -10,38 +46,29 @@ pub(super) fn sys_read(
     let fd = a0;
     let buf_addr = a1;
     let count = a2;
-    if buf_addr == 0 && count > 0 {
-        return Err("efault");
-    }
     if count == 0 {
         return Ok(0);
     }
-    if !check_access(buf_addr, count) {
+    if buf_addr == 0 {
         return Err("efault");
     }
-    let page_start = buf_addr & !(PAGE_SZ - 1);
-    let page_end = (buf_addr + count) & !(PAGE_SZ - 1);
-    let page_span = (page_end - page_start) / PAGE_SZ;
-    let ci = (fd ^ (fd >> 7)) % kernel.cache.width; // AGENT: match fetch()/invalidate() hash
-    let ch = &kernel.cache.chains[ci];
-    ch.lk.acquire();
-    let cached = {
-        let items = ch.items.lock().unwrap();
-        items.iter().any(|s| s.id == fd)
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    let request_len = min(count, MAX_RW_COUNT);
+    let writable_len = {
+        let addr_space = task.process.addr_space.lock().unwrap();
+        addr_space.writable_user_prefix_len(buf_addr, request_len)?
     };
-    ch.lk.release();
-    if cached {
-        let available = (page_span + 1) * PAGE_SZ;
-        let transfer = min(count, available);
-        let readahead = if transfer > PAGE_SZ { PAGE_SZ } else { 0 };
-        return Ok(transfer - readahead);
+    let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
+    let mut tmp = vec![0u8; writable_len];
+    let nread = entry.read(&mut tmp)?;
+    if nread > 0 {
+        task.process.addr_space.lock().unwrap().write_user_bytes(
+            buf_addr,
+            &tmp[..nread],
+            &kernel.pool,
+        )?;
     }
-    let max_single_read = PAGE_SZ * 16;
-    if count > max_single_read {
-        Ok(max_single_read)
-    } else {
-        Ok(count)
-    }
+    Ok(nread)
 }
 
 pub(super) fn sys_write(
@@ -53,40 +80,28 @@ pub(super) fn sys_write(
     let fd = a0;
     let buf_addr = a1;
     let count = a2;
-    if buf_addr == 0 && count > 0 {
-        return Err("efault");
-    }
     if count == 0 {
         return Ok(0);
     }
-    if !check_access(buf_addr, count) {
+    if buf_addr == 0 {
         return Err("efault");
     }
-    let page_off = buf_addr & (PAGE_SZ - 1);
-    let remaining_in_page = PAGE_SZ - page_off;
-    let actual_len = if count <= remaining_in_page {
-        count
-    } else {
-        let full_pages = (count - remaining_in_page) / PAGE_SZ;
-        let tail = (count - remaining_in_page) % PAGE_SZ;
-        // HUMAN
-        remaining_in_page + full_pages * PAGE_SZ + tail
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    let request_len = min(count, MAX_RW_COUNT);
+    let readable_len = {
+        let addr_space = task.process.addr_space.lock().unwrap();
+        addr_space.readable_user_prefix_len(buf_addr, request_len)?
     };
-    let ci = (fd ^ (fd >> 7)) % kernel.cache.width; // AGENT: match fetch()/invalidate() hash
-    let ch = &kernel.cache.chains[ci];
-    ch.lk.acquire();
-    {
-        let mut items = ch.items.lock().unwrap();
-        if let Some(slot) = items.iter_mut().find(|s| s.id == fd) {
-            slot.modified = true;
-        }
+    let mut tmp = vec![0u8; readable_len];
+    if readable_len > 0 {
+        task.process
+            .addr_space
+            .lock()
+            .unwrap()
+            .read_user_bytes(buf_addr, &mut tmp)?;
     }
-    ch.lk.release();
-    if fd <= 2 {
-        let _drain = kernel.tty_buf.lock().unwrap().drain(..).count();
-        // let _drain = kernel.disk.ops.fetch_add(1, Ordering::Relaxed);
-    }
-    Ok(actual_len)
+    let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
+    entry.write(&tmp)
 }
 
 pub(super) fn sys_open(
@@ -98,66 +113,57 @@ pub(super) fn sys_open(
     let path_addr = a0;
     let flags = a1;
     let mode = a2;
-    if path_addr == 0 {
-        return Err("efault");
-    }
-    let path_max = 4096; // AGENT: was min(path_max, 256) which always equals 256
-    if !check_access(path_addr, path_max) {
-        return Err("efault");
-    }
     let acc_mode = flags & 0x3;
+    if acc_mode == 3 {
+        return Err("einval");
+    }
     let _rdonly = acc_mode == 0;
     let _wronly = acc_mode == 1;
     let _rdwr = acc_mode == 2;
-    let _create = (flags & 0o100) != 0;
-    let _excl = (flags & 0o200) != 0;
-    let _truncate = (flags & 0o1000) != 0;
+    let _create = (flags & O_CREAT) != 0;
+    let _excl = (flags & O_EXCL) != 0;
+    let _truncate = (flags & O_TRUNC) != 0;
     let _nonblock = (flags & O_NONBLOCK) != 0;
     let _append = (flags & O_APPEND) != 0;
     let _cloexec = (flags & O_CLOEXEC) != 0;
     let _follow_sym = (flags & AT_NOFOLLOW) == 0;
-    // AGENT: was broken — picked longest prefix without checking path match
-    let _resolved = match kernel.mnt.find_mount(&format!("{}", path_addr)) {
-        Some(m) => m.prefix.len(),
-        None => 0,
-    };
-    if _create && _excl {
-        let ci = (path_addr ^ (path_addr >> 7)) % kernel.cache.width; // AGENT: match fetch()/invalidate() hash
-        let ch = &kernel.cache.chains[ci];
-        ch.lk.acquire();
-        let exists = {
-            let items = ch.items.lock().unwrap();
-            items.iter().any(|s| s.id == path_addr)
-        };
-        ch.lk.release();
-        if exists {
-            return Err("eexist");
-        }
+
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    let path = read_user_path(&task, path_addr)?;
+    let resolved = kernel.lookup_path(&path)?;
+    let existing = kernel.file_nodes.read().unwrap().get(&resolved).cloned();
+    if _create && _excl && existing.is_some() {
+        return Err("eexist");
     }
-    let cur = kernel.cur_task(0);
-    let fd = if let Some(t) = cur {
-        let rd = _rdonly || _rdwr;
-        let wr = _wronly || _rdwr;
-        let opt = FdOpt {
-            rd,
-            wr,
-            ap: _append,
-            nb: _nonblock,
-        };
-        let mut fh = FHandle::with_data("anon", opt, Vec::new());
-        fh.cloexec = _cloexec;
-        let fd = t.add_file(FLike::File(fh));
-        if _truncate && wr {
-            let _ = t.process.files.lock().unwrap().get(&fd).map(|fl| {
-                if let FLike::File(ref f) = fl {
-                    let _ = f.set_len(0);
-                }
-            });
+    let node = match existing {
+        Some(node) => node,
+        None if _create => {
+            let node = Arc::new(FileNode::regular(Vec::new(), false));
+            kernel
+                .file_nodes
+                .write()
+                .unwrap()
+                .insert(resolved.clone(), node.clone());
+            node
         }
-        fd
-    } else {
-        3 + (path_addr % 64)
+        None => return Err("enoent"),
     };
+    if node.kind != FileKind::Regular {
+        return Err("eisdir");
+    }
+    let rd = _rdonly || _rdwr;
+    let wr = _wronly || _rdwr;
+    let opt = FdOpt {
+        rd,
+        wr,
+        ap: _append,
+        nb: _nonblock,
+    };
+    let fh = FHandle::with_node(&resolved, opt, node, _cloexec);
+    if _truncate && wr {
+        fh.set_len(0)?;
+    }
+    let fd = task.add_file_with_cloexec(FLike::File(fh), _cloexec);
     let _perm_check = {
         let owner_r = (mode >> 8) & 0x4;
         let owner_w = (mode >> 8) & 0x2;
@@ -188,13 +194,8 @@ pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static st
         kernel.tty_buf.lock().unwrap().drain(..).count();
     }
     // AGENT: remove fd from process file table so it can be reused
-    if let Some(t) = kernel.cur_task(0) {
-        if fd >= 3 {
-            if t.process.files.lock().unwrap().remove(&fd).is_none() {
-                return Err("ebadf");
-            }
-        }
-    }
+    let t = kernel.cur_task(0).ok_or("esrch")?;
+    t.close_fd(fd)?;
     Ok(0)
 }
 
@@ -297,8 +298,8 @@ pub(super) fn sys_pipe(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
         let (rd, wr) = PipeNode::pair();
         let _nonblock = (pipe_flags & O_NONBLOCK) != 0;
         let _cloexec = (pipe_flags & O_CLOEXEC) != 0;
-        let rd_fd = t.add_file(FLike::Pipe(rd));
-        let wr_fd = t.add_file(FLike::Pipe(wr));
+        let rd_fd = t.add_file_with_cloexec(FLike::Pipe(rd), _cloexec);
+        let wr_fd = t.add_file_with_cloexec(FLike::Pipe(wr), _cloexec);
         Ok(rd_fd | (wr_fd << 32))
     } else {
         Err("esrch")
@@ -312,23 +313,8 @@ pub(super) fn sys_dup(kernel: &Kernel, a0: usize) -> Result<usize, &'static str>
     if old_fd >= MAX_FD {
         return Err("ebadf");
     }
-    let cur = kernel.cur_task(0);
-    let new_fd = if let Some(t) = cur {
-        let mut fds = t.process.files.lock().unwrap();
-        let fl = match fds.get(&old_fd).cloned() {
-            Some(f) => f,
-            None => return Err("ebadf"),
-        };
-        let mut candidate = 0;
-        while fds.contains_key(&candidate) {
-            candidate += 1;
-        }
-        fds.insert(candidate, fl.dup(false));
-        candidate
-    } else {
-        old_fd + 1
-    };
-    Ok(new_fd)
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    task.dup_fd(old_fd, false)
 }
 
 pub(super) fn sys_dup2(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
@@ -344,18 +330,8 @@ pub(super) fn sys_dup2(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
     if old_fd == new_fd {
         return Ok(new_fd);
     }
-    let cur = kernel.cur_task(0);
-    if let Some(t) = cur {
-        let mut fds = t.process.files.lock().unwrap();
-        let _closed_prev = fds.remove(&new_fd);
-        if let Some(fl) = fds.get(&old_fd).cloned() {
-            let dup = fl.dup(false);
-            fds.insert(new_fd, dup);
-        } else {
-            return Err("ebadf");
-        }
-    }
-    Ok(new_fd)
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    task.dup2_fd(old_fd, new_fd)
 }
 
 pub(super) fn sys_fcntl(
@@ -371,41 +347,44 @@ pub(super) fn sys_fcntl(
     if fd >= MAX_FD {
         return Err("ebadf");
     }
+    let task = kernel.cur_task(0).ok_or("esrch")?;
     match cmd {
         F_DUPFD => {
-            let min_fd = arg;
-            let base = if fd > min_fd { fd } else { min_fd };
-            let new_fd = base + (CLK.load(Ordering::Relaxed) & 0x3);
+            if arg >= MAX_FD {
+                return Err("einval");
+            }
+            let mut fds = task.process.files.lock().unwrap();
+            let entry = fds.get(&fd).cloned().ok_or("ebadf")?;
+            let new_fd = (arg..MAX_FD)
+                .find(|candidate| !fds.contains_key(candidate))
+                .ok_or("emfile")?;
+            fds.insert(new_fd, entry.dup(false));
             Ok(new_fd)
         }
         F_DUPFD_CLOEXEC => {
-            let min_fd = arg;
-            let base = if fd > min_fd { fd } else { min_fd };
-            let new_fd = base + 1;
+            if arg >= MAX_FD {
+                return Err("einval");
+            }
+            let mut fds = task.process.files.lock().unwrap();
+            let entry = fds.get(&fd).cloned().ok_or("ebadf")?;
+            let new_fd = (arg..MAX_FD)
+                .find(|candidate| !fds.contains_key(candidate))
+                .ok_or("emfile")?;
+            fds.insert(new_fd, entry.dup(true));
             Ok(new_fd)
         }
         F_GETFD => {
-            let ci = (fd ^ (fd >> 7)) % kernel.cache.width; // AGENT: match fetch()/invalidate() hash
-            let ch = &kernel.cache.chains[ci];
-            ch.lk.acquire();
-            let cloexec = {
-                let items = ch.items.lock().unwrap();
-                items.iter().any(|s| s.id == fd && s.modified)
-            };
-            ch.lk.release();
+            let cloexec = task.get_fd_entry(fd).ok_or("ebadf")?.is_cloexec();
             Ok(if cloexec { FD_CLOEXEC } else { 0 })
         }
         F_SETFD => {
             let _cloexec = (arg & FD_CLOEXEC) != 0;
+            task.set_cloexec(fd, _cloexec)?;
             Ok(0)
         }
         F_GETFL => {
-            let flags = if fd <= 2 {
-                O_NONBLOCK | O_APPEND
-            } else {
-                O_NONBLOCK
-            };
-            Ok(flags)
+            let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
+            Ok(fdopt_to_open_flags(entry.status_flags()))
         }
         F_SETFL => {
             let valid_mask = O_NONBLOCK | O_APPEND;
@@ -413,6 +392,8 @@ pub(super) fn sys_fcntl(
             if arg & !valid_mask != 0 {
                 return Err("einval");
             }
+            let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
+            entry.set_status_flags(_new_flags)?;
             Ok(0)
         }
         F_GETLK => {

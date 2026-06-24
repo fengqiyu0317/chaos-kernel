@@ -3,10 +3,10 @@ use kernel_sim::{
     AddrSpace, EpData, EpEvent, ExitReason, FHandle, FLike, FdOpt, Kernel, PageBacking,
     PageTableEntry, PgFrame, SchedulePolicy, Task, TaskRunState, TaskTable, VmRegion, AT_ENTRY,
     AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, N_FRAMES, N_PROC, N_REGS,
-    O_CLOEXEC, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK, SYS_EPOLL_CREATE, SYS_EPOLL_CTL,
-    SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN,
-    SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED,
-    VM_WRITE,
+    O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP,
+    SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL,
+    SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE,
+    USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -51,6 +51,39 @@ fn read_user_c_string(addr_space: &AddrSpace, addr: usize) -> String {
     String::from_utf8(bytes).expect("user string should be utf-8")
 }
 
+// AGENT: place a NUL-terminated path into user memory for syscall open/exec tests.
+fn write_user_c_string(kernel: &Kernel, task: &Arc<Task>, addr: usize, value: &str) {
+    let mut bytes = value.as_bytes().to_vec();
+    bytes.push(0);
+    let page = addr & !(PAGE_SZ - 1);
+    let end = addr + bytes.len();
+    let mapped_end = (end + PAGE_SZ - 1) & !(PAGE_SZ - 1);
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        if addr_space.vm_map.find(addr).is_none() {
+            addr_space
+                .map_region(
+                    VmRegion::new(page, mapped_end - page, VM_READ | VM_WRITE),
+                    &kernel.pool,
+                )
+                .expect("user string page should map");
+        }
+        addr_space
+            .write_user_bytes(addr, &bytes, &kernel.pool)
+            .expect("user string should be writable");
+    }
+}
+
+// AGENT: create a user mapping for syscall copy-in/copy-out tests.
+fn map_user_region(kernel: &Kernel, task: &Arc<Task>, addr: usize, len: usize, flags: u32) {
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .map_region(VmRegion::new(addr, len, flags), &kernel.pool)
+        .expect("user test region should map");
+}
+
 fn install_test_exec(kernel: &Kernel, path: &str) {
     kernel
         .install_exec_file(path, test_exec_elf())
@@ -63,8 +96,10 @@ fn seed_failed_exec_state(
     task: &Arc<Task>,
     old_mapping: usize,
 ) -> (usize, usize, usize) {
+    let path_addr = old_mapping + PAGE_SZ;
+    write_user_c_string(kernel, task, path_addr, "/tmp/failed-exec-cloexec");
     let close_fd = kernel
-        .dispatch_syscall(SYS_OPEN, old_mapping, O_CLOEXEC, 0, 0, 0, 0)
+        .dispatch_syscall(SYS_OPEN, path_addr, O_CREAT | O_CLOEXEC, 0, 0, 0, 0)
         .expect("open should create a cloexec fd");
     *task.process.exec_path.lock().unwrap() = String::from("/bin/old");
     {
@@ -519,6 +554,132 @@ fn mmap_file_mapping_validates_offset_and_shared_write_permissions() {
 }
 
 #[test]
+// AGENT: sys_read copies real file bytes into user memory and shares dup offset.
+fn sys_read_regular_file_copies_data_and_advances_shared_offset() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    kernel
+        .install_file("/tmp/read-real", b"abcdef".to_vec(), false)
+        .expect("test file should install");
+    let task = kernel.cur_task(0).expect("init should be current");
+    const PATH: usize = 0x2100_0000;
+    const BUF: usize = 0x2101_0000;
+    write_user_c_string(&kernel, &task, PATH, "/tmp/read-real");
+    map_user_region(&kernel, &task, BUF, PAGE_SZ, VM_READ | VM_WRITE);
+
+    let fd = kernel
+        .dispatch_syscall(SYS_OPEN, PATH, 0, 0, 0, 0, 0)
+        .expect("open should resolve an installed file");
+    let first = kernel
+        .dispatch_syscall(SYS_READ, fd, BUF, 3, 0, 0, 0)
+        .expect("first read should succeed");
+    assert_eq!(first, 3);
+    let mut loaded = [0u8; 3];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(BUF, &mut loaded)
+        .expect("read bytes should be in user memory");
+    assert_eq!(&loaded, b"abc");
+
+    let dup_fd = kernel
+        .dispatch_syscall(SYS_DUP, fd, 0, 0, 0, 0, 0)
+        .expect("dup should share the open-file description");
+    let second = kernel
+        .dispatch_syscall(SYS_READ, dup_fd, BUF, 3, 0, 0, 0)
+        .expect("dup read should continue from the shared offset");
+    assert_eq!(second, 3);
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(BUF, &mut loaded)
+        .expect("second read bytes should be in user memory");
+    assert_eq!(&loaded, b"def");
+
+    let eof = kernel
+        .dispatch_syscall(SYS_READ, fd, BUF, 3, 0, 0, 0)
+        .expect("EOF read should succeed");
+    assert_eq!(eof, 0);
+}
+
+#[test]
+// AGENT: sys_read reports real fd and user-buffer errors instead of synthetic lengths.
+fn sys_read_validates_fd_permissions_and_user_buffer() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    const PATH: usize = 0x2200_0000;
+    const BUF: usize = 0x2201_0000;
+    const RO_BUF: usize = 0x2202_0000;
+    write_user_c_string(&kernel, &task, PATH, "/tmp/write-only");
+    map_user_region(&kernel, &task, BUF, PAGE_SZ, VM_READ | VM_WRITE);
+    map_user_region(&kernel, &task, RO_BUF, PAGE_SZ, VM_READ);
+
+    let wr_fd = kernel
+        .dispatch_syscall(SYS_OPEN, PATH, O_CREAT | 1, 0, 0, 0, 0)
+        .expect("write-only open should create a fd");
+    let bad_fd = kernel
+        .dispatch_syscall(SYS_READ, wr_fd + 100, BUF, 1, 0, 0, 0)
+        .expect_err("invalid fd should fail");
+    assert_eq!(bad_fd, "ebadf");
+    let bad_perm = kernel
+        .dispatch_syscall(SYS_READ, wr_fd, BUF, 1, 0, 0, 0)
+        .expect_err("read on write-only fd should fail");
+    assert_eq!(bad_perm, "ebadf");
+    let unmapped = kernel
+        .dispatch_syscall(SYS_READ, wr_fd, 0x2300_0000, 1, 0, 0, 0)
+        .expect_err("unmapped user buffer should fail before fd read");
+    assert_eq!(unmapped, "efault");
+    let readonly = kernel
+        .dispatch_syscall(SYS_READ, wr_fd, RO_BUF, 1, 0, 0, 0)
+        .expect_err("read-only user buffer should fail before fd read");
+    assert_eq!(readonly, "efault");
+}
+
+#[test]
+// AGENT: sys_write and sys_read move real bytes through pipe file objects.
+fn sys_read_and_write_use_pipe_file_objects() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    const SRC: usize = 0x2400_0000;
+    const DST: usize = 0x2401_0000;
+    map_user_region(&kernel, &task, SRC, PAGE_SZ, VM_READ | VM_WRITE);
+    map_user_region(&kernel, &task, DST, PAGE_SZ, VM_READ | VM_WRITE);
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .write_user_bytes(SRC, b"pipe", &kernel.pool)
+        .expect("source bytes should be writable");
+    let (rd_fd, wr_fd) = kernel.do_pipe(1).expect("pipe should create fds");
+
+    let written = kernel
+        .dispatch_syscall(SYS_WRITE, wr_fd, SRC, 4, 0, 0, 0)
+        .expect("pipe write should read user bytes");
+    assert_eq!(written, 4);
+    let read = kernel
+        .dispatch_syscall(SYS_READ, rd_fd, DST, 8, 0, 0, 0)
+        .expect("pipe read should copy queued bytes");
+    assert_eq!(read, 4);
+    let mut loaded = [0u8; 4];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(DST, &mut loaded)
+        .expect("pipe bytes should be copied to user memory");
+    assert_eq!(&loaded, b"pipe");
+
+    let empty = kernel
+        .dispatch_syscall(SYS_READ, rd_fd, DST, 1, 0, 0, 0)
+        .expect_err("empty pipe with a live writer reports again");
+    assert_eq!(empty, "again");
+}
+
+#[test]
 // AGENT: munmap requires a current task after validating the syscall range.
 fn munmap_without_current_task_returns_esrch() {
     let kernel = Kernel::new(N_FRAMES);
@@ -810,8 +971,10 @@ fn fork_keeps_shared_writable_mapping_without_cow() {
 fn fork_preserves_cloexec_and_epoll_state() {
     let kernel = Kernel::new(N_FRAMES);
     kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    write_user_c_string(&kernel, &task, 0x1000, "/tmp/fork-cloexec");
     let fd = kernel
-        .dispatch_syscall(SYS_OPEN, 0x1000, O_CLOEXEC, 0, 0, 0, 0)
+        .dispatch_syscall(SYS_OPEN, 0x1000, O_CREAT | O_CLOEXEC, 0, 0, 0, 0)
         .expect("open should create cloexec file");
     let epfd = kernel
         .dispatch_syscall(SYS_EPOLL_CREATE, 1, 0, 0, 0, 0, 0)
@@ -878,11 +1041,13 @@ fn do_exec_commits_new_address_space_context_and_cloexec() {
     kernel.proc_init();
     install_test_exec(&kernel, "/bin/next");
     let task = kernel.cur_task(0).expect("init should be current");
+    write_user_c_string(&kernel, &task, 0x2000, "/tmp/exec-keep");
+    write_user_c_string(&kernel, &task, 0x3000, "/tmp/exec-close");
     let keep_fd = kernel
-        .dispatch_syscall(SYS_OPEN, 0x2000, 0, 0, 0, 0, 0)
+        .dispatch_syscall(SYS_OPEN, 0x2000, O_CREAT, 0, 0, 0, 0)
         .expect("open should create a non-cloexec fd");
     let close_fd = kernel
-        .dispatch_syscall(SYS_OPEN, 0x3000, O_CLOEXEC, 0, 0, 0, 0)
+        .dispatch_syscall(SYS_OPEN, 0x3000, O_CREAT | O_CLOEXEC, 0, 0, 0, 0)
         .expect("open should create a cloexec fd");
     let old_token = task.vm_token();
     {
@@ -1136,8 +1301,9 @@ fn fork_from_cloned_thread_uses_shared_process_state_and_thread_context() {
         .lock()
         .unwrap()
         .push(String::from("leader-fd"));
+    write_user_c_string(&kernel, &task, 0x5600, "/tmp/thread-shared-fd");
     let fd = kernel
-        .dispatch_syscall(SYS_OPEN, 0x5600, 0, 0, 0, 0, 0)
+        .dispatch_syscall(SYS_OPEN, 0x5600, O_CREAT, 0, 0, 0, 0)
         .expect("open should add a process-shared fd");
     let epfd = kernel
         .dispatch_syscall(SYS_EPOLL_CREATE, 4, 0, 0, 0, 0, 0)
@@ -1235,9 +1401,6 @@ fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
     kernel.proc_init();
     install_test_exec(&kernel, "/bin/too-big");
     let task = kernel.cur_task(0).expect("init should be current");
-    let close_fd = kernel
-        .dispatch_syscall(SYS_OPEN, 0x4000, O_CLOEXEC, 0, 0, 0, 0)
-        .expect("open should create a cloexec fd");
     *task.process.exec_path.lock().unwrap() = String::from("/bin/old");
     {
         let mut addr_space = task.process.addr_space.lock().unwrap();
@@ -1247,7 +1410,13 @@ fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
                 &kernel.pool,
             )
             .expect("old mapping should be created");
+        addr_space
+            .write_user_bytes(0x5400_0000, b"/tmp/exec-failure-close\0", &kernel.pool)
+            .expect("open path should live in the old mapping");
     }
+    let close_fd = kernel
+        .dispatch_syscall(SYS_OPEN, 0x5400_0000, O_CREAT | O_CLOEXEC, 0, 0, 0, 0)
+        .expect("open should create a cloexec fd");
     {
         let mut thd = task.thd_ctx.lock().unwrap();
         let ctx = thd.as_mut().expect("thread context should exist");
@@ -1396,8 +1565,9 @@ fn syscall_exec_reads_user_memory_and_commits_do_exec() {
     kernel.proc_init();
     install_test_exec(&kernel, "/bin/next");
     let task = kernel.cur_task(0).expect("init should be current");
+    write_user_c_string(&kernel, &task, 0x6000, "/tmp/sys-exec-close");
     let close_fd = kernel
-        .dispatch_syscall(SYS_OPEN, 0x6000, O_CLOEXEC, 0, 0, 0, 0)
+        .dispatch_syscall(SYS_OPEN, 0x6000, O_CREAT | O_CLOEXEC, 0, 0, 0, 0)
         .expect("open should create a cloexec fd");
     let old_token = task.vm_token();
 
@@ -1780,8 +1950,9 @@ fn exit_releases_process_resources_before_wait_reaps_zombie() {
     kernel.run_queue.remove(child_id);
     kernel.run_queue.set_current(child_id);
     kernel.set_cur(0, Some(child.clone()));
+    write_user_c_string(&kernel, &child, CHILD_MAPPING, "/tmp/child-owned-fd");
     let _fd = kernel
-        .dispatch_syscall(SYS_OPEN, CHILD_MAPPING, 0, 0, 0, 0, 0)
+        .dispatch_syscall(SYS_OPEN, CHILD_MAPPING, O_CREAT, 0, 0, 0, 0)
         .expect("child open should create a file descriptor");
     let _epfd = kernel
         .dispatch_syscall(SYS_EPOLL_CREATE, 4, 0, 0, 0, 0, 0)

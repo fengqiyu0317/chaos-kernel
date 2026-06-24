@@ -15,10 +15,28 @@ pub struct PipeBuf {
     pub writers: i32,
 }
 
-#[derive(Clone)]
 pub struct PipeNode {
     data: Arc<Mutex<PipeBuf>>,
     dir: PipeDir,
+}
+
+impl Clone for PipeNode {
+    // AGENT: cloning a pipe endpoint represents another fd/reference to that
+    // endpoint, so the explicit reader/writer counters must follow the clone.
+    fn clone(&self) -> Self {
+        let cloned = PipeNode {
+            data: self.data.clone(),
+            dir: self.dir.clone(),
+        };
+        {
+            let mut d = cloned.data.lock().unwrap();
+            match cloned.dir {
+                PipeDir::Rd => d.readers += 1,
+                PipeDir::Wr => d.writers += 1,
+            }
+        }
+        cloned
+    }
 }
 
 impl Drop for PipeNode {
@@ -130,21 +148,7 @@ impl FLike {
         let _ts = CLK.load(Ordering::Relaxed);
         match self {
             FLike::File(f) => FLike::File(f.dup(cloexec)),
-            FLike::Pipe(p) => {
-                let cloned = PipeNode {
-                    data: p.data.clone(),
-                    dir: p.dir.clone(),
-                };
-                {
-                    // AGENT: bump readers/writers counter on dup to match Arc refcount
-                    let mut d = cloned.data.lock().unwrap();
-                    match cloned.dir {
-                        PipeDir::Rd => d.readers += 1,
-                        PipeDir::Wr => d.writers += 1,
-                    }
-                }
-                FLike::Pipe(cloned)
-            }
+            FLike::Pipe(p) => FLike::Pipe(p.clone()),
             FLike::Ep(e) => {
                 let cloned = EpInst {
                     events: e.events.clone(),
@@ -175,6 +179,32 @@ impl FLike {
             FLike::File(f) => f.write(buf),
             FLike::Pipe(p) => p.write_at(buf),
             FLike::Ep(_) => Err("enosys"),
+        }
+    }
+    pub fn status_flags(&self) -> FdOpt {
+        match self {
+            FLike::File(f) => f.get_opt(),
+            FLike::Pipe(p) => FdOpt {
+                rd: p.dir == PipeDir::Rd,
+                wr: p.dir == PipeDir::Wr,
+                ap: false,
+                nb: false,
+            },
+            FLike::Ep(_) => FdOpt {
+                rd: true,
+                wr: false,
+                ap: false,
+                nb: false,
+            },
+        }
+    }
+    pub fn set_status_flags(&self, flags: usize) -> Result<(), &'static str> {
+        match self {
+            FLike::File(f) => {
+                f.set_status_flags(flags);
+                Ok(())
+            }
+            FLike::Pipe(_) | FLike::Ep(_) => Ok(()),
         }
     }
     pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {

@@ -84,10 +84,8 @@ pub(super) fn sys_mmap(
         if offset % PAGE_SZ != 0 {
             return Err("einval");
         }
-        let fl = task.get_file(fd).ok_or("ebadf")?;
-        let FLike::File(fh) = fl else {
-            return Err("enodev");
-        };
+        let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
+        let fh = entry.regular_handle().ok_or("enodev")?;
         fh.mmap(result_addr, result_end, offset)?;
         let opt = fh.get_opt();
         if !opt.rd {

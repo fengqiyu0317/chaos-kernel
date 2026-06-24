@@ -228,6 +228,57 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-25：kernel-sim 文件 I/O 与 pipe 用户内存路径
+
+### 目标
+
+将 `kernel-sim` 的 `open/read/write/dup/pipe` 路径从占位行为推进到真实用户内存 copy-in/copy-out、真实 fd 权限检查和真实 open-file description 共享 offset 语义，并补充 smoke 回归。
+
+### 已完成修改
+
+- `sys_open()` 从当前 task 用户地址空间读取 NUL 结尾路径，接入共享 `FileNode` 表、`O_CREAT`、`O_CLOEXEC`、访问模式和 `O_TRUNC` 基础语义。
+- `sys_read()` / `sys_write()` 先按用户缓冲区可写/可读前缀做 copy-out/copy-in，再调用 fd entry 的真实 read/write 实现。
+- fd 层区分 per-fd `FD_CLOEXEC` 和共享 open-file description，`dup`/`dup2` 共享文件 offset 与状态。
+- pipe 层使用共享队列搬运真实字节，并维护读端/写端引用计数，空 pipe 且写端仍存在时返回 `again`。
+- 地址空间新增 readable/writable prefix helper，用于 syscall 用户缓冲区校验和 short I/O。
+- `smoke.rs` 新增文件 read/dup offset、read 错误路径、pipe read/write 三个回归测试，并把旧 open 相关测试改为写入真实用户路径。
+- `TASK.md` 补充文件 I/O、pipe、用户缓冲区复制和后续语义缺口。
+
+### 关键文件
+
+- `kernel-sim/src/kernel/syscall/fs.rs`
+- `kernel-sim/src/kernel/fs/fd.rs`
+- `kernel-sim/src/kernel/fs/pipe.rs`
+- `kernel-sim/src/kernel/mm/address_space.rs`
+- `kernel-sim/src/kernel/proc/task.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+- `docs/ai-record.md`
+
+### 测试结果
+
+```bash
+cd kernel-sim
+cargo fmt --check
+git diff --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`git diff --check` 通过；`cargo test --test smoke` 通过 `51 passed`；完整 `cargo test` 通过，其中 `elf.rs` 为 `3 passed`，`smoke.rs` 为 `51 passed`。
+
+### 未解决问题
+
+- `sys_open()` 路径解析仍是简化模型，尚未补齐 cwd 相对路径、目录遍历、符号链接、mode/umask 和完整错误边界。
+- pipe 仍未实现阻塞等待、`O_NONBLOCK` 差异、写端关闭后的 EOF 唤醒、`SIGPIPE`/`EPIPE` 等完整语义。
+- 用户缓冲区复制目前按 contiguous prefix 产生 short I/O，尚未接入 lazy page fault。
+
+### 不要改的部分
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- 对 `kernel-sim` 相关问题，只修改 `chaos/kernel-sim/` 和必要的项目内记录文件。
+- 不要移动、复制或删除 `chaos/.git`。
+
 ## 2026-06-24：kernel-sim munmap 回收与错误传播
 
 ### 目标

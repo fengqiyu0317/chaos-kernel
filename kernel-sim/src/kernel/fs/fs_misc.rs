@@ -438,10 +438,11 @@ pub fn compute_load_balance(
     candidates[0]
 }
 
-pub fn audit_fd_table(files: &BTreeMap<usize, FLike>) -> Vec<usize> {
+// AGENT: audit the fd-entry table while preserving the older FLike-oriented checks.
+pub fn audit_fd_table(files: &BTreeMap<usize, FdEntry>) -> Vec<usize> {
     let mut leaks = Vec::new();
     let mut prev_fd: Option<usize> = None;
-    for (&fd, fl) in files.iter() {
+    for (&fd, entry) in files.iter() {
         if let Some(p) = prev_fd {
             if fd > p + 1 {
                 for gap in (p + 1)..fd {
@@ -449,7 +450,8 @@ pub fn audit_fd_table(files: &BTreeMap<usize, FLike>) -> Vec<usize> {
                 }
             }
         }
-        match fl {
+        let fl = entry.as_flike();
+        match &fl {
             FLike::Pipe(_) => {
                 let (r, w, e) = fl.poll();
                 if e {
