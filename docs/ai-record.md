@@ -228,6 +228,44 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-25：kernel-sim core 模块拆分
+
+目标：将 `kernel-sim/src/kernel/core` 中过大的核心实现文件按功能拆分，保持原有 `Kernel` API 和运行语义不变，便于后续阅读和维护。
+
+已完成修改：
+
+- 将 `kernel-sim/src/kernel/core/arch.rs` 拆分为 `arch/clock.rs`、`arch/context.rs`、`arch/serial.rs`、`arch/trap.rs` 和 `arch/mod.rs`，由 `arch/mod.rs` 继续导出原有符号。
+- 将 `kernel-sim/src/kernel/core/kernel_ops.rs` 改为聚合模块，并把实现拆到 `kernel_ops/sched_signal.rs`、`process.rs`、`exec.rs`、`fs_store.rs`、`memory.rs`、`pipe.rs`。
+- 保持已有函数体逻辑和公开方法名不变；未为每个搬迁函数新增 `// AGENT` 注释。
+
+关键文件：
+
+- `kernel-sim/src/kernel/core/arch.rs`
+- `kernel-sim/src/kernel/core/arch/`
+- `kernel-sim/src/kernel/core/kernel_ops.rs`
+- `kernel-sim/src/kernel/core/kernel_ops/`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；完整 `cargo test` 通过，其中 `tests/elf.rs` 通过 `3 passed`，`tests/smoke.rs` 通过 `51 passed`。
+
+未解决问题：
+
+- 本次是文件结构拆分，不改变现有内核语义；已有 exec、wait4、信号、mmap 等后续语义 TODO 仍以 `TASK.md` 中记录为准。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
+来源：Codex 本轮文件拆分与验证记录。
+
 ## 2026-06-25：kernel-sim 文件 I/O 与 pipe 用户内存路径
 
 ### 目标
