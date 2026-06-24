@@ -114,23 +114,33 @@ pub(super) fn sys_mmap(
     Ok(result_addr)
 }
 
+// AGENT: reject invalid munmap parameters before mutating address-space state.
+// AGENT TODO: propagate writeback/unmap errors and release last-reference
+// frames through FramePool.
 pub(super) fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let addr = a0;
     let len = a1;
-    if addr % PAGE_SZ != 0 {
+    if len == 0 || addr % PAGE_SZ != 0 {
         return Err("einval");
     }
-    let aligned_len = (len + PAGE_SZ - 1) & !(PAGE_SZ - 1);
-    if let Some(task) = kernel.cur_task(0) {
-        task.process
-            .addr_space
-            .lock()
-            .unwrap()
-            .unmap_range(addr, aligned_len);
+    let aligned_len = len.checked_add(PAGE_SZ - 1).ok_or("enomem")? & !(PAGE_SZ - 1);
+    let end = addr.checked_add(aligned_len).ok_or("enomem")?;
+    if end > KERN_BASE {
+        return Err("enomem");
     }
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .unmap_range(addr, aligned_len);
     Ok(0)
 }
 
+// AGENT TODO: sys_brk still stores a page-aligned break. Track the byte-granular
+// program break separately from the mapped heap extent, preserve the intended
+// raw-syscall or libc-wrapper failure semantics, enforce start_brk/min_brk, and
+// move heap pages toward lazy allocation.
 pub(super) fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
     let new_brk = a0;
     if new_brk == 0 {

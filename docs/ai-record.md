@@ -272,6 +272,46 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-24：kernel-sim sys_munmap 参数校验
+
+目标：补齐 `TASK.md` 中记录的 `sys_munmap()` syscall 入口参数语义，防止零长度、未对齐地址、长度溢出、地址区间溢出和越过用户空间边界的请求进入地址空间修改路径。
+
+已完成修改：
+
+- `sys_munmap()` 在修改 `AddrSpace` 前拒绝 `len == 0` 和未页对齐地址。
+- `sys_munmap()` 使用 `checked_add()` 计算 `len + PAGE_SZ - 1` 和 `addr + aligned_len`，避免整数回绕。
+- `sys_munmap()` 拒绝 `end > KERN_BASE` 的用户地址范围，并在无当前 task 时返回 `esrch`。
+- 新增 smoke 回归覆盖无当前 task、非法参数不应解除已有映射、合法非页整倍长度向上按页解除映射。
+- `TASK.md` 标记 munmap 参数校验已完成，并保留 writeback 错误传播和 frame 回收 TODO。
+
+关键文件：
+
+- `kernel-sim/src/kernel/syscall/mm.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+- `docs/ai-record.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt
+cargo test --test smoke munmap
+cargo test
+```
+
+结果：`cargo test --test smoke munmap` 通过 `3 passed`；完整 `cargo test` 通过 `45 passed`。
+
+未解决问题：
+
+- `AddrSpace::unmap_range()` 仍只返回解除的 PTE 页数，`sys_munmap()` 尚未传播 `MAP_SHARED` 文件页 flush 错误。
+- `AddrSpace::unmap_range()` 删除 PTE 时仍未在最后一个引用释放时把 frame 归还 `FramePool`。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
 来源：当前 Codex 会话、`git diff` 和本轮本地测试结果。
 
 ## 2026-06-23：kernel-sim exec 文件来源重构

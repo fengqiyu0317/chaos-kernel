@@ -1,11 +1,11 @@
 // AGENT
 use kernel_sim::{
     AddrSpace, EpData, EpEvent, ExitReason, FHandle, FLike, FdOpt, Kernel, PageTableEntry, PgFrame,
-    SchedulePolicy, Task, TaskRunState, TaskTable, VmRegion, AT_ENTRY, AT_PAGESZ, MAP_PRIVATE,
-    MAP_SHARED, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1,
-    SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL,
-    SYS_MMAP, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, USR_STK_OFF, USR_STK_SZ, VM_EXEC,
-    VM_READ, VM_SHARED, VM_WRITE,
+    SchedulePolicy, Task, TaskRunState, TaskTable, VmRegion, AT_ENTRY, AT_PAGESZ, KERN_BASE,
+    MAP_PRIVATE, MAP_SHARED, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, PAGE_SZ, PROT_READ, PROT_WRITE,
+    SIGUSR1, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID,
+    SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, USR_STK_OFF,
+    USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
@@ -515,6 +515,86 @@ fn mmap_file_mapping_validates_offset_and_shared_write_permissions() {
         )
         .expect_err("shared writable mmap requires a writable fd");
     assert_eq!(bad_write, "eacces");
+}
+
+#[test]
+// AGENT: munmap requires a current task after validating the syscall range.
+fn munmap_without_current_task_returns_esrch() {
+    let kernel = Kernel::new(N_FRAMES);
+
+    let err = kernel
+        .dispatch_syscall(SYS_MUNMAP, 0x5600_0000, PAGE_SZ, 0, 0, 0, 0)
+        .expect_err("munmap without a current task should fail");
+
+    assert_eq!(err, "esrch");
+}
+
+#[test]
+// AGENT: munmap validates syscall range parameters before removing mappings.
+fn munmap_rejects_invalid_ranges_before_unmapping() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    let base = 0x5400_0000;
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(base, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("test mapping should be created");
+    }
+
+    let cases = [
+        (base, 0, "einval"),
+        (base + 1, PAGE_SZ, "einval"),
+        (base, usize::MAX, "enomem"),
+        (usize::MAX & !(PAGE_SZ - 1), PAGE_SZ * 2, "enomem"),
+        (KERN_BASE - PAGE_SZ, PAGE_SZ * 2, "enomem"),
+    ];
+    for (addr, len, expected) in cases {
+        let err = kernel
+            .dispatch_syscall(SYS_MUNMAP, addr, len, 0, 0, 0, 0)
+            .expect_err("invalid munmap should fail");
+        assert_eq!(err, expected);
+        assert!(
+            task.process
+                .addr_space
+                .lock()
+                .unwrap()
+                .vm_map
+                .find(base)
+                .is_some(),
+            "failed munmap must not remove the existing mapping"
+        );
+    }
+}
+
+#[test]
+// AGENT: munmap rounds non-zero lengths up to full pages on the syscall path.
+fn munmap_rounds_length_up_to_pages() {
+    let kernel = Kernel::new(N_FRAMES);
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    let base = 0x5500_0000;
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(base, PAGE_SZ * 2, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("test mapping should be created");
+    }
+
+    kernel
+        .dispatch_syscall(SYS_MUNMAP, base, PAGE_SZ + 1, 0, 0, 0, 0)
+        .expect("valid munmap should succeed");
+
+    let addr_space = task.process.addr_space.lock().unwrap();
+    assert!(addr_space.vm_map.find(base).is_none());
+    assert!(addr_space.vm_map.find(base + PAGE_SZ).is_none());
 }
 
 #[test]
