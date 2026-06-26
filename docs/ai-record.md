@@ -317,6 +317,56 @@ cargo test
 
 来源：Codex 本轮文件拆分与验证记录。
 
+## 2026-06-26：kernel-sim timer wheel 接入调度 tick
+
+### 目标
+
+把 `kernel-sim/src/kernel/core/time.rs` 中已有的 `TimerWheel` 从孤立 helper 接入 `Kernel` 运行时状态，并从 `schedule_tick()` 的 CPU0 tick 路径推进它；同时记录 `sync.rs` 中大内核锁和等待同步 helper 的后续语义 TODO。
+
+### 已完成修改
+
+- `Kernel` 新增 `timers: Mutex<TimerWheel>`，由 `Kernel::new()` 初始化全局 timer wheel。
+- `schedule_tick()` 在 `dtk(cpu)` 更新逻辑时钟后，对 CPU0 调用 `advance_timers()` 推进 timer wheel；非 CPU0 仍只推进 `CLK_ALL` 并返回。
+- 新增 `Kernel::advance_timers()` 和占位 `dispatch_timer()`，为后续 typed timer target 分发预留集中入口。
+- `TimerEntry::expired()` 改为 `CLK >= deadline`，timer 在到达 deadline 的 tick 当场过期；`TimerWheel::new()` 的初始槽位对齐当前 `CLK % TIMER_WHEEL_SIZE`。
+- 新增 smoke 回归 `cpu0_schedule_tick_advances_kernel_timer_wheel`，覆盖 CPU1 tick 不触发 wheel、CPU0 tick 触发到期 timer。
+- `kernel-sim/src/kernel/core/sync.rs` 增加当前使用路径说明和 `KernLock` 后续收紧 TODO；`TASK.md` 同步记录 timer wheel 接入完成与剩余 timeout / typed target / 长 deadline 语义问题。
+
+### 关键文件
+
+- `kernel-sim/src/kernel/core/time.rs`
+- `kernel-sim/src/kernel/core/kernel_base.rs`
+- `kernel-sim/src/kernel/core/kernel_ops/sched_signal.rs`
+- `kernel-sim/src/kernel/core/sync.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+- `docs/ai-record.md`
+
+### 测试结果
+
+```bash
+cd kernel-sim
+cargo fmt --check
+git diff --check
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`git diff --check` 通过；完整 `cargo test` 通过，其中 `tests/elf.rs` 为 `3 passed`，`tests/smoke.rs` 为 `52 passed`。
+
+### 未解决问题
+
+- timer 到期后的真实分发仍未接入，`TimerEntry.callback_id` 还没有替换为 `WaitToken`、futex waiter、epoll waiter、task wakeup 或 process timer/signal 等 typed target。
+- `WaitQueue::sleep_timeout`、`SyncQueue::wait_timeout`、futex wait timeout、`epoll_wait(timeout)` 仍未统一通过 timer wheel 注册 deadline。
+- timer wheel 对超过一圈的 deadline 仍缺少显式 round/counting 机制；重复 timer 重排语义仍需继续完善。
+- `KernLock` 仍是简化模拟锁，owner 校验、RAII guard、公平性和真实内核抢占/中断语义仍待补齐或明确标注为非目标。
+
+### 不要改的部分
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
+来源：Codex 本轮 timer wheel 接入、同步模块 TODO 标注与验证记录。
+
 ## 2026-06-25：kernel-sim 文件 I/O 与 pipe 用户内存路径
 
 ### 目标

@@ -23,9 +23,9 @@ impl TimerEntry {
         }
     }
 
+    // AGENT: a timer expires on the tick that reaches its deadline.
     pub fn expired(&self) -> bool {
-        // AGENT TODO: real deadline checks should treat CLK == deadline as expired.
-        CLK.load(Ordering::Relaxed) > self.deadline
+        CLK.load(Ordering::Relaxed) >= self.deadline
     }
 
     pub fn reset(&mut self) {
@@ -50,9 +50,8 @@ impl TimerEntry {
     }
 }
 
-// AGENT TODO: store this wheel in Kernel state and advance it from the CPU0
-// schedule_tick path after CLK is updated, then dispatch fired timers into the
-// kernel wait/futex/epoll/task wakeup paths.
+// AGENT: timer wheel owned by Kernel and advanced from the CPU0 schedule_tick path.
+// AGENT TODO: dispatch fired timers into wait/futex/epoll/task wakeup paths.
 pub struct TimerWheel {
     pub slots: Vec<Vec<TimerEntry>>,
     pub current_slot: usize,
@@ -66,7 +65,7 @@ impl TimerWheel {
         }
         Self {
             slots,
-            current_slot: 0,
+            current_slot: CLK.load(Ordering::Relaxed) % TIMER_WHEEL_SIZE,
         }
     }
 

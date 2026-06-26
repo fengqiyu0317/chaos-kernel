@@ -1,6 +1,35 @@
 // AGENT
 use super::*;
 
+// AGENT: Usage map for this module in the current kernel-sim code.
+//
+// Active paths:
+// - GKL/KernLock backs Kernel::tick() and BlockCache::sync_all(), though those
+//   callers mostly touch GKL fields directly and only call leave().
+// - Spin backs cache-chain locking and Channel; several callers still access
+//   Spin.v directly.
+// - EvBus/EvFlag is used as event-bit storage by pipe, process exit/signal,
+//   and semaphore state transitions.
+// - WaitToken is the common host-thread wait token used by Channel,
+//   proc::WaitQueue, SyncQueue helpers, and FutexBucket.
+// - SyncQueue is used by Channel through new(), signal(), broadcast(), and
+//   direct access to q.
+// - FutexBucket is wired to SYS_FUTEX and process-exit cleanup.
+//
+// Partially wired paths:
+// - Sema is created through SemArr/SemCtx and uses remove()/release(), but
+//   semget/semop/semctl-style syscall dispatch is not present.
+//
+// Unused or reserved paths:
+// - KernLock::enter/held/owner/level/try_enter; Spin::try_acquire/is_held.
+// - EvCb, EvBus::sub(), top-level wait_ev(), and EvFlag::WRITABLE/ERROR.
+// - RegEp and SyncQueue's generic wait/timeout/epoll-registration helpers.
+// - WaitToken::id() and SocketState.
+// AGENT TODO: Tighten KernLock into a proper recursive GKL abstraction before
+// treating it as real kernel-lock semantics: keep fields private, route
+// Kernel::tick()/BlockCache::sync_all() through enter()/try_enter(), make
+// release owner-checked or guard-based, and document or implement the missing
+// real-kernel pieces such as fairness, preemption, and interrupt control.
 pub struct KernLock {
     pub(crate) flag: AtomicBool,
     pub(crate) holder: AtomicUsize,
@@ -36,6 +65,9 @@ impl KernLock {
         self.holder.store(id, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
     }
+    // AGENT TODO: Replace bare leave() with leave(id) or a KernLockGuard Drop
+    // path so non-owners cannot accidentally release the lock and underflow or
+    // mismatched recursion depth can be caught explicitly.
     pub fn leave(&self) {
         let d = self.depth.load(Ordering::Relaxed);
         if d > 1 {

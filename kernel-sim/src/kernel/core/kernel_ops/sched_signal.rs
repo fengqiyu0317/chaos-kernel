@@ -75,8 +75,29 @@ impl Kernel {
         delivered
     }
 
+    // AGENT: advance global timers after CPU0 has advanced the logical clock.
+    pub(crate) fn advance_timers(&self) {
+        let fired = {
+            let mut timers = self.timers.lock().unwrap();
+            timers.advance()
+        };
+
+        for timer in fired {
+            self.dispatch_timer(timer);
+        }
+    }
+
+    // AGENT TODO: replace numeric callback IDs with typed timer targets.
+    fn dispatch_timer(&self, timer: TimerEntry) {
+        let _ = timer;
+    }
+
+    // AGENT: CPU0 owns logical timer progression; other CPUs only update CLK_ALL.
     pub fn schedule_tick(&self, cpu: usize) {
         dtk(cpu);
+        if cpu == 0 {
+            self.advance_timers();
+        }
         if cpu != 0 || !self.run_queue.preemptible() {
             return;
         }

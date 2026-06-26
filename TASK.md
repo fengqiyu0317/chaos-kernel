@@ -36,6 +36,7 @@
 - 2026-06-24：`kernel-sim` 的 `AddrSpace::unmap_range()` 已改为返回 `Result` 并接收 `FramePool`：先传播 `MAP_SHARED` 文件页 flush 错误，成功后再删除 VMA/PTE；最后一个 `PgFrame` 引用释放时归还 frame，`sys_munmap()`、`MAP_FIXED` 覆盖和 `brk` 收缩都复用该路径。新增 smoke 回归覆盖 munmap frame 回收、共享文件页写回错误传播、brk 收缩回收。
 - 2026-06-24：`kernel-sim` 的 fd 表已改为 `FdEntry` + `OpenFileDescription` 两层模型：`FD_CLOEXEC` 留在 fd entry，dup/fork 共享 open-file description，普通文件 offset/status flags 继续由共享 `FHandle` 推进，pipe endpoint clone 会维护 readers/writers 计数。
 - 2026-06-24：`sys_open()` / `sys_read()` / `sys_write()` 已接入真实用户地址空间和 `FileNode`/`FLike` 数据路径：open 从用户内存读取 C 字符串路径并使用统一路径文件表，read/write 通过 fd entry 调用普通文件或 pipe 对象，再用 `AddrSpace::{read,write}_user_bytes()` 搬运真实字节。新增 smoke 回归覆盖真实文件读、dup 共享 offset、EOF、bad fd、只写 fd、用户缓冲区 `efault`、pipe 数据读写与空 pipe `again`。
+- 2026-06-26：`kernel-sim/src/kernel/core/time.rs` 的 `TimerWheel` 已接入 `Kernel` 状态：`Kernel` 持有全局 timer wheel，`schedule_tick()` 在 CPU0 更新逻辑时钟后推进它，并补充 smoke 回归覆盖 CPU0 tick 触发 timer wheel。
 
 ## 关键文件
 
@@ -180,6 +181,10 @@ cargo test --test pressure
 - TODO: `kernel-sim` 尚未把 credentials、uid/gid、supplementary groups、capability sets、securebits、no_new_privs 等进程安全身份挂到 `Task`，因此 `fork_task` 也没有实现这些真实 Linux 属性的继承规则。
 - TODO: `kernel-sim` 的 fork 失败条件目前主要受全局 `N_PROC` 限制约束；尚未建模 `RLIMIT_NPROC`、系统线程数上限、`pid_max`、cgroup pids 限制、PID namespace init 退出、内存压力导致的 `ENOMEM` 等真实错误路径。
 - TODO: `kernel-sim` 尚未建模 per-task `alarm`、`setitimer`、POSIX timer 等计时器集合；真实 fork 中 child 不继承 parent timers，目前只有全局/通用 timer wheel 和 `clock_gettime` 级别的时间读取。
+- TODO: `kernel-sim` 的带超时等待仍分散使用 host `Instant` / `thread::park_timeout` 或轮询；后续应让 `WaitQueue::sleep_timeout`、`SyncQueue::wait_timeout`、futex wait timeout、`epoll_wait(timeout)` 等统一通过 timer wheel 注册 deadline，到期后唤醒对应 `WaitToken`。
+- TODO: `kernel-sim/src/kernel/core/time.rs` 的 `TimerEntry.callback_id` 目前缺少真实分发表；后续应明确 timer 到期后的目标类型，例如唤醒 `WaitToken`、任务、futex waiter、epoll waiter，或投递 per-process timer/signal 事件。
+- TODO: `kernel-sim/src/kernel/core/time.rs` 的 timer wheel 语义仍需完善：超过一圈的 deadline 不能只靠 `deadline % TIMER_WHEEL_SIZE` 提前触发，重复 timer 重新入队时也应保留完整到期语义。
+- TODO: `kernel-sim` 的 `WaitToken` 当前只记录是否已被唤醒；接入 timer wheel 后应区分普通事件唤醒和 timeout 唤醒，避免 futex、epoll、wait queue 等路径把超时误判成正常唤醒。
 - TODO: `kernel-sim` 尚未建模 `mlock/mlockall` 内存锁状态、`MADV_WIPEONFORK` 清零语义，以及完整 `madvise` fork 标志；已有 `VM_DONTCOPY` 只覆盖了 DONTFORK 类似行为的一部分。
 - TODO: `kernel-sim` 的 futex 模型尚未覆盖真实 Linux 的 shared futex key、priority-inheritance futex、robust futex list、`OWNER_DIED` 标记和 owner 退出时唤醒等待者等语义。
 - TODO: `kernel-sim` 的 file lock 模型尚未区分 POSIX process-associated record locks、open-file-description locks 和 `flock` locks；真实 fork 中这些锁的继承/不继承规则不同。
@@ -209,8 +214,15 @@ cargo test --test pressure
 - TODO: `kernel-sim` 的 `brk` 失败返回仍是简化 `Err("enomem")` 模型；若模拟 raw Linux `brk` syscall，应在失败时返回原 current break，若模拟 libc `brk()` 包装，则需要明确转换为 `0/-1` 与 errno 的边界。
 - TODO: `kernel-sim` 尚未维护 `start_brk`/最小 break 与完整 heap VMA 边界；后续应防止 `brk` 收缩误删 ELF text/data/bss 或其他非 heap 映射，并处理 heap 与 mmap/stack/resource limit 冲突时的失败回滚。
 - TODO: `kernel-sim` 的 `brk` 增长目前通过 `resize_brk()` / `map_region()` eager 分配整段物理页；若贴近真实内核，应先登记 heap VMA、缺页时再分配页面，并增加未对齐增长/收缩、失败保持原 break、低于最小 break、与 mmap 碰撞等 smoke 回归。
+- TODO: `kernel-sim/src/kernel/core/net.rs` 目前只公开 IPv4/TCP checksum 与 IPv4 header 解析 helper，尚未接入任何运行时路径；后续若实现网络能力，应先新增 socket 文件对象并接入 `FLike` / fd 表 / `read` / `write` / `poll` / `epoll` 路径。
+- TODO: `kernel-sim` 尚未实现 `SYS_SOCKET`、`SYS_BIND`、`SYS_CONNECT`、`SYS_ACCEPT`、`SYS_SENDTO`、`SYS_RECVFROM` 等 socket syscall；若补齐 `AF_INET` / `SOCK_STREAM` / `SOCK_DGRAM`，应让 syscall 创建或操作 `FLike::Socket`，而不是绕开现有 fd 模型。
+- TODO: `kernel-sim` 尚未维护 loopback/虚拟网卡、端口绑定表、socket receive queue、连接状态和非阻塞/阻塞唤醒规则；短期可先做进程内 loopback socket，长期再把 `net.rs` 的 IPv4/TCP 解析和 checksum helper 用到真实包收发路径。
+- TODO: `kernel-sim` 若实现真实 IPv4/TCP 包模拟，发送路径应使用 `compute_inet_checksum()` 计算 IP header checksum，并使用 `tcp_checksum()` 或 `build_pseudo_header()` 计算 TCP/UDP pseudo-header checksum；接收路径应通过 `parse_ipv4_header()` 校验版本、IHL、total length、protocol 和 header checksum，再按 protocol 分发。
 
 ### important
+- TODO: `kernel-sim/src/kernel/core/sync.rs` 的 `KernLock::leave()` 目前不接收调用者 id，也不校验当前调用者是否为 owner；后续应改为 `leave(id)` 或 RAII `KernLockGuard` 的 `Drop` 路径，显式捕获非持有者释放、未持锁释放和递归深度不匹配。
+- TODO: `kernel-sim` 当前 `GKL` 的 `flag` / `holder` / `depth` 仍是 `pub(crate)`，`Kernel::tick()` 和 `BlockCache::sync_all()` 复制了进入锁的实现细节，只在退出时调用 `GKL.leave()`；后续应收紧字段可见性，并统一改走 `KernLock::enter()` / `try_enter()` 或 guard API。
+- TODO: `kernel-sim` 的 `KernLock` 目前只是可重入自旋式模拟锁，缺少公平性、阻塞等待、抢占/中断控制以及 panic/提前返回自动释放语义；若后续要把它作为真实大内核锁模型，应补齐这些语义或在接口文档中明确它只是 simulator 简化实现。
 - TODO: `kernel-sim` 的 syscall 文件 I/O 已有 fd entry / open-file description 基础模型，但仍未实现 `readv`/`writev`、`pread`/`pwrite`、`lseek` syscall、目录 fd 语义、权限/credential 检查、真实设备/tty 行规程等更完整文件系统行为。
 - TODO: `kernel-sim/src/kernel/syscall/fs.rs` 的 `sys_open()` 已从用户地址空间读取路径并接入 `FileNode` 表，但路径解析仍是简化绝对路径模型；后续应补齐 cwd 相对路径、目录遍历、符号链接、mode/umask、真实 `EISDIR`/`ENOTDIR`/`ELOOP` 等错误边界。
 - TODO: `kernel-sim` 的 pipe read/write 已走真实 `PipeNode` 队列，但空 pipe 目前直接返回 `again`，尚未实现阻塞等待、`O_NONBLOCK` 差异、关闭写端后的 EOF 唤醒、`SIGPIPE`/`EPIPE` 等完整 pipe 语义。
