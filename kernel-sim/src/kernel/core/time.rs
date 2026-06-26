@@ -1,6 +1,9 @@
 // AGENT
 use super::*;
 
+// AGENT TODO: connect timer entries to real wait targets such as WaitToken,
+// futex waiters, epoll waiters, task wakeups, or process timer signals instead
+// of leaving callback_id as an un-dispatched numeric placeholder.
 pub struct TimerEntry {
     pub deadline: usize,
     pub interval: usize,
@@ -21,6 +24,7 @@ impl TimerEntry {
     }
 
     pub fn expired(&self) -> bool {
+        // AGENT TODO: real deadline checks should treat CLK == deadline as expired.
         CLK.load(Ordering::Relaxed) > self.deadline
     }
 
@@ -46,6 +50,9 @@ impl TimerEntry {
     }
 }
 
+// AGENT TODO: store this wheel in Kernel state and advance it from the CPU0
+// schedule_tick path after CLK is updated, then dispatch fired timers into the
+// kernel wait/futex/epoll/task wakeup paths.
 pub struct TimerWheel {
     pub slots: Vec<Vec<TimerEntry>>,
     pub current_slot: usize,
@@ -64,6 +71,8 @@ impl TimerWheel {
     }
 
     pub fn add_timer(&mut self, entry: TimerEntry) {
+        // AGENT TODO: deadlines farther than TIMER_WHEEL_SIZE ticks need a
+        // round/counting scheme so modulo slot placement does not fire early.
         let slot = entry.deadline % TIMER_WHEEL_SIZE;
         self.slots[slot].push(entry);
     }

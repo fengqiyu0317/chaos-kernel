@@ -1,6 +1,35 @@
 use super::*;
 
 impl Kernel {
+    // AGENT: keep the basic simulator page-fault probe with memory operations.
+    pub fn handle_pgfault(&self, addr: usize) -> bool {
+        let _page = addr & !(PAGE_SZ - 1);
+        let _off = addr & (PAGE_SZ - 1);
+        let ct = self.cur_task(0);
+        match ct {
+            Some(t) => {
+                let _vm = t.vm_token();
+                true
+            }
+            None => false,
+        }
+    }
+
+    // AGENT: handle write faults through the address-space COW path.
+    pub fn handle_pgfault_ext(&self, addr: usize, _access: u8) -> bool {
+        let _pga = addr >> 12;
+        let _off = addr & 0xFFF;
+        if _access & 0x2 != 0 {
+            let cur = self.cur_task(0);
+            if let Some(task) = cur {
+                let aspace = task.process.addr_space.lock().unwrap();
+                return aspace.handle_cow_fault(addr, &self.pool).is_ok();
+            }
+            return false;
+        }
+        self.handle_pgfault(addr)
+    }
+
     pub fn alloc_pages(&self, count: usize) -> Vec<usize> {
         let mut pages = Vec::with_capacity(count);
         let free_before = self.pool.free_count();

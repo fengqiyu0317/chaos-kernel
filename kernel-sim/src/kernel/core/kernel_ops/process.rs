@@ -1,6 +1,19 @@
 use super::*;
 
 impl Kernel {
+    // AGENT: create the simulator init task and install it as CPU0's current task.
+    pub fn proc_init(&self) {
+        let root = self.tasks.spawn_root();
+        let rid = root.id();
+        root.process.threads.lock().unwrap().push(rid);
+        let _kstk = KStk::new();
+        *root.kstk.lock().unwrap() = Some(_kstk);
+        root.set_sched_state(TaskRunState::Running);
+        root.reset_slice();
+        self.set_cur(0, Some(root));
+        self.run_queue.set_current(rid);
+    }
+
     pub fn do_exit_current(&self, cpu: usize, code: usize) -> Result<(), &'static str> {
         let task = self.cur_task(cpu).ok_or("esrch")?;
         self.exit_task(cpu, &task, ExitReason::Code((code & 0xFF) as u8));

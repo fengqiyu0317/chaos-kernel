@@ -1,6 +1,6 @@
 # Chaos AI 工作日志
 
-更新时间：2026-06-24
+更新时间：2026-06-26
 
 ## 维护约定
 
@@ -260,6 +260,57 @@ cargo test
 - 本次是文件结构拆分，不改变现有内核语义；已有 exec、wait4、信号、mmap 等后续语义 TODO 仍以 `TASK.md` 中记录为准。
 
 不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
+## 2026-06-26：kernel-sim Kernel 辅助方法继续拆分
+
+### 目标
+
+继续收敛 `kernel-sim/src/kernel/core/kernel_base.rs` 的职责，让 `Kernel` 结构体定义只保留共享模拟器状态和构造函数，把运行时、IPC、TTY、页错误和 init task 辅助方法移动到 `kernel_ops/` 子模块。按用户要求，本次发布不提交 `TASK.md` 的本地修改。
+
+### 已完成修改
+
+- `kernel_base.rs` 保留 `Kernel` 字段与 `Kernel::new()`，移除原本混在状态定义文件里的行为方法。
+- 新增 `kernel_ops/runtime.rs`，保存 `tick()`、`cur_task()`、`set_cur()`。
+- 新增 `kernel_ops/ipc.rs`，保存 `get_sem()`、`get_shm()`。
+- 新增 `kernel_ops/tty.rs`，保存 `tty_push()`、`tty_pop()`。
+- 将 `handle_pgfault()`、`handle_pgfault_ext()` 移入 `kernel_ops/memory.rs`，将 `proc_init()` 移入 `kernel_ops/process.rs`。
+- `kernel_ops.rs` 继续作为聚合模块导入新增子模块。
+- `net.rs`、`time.rs` 增加 `// AGENT TODO`，标明网络 helper 和 timer wheel 尚未接入真实运行时路径。
+
+### 关键文件
+
+- `kernel-sim/src/kernel/core/kernel_base.rs`
+- `kernel-sim/src/kernel/core/kernel_ops.rs`
+- `kernel-sim/src/kernel/core/kernel_ops/runtime.rs`
+- `kernel-sim/src/kernel/core/kernel_ops/ipc.rs`
+- `kernel-sim/src/kernel/core/kernel_ops/tty.rs`
+- `kernel-sim/src/kernel/core/kernel_ops/memory.rs`
+- `kernel-sim/src/kernel/core/kernel_ops/process.rs`
+- `kernel-sim/src/kernel/core/net.rs`
+- `kernel-sim/src/kernel/core/time.rs`
+- `docs/ai-record.md`
+
+### 测试结果
+
+```bash
+cd kernel-sim
+cargo fmt --check
+git diff --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`git diff --check` 通过；`cargo test --test smoke` 通过 `51 passed`；完整 `cargo test` 通过，其中 `tests/elf.rs` 为 `3 passed`，`tests/smoke.rs` 为 `51 passed`。
+
+### 未解决问题
+
+- 本次是结构拆分和 TODO 标注，不改变已有内核语义；exec、wait4、mmap、timer、network 等后续语义缺口仍以项目 TODO 记录为准。
+- `TASK.md` 仍有本地修改，但本次按用户要求没有提交。
+
+### 不要改的部分
 
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
