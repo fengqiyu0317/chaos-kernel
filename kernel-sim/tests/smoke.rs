@@ -1,14 +1,14 @@
 // AGENT
 use kernel_sim::{
-    compute_inet_checksum, parse_ipv4_header, AddrSpace, BlockCache, Channel, EpData, EpEvent,
-    ExitReason, FHandle, FLike, FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking,
-    PageTableEntry, PgFrame, SchedulePolicy, Spin, SpinLock, Task, TaskRunState, TaskTable,
-    TimerEntry, VmRegion, WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS,
-    MAP_PRIVATE, MAP_SHARED, MAX_THREAD_ID, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ,
-    PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC,
-    SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ,
-    SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ,
-    VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    compute_inet_checksum, parse_ipv4_header, wait_ev, AddrSpace, BlockCache, Channel, EpData,
+    EpEvent, EvBus, EvFlag, ExitReason, FHandle, FLike, FdOpt, KernLock, Kernel,
+    KernelRuntimeTicker, PageBacking, PageTableEntry, PgFrame, SchedulePolicy, Spin, SpinLock,
+    Task, TaskRunState, TaskTable, TimerEntry, VmRegion, WaitOutcome, WaitToken, AT_ENTRY,
+    AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MAX_THREAD_ID, N_FRAMES, N_PROC,
+    N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP,
+    SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL,
+    SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE,
+    TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
@@ -214,6 +214,43 @@ fn channel_close_wakes_blocked_recv() {
 
     assert_eq!(worker.join().unwrap(), None);
     assert!(ch.is_closed());
+}
+
+// AGENT: wait_ev should return immediately when the requested readiness bit is
+// already present.
+#[test]
+fn ev_bus_wait_ev_returns_existing_event() {
+    let bus = EvBus::make();
+    bus.lock().unwrap().set(EvFlag::READABLE);
+
+    let ev = wait_ev(&bus, EvFlag::READABLE);
+
+    assert_eq!(ev & EvFlag::READABLE, EvFlag::READABLE);
+}
+
+// AGENT: wait_ev should block through a WaitToken and wake when change() sets a
+// matching event bit.
+#[test]
+fn ev_bus_wait_ev_wakes_on_matching_event() {
+    let bus = EvBus::make();
+    let waiter_bus = bus.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let waiter = thread::spawn(move || {
+        let ev = wait_ev(&waiter_bus, EvFlag::READABLE);
+        done_tx.send(ev).unwrap();
+    });
+
+    thread::sleep(Duration::from_millis(10));
+    assert!(done_rx.try_recv().is_err());
+
+    bus.lock().unwrap().set(EvFlag::READABLE);
+    let ev = done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("wait_ev waiter should wake after matching event");
+
+    assert_eq!(ev & EvFlag::READABLE, EvFlag::READABLE);
+    waiter.join().unwrap();
 }
 
 // AGENT: write a valid IPv4 header checksum for synthetic parser smoke tests.

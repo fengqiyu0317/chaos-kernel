@@ -24,7 +24,9 @@ use super::*;
 // - KernLock::enter/try_enter/held/owner/level are available for focused tests
 //   or future paths that cannot use the guard API; Spin::try_acquire/is_held
 //   and SpinLock<T> are available for short non-blocking critical sections.
-// - EvCb, EvBus::sub(), top-level wait_ev(), and EvFlag::WRITABLE/ERROR.
+// - EvCb, EvBus::sub(), and EvFlag::WRITABLE/ERROR.
+// - top-level wait_ev() is available for EvBus readiness waits, but has no
+//   active syscall path yet.
 // - RegEp and SyncQueue's generic wait/timeout/epoll-registration helpers.
 // - WaitToken::id() and SocketState.
 // AGENT TODO: KernLock is still a simulator recursive spin lock, not full
@@ -374,14 +376,21 @@ impl EvFlag {
 
 pub type EvCb = Box<dyn Fn(u32) -> bool + Send>;
 
+// AGENT: EvBus waiters pair an event mask with the host-thread wait token that
+// should be woken once the bus reaches a matching readiness state.
+struct EvWaiter {
+    mask: u32,
+    token: WaitToken,
+}
+
 // AGENT TODO: EvBus is still a lightweight event-bit store, not a full
 // kernel-style wait/readiness mechanism. It lacks event payloads/counting,
-// atomic sleep/wakeup integration, epoll-ready propagation, and lock-free
-// callback dispatch.
+// epoll-ready propagation, and lock-free callback dispatch.
 #[derive(Default)]
 pub struct EvBus {
     pub ev: u32,
     pub cbs: Vec<Box<dyn Fn(u32) -> bool + Send>>,
+    waiters: VecDeque<EvWaiter>,
 }
 impl EvBus {
     pub fn make() -> Arc<Mutex<Self>> {
@@ -393,11 +402,25 @@ impl EvBus {
     pub fn clear(&mut self, s: u32) {
         self.change(s, 0);
     }
+    // AGENT: event changes wake every queued waiter whose mask is now ready.
     pub fn change(&mut self, rst: u32, s: u32) {
         let orig = self.ev;
         self.ev = (self.ev & !rst) | s;
         if self.ev != orig {
+            let ev = self.ev;
+            let mut ready = Vec::new();
+            self.waiters.retain(|waiter| {
+                if (ev & waiter.mask) != 0 {
+                    ready.push(waiter.token.clone());
+                    false
+                } else {
+                    true
+                }
+            });
             self.cbs.retain(|f| !f(self.ev));
+            for token in ready {
+                token.wake();
+            }
         }
     }
     pub fn sub(&mut self, cb: Box<dyn Fn(u32) -> bool + Send>) {
@@ -408,22 +431,23 @@ impl EvBus {
     }
 }
 
+// AGENT: check readiness and enqueue the WaitToken while holding the EvBus lock
+// so a concurrent event change cannot happen between the check and sleep setup.
 pub fn wait_ev(bus: &Arc<Mutex<EvBus>>, mask: u32) -> u32 {
     loop {
+        let token = WaitToken::current();
         {
-            let g = bus.lock().unwrap();
+            let mut g = bus.lock().unwrap();
             if (g.ev & mask) != 0 {
                 return g.ev;
             }
+            g.waiters.push_back(EvWaiter {
+                mask,
+                token: token.clone(),
+            });
         }
-        thread::yield_now();
+        token.wait(None);
     }
-}
-
-pub struct RegEp {
-    pub task_id: usize,
-    pub epfd: usize,
-    pub fd: usize,
 }
 
 // AGENT: keep host-thread parking behind a token so kernel wait queues do not
@@ -619,6 +643,18 @@ pub enum SocketState {
     Closing,
 }
 
+pub struct RegEp {
+    pub task_id: usize,
+    pub epfd: usize,
+    pub fd: usize,
+}
+
+// AGENT TODO: SyncQueue's generic helpers are not yet a full
+// condition-variable/wait-queue abstraction. They do not atomically pair
+// condition checks, waiter enqueue, and release/reacquire of the caller's
+// guard; wait_timeout still uses host time; RegEp is not wired into epoll
+// readiness wakeups. Channel currently uses q directly with its own lock
+// ordering.
 pub struct SyncQueue {
     pub(crate) q: Mutex<VecDeque<WaitToken>>,
     eq: Mutex<VecDeque<RegEp>>,
