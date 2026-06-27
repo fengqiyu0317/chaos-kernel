@@ -582,6 +582,49 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-27：kernel-sim runtime ticker guard
+
+目标：为 `kernel-sim` 增加显式可控的后台 runtime ticker，使需要真实运行时推进逻辑 timer wheel 的场景可以通过 `Arc<Kernel>` 启动 100Hz CPU0 tick，同时保持普通测试仍可手动调用 `schedule_tick(0)`。
+
+已完成修改：
+
+- 新增 `KernelRuntimeTicker` RAII guard，通过后台线程周期性调用 `kernel.schedule_tick(0)`，并用全局单例标志避免多个 ticker 同时推进全局逻辑时钟和 timer wheel。
+- `KernelRuntimeTicker::stop()` / `Drop` 会唤醒后台线程、等待退出并释放单例槽位。
+- `kernel_ops.rs` 重新导出 `KernelRuntimeTicker`，不公开整个 runtime helper module。
+- 新增 smoke 回归 `runtime_ticker_guard_drives_timer_waits_and_stops_cleanly`，覆盖 ticker 启动、重复启动失败、timer wait 被后台 tick 超时唤醒、停止后可重新启动。
+- 补充 `TASK.md` 和 `net.rs` 中关于网络 helper 后续协议边界、checksum、socket 路径的 TODO 记录。
+
+关键文件：
+
+- `kernel-sim/src/kernel/core/kernel_ops.rs`
+- `kernel-sim/src/kernel/core/kernel_ops/runtime.rs`
+- `kernel-sim/tests/smoke.rs`
+- `kernel-sim/src/kernel/core/net.rs`
+- `TASK.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+git diff --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`git diff --check` 通过；`cargo test --test smoke` 通过 `54 passed`；完整 `cargo test` 通过 `elf 3 passed`、`smoke 54 passed`。
+
+未解决问题：
+
+- `KernelRuntimeTicker` 只是 opt-in runtime guard，默认测试和确定性调度路径仍应显式调用 `schedule_tick(0)`。
+- `kernel-sim` 的 timer wheel 仍是 simulator-wide 全局状态，timer 相关测试需要继续使用串行化锁避免互相触发。
+- `net.rs` 仍是 helper-only，尚未接入 socket syscall、`FLike::Socket`、loopback/虚拟网卡或真实包收发路径。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
 ## 2026-06-24：kernel-sim sys_munmap 参数校验
 
 目标：补齐 `TASK.md` 中记录的 `sys_munmap()` syscall 入口参数语义，防止零长度、未对齐地址、长度溢出、地址区间溢出和越过用户空间边界的请求进入地址空间修改路径。

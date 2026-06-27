@@ -4,6 +4,11 @@ use super::*;
 // AGENT TODO: These protocol helpers are not wired into the simulator yet.
 // Future AF_INET socket support should call them from a Socket/FLike data path
 // for IPv4 header validation and TCP/UDP checksum handling.
+// AGENT TODO: Harden the helpers themselves before treating this as a reliable
+// protocol utility layer: return structured IPv4 parse info/errors, validate
+// total length and payload ranges, use wider checksum accumulation plus verify
+// helpers, make TCP checksum APIs operate on TCP segments explicitly, return a
+// fixed 12-byte pseudo header, and cover edge cases with unit tests.
 pub fn tcp_checksum(src_ip: u32, dst_ip: u32, payload: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     sum += (src_ip >> 16) & 0xFFFF;

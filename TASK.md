@@ -1,6 +1,6 @@
 # Chaos 项目交接状态
 
-更新日期：2026-06-24
+更新日期：2026-06-27
 
 ## 目标
 
@@ -38,6 +38,7 @@
 - 2026-06-24：`sys_open()` / `sys_read()` / `sys_write()` 已接入真实用户地址空间和 `FileNode`/`FLike` 数据路径：open 从用户内存读取 C 字符串路径并使用统一路径文件表，read/write 通过 fd entry 调用普通文件或 pipe 对象，再用 `AddrSpace::{read,write}_user_bytes()` 搬运真实字节。新增 smoke 回归覆盖真实文件读、dup 共享 offset、EOF、bad fd、只写 fd、用户缓冲区 `efault`、pipe 数据读写与空 pipe `again`。
 - 2026-06-26：`kernel-sim/src/kernel/core/time.rs` 的 `TimerWheel` 已接入 `Kernel` 状态：`Kernel` 持有全局 timer wheel，`schedule_tick()` 在 CPU0 更新逻辑时钟后推进它，并补充 smoke 回归覆盖 CPU0 tick 触发 timer wheel。
 - 2026-06-26：`kernel-sim/src/kernel/core/time.rs` 的 `TimerEntry.callback_id` 占位已替换为 `TimerTarget` typed target；timer 到期后由 `dispatch_timer()` 分发到 `WaitToken` timeout、任务唤醒或信号投递路径，`WaitToken` 也已区分普通事件唤醒和 timeout 唤醒，futex syscall timeout 改为注册 timer wheel deadline。
+- 2026-06-27：`kernel-sim` 新增显式 `KernelRuntimeTicker` runtime guard，可通过 `Arc<Kernel>` 启动后台 100Hz CPU0 tick，并在 `stop()` / `Drop` 时停止线程、释放单例 ticker 槽位；默认测试路径继续手动调用 `schedule_tick(0)`。
 
 ## 关键文件
 
@@ -196,6 +197,7 @@ cargo test --test pressure
 - TODO: `kernel-sim` 的 fork 失败条件目前主要受全局 `N_PROC` 限制约束；尚未建模 `RLIMIT_NPROC`、系统线程数上限、`pid_max`、cgroup pids 限制、PID namespace init 退出、内存压力导致的 `ENOMEM` 等真实错误路径。
 - TODO: 真实 fork 中 child 不继承 parent timers，目前只有全局/通用 timer wheel 和 `clock_gettime` 级别的时间读取。
 - TODO: `kernel-sim` 的带超时等待仍有路径分散使用 host `Instant` / `thread::park_timeout` 或轮询；后续应继续让 `WaitQueue::sleep_timeout`、`SyncQueue::wait_timeout`、`epoll_wait(timeout)` 等统一通过 timer wheel 注册 deadline。当前 futex syscall timeout 已接入 timer wheel。
+- TODO: `kernel-sim/src/kernel/core/kernel_ops/runtime.rs` 的 `KernelRuntimeTicker` 停机路径当前仍直接使用 `std::sync::Condvar` 管理宿主线程 wait/notify；项目长期应提供自有 runtime wait primitive 包住这层宿主语义，避免业务代码直接依赖 Rust 自带 `Condvar`，但该 primitive 不能依赖由 ticker 自己推进的逻辑 timer wheel。
 - TODO: `kernel-sim/src/kernel/core/time.rs` 的 timer wheel 超过一圈 deadline 和 repeat timer 已依赖绝对 deadline 复查避免提前触发；后续仍应补充显式回归覆盖远期 deadline、重复 timer 重排和取消竞态。
 - TODO: `kernel-sim` 尚未建模 `mlock/mlockall` 内存锁状态、`MADV_WIPEONFORK` 清零语义，以及完整 `madvise` fork 标志；已有 `VM_DONTCOPY` 只覆盖了 DONTFORK 类似行为的一部分。
 - TODO: `kernel-sim` 的 futex 模型尚未覆盖真实 Linux 的 shared futex key、priority-inheritance futex、robust futex list、`OWNER_DIED` 标记和 owner 退出时唤醒等待者等语义。
@@ -227,6 +229,11 @@ cargo test --test pressure
 - TODO: `kernel-sim` 尚未维护 `start_brk`/最小 break 与完整 heap VMA 边界；后续应防止 `brk` 收缩误删 ELF text/data/bss 或其他非 heap 映射，并处理 heap 与 mmap/stack/resource limit 冲突时的失败回滚。
 - TODO: `kernel-sim` 的 `brk` 增长目前通过 `resize_brk()` / `map_region()` eager 分配整段物理页；若贴近真实内核，应先登记 heap VMA、缺页时再分配页面，并增加未对齐增长/收缩、失败保持原 break、低于最小 break、与 mmap 碰撞等 smoke 回归。
 - TODO: `kernel-sim/src/kernel/core/net.rs` 目前只公开 IPv4/TCP checksum 与 IPv4 header 解析 helper，尚未接入任何运行时路径；后续若实现网络能力，应先新增 socket 文件对象并接入 `FLike` / fd 表 / `read` / `write` / `poll` / `epoll` 路径。
+- TODO: `kernel-sim/src/kernel/core/net.rs` 的 helper 函数本身还需补齐协议级边界：`parse_ipv4_header()` 应返回结构化 IPv4 header 信息，包括 header length、payload range、TTL、flags/fragment 等字段，并显式校验 `total_len >= header_len`、`total_len <= pkt.len()` 和 payload 边界。
+- TODO: `kernel-sim/src/kernel/core/net.rs` 后续应把 `parse_ipv4_header()` 的 `Option` 返回改为可诊断错误类型，区分 too short、not IPv4、bad IHL、bad total length、bad checksum 等失败原因，便于单元测试和后续包接收路径处理。
+- TODO: `kernel-sim/src/kernel/core/net.rs` 的 checksum helper 应更适合作为通用协议工具：`compute_inet_checksum()` 使用更宽累加类型避免长输入溢出，补充 `verify_inet_checksum()`，并把 IPv4 header checksum 验证表达为对 header 数据的统一校验。
+- TODO: `kernel-sim/src/kernel/core/net.rs` 的 TCP helper 需要明确输入是 TCP segment 而非普通 payload：后续应拆出 `tcp_checksum_ipv4()` / `verify_tcp_checksum_ipv4()`，校验 segment 长度、最小 TCP header 长度，并明确 checksum 字段由调用者清零还是函数内部清零。
+- TODO: `kernel-sim/src/kernel/core/net.rs` 的 `build_pseudo_header()` 可改为返回固定 `[u8; 12]`，避免为 IPv4 pseudo header 分配 `Vec`；同时补充奇数字节长度、带 IPv4 options、checksum 错误、长度字段异常、TCP segment 超长等单元测试。
 - TODO: `kernel-sim` 尚未实现 `SYS_SOCKET`、`SYS_BIND`、`SYS_CONNECT`、`SYS_ACCEPT`、`SYS_SENDTO`、`SYS_RECVFROM` 等 socket syscall；若补齐 `AF_INET` / `SOCK_STREAM` / `SOCK_DGRAM`，应让 syscall 创建或操作 `FLike::Socket`，而不是绕开现有 fd 模型。
 - TODO: `kernel-sim` 尚未维护 loopback/虚拟网卡、端口绑定表、socket receive queue、连接状态和非阻塞/阻塞唤醒规则；短期可先做进程内 loopback socket，长期再把 `net.rs` 的 IPv4/TCP 解析和 checksum helper 用到真实包收发路径。
 - TODO: `kernel-sim` 若实现真实 IPv4/TCP 包模拟，发送路径应使用 `compute_inet_checksum()` 计算 IP header checksum，并使用 `tcp_checksum()` 或 `build_pseudo_header()` 计算 TCP/UDP pseudo-header checksum；接收路径应通过 `parse_ipv4_header()` 校验版本、IHL、total length、protocol 和 header checksum，再按 protocol 分发。

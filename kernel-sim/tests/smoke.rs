@@ -1,15 +1,16 @@
 // AGENT
 use kernel_sim::{
-    AddrSpace, EpData, EpEvent, ExitReason, FHandle, FLike, FdOpt, Kernel, PageBacking,
-    PageTableEntry, PgFrame, SchedulePolicy, Task, TaskRunState, TaskTable, TimerEntry, VmRegion,
-    WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED,
-    N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK,
-    SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID,
-    SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4,
-    SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    AddrSpace, EpData, EpEvent, ExitReason, FHandle, FLike, FdOpt, Kernel, KernelRuntimeTicker,
+    PageBacking, PageTableEntry, PgFrame, SchedulePolicy, Task, TaskRunState, TaskTable,
+    TimerEntry, VmRegion, WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS,
+    MAP_PRIVATE, MAP_SHARED, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ,
+    PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT,
+    SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ,
+    SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ,
+    VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Barrier, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1876,6 +1877,54 @@ fn timer_target_wakes_wait_token_as_timeout() {
         waiter.join().expect("timer waiter should not panic"),
         WaitOutcome::Timeout
     );
+}
+
+// AGENT: optional runtime ticker drives logical timer waits without replacing
+// tests that explicitly call schedule_tick(0).
+#[test]
+fn runtime_ticker_guard_drives_timer_waits_and_stops_cleanly() {
+    let _timer_guard = lock_timer_tests();
+    let kernel = Arc::new(Kernel::new(N_FRAMES));
+    let mut ticker = KernelRuntimeTicker::start(Arc::clone(&kernel))
+        .expect("runtime ticker should start for Arc<Kernel>");
+
+    assert!(
+        KernelRuntimeTicker::start(Arc::clone(&kernel)).is_err(),
+        "only one runtime ticker may advance the global timer wheel"
+    );
+
+    let (token_tx, token_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let token = WaitToken::current();
+        token_tx
+            .send(token.clone())
+            .expect("wait token should be observable by test");
+        let outcome = token.wait_with_timer(Duration::from_millis(10));
+        done_tx
+            .send(outcome)
+            .expect("timer wait outcome should be observable by test");
+    });
+    let token = token_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("wait token should be registered");
+    let outcome = match done_rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            token.wake();
+            waiter.join().expect("waiter should stop after test wake");
+            panic!("runtime ticker did not drive timer wait: {err}");
+        }
+    };
+    waiter
+        .join()
+        .expect("timer waiter thread should finish cleanly");
+    assert_eq!(outcome, WaitOutcome::Timeout);
+
+    ticker.stop();
+    let restarted = KernelRuntimeTicker::start(Arc::clone(&kernel))
+        .expect("runtime ticker should release singleton slot on stop");
+    drop(restarted);
 }
 
 #[test]
