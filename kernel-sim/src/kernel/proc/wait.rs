@@ -111,13 +111,10 @@ impl WaitQueue {
             flags,
         });
         drop(q);
-        if token.wait(Some(timeout)) {
-            true
-        } else {
-            let mut q = self.inner.lock().unwrap();
-            if token.is_woken() {
-                true
-            } else {
+        match token.wait(Some(timeout)) {
+            WaitOutcome::Event => true,
+            WaitOutcome::Timeout => {
+                let mut q = self.inner.lock().unwrap();
                 q.retain(|entry| !entry.token.same(&token));
                 false
             }
@@ -125,14 +122,20 @@ impl WaitQueue {
     }
 
     pub fn wake_one(&self, key: usize) -> bool {
-        let mut q = self.inner.lock().unwrap();
-        if let Some(pos) = q.iter().position(|entry| entry.key == key) {
-            let entry = q.remove(pos).unwrap();
-            entry.token.wake();
-            self.wake_count.fetch_add(1, Ordering::Relaxed);
-            true
-        } else {
-            false
+        loop {
+            let entry = {
+                let mut q = self.inner.lock().unwrap();
+                q.iter()
+                    .position(|entry| entry.key == key)
+                    .map(|pos| q.remove(pos).unwrap())
+            };
+            let Some(entry) = entry else {
+                return false;
+            };
+            if entry.token.wake() {
+                self.wake_count.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
         }
     }
 
@@ -142,8 +145,9 @@ impl WaitQueue {
         let mut remaining = VecDeque::new();
         for entry in q.drain(..) {
             if entry.key == key {
-                entry.token.wake();
-                count += 1;
+                if entry.token.wake() {
+                    count += 1;
+                }
             } else {
                 remaining.push_back(entry);
             }
@@ -159,8 +163,9 @@ impl WaitQueue {
         let mut remaining = VecDeque::new();
         for entry in q.drain(..) {
             if pred(entry.key, entry.flags) {
-                entry.token.wake();
-                count += 1;
+                if entry.token.wake() {
+                    count += 1;
+                }
             } else {
                 remaining.push_back(entry);
             }

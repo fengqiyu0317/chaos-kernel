@@ -2,14 +2,14 @@
 use kernel_sim::{
     AddrSpace, EpData, EpEvent, ExitReason, FHandle, FLike, FdOpt, Kernel, PageBacking,
     PageTableEntry, PgFrame, SchedulePolicy, Task, TaskRunState, TaskTable, TimerEntry, VmRegion,
-    AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, N_FRAMES, N_PROC,
-    N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP,
-    SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL,
-    SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE,
-    TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED,
+    N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK,
+    SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID,
+    SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4,
+    SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,17 @@ const TEST_EXEC_LOAD_OFFSET: usize = PAGE_SZ;
 const ELF_PH_OFF: usize = 64;
 const ELF_PH_SIZE: usize = 56;
 const TEST_EXEC_PAYLOAD: &[u8] = b"kernel-sim exec payload";
+
+// AGENT: global TimerWheel tests must not run in parallel because one test's
+// schedule_tick can expire another test's timeout waiter.
+static TIMER_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn lock_timer_tests() -> std::sync::MutexGuard<'static, ()> {
+    TIMER_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap()
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -82,6 +93,18 @@ fn map_user_region(kernel: &Kernel, task: &Arc<Task>, addr: usize, len: usize, f
         .unwrap()
         .map_region(VmRegion::new(addr, len, flags), &kernel.pool)
         .expect("user test region should map");
+}
+
+// AGENT: drive logical timers in tests that intentionally wait for timer-wheel
+// expiry instead of host-time timeout.
+fn drive_timers_until_idle(kernel: &Kernel) -> bool {
+    for _ in 0..=TIMER_WHEEL_SIZE {
+        if kernel.timers.lock().unwrap().active_count() == 0 {
+            return true;
+        }
+        kernel.schedule_tick(0);
+    }
+    kernel.timers.lock().unwrap().active_count() == 0
 }
 
 fn install_test_exec(kernel: &Kernel, path: &str) {
@@ -1773,6 +1796,7 @@ fn custom_signal_handler_updates_context_and_sigreturn_restores_it() {
 
 #[test]
 fn forked_task_enters_run_queue_and_receives_cpu_after_slice() {
+    let _timer_guard = lock_timer_tests();
     let kernel = Kernel::new(N_FRAMES);
     kernel.proc_init();
     let child = kernel.do_fork(1).expect("fork should create child task");
@@ -1793,6 +1817,7 @@ fn forked_task_enters_run_queue_and_receives_cpu_after_slice() {
 
 #[test]
 fn single_current_task_keeps_running_across_ticks() {
+    let _timer_guard = lock_timer_tests();
     let kernel = Kernel::new(N_FRAMES);
     kernel.proc_init();
 
@@ -1809,6 +1834,7 @@ fn single_current_task_keeps_running_across_ticks() {
 
 #[test]
 fn cpu0_schedule_tick_advances_kernel_timer_wheel() {
+    let _timer_guard = lock_timer_tests();
     let kernel = Kernel::new(N_FRAMES);
     let deadline = {
         let mut timers = kernel.timers.lock().unwrap();
@@ -1824,6 +1850,32 @@ fn cpu0_schedule_tick_advances_kernel_timer_wheel() {
     let timers = kernel.timers.lock().unwrap();
     assert_eq!(timers.current_slot, deadline);
     assert_eq!(timers.active_count(), 0);
+}
+
+#[test]
+fn timer_target_wakes_wait_token_as_timeout() {
+    let _timer_guard = lock_timer_tests();
+    let kernel = Arc::new(Kernel::new(N_FRAMES));
+    let waiter = thread::spawn(move || {
+        let token = WaitToken::current();
+        token.wait_with_timer(Duration::from_millis(10))
+    });
+
+    let wait_until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < wait_until {
+        if kernel.timers.lock().unwrap().active_count() == 1 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(kernel.timers.lock().unwrap().active_count(), 1);
+
+    assert!(drive_timers_until_idle(&kernel));
+
+    assert_eq!(
+        waiter.join().expect("timer waiter should not panic"),
+        WaitOutcome::Timeout
+    );
 }
 
 #[test]
@@ -2092,6 +2144,7 @@ fn futex_wait_returns_eagain_when_value_changed() {
 
 #[test]
 fn futex_wait_sleeps_until_wake() {
+    let _timer_guard = lock_timer_tests();
     let kernel = Arc::new(Kernel::new(N_FRAMES));
     kernel.proc_init();
     let futex_word = Arc::new(AtomicU32::new(1));
@@ -2134,6 +2187,7 @@ fn futex_wake_zero_wakes_nobody() {
 
 #[test]
 fn futex_requeue_wakes_and_moves_waiters() {
+    let _timer_guard = lock_timer_tests();
     let kernel = Arc::new(Kernel::new(N_FRAMES));
     kernel.proc_init();
     let src = Arc::new(AtomicU32::new(1));
@@ -2179,6 +2233,7 @@ fn futex_requeue_wakes_and_moves_waiters() {
 
 #[test]
 fn futex_wake_op_updates_uaddr2_and_conditionally_wakes_both_queues() {
+    let _timer_guard = lock_timer_tests();
     const FUTEX_OP_ADD: usize = 1;
     const FUTEX_OP_CMP_EQ: usize = 0;
 
@@ -2244,6 +2299,7 @@ fn futex_wake_op_sign_extends_oparg_and_cmparg() {
 
 #[test]
 fn futex_wake_op_invalid_cmp_does_not_wake_waiters() {
+    let _timer_guard = lock_timer_tests();
     const FUTEX_OP_ADD: usize = 1;
     const FUTEX_OP_CMP_INVALID: usize = 6;
 
@@ -2271,6 +2327,7 @@ fn futex_wake_op_invalid_cmp_does_not_wake_waiters() {
 
     assert_eq!(err, "einval");
     assert_eq!(dst.load(Ordering::SeqCst), 1);
+    assert!(drive_timers_until_idle(&kernel));
     assert_eq!(
         waiter.join().expect("waiter thread should finish"),
         Err("timeout")
@@ -2295,6 +2352,7 @@ fn futex_cmp_requeue_returns_eagain_when_source_value_changed() {
 
 #[test]
 fn futex_cmp_requeue_wakes_and_moves_after_compare() {
+    let _timer_guard = lock_timer_tests();
     let kernel = Arc::new(Kernel::new(N_FRAMES));
     kernel.proc_init();
     let src = Arc::new(AtomicU32::new(1));

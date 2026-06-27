@@ -87,9 +87,36 @@ impl Kernel {
         }
     }
 
-    // AGENT TODO: replace numeric callback IDs with typed timer targets.
+    // AGENT: dispatch typed timer expiry targets into the existing wake/signal
+    // paths after the timer wheel lock has been released.
     fn dispatch_timer(&self, timer: TimerEntry) {
-        let _ = timer;
+        match timer.target {
+            TimerTarget::Noop => {}
+            TimerTarget::WakeToken { token } => {
+                token.wake_timeout();
+            }
+            TimerTarget::WakeTask { task_id } => {
+                let Some(task) = self.tasks.find(task_id) else {
+                    return;
+                };
+                if task.done() {
+                    return;
+                }
+                if task.sched_state() == TaskRunState::Sleeping {
+                    task.set_sched_state(TaskRunState::Runnable);
+                    self.run_queue.enqueue(task.id(), task.sched_policy());
+                }
+            }
+            TimerTarget::SignalTask {
+                task_id,
+                signo,
+                sender_tid,
+            } => {
+                if let Some(task) = self.tasks.find(task_id) {
+                    self.send_signal_to_task(&task, signo, sender_tid);
+                }
+            }
+        }
     }
 
     // AGENT: CPU0 owns logical timer progression; other CPUs only update CLK_ALL.

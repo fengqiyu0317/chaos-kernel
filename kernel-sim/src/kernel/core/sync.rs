@@ -220,6 +220,16 @@ pub struct RegEp {
 // store std::thread::Thread directly.
 static WAIT_TOKEN_SEQ: AtomicUsize = AtomicUsize::new(1);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    Event,
+    Timeout,
+}
+
+const WAIT_PENDING: u8 = 0;
+const WAIT_EVENT: u8 = 1;
+const WAIT_TIMEOUT: u8 = 2;
+
 #[derive(Clone)]
 pub struct WaitToken {
     id: usize,
@@ -227,7 +237,7 @@ pub struct WaitToken {
 }
 
 struct WaitState {
-    woken: AtomicBool,
+    outcome: AtomicU8,
     host: HostWaiter,
 }
 
@@ -260,7 +270,7 @@ impl WaitToken {
         Self {
             id: WAIT_TOKEN_SEQ.fetch_add(1, Ordering::Relaxed),
             state: Arc::new(WaitState {
-                woken: AtomicBool::new(false),
+                outcome: AtomicU8::new(WAIT_PENDING),
                 host: HostWaiter::current(),
             }),
         }
@@ -270,19 +280,59 @@ impl WaitToken {
         self.id
     }
 
-    pub fn wake(&self) {
-        if !self.state.woken.swap(true, Ordering::Release) {
+    pub fn wake(&self) -> bool {
+        self.wake_event()
+    }
+
+    // AGENT: mark a normal event wake; returns false if timeout or another wake
+    // already won the race.
+    pub fn wake_event(&self) -> bool {
+        if self
+            .state
+            .outcome
+            .compare_exchange(
+                WAIT_PENDING,
+                WAIT_EVENT,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
             self.state.host.wake();
+            true
+        } else {
+            false
         }
     }
 
-    pub fn wait(&self, timeout: Option<Duration>) -> bool {
+    // AGENT: mark a timer expiry wake separately from a normal event wake.
+    pub fn wake_timeout(&self) -> bool {
+        if self
+            .state
+            .outcome
+            .compare_exchange(
+                WAIT_PENDING,
+                WAIT_TIMEOUT,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.state.host.wake();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn wait(&self, timeout: Option<Duration>) -> WaitOutcome {
         match timeout {
             Some(d) => {
                 let deadline = std::time::Instant::now() + d;
                 while !self.is_woken() {
                     let now = std::time::Instant::now();
                     if now >= deadline {
+                        self.wake_timeout();
                         break;
                     }
                     self.state.host.park_timeout(deadline - now);
@@ -294,11 +344,49 @@ impl WaitToken {
                 }
             }
         }
-        self.is_woken()
+        self.outcome()
+    }
+
+    // AGENT: wait using the logical kernel timer wheel instead of host
+    // Instant/park_timeout.
+    pub fn wait_with_timer(&self, timeout: Duration) -> WaitOutcome {
+        let ticks = duration_to_ticks(timeout);
+        if ticks == 0 {
+            self.wake_timeout();
+            return self.outcome();
+        }
+        let deadline = CLK.load(Ordering::Relaxed).saturating_add(ticks);
+        let timers = global_timer_wheel();
+        let timer_id = {
+            let mut wheel = timers.lock().unwrap();
+            wheel.register_timer(
+                deadline,
+                0,
+                TimerTarget::WakeToken {
+                    token: self.clone(),
+                },
+            )
+        };
+        let outcome = self.wait(None);
+        if outcome == WaitOutcome::Event {
+            timers.lock().unwrap().cancel(timer_id);
+        }
+        outcome
     }
 
     pub fn is_woken(&self) -> bool {
-        self.state.woken.load(Ordering::Acquire)
+        self.state.outcome.load(Ordering::Acquire) != WAIT_PENDING
+    }
+
+    pub fn is_timeout(&self) -> bool {
+        self.state.outcome.load(Ordering::Acquire) == WAIT_TIMEOUT
+    }
+
+    pub fn outcome(&self) -> WaitOutcome {
+        match self.state.outcome.load(Ordering::Acquire) {
+            WAIT_TIMEOUT => WaitOutcome::Timeout,
+            _ => WaitOutcome::Event,
+        }
     }
 
     pub fn same(&self, other: &Self) -> bool {
@@ -348,18 +436,15 @@ impl SyncQueue {
         pred(&d)
     }
     pub fn signal(&self) {
-        let mut q = self.q.lock().unwrap();
-        match q.len() {
-            0 => {}
-            1 => {
-                let token = q.pop_front().unwrap();
-                drop(q);
-                token.wake();
-            }
-            _ => {
-                let token = q.pop_front().unwrap();
-                drop(q);
-                token.wake();
+        loop {
+            let token = {
+                let mut q = self.q.lock().unwrap();
+                q.pop_front()
+            };
+            match token {
+                Some(token) if token.wake() => return,
+                Some(_) => continue,
+                None => return,
             }
         }
     }
@@ -371,16 +456,21 @@ impl SyncQueue {
             token.wake();
         }
     }
-    // AGENT: replaced locked-while-unparking with batch-drain-then-unpark (consistent with signal/broadcast)
+    // AGENT: wake up to n live tokens and skip stale tokens already completed by timeout.
     pub fn signal_n(&self, n: usize) -> usize {
-        let mut q = self.q.lock().unwrap();
-        let to_wake = n.min(q.len());
-        let batch: Vec<_> = q.drain(..to_wake).collect();
-        drop(q);
-        for token in &batch {
-            token.wake();
+        let mut woken = 0;
+        while woken < n {
+            let token = {
+                let mut q = self.q.lock().unwrap();
+                q.pop_front()
+            };
+            match token {
+                Some(token) if token.wake() => woken += 1,
+                Some(_) => continue,
+                None => break,
+            }
         }
-        batch.len()
+        woken
     }
     pub fn pending(&self) -> usize {
         let q = self.q.lock().unwrap();
@@ -442,13 +532,10 @@ impl SyncQueue {
             q.push_back(token.clone());
         }
         drop(g.lock().unwrap());
-        if token.wait(Some(timeout)) {
-            true
-        } else {
-            let mut q = self.q.lock().unwrap();
-            if token.is_woken() {
-                true
-            } else {
+        match token.wait(Some(timeout)) {
+            WaitOutcome::Event => true,
+            WaitOutcome::Timeout => {
+                let mut q = self.q.lock().unwrap();
                 q.retain(|queued| !queued.same(&token));
                 false
             }
@@ -591,6 +678,13 @@ impl FutexRequeueResult {
     }
 }
 
+// AGENT: distinguish futex timeout backends while sharing the waiter setup.
+#[derive(Clone, Copy)]
+enum FutexWaitClock {
+    Host,
+    KernelTimer,
+}
+
 pub struct FutexBucket {
     waiters: Mutex<VecDeque<FutexWaiter>>,
 }
@@ -608,12 +702,35 @@ impl FutexBucket {
         val: &AtomicU32,
         timeout: Option<Duration>,
     ) -> Result<(), &'static str> {
+        self.wait_inner(addr, expected, val, timeout, FutexWaitClock::Host)
+    }
+
+    // AGENT: futex syscall timeouts use the kernel timer wheel so timeout wakeup
+    // follows the same logical clock as scheduler ticks.
+    pub fn wait_with_timer(
+        &self,
+        addr: usize,
+        expected: u32,
+        val: &AtomicU32,
+        timeout: Option<Duration>,
+    ) -> Result<(), &'static str> {
+        self.wait_inner(addr, expected, val, timeout, FutexWaitClock::KernelTimer)
+    }
+
+    // AGENT: compare and enqueue under one queue lock so a wake cannot slip
+    // between seeing the expected value and publishing this waiter.
+    fn wait_inner(
+        &self,
+        addr: usize,
+        expected: u32,
+        val: &AtomicU32,
+        timeout: Option<Duration>,
+        clock: FutexWaitClock,
+    ) -> Result<(), &'static str> {
         assert_eq!(val.as_ptr() as usize, addr, "addr must match val address");
         let token = WaitToken::current();
         {
             let mut w = self.waiters.lock().unwrap();
-            // AGENT: compare and enqueue under one queue lock so a wake cannot
-            // slip between seeing the expected value and publishing this waiter.
             if val.load(Ordering::SeqCst) != expected {
                 return Err("changed");
             }
@@ -623,16 +740,22 @@ impl FutexBucket {
             });
         }
 
-        if token.wait(timeout) {
-            return Ok(());
-        }
+        let outcome = match (clock, timeout) {
+            (FutexWaitClock::KernelTimer, Some(timeout)) => token.wait_with_timer(timeout),
+            _ => token.wait(timeout),
+        };
+        self.finish_wait(&token, outcome)
+    }
 
-        let mut w = self.waiters.lock().unwrap();
-        if token.is_woken() {
-            return Ok(());
+    fn finish_wait(&self, token: &WaitToken, outcome: WaitOutcome) -> Result<(), &'static str> {
+        match outcome {
+            WaitOutcome::Event => Ok(()),
+            WaitOutcome::Timeout => {
+                let mut w = self.waiters.lock().unwrap();
+                w.retain(|waiter| !waiter.token.same(token));
+                Err("timeout")
+            }
         }
-        w.retain(|waiter| !waiter.token.same(&token));
-        Err("timeout")
     }
     pub fn wake(&self, addr: usize, count: usize) -> usize {
         let mut w = self.waiters.lock().unwrap();
@@ -697,8 +820,9 @@ impl FutexBucket {
         let mut woken = 0;
         waiters.retain(|waiter| {
             if waiter.addr == addr && woken < count {
-                waiter.token.wake();
-                woken += 1;
+                if waiter.token.wake() {
+                    woken += 1;
+                }
                 false
             } else {
                 true
@@ -717,8 +841,9 @@ impl FutexBucket {
         for waiter in waiters.iter_mut() {
             if waiter.addr == src {
                 if wk < wake_n {
-                    waiter.token.wake();
-                    wk += 1;
+                    if waiter.token.wake() {
+                        wk += 1;
+                    }
                 } else if mv < move_n {
                     waiter.addr = dst;
                     mv += 1;

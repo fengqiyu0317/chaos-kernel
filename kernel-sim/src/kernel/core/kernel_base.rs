@@ -9,8 +9,8 @@ pub struct Kernel {
     pub pool: FramePool,
     pub cpus: Mutex<[Option<Arc<Task>>; MAX_CPU]>,
     pub mnt: MountTable,
-    // AGENT: simulator-wide timer wheel driven from CPU0 scheduler ticks.
-    pub timers: Mutex<TimerWheel>,
+    // AGENT: handle to the simulator-wide timer wheel driven from CPU0 ticks.
+    pub timers: &'static Mutex<TimerWheel>,
     // AGENT: unified path-backed file table shared by open-like handles and exec.
     pub file_nodes: RwLock<BTreeMap<String, Arc<FileNode>>>,
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
@@ -27,7 +27,7 @@ impl Kernel {
             pool: FramePool::new(nf),
             cpus: Mutex::new([None, None, None, None, None, None, None, None]),
             mnt: MountTable::new(),
-            timers: Mutex::new(TimerWheel::new()),
+            timers: global_timer_wheel(),
             file_nodes: RwLock::new(BTreeMap::new()),
             sem_store: RwLock::new(BTreeMap::new()),
             shm_store: RwLock::new(BTreeMap::new()),

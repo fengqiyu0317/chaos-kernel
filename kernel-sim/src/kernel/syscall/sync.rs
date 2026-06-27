@@ -37,7 +37,7 @@ pub(super) fn sys_futex(
             let current = kernel.cur_task(0).ok_or("esrch")?;
             let futex = current.get_futex();
             let word = unsafe { &*(uaddr as *const AtomicU32) };
-            match futex.wait(uaddr, val as u32, word, timeout) {
+            match futex.wait_with_timer(uaddr, val as u32, word, timeout) {
                 Ok(()) => Ok(0),
                 Err("changed") => Err("eagain"),
                 Err(e) => Err(e),

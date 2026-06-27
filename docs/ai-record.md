@@ -1,6 +1,6 @@
 # Chaos AI 工作日志
 
-更新时间：2026-06-26
+更新时间：2026-06-27
 
 ## 维护约定
 
@@ -366,6 +366,70 @@ cargo test
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
 来源：Codex 本轮 timer wheel 接入、同步模块 TODO 标注与验证记录。
+
+## 2026-06-27：kernel-sim typed timer target 与 futex timeout
+
+### 目标
+
+把 timer wheel 从占位 callback id 推进到可分发的 typed target，并让 futex syscall timeout 通过 kernel-sim 逻辑 timer wheel 到期唤醒；同时收敛 `FutexBucket::wait()` 和 `wait_with_timer()` 的重复等待入队逻辑。
+
+### 已完成修改
+
+- `TimerEntry.callback_id` 替换为 `TimerTarget`，支持 `Noop`、`WakeToken`、`WakeTask` 和 `SignalTask`。
+- `TimerWheel` 新增可取消的 `register_timer()` id 分配路径，并用绝对 deadline 复查避免超过一圈的 timer 被过早触发。
+- `Kernel::timers` 改为指向 simulator-wide global timer wheel，`dispatch_timer()` 按 typed target 分发到 wait token timeout、任务唤醒或信号投递路径。
+- `WaitToken` 从单一 woken bool 改为 `WaitOutcome::{Event, Timeout}`，区分普通唤醒和超时唤醒；普通 wake 返回是否真正唤醒，避免 timeout 后的 stale token 被重复计数。
+- `SYS_FUTEX` 的 wait timeout 改走 `FutexBucket::wait_with_timer()`，有 timeout 时注册 timer wheel deadline；无 timeout 时保持阻塞等待。
+- `FutexBucket::wait()` 和 `wait_with_timer()` 共用私有 `wait_inner()`，保留 host-time 与 kernel-timer 两种 timeout 后端，避免重复的 futex word 检查、入队和超时清理代码。
+- 新增/调整 smoke 回归覆盖 `TimerTarget::WakeToken` timeout、timer 测试串行化，以及 futex timeout 后清理 stale waiter 的路径。
+- `TASK.md` 同步更新 timer/futex timeout 当前状态和剩余 TODO。
+
+### 关键文件
+
+- `kernel-sim/src/kernel/core/time.rs`
+- `kernel-sim/src/kernel/core/kernel_base.rs`
+- `kernel-sim/src/kernel/core/kernel_ops/sched_signal.rs`
+- `kernel-sim/src/kernel/core/sync.rs`
+- `kernel-sim/src/kernel/proc/wait.rs`
+- `kernel-sim/src/kernel/syscall/sync.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+- `docs/ai-record.md`
+
+### 测试结果
+
+```bash
+cd kernel-sim
+cargo fmt --check
+git diff --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`git diff --check` 通过；`cargo test --test smoke` 通过 `53 passed`；完整 `cargo test` 通过，其中 `tests/elf.rs` 为 `3 passed`，`tests/smoke.rs` 为 `53 passed`，doc-tests 为 `0 passed`。
+
+补充定点验证：
+
+```bash
+cd kernel-sim
+cargo test --test smoke futex
+cargo test --test smoke timer_target_wakes_wait_token_as_timeout
+```
+
+结果：futex 过滤测试 `9 passed`；`timer_target_wakes_wait_token_as_timeout` 通过。
+
+### 未解决问题
+
+- `WaitQueue::sleep_timeout`、`SyncQueue::wait_timeout` 和 `epoll_wait(timeout)` 仍未统一通过 timer wheel 注册 deadline，当前 futex syscall timeout 已完成迁移。
+- POSIX timer / alarm / setitimer 的完整真实语义仍需继续补齐，尤其是 CPU-time accounting、overrun、`sigevent` 细节。
+- timer wheel 还应补充远期 deadline、repeat timer 重排和取消竞态的更细回归。
+
+### 不要改的部分
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
+来源：Codex 本轮 typed timer target、futex timeout 和等待路径合并验证记录。
 
 ## 2026-06-25：kernel-sim 文件 I/O 与 pipe 用户内存路径
 
