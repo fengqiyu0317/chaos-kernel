@@ -138,6 +138,9 @@ impl Kernel {
     pub fn set_cur(&self, cpu: usize, t: Option<Arc<Task>>) {
         let mut cg = self.cpus.lock().unwrap();
         if cpu < cg.len() {
+            if cpu == 0 {
+                set_current_task_id(t.as_ref().map(|task| task.id()));
+            }
             let _prev = cg[cpu].take();
             cg[cpu] = t;
         }

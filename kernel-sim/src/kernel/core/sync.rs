@@ -1,4 +1,5 @@
 // AGENT
+use super::current::{require_current_task_id, NO_CURRENT_TASK_ID};
 use super::*;
 
 // AGENT: Usage map for this module in the current kernel-sim code.
@@ -7,7 +8,8 @@ use super::*;
 // - GKL/KernLock backs Kernel::tick() and BlockCache::sync_all() through
 //   KernLockGuard so release stays caller-checked and panic-safe.
 // - Spin backs cache-chain locking and Channel through SpinGuard so release is
-//   panic-safe and callers cannot touch the atomic state directly.
+//   panic-safe and callers cannot touch the atomic state directly; ownership is
+//   keyed by simulator Task::id() values instead of host std::thread identity.
 // - EvBus/EvFlag is used as event-bit storage by pipe, process exit/signal,
 //   and semaphore state transitions.
 // - WaitToken is the common host-thread wait token used by Channel,
@@ -162,30 +164,17 @@ impl Drop for KernLockGuard<'_> {
     }
 }
 
-const SPIN_NO_OWNER: usize = 0;
+const SPIN_NO_OWNER: usize = NO_CURRENT_TASK_ID;
 
-static SPIN_THREAD_SEQ: AtomicUsize = AtomicUsize::new(1);
-
-std::thread_local! {
-    static SPIN_THREAD_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-// AGENT: give host threads stable simulator-local ids for Spin owner checks.
-fn spin_thread_id() -> usize {
-    SPIN_THREAD_ID.with(|slot| {
-        let id = slot.get();
-        if id != SPIN_NO_OWNER {
-            return id;
-        }
-        let id = SPIN_THREAD_SEQ.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(id, SPIN_NO_OWNER, "Spin thread id overflowed sentinel");
-        slot.set(id);
-        id
-    })
+// AGENT: Spin derives its owner from the current-task context maintained by
+// Kernel::set_cur(), so callers do not pass owner ids through every lock call
+// and Spin does not depend on the full Kernel object.
+fn spin_owner() -> usize {
+    require_current_task_id("Spin")
 }
 
 // AGENT: ticket-based simulator spinlock with private state, FIFO acquisition,
-// RAII guard support, and debug owner checks. It still models only short
+// RAII guard support, and task-id owner checks. It still models only short
 // non-blocking critical sections; it does not mask interrupts or preemption.
 pub struct Spin {
     next_ticket: AtomicUsize,
@@ -200,30 +189,32 @@ impl Spin {
             owner: AtomicUsize::new(SPIN_NO_OWNER),
         }
     }
-    // AGENT: FIFO acquire catches recursive use instead of self-deadlocking.
+    // AGENT: FIFO acquire now owns current-task lookup and ticket acquisition
+    // directly instead of delegating through an owner-parameter helper.
     pub fn acquire(&self) {
-        let id = spin_thread_id();
+        let owner = spin_owner();
         assert_ne!(
             self.owner.load(Ordering::Relaxed),
-            id,
-            "Spin::acquire attempted recursive locking by owner {}",
-            id
+            owner,
+            "Spin::acquire attempted recursive locking by task {}",
+            owner
         );
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         while self.serving.load(Ordering::Acquire) != ticket {
             ::core::hint::spin_loop();
         }
-        self.owner.store(id, Ordering::Relaxed);
+        self.owner.store(owner, Ordering::Relaxed);
     }
-    // AGENT: non-blocking acquire only succeeds when no owner or queued waiter
-    // is ahead, preserving ticket-lock fairness for blocking acquirers.
+    // AGENT: non-blocking acquire performs owner lookup inline and only
+    // succeeds when no owner or queued waiter is ahead, preserving ticket-lock
+    // fairness for blocking acquirers.
     pub fn try_acquire(&self) -> bool {
-        let id = spin_thread_id();
+        let owner = spin_owner();
         assert_ne!(
             self.owner.load(Ordering::Relaxed),
-            id,
-            "Spin::try_acquire attempted recursive locking by owner {}",
-            id
+            owner,
+            "Spin::try_acquire attempted recursive locking by task {}",
+            owner
         );
         let serving = self.serving.load(Ordering::Acquire);
         let next = self.next_ticket.load(Ordering::Relaxed);
@@ -242,22 +233,23 @@ impl Spin {
         {
             return false;
         }
-        self.owner.store(id, Ordering::Relaxed);
+        self.owner.store(owner, Ordering::Relaxed);
         true
     }
-    // AGENT: release verifies the current host thread owns this Spin.
+    // AGENT: release verifies the current simulator task owns this Spin without
+    // delegating through a private owner-parameter wrapper.
     pub fn release(&self) {
-        let id = spin_thread_id();
-        let owner = self.owner.load(Ordering::Relaxed);
+        let owner = spin_owner();
+        let current_owner = self.owner.load(Ordering::Relaxed);
         assert!(
-            owner != SPIN_NO_OWNER,
-            "Spin::release by thread {} without held lock",
-            id
+            current_owner != SPIN_NO_OWNER,
+            "Spin::release by task {} without held lock",
+            owner
         );
         assert_eq!(
-            owner, id,
-            "Spin::release by non-owner thread {}, owner is {}",
-            id, owner
+            current_owner, owner,
+            "Spin::release by non-owner task {}, owner is {}",
+            owner, current_owner
         );
         self.owner.store(SPIN_NO_OWNER, Ordering::Relaxed);
         self.serving.fetch_add(1, Ordering::Release);
@@ -268,17 +260,25 @@ impl Spin {
     pub fn level(&self) -> usize {
         usize::from(self.owner.load(Ordering::Relaxed) != SPIN_NO_OWNER)
     }
+    // AGENT: guard reuses acquire() and records the owner written by acquire()
+    // so Drop can release without requiring a still-current task context.
     pub fn guard(&self) -> SpinGuard<'_> {
         self.acquire();
+        let owner = self.owner.load(Ordering::Relaxed);
         SpinGuard {
             lock: self,
+            owner,
             _not_send: std::marker::PhantomData,
         }
     }
+    // AGENT: try_guard reuses try_acquire() and captures the stored owner only
+    // after the non-blocking acquisition succeeds.
     pub fn try_guard(&self) -> Option<SpinGuard<'_>> {
         if self.try_acquire() {
+            let owner = self.owner.load(Ordering::Relaxed);
             Some(SpinGuard {
                 lock: self,
+                owner,
                 _not_send: std::marker::PhantomData,
             })
         } else {
@@ -293,13 +293,27 @@ unsafe impl Sync for Spin {}
 #[must_use = "SpinGuard releases the lock when dropped"]
 pub struct SpinGuard<'a> {
     lock: &'a Spin,
+    owner: usize,
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-// AGENT: drop-based release keeps early returns from leaking the spinlock.
+// AGENT: drop-based release keeps early returns from leaking the spinlock and
+// uses the guard's recorded owner instead of the current-task helper.
 impl Drop for SpinGuard<'_> {
     fn drop(&mut self) {
-        self.lock.release();
+        let current_owner = self.lock.owner.load(Ordering::Relaxed);
+        assert!(
+            current_owner != SPIN_NO_OWNER,
+            "SpinGuard::drop by task {} without held lock",
+            self.owner
+        );
+        assert_eq!(
+            current_owner, self.owner,
+            "SpinGuard::drop by non-owner task {}, owner is {}",
+            self.owner, current_owner
+        );
+        self.lock.owner.store(SPIN_NO_OWNER, Ordering::Relaxed);
+        self.lock.serving.fetch_add(1, Ordering::Release);
     }
 }
 

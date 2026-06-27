@@ -180,6 +180,7 @@ pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static st
     if fd >= MAX_FD {
         return Err("ebadf");
     }
+    let t = kernel.cur_task(0).ok_or("esrch")?;
     let ci = (fd ^ (fd >> 7)) % kernel.cache.width; // AGENT: match fetch()/invalidate() hash
     let ch = &kernel.cache.chains[ci];
     // AGENT: cache close cleanup uses SpinGuard so every return path releases the chain lock.
@@ -195,7 +196,6 @@ pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static st
         kernel.tty_buf.lock().unwrap().drain(..).count();
     }
     // AGENT: remove fd from process file table so it can be reused
-    let t = kernel.cur_task(0).ok_or("esrch")?;
     t.close_fd(fd)?;
     Ok(0)
 }

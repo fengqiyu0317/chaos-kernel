@@ -264,6 +264,48 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-27：kernel-sim Spin current task owner 语义
+
+目标：让 `Spin` 的 owner 检查基于 simulator 当前 `Task::id()`，避免低层同步原语依赖宿主线程身份或完整 `Kernel` 对象，同时保持 guard 自动释放和现有阻塞路径不在自旋锁内睡眠。
+
+已完成修改：
+
+- 新增 `kernel-sim/src/kernel/core/current.rs`，维护 CPU-local/current-task id 上下文，并由 `Kernel::set_cur()` 在 CPU0 安装当前任务 id。
+- `Spin` 改为通过当前 simulator task id 做递归 acquire、非 owner release 和 guard drop 检查；`SpinGuard` 记录 acquire 时的 owner，drop 时无需再次依赖当前任务上下文。
+- `sys_close()` 在获取 cache chain `SpinGuard` 前取得当前 task，避免锁内才查询 current task。
+- smoke 测试显式安装测试任务 id，覆盖 `Spin` owner、非 owner、递归 acquire、`SpinLock<T>` 和 `BlockCache::fetch()` 锁外 sleep 行为。
+- `TASK.md` 已把本轮 `Spin` 状态记录移动到已完成修改，并保留后续真实内核语义 TODO。
+
+关键文件：
+
+- `kernel-sim/src/kernel/core/current.rs`
+- `kernel-sim/src/kernel/core/sync.rs`
+- `kernel-sim/src/kernel/core/kernel_ops/runtime.rs`
+- `kernel-sim/src/kernel/syscall/fs.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test smoke
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `73 passed`；完整 `cargo test` 通过，其中 `elf` 测试 `3 passed`、`smoke` 测试 `73 passed`、doc tests 通过。
+
+未解决问题：
+
+- `Spin` 仍是 userspace simulator ticket-lock 模型，尚未接入抢占关闭、中断屏蔽、CPU 本地状态或调度器临界区约束。
+- `SyncQueue`、`EvBus`、epoll/readiness 与 timeout 等等待路径仍有统一语义和 lost wakeup 风险 TODO。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
 ## 2026-06-27：kernel-sim 锁语义和 TODO 分类推送记录
 
 目标：将本地领先 `origin/master` 的 kernel-sim 锁语义修复、TODO 分类和回归测试更新到 GitHub 仓库。

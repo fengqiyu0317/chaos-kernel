@@ -2,6 +2,7 @@
 use super::*;
 
 pub mod arch;
+pub mod current;
 pub mod kernel_base;
 pub mod kernel_ops;
 pub mod net;
@@ -10,6 +11,7 @@ pub mod sync;
 pub mod time;
 
 pub use self::arch::*;
+pub use self::current::*;
 pub use self::kernel_base::*;
 pub use self::kernel_ops::*;
 pub use self::net::*;

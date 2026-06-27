@@ -1,7 +1,7 @@
 // AGENT
 use kernel_sim::{
-    compute_inet_checksum, parse_ipv4_header, wait_ev, AddrSpace, BlockCache, Channel, EpData,
-    EpEvent, EvBus, EvFlag, ExitReason, FHandle, FLike, FdOpt, KernLock, Kernel,
+    compute_inet_checksum, parse_ipv4_header, set_current_task_id, wait_ev, AddrSpace, BlockCache,
+    Channel, EpData, EpEvent, EvBus, EvFlag, ExitReason, FHandle, FLike, FdOpt, KernLock, Kernel,
     KernelRuntimeTicker, PageBacking, PageTableEntry, PgFrame, SchedulePolicy, Spin, SpinLock,
     Task, TaskRunState, TaskTable, TimerEntry, VmRegion, WaitOutcome, WaitToken, AT_ENTRY,
     AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MAX_THREAD_ID, N_FRAMES, N_PROC,
@@ -32,6 +32,15 @@ fn lock_timer_tests() -> std::sync::MutexGuard<'static, ()> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap()
+}
+
+// AGENT: direct Spin tests run outside Kernel::set_cur(), so they install a
+// simulator task id explicitly before exercising the no-argument Spin API.
+fn set_test_current_task(id: usize) -> usize {
+    let task = Task::make(id, "spin-test");
+    let id = task.id();
+    set_current_task_id(Some(id));
+    id
 }
 
 // AGENT: smoke coverage for KernLock guard release and owner/depth validation.
@@ -108,6 +117,7 @@ fn kern_lock_try_guard_respects_owner() {
 #[test]
 fn spin_guard_releases_and_try_guard_respects_owner() {
     let lock = Arc::new(Spin::new());
+    let owner = set_test_current_task(1);
     assert!(!lock.is_held());
 
     let guard = lock.guard();
@@ -115,9 +125,13 @@ fn spin_guard_releases_and_try_guard_respects_owner() {
     assert_eq!(lock.level(), 1);
 
     let cloned = lock.clone();
-    let worker = thread::spawn(move || cloned.try_guard().is_none());
+    let worker = thread::spawn(move || {
+        set_test_current_task(2);
+        cloned.try_guard().is_none()
+    });
     assert!(worker.join().unwrap());
 
+    set_current_task_id(Some(owner));
     drop(guard);
     assert!(!lock.is_held());
     assert_eq!(lock.level(), 0);
@@ -128,26 +142,38 @@ fn spin_guard_releases_and_try_guard_respects_owner() {
 #[test]
 fn spin_rejects_recursive_acquire() {
     let lock = Spin::new();
+    let owner = set_test_current_task(1);
     let _guard = lock.guard();
 
-    let result = std::panic::catch_unwind(|| lock.acquire());
+    let result = std::panic::catch_unwind(|| {
+        set_current_task_id(Some(owner));
+        lock.acquire()
+    });
     assert!(result.is_err());
     assert!(lock.is_held());
     assert_eq!(lock.level(), 1);
 }
 
-// AGENT: Spin release checks the owning host thread.
+// AGENT: Spin release checks the owning simulator task id.
 #[test]
 fn spin_rejects_non_owner_release() {
     let lock = Arc::new(Spin::new());
+    let owner = set_test_current_task(1);
     let guard = lock.guard();
     let cloned = lock.clone();
 
-    let worker = thread::spawn(move || std::panic::catch_unwind(|| cloned.release()).is_err());
+    let worker = thread::spawn(move || {
+        std::panic::catch_unwind(|| {
+            set_test_current_task(2);
+            cloned.release()
+        })
+        .is_err()
+    });
     assert!(worker.join().unwrap());
     assert!(lock.is_held());
     assert_eq!(lock.level(), 1);
 
+    set_current_task_id(Some(owner));
     drop(guard);
     assert!(!lock.is_held());
 }
@@ -156,6 +182,7 @@ fn spin_rejects_non_owner_release() {
 #[test]
 fn spin_rejects_unheld_release() {
     let lock = Spin::new();
+    set_test_current_task(1);
 
     let result = std::panic::catch_unwind(|| lock.release());
     assert!(result.is_err());
@@ -167,6 +194,7 @@ fn spin_rejects_unheld_release() {
 #[test]
 fn spin_lock_guard_protects_data() {
     let lock = SpinLock::new(Vec::<usize>::new());
+    set_test_current_task(1);
     {
         let mut data = lock.lock();
         data.push(1);
@@ -175,6 +203,7 @@ fn spin_lock_guard_protects_data() {
     }
 
     assert!(!lock.is_locked());
+    set_test_current_task(1);
     let data = lock.lock();
     assert_eq!(&*data, &[1, 2]);
 }
@@ -185,12 +214,14 @@ fn block_cache_fetch_sleeps_outside_spin_guard() {
     let cache = Arc::new(BlockCache::new(1));
     let worker_cache = cache.clone();
     let worker = thread::spawn(move || {
+        set_test_current_task(1);
         worker_cache
             .fetch(42, Duration::from_millis(80))
             .expect("fetch should synthesize data")
     });
 
     thread::sleep(Duration::from_millis(10));
+    set_test_current_task(2);
     let guard = cache.chains[0]
         .lk
         .try_guard()
@@ -199,6 +230,7 @@ fn block_cache_fetch_sleeps_outside_spin_guard() {
 
     let data = worker.join().unwrap();
     assert_eq!(data.len(), 512);
+    set_test_current_task(2);
     assert_eq!(cache.total_entries(), 1);
 }
 
