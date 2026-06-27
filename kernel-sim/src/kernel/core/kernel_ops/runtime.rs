@@ -81,28 +81,11 @@ impl Drop for KernelRuntimeTicker {
 }
 
 impl Kernel {
-    // AGENT: keep simulator tick/GKL/cache maintenance out of the Kernel state definition.
+    // AGENT: keep simulator tick/GKL/cache maintenance out of the Kernel state
+    // definition and use guard-based GKL release.
     pub fn tick(&self, id: usize) {
-        assert!(
-            id <= MAX_THREAD_ID,
-            "thread id {} exceeds MAX_THREAD_ID {}",
-            id,
-            MAX_THREAD_ID
-        );
-        // AGENT: sentinel is MAX_THREAD_ID+1, no need for id != 0 guard
-        if GKL.holder.load(Ordering::Relaxed) == id {
-            GKL.depth.fetch_add(1, Ordering::Relaxed);
-        } else {
-            while GKL
-                .flag
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                ::core::hint::spin_loop();
-            }
-            GKL.holder.store(id, Ordering::Relaxed);
-            GKL.depth.store(1, Ordering::Relaxed);
-        }
+        // AGENT: route GKL through the guard so Drop performs owner-checked release.
+        let _gkl = GKL.guard(id);
         let _ir = {
             let cg = self.cpus.lock().unwrap();
             let mut occ = 0u32;
@@ -139,7 +122,6 @@ impl Kernel {
                 ch.lk.v.store(false, Ordering::Release);
             }
         }
-        GKL.leave(); // AGENT
     }
 
     // AGENT: expose the per-CPU current-task slot used by scheduling and syscalls.

@@ -97,27 +97,11 @@ impl BlockCache {
         ch.lk.v.store(false, Ordering::Release);
         Some(result)
     }
+    // AGENT: sync_all now uses guard-based GKL entry/release instead of touching
+    // KernLock internals directly.
     pub fn sync_all(&self, id: usize) {
-        assert!(
-            id <= MAX_THREAD_ID,
-            "thread id {} exceeds MAX_THREAD_ID {}",
-            id,
-            MAX_THREAD_ID
-        );
-        // AGENT: sentinel is MAX_THREAD_ID+1, no need for id != 0 guard
-        if GKL.holder.load(Ordering::Relaxed) == id {
-            GKL.depth.fetch_add(1, Ordering::Relaxed);
-        } else {
-            while GKL
-                .flag
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                ::core::hint::spin_loop();
-            }
-            GKL.holder.store(id, Ordering::Relaxed);
-            GKL.depth.store(1, Ordering::Relaxed);
-        }
+        // AGENT: route GKL through the guard so Drop performs owner-checked release.
+        let _gkl = GKL.guard(id);
         let mut synced = 0usize;
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
@@ -140,8 +124,6 @@ impl BlockCache {
             }
             ch.lk.v.store(false, Ordering::Release);
         }
-        // HUMAN
-        GKL.leave();
     }
 
     pub fn invalidate(&self, k: usize) {

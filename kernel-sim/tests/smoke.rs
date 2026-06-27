@@ -1,13 +1,13 @@
 // AGENT
 use kernel_sim::{
     compute_inet_checksum, parse_ipv4_header, AddrSpace, EpData, EpEvent, ExitReason, FHandle,
-    FLike, FdOpt, Kernel, KernelRuntimeTicker, PageBacking, PageTableEntry, PgFrame,
+    FLike, FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking, PageTableEntry, PgFrame,
     SchedulePolicy, Task, TaskRunState, TaskTable, TimerEntry, VmRegion, WaitOutcome, WaitToken,
-    AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, N_FRAMES, N_PROC,
-    N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP,
-    SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL,
-    SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE,
-    TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MAX_THREAD_ID,
+    N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK,
+    SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID,
+    SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4,
+    SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
@@ -31,6 +31,75 @@ fn lock_timer_tests() -> std::sync::MutexGuard<'static, ()> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap()
+}
+
+// AGENT: smoke coverage for KernLock guard release and owner/depth validation.
+#[test]
+fn kern_lock_guard_releases_reentrant_lock_by_depth() {
+    let lock = KernLock::new();
+    assert!(!lock.held());
+
+    let outer = lock.guard(7);
+    assert!(lock.held());
+    assert_eq!(lock.owner(), 7);
+    assert_eq!(lock.level(), 1);
+
+    {
+        let _inner = lock.guard(7);
+        assert!(lock.held());
+        assert_eq!(lock.owner(), 7);
+        assert_eq!(lock.level(), 2);
+    }
+
+    assert!(lock.held());
+    assert_eq!(lock.owner(), 7);
+    assert_eq!(lock.level(), 1);
+
+    drop(outer);
+    assert!(!lock.held());
+    assert_eq!(lock.owner(), MAX_THREAD_ID + 1);
+    assert_eq!(lock.level(), 0);
+}
+
+// AGENT: non-owner release must panic without corrupting lock state.
+#[test]
+fn kern_lock_rejects_non_owner_leave() {
+    let lock = KernLock::new();
+    lock.enter(3);
+
+    let result = std::panic::catch_unwind(|| lock.leave(4));
+    assert!(result.is_err());
+    assert!(lock.held());
+    assert_eq!(lock.owner(), 3);
+    assert_eq!(lock.level(), 1);
+
+    lock.leave(3);
+    assert!(!lock.held());
+}
+
+// AGENT: releasing an unlocked KernLock is a detected bug.
+#[test]
+fn kern_lock_rejects_unheld_leave() {
+    let lock = KernLock::new();
+
+    let result = std::panic::catch_unwind(|| lock.leave(1));
+    assert!(result.is_err());
+    assert!(!lock.held());
+    assert_eq!(lock.level(), 0);
+}
+
+// AGENT: try_guard must fail for non-owners and preserve recursive entry for owners.
+#[test]
+fn kern_lock_try_guard_respects_owner() {
+    let lock = KernLock::new();
+    let _guard = lock.guard(5);
+
+    assert!(lock.try_guard(6).is_none());
+    {
+        let _nested = lock.try_guard(5).expect("owner can recursively enter");
+        assert_eq!(lock.level(), 2);
+    }
+    assert_eq!(lock.level(), 1);
 }
 
 // AGENT: write a valid IPv4 header checksum for synthetic parser smoke tests.
