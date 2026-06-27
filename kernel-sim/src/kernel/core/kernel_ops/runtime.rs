@@ -105,21 +105,15 @@ impl Kernel {
         {
             for ci in 0..self.cache.chains.len() {
                 let ch = &self.cache.chains[ci];
-                while ch
-                    .lk
-                    .v
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_err()
-                {
-                    ::core::hint::spin_loop();
-                }
+                // AGENT: cache maintenance uses SpinGuard instead of touching
+                // the chain Spin internals directly.
+                let _guard = ch.lk.guard();
                 {
                     let mut items = ch.items.lock().unwrap();
                     for s in items.iter_mut() {
                         s.modified = false;
                     }
                 }
-                ch.lk.v.store(false, Ordering::Release);
             }
         }
     }

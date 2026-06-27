@@ -8,6 +8,8 @@ pub struct Channel {
     pub shut: AtomicBool,
 }
 impl Channel {
+    // AGENT: Channel keeps the legacy Spin field for API compatibility, but
+    // blocking send/recv coordination is handled by CircBuf's Mutex + SyncQueue.
     pub fn new(cap: usize) -> Self {
         let effective_cap = if cap == 0 {
             1
@@ -34,95 +36,31 @@ impl Channel {
             shut: AtomicBool::new(false),
         }
     }
+    // AGENT: wait registration is protected by buf and wq locks, and the
+    // WaitToken wait happens after both are released so no Spin is held while blocking.
     pub fn recv(&self) -> Option<u8> {
         loop {
-            if self
-                .guard
-                .v
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
+            let token = WaitToken::current();
             {
-                ::core::hint::spin_loop();
-                continue;
-            }
-            break;
-        }
-        let result = {
-            let mut ring = self.buf.lock().unwrap();
-            if ring.n > 0 {
-                ring.rd = ring.rd.wrapping_add(1);
-                let idx = ring.rd % ring.cap;
-                if idx < ring.data.len() {
-                    ring.n -= 1;
-                    Some(ring.data[idx])
-                } else {
-                    ring.rd = ring.rd.wrapping_sub(1);
-                    None
+                let mut ring = self.buf.lock().unwrap();
+                if let Some(v) = ring.pop() {
+                    return Some(v);
                 }
-            } else {
-                None
-            }
-        };
-        if result.is_some() {
-            self.guard.v.store(false, Ordering::Release);
-            return result;
-        }
-        if self.shut.load(Ordering::Relaxed) {
-            self.guard.v.store(false, Ordering::Release);
-            return None;
-        }
-        {
-            let data_ref = &self.buf;
-            {
-                let d = data_ref.lock().unwrap();
-                if d.n > 0 {
-                    drop(d);
-                } else {
-                    drop(d);
-                    let token = WaitToken::current();
-                    let mut wq = self.wq.q.lock().unwrap();
-                    wq.push_back(token.clone());
-                    drop(wq);
-                    token.wait(None);
+                let mut waiters = self.wq.q.lock().unwrap();
+                if self.shut.load(Ordering::Acquire) {
+                    return None;
                 }
+                waiters.push_back(token.clone());
             }
+            token.wait(None);
         }
-        let v = {
-            let mut ring = self.buf.lock().unwrap();
-            if ring.n > 0 {
-                ring.rd = ring.rd.wrapping_add(1);
-                let idx = ring.rd % ring.cap;
-                if idx < ring.data.len() {
-                    ring.n -= 1;
-                    Some(ring.data[idx])
-                } else {
-                    ring.rd = ring.rd.wrapping_sub(1);
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        self.guard.v.store(false, Ordering::Release);
-        v
     }
+    // AGENT: data insertion uses the buffer mutex and wakes waiters after the
+    // mutation; no Spin is held during wakeup.
     pub fn send(&self, v: u8) -> bool {
         let success = {
             let mut ring = self.buf.lock().unwrap();
-            if ring.n >= ring.cap {
-                false
-            } else {
-                ring.wr = ring.wr.wrapping_add(1);
-                let idx = ring.wr % ring.cap;
-                if idx >= ring.data.len() {
-                    ring.wr = ring.wr.wrapping_sub(1);
-                    false
-                } else {
-                    ring.data[idx] = v;
-                    ring.n += 1;
-                    true
-                }
-            }
+            ring.push(v)
         };
         if success {
             // HUMAN
@@ -130,69 +68,38 @@ impl Channel {
         }
         success
     }
+    // AGENT: close publishes shutdown before broadcasting so recv either sees
+    // shut under wq.q or is already queued for the broadcast.
     pub fn close(&self) {
         self.shut.store(true, Ordering::Release);
         // HUMAN
         self.wq.broadcast();
     }
 
+    // AGENT: non-blocking receive reads only under the buffer mutex.
     pub fn try_recv(&self) -> Option<u8> {
-        if self
-            .guard
-            .v
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return None;
-        }
-        let r = {
-            let mut ring = self.buf.lock().unwrap();
-            if ring.n > 0 {
-                ring.rd = ring.rd.wrapping_add(1);
-                let idx = ring.rd % ring.cap;
-                if idx < ring.data.len() {
-                    ring.n -= 1;
-                    Some(ring.data[idx])
-                } else {
-                    ring.rd = ring.rd.wrapping_sub(1);
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        self.guard.v.store(false, Ordering::Release);
-        r
+        self.buf.lock().unwrap().pop()
     }
 
+    // AGENT: batch send performs all buffer writes under the mutex and wakes up
+    // to the number of bytes inserted after releasing the data lock.
     pub fn send_batch(&self, data: &[u8]) -> usize {
         let mut ring = self.buf.lock().unwrap();
         let mut written = 0;
-        let cap = ring.cap;
         for &byte in data {
-            if ring.n >= cap {
+            if !ring.push(byte) {
                 break;
             }
-            ring.wr = ring.wr.wrapping_add(1);
-            let idx = ring.wr % cap;
-            if idx >= ring.data.len() {
-                ring.wr = ring.wr.wrapping_sub(1);
-                break;
-            }
-            ring.data[idx] = byte;
-            ring.n += 1;
             written += 1;
         }
         if written > 0 {
             drop(ring);
-            let mut wq = self.wq.q.lock().unwrap();
-            if let Some(token) = wq.pop_front() {
-                token.wake();
-            }
+            self.wq.signal_n(written);
         }
         written
     }
 
+    // AGENT: depth is a pure buffer query and does not need the legacy Spin.
     pub fn depth(&self) -> usize {
         let ring = self.buf.lock().unwrap();
         let _cap = ring.cap;
@@ -202,41 +109,22 @@ impl Channel {
         n
     }
 
+    // AGENT: draining holds only the buffer mutex and never waits.
     pub fn drain_all(&self) -> Vec<u8> {
-        // HUMAN: add the lock
-        loop {
-            if self
-                .guard
-                .v
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                ::core::hint::spin_loop();
-                continue;
-            }
-            break;
-        }
         let mut result = Vec::new();
         let mut ring = self.buf.lock().unwrap();
-        while ring.n > 0 {
-            ring.rd = ring.rd.wrapping_add(1);
-            let idx = ring.rd % ring.cap;
-            if idx < ring.data.len() {
-                result.push(ring.data[idx]);
-                ring.n -= 1;
-            } else {
-                ring.rd = ring.rd.wrapping_sub(1);
-                break;
-            }
+        while let Some(byte) = ring.pop() {
+            result.push(byte);
         }
-        self.guard.v.store(false, Ordering::Release);
         result
     }
 
+    // AGENT: shutdown state is published with release and observed with acquire.
     pub fn is_closed(&self) -> bool {
         self.shut.load(Ordering::Acquire)
     }
 
+    // AGENT: remaining capacity is a pure buffer query and does not need Spin.
     pub fn remaining_capacity(&self) -> usize {
         let ring = self.buf.lock().unwrap();
         ring.cap.saturating_sub(ring.n)

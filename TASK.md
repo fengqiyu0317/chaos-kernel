@@ -256,6 +256,10 @@ cargo test --test pressure
 - `[M4][普通] TODO`: `kernel-sim` 尚未建模 `mlock/mlockall` 内存锁状态、`MADV_WIPEONFORK` 清零语义，以及完整 `madvise` fork 标志；已有 `VM_DONTCOPY` 只覆盖了 DONTFORK 类似行为的一部分。
 - `[M4][普通] TODO`: `kernel-sim/src/kernel/mm/address_space.rs` 的 `page_table_root` / `vm_token` 目前只是全局递增的模拟地址空间 token，`asid_from_token()` 也只是把 token 映射到非零 `u16`；尚未建模真实 `satp`/页表根、ASID generation、ASID 复用时的 TLB flush/shootdown 等完整 MMU 语义。
 - `[M4][普通] TODO`: `kernel-sim/src/kernel/mm/bits.rs` 目前只被公开导出，尚未接入实际 `FramePool` / VMA / 页表路径；若后续把 frame allocator 改为 bitmap 或 buddy allocator，应让该模块承担空闲 bit 查找、空闲页统计、2 的幂/order 计算、地址/页号按阶对齐，以及连续页块拆分/合并所需的底层位操作，并补充对应分配/碎片回归测试。
+- `[M4][普通] TODO`: `kernel-sim/src/kernel/mm/bits.rs` 后续应先补模块级回归测试，再考虑接入主分配路径；测试至少覆盖 `popcount64` / `clz64` / `ffs64` 与 Rust 内建结果一致、`align_up` / `align_down` / `log2_floor` 的边界行为，以及 `BuddyAllocator` 分配、拆分、释放后合并和碎片统计。
+- `[M4][普通] TODO`: `kernel-sim/src/kernel/mm/bits.rs` 的 `BuddyAllocator::free_order()` 需要补输入校验并返回可观察错误，至少检查 `order <= max_order`、地址页对齐、地址位于 `[base_addr, base_addr + total_pages * PAGE_SZ)` 内，并避免重复 free 导致 free list 出现重复块。
+- `[M4][普通] TODO`: `kernel-sim/src/kernel/mm/bits.rs` 的 buddy 地址计算应按 `base_addr` 的相对偏移处理，避免 `base_addr != 0` 时直接用 `current_addr ^ block_size` 导致合并目标错误；修复时需新增非零 base 的释放合并回归。
+- `[M4][普通] TODO`: 暂缓把 `BuddyAllocator` 直接接入 `FramePool` 主路径；在替换 `FramePool.slots` 之前，必须先设计单一页帧状态来源，并覆盖 `frame_alloc` / `frame_dealloc`、COW fault、`munmap` 回收、`brk` 收缩和 exec 失败回滚等页帧生命周期回归，避免 `FramePool.slots` 与 `BuddyAllocator.free_lists` 双重记账不一致。
 - `[M4][普通] TODO`: `kernel-sim` 的 `sys_mmap()` 参数校验仍可继续贴近真实 syscall：当前已校验非匿名映射 offset 页对齐、flags/prot 基本组合、`prot` 与文件打开权限、`len + addr` 溢出；后续仍需决定匿名映射 fd 兼容规则和更多 Linux mmap flags。
 - `[M4][普通] TODO`: `kernel-sim` 的 `mmap` 目前仍是 eager 模型：匿名 `map_region()` 和文件 `map_file_region()` 都会立即为整个区间分配物理页；如果要靠近真实语义，需要改成先登记 VMA、缺页时再分配/装入页面，并配套覆盖 `fork` COW、`munmap`、文件共享页和 frame 回收测试。
 - `[M4][普通] TODO`: `kernel-sim/src/kernel/syscall/mm.rs` 的 `sys_brk()` 目前把请求地址向上页对齐后直接保存并返回；真实语义应区分字节级 program break 和页对齐的 heap 映射范围，`brk(0)`/成功返回也应反映未页对齐的当前 break。
@@ -295,7 +299,13 @@ cargo test --test pressure
 ### M8 同步原语、锁与 futex
 
 - `[M8][普通] TODO`: `kernel-sim` 的 futex 模型尚未覆盖真实 Linux 的 shared futex key、priority-inheritance futex、robust futex list、`OWNER_DIED` 标记和 owner 退出时唤醒等待者等语义。
-- `[M8][普通] TODO`: `kernel-sim/src/kernel/core/sync.rs` 的 `Spin` 目前仍只是裸 `AtomicBool` 自旋标志，且部分调用点直接访问 `Spin.v`；它缺少 RAII guard、owner/depth 检查、公平性、抢占/中断屏蔽和类型级被保护数据绑定。后续应收紧字段可见性，统一调用者走封装接口或 `SpinGuard` / `SpinLock<T>`，并审计 `BlockCache`、`Channel` 等路径，避免持自旋锁期间执行 `thread::sleep()`、`WaitToken::wait()` 等阻塞操作。
+- `[M8][普通] TODO`: `kernel-sim/src/kernel/core/sync.rs` 的 `EvBus` 目前只是 `u32` 事件位图加 callback 列表，缺少事件来源、事件类型载荷、事件计数、一次性/持续性事件、边沿触发/水平触发等完整事件模型；连续同类事件会被同一个 bit 合并。
+- `[M8][普通] TODO`: `EvBus::sub()` / 顶层 `wait_ev()` 目前没有接入主要等待路径；实际阻塞等待更多走 `WaitToken` / `SyncQueue` / `WaitQueue`。后续应统一 readiness state、wait queue、epoll registration、取消注册、timeout 和 wake one/all 语义。
+- `[M8][重要] TODO`: `EvBus` 的等待语义仍不完整：顶层 `wait_ev()` 使用循环检查加 `thread::yield_now()`，没有实现真实内核需要的“检查条件、原子入队、睡眠、事件唤醒”流程，存在忙等和丢失唤醒风险；后续应改为基于等待队列/`WaitToken` 的阻塞唤醒。
+- `[M8][普通] TODO`: `EvBus::change()` 在事件状态更新过程中同步执行 callbacks，且通常发生在外层 `Mutex<EvBus>` 持锁期间；后续应拆分状态更新、待唤醒对象收集和锁外分发，降低 callback 重入、锁顺序反转或死锁风险。
+- `[M8][普通] TODO`: `EvBus` 与文件 readiness / semaphore 统计的连接仍是简化模型：`WRITABLE` / `ERROR` 基本只是预留，pipe 只维护部分 `READABLE` / `CLOSED` 状态，`Sema::get_ncnt()` 依赖 `cb_len()` 但 acquire 路径没有登记真实等待者；后续应补齐 pipe/poll/epoll readiness、错误状态和真实等待者计数。
+- 2026-06-27：`kernel-sim/src/kernel/core/sync.rs` 的 `Spin` 已从裸 `AtomicBool` 改为私有 ticket-lock 状态，新增 `SpinGuard` RAII 释放、owner/depth 检查和 `SpinLock<T>`；`BlockCache`、`Channel`、runtime tick、`sys_close()` 已移除 `Spin.v` 直接访问，`BlockCache::fetch()` 不再持 chain 自旋锁执行 `thread::sleep()`，`Channel::recv()` 不再持自旋锁执行 `WaitToken::wait()`。
+- `[M8][普通] TODO`: `Spin` 剩余真实内核语义债务：当前 ticket-lock 仍是 userspace simulator 模型，没有接入抢占关闭、中断屏蔽、CPU 本地状态或调度器临界区约束；后续若继续贴近内核语义，应定义 spin 临界区是否允许 host mutex、是否需要 irqsave/irqrestore 变体，并逐步把适合短临界区的数据从“`Spin` + 其他锁”迁移到 `SpinLock<T>`。
 - `[M8][重要] TODO`: `kernel-sim` 的 `KernLock` 目前仍只是可重入自旋式模拟锁，缺少公平性、阻塞等待、抢占/中断控制等真实内核大锁语义；当前 guard 只解决 owner-checked 释放和 guard 路径的自动释放，若后续要把它作为真实大内核锁模型，应继续补齐这些语义或在接口文档中明确它只是 simulator 简化实现。
 
 ## 不要改的部分

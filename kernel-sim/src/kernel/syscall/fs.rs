@@ -182,14 +182,15 @@ pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static st
     }
     let ci = (fd ^ (fd >> 7)) % kernel.cache.width; // AGENT: match fetch()/invalidate() hash
     let ch = &kernel.cache.chains[ci];
-    ch.lk.acquire();
+    // AGENT: cache close cleanup uses SpinGuard so every return path releases the chain lock.
+    let _guard = ch.lk.guard();
     let was_cached = {
         let mut items = ch.items.lock().unwrap();
         let before = items.len();
         items.retain(|s| s.id != fd);
         items.len() < before
     };
-    ch.lk.release();
+    drop(_guard);
     if was_cached {
         kernel.tty_buf.lock().unwrap().drain(..).count();
     }

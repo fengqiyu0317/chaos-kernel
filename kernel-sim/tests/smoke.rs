@@ -1,13 +1,14 @@
 // AGENT
 use kernel_sim::{
-    compute_inet_checksum, parse_ipv4_header, AddrSpace, EpData, EpEvent, ExitReason, FHandle,
-    FLike, FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking, PageTableEntry, PgFrame,
-    SchedulePolicy, Task, TaskRunState, TaskTable, TimerEntry, VmRegion, WaitOutcome, WaitToken,
-    AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MAX_THREAD_ID,
-    N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK,
-    SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID,
-    SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4,
-    SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    compute_inet_checksum, parse_ipv4_header, AddrSpace, BlockCache, Channel, EpData, EpEvent,
+    ExitReason, FHandle, FLike, FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking,
+    PageTableEntry, PgFrame, SchedulePolicy, Spin, SpinLock, Task, TaskRunState, TaskTable,
+    TimerEntry, VmRegion, WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS,
+    MAP_PRIVATE, MAP_SHARED, MAX_THREAD_ID, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ,
+    PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC,
+    SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ,
+    SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ,
+    VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
@@ -100,6 +101,119 @@ fn kern_lock_try_guard_respects_owner() {
         assert_eq!(lock.level(), 2);
     }
     assert_eq!(lock.level(), 1);
+}
+
+// AGENT: SpinGuard releases a ticket-lock Spin on drop, and another thread
+// cannot acquire it while the guard is live.
+#[test]
+fn spin_guard_releases_and_try_guard_respects_owner() {
+    let lock = Arc::new(Spin::new());
+    assert!(!lock.is_held());
+
+    let guard = lock.guard();
+    assert!(lock.is_held());
+    assert_eq!(lock.level(), 1);
+
+    let cloned = lock.clone();
+    let worker = thread::spawn(move || cloned.try_guard().is_none());
+    assert!(worker.join().unwrap());
+
+    drop(guard);
+    assert!(!lock.is_held());
+    assert_eq!(lock.level(), 0);
+    assert!(lock.try_guard().is_some());
+}
+
+// AGENT: same-thread recursive Spin acquisition is rejected instead of spinning forever.
+#[test]
+fn spin_rejects_recursive_acquire() {
+    let lock = Spin::new();
+    let _guard = lock.guard();
+
+    let result = std::panic::catch_unwind(|| lock.acquire());
+    assert!(result.is_err());
+    assert!(lock.is_held());
+    assert_eq!(lock.level(), 1);
+}
+
+// AGENT: Spin release checks the owning host thread.
+#[test]
+fn spin_rejects_non_owner_release() {
+    let lock = Arc::new(Spin::new());
+    let guard = lock.guard();
+    let cloned = lock.clone();
+
+    let worker = thread::spawn(move || std::panic::catch_unwind(|| cloned.release()).is_err());
+    assert!(worker.join().unwrap());
+    assert!(lock.is_held());
+    assert_eq!(lock.level(), 1);
+
+    drop(guard);
+    assert!(!lock.is_held());
+}
+
+// AGENT: releasing an unlocked Spin is a detected bug.
+#[test]
+fn spin_rejects_unheld_release() {
+    let lock = Spin::new();
+
+    let result = std::panic::catch_unwind(|| lock.release());
+    assert!(result.is_err());
+    assert!(!lock.is_held());
+    assert_eq!(lock.level(), 0);
+}
+
+// AGENT: SpinLock<T> ties mutable data access to the SpinGuard lifetime.
+#[test]
+fn spin_lock_guard_protects_data() {
+    let lock = SpinLock::new(Vec::<usize>::new());
+    {
+        let mut data = lock.lock();
+        data.push(1);
+        data.push(2);
+        assert!(lock.is_locked());
+    }
+
+    assert!(!lock.is_locked());
+    let data = lock.lock();
+    assert_eq!(&*data, &[1, 2]);
+}
+
+// AGENT: BlockCache miss latency must not keep the chain Spin held while sleeping.
+#[test]
+fn block_cache_fetch_sleeps_outside_spin_guard() {
+    let cache = Arc::new(BlockCache::new(1));
+    let worker_cache = cache.clone();
+    let worker = thread::spawn(move || {
+        worker_cache
+            .fetch(42, Duration::from_millis(80))
+            .expect("fetch should synthesize data")
+    });
+
+    thread::sleep(Duration::from_millis(10));
+    let guard = cache.chains[0]
+        .lk
+        .try_guard()
+        .expect("fetch latency must not hold the chain Spin");
+    drop(guard);
+
+    let data = worker.join().unwrap();
+    assert_eq!(data.len(), 512);
+    assert_eq!(cache.total_entries(), 1);
+}
+
+// AGENT: Channel close wakes a blocked receiver without any Spin-held wait.
+#[test]
+fn channel_close_wakes_blocked_recv() {
+    let ch = Arc::new(Channel::new(1));
+    let recv_ch = ch.clone();
+    let worker = thread::spawn(move || recv_ch.recv());
+
+    thread::sleep(Duration::from_millis(10));
+    ch.close();
+
+    assert_eq!(worker.join().unwrap(), None);
+    assert!(ch.is_closed());
 }
 
 // AGENT: write a valid IPv4 header checksum for synthetic parser smoke tests.

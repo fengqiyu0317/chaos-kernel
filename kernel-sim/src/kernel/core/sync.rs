@@ -6,8 +6,8 @@ use super::*;
 // Active paths:
 // - GKL/KernLock backs Kernel::tick() and BlockCache::sync_all() through
 //   KernLockGuard so release stays caller-checked and panic-safe.
-// - Spin backs cache-chain locking and Channel; several callers still access
-//   Spin.v directly.
+// - Spin backs cache-chain locking and Channel through SpinGuard so release is
+//   panic-safe and callers cannot touch the atomic state directly.
 // - EvBus/EvFlag is used as event-bit storage by pipe, process exit/signal,
 //   and semaphore state transitions.
 // - WaitToken is the common host-thread wait token used by Channel,
@@ -22,7 +22,8 @@ use super::*;
 //
 // Unused or reserved paths:
 // - KernLock::enter/try_enter/held/owner/level are available for focused tests
-//   or future paths that cannot use the guard API; Spin::try_acquire/is_held.
+//   or future paths that cannot use the guard API; Spin::try_acquire/is_held
+//   and SpinLock<T> are available for short non-blocking critical sections.
 // - EvCb, EvBus::sub(), top-level wait_ev(), and EvFlag::WRITABLE/ERROR.
 // - RegEp and SyncQueue's generic wait/timeout/epoll-registration helpers.
 // - WaitToken::id() and SocketState.
@@ -159,38 +160,200 @@ impl Drop for KernLockGuard<'_> {
     }
 }
 
+const SPIN_NO_OWNER: usize = 0;
+
+static SPIN_THREAD_SEQ: AtomicUsize = AtomicUsize::new(1);
+
+std::thread_local! {
+    static SPIN_THREAD_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// AGENT: give host threads stable simulator-local ids for Spin owner checks.
+fn spin_thread_id() -> usize {
+    SPIN_THREAD_ID.with(|slot| {
+        let id = slot.get();
+        if id != SPIN_NO_OWNER {
+            return id;
+        }
+        let id = SPIN_THREAD_SEQ.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(id, SPIN_NO_OWNER, "Spin thread id overflowed sentinel");
+        slot.set(id);
+        id
+    })
+}
+
+// AGENT: ticket-based simulator spinlock with private state, FIFO acquisition,
+// RAII guard support, and debug owner checks. It still models only short
+// non-blocking critical sections; it does not mask interrupts or preemption.
 pub struct Spin {
-    pub(crate) v: AtomicBool,
+    next_ticket: AtomicUsize,
+    serving: AtomicUsize,
+    owner: AtomicUsize,
 }
 impl Spin {
     pub const fn new() -> Self {
         Self {
-            v: AtomicBool::new(false),
+            next_ticket: AtomicUsize::new(0),
+            serving: AtomicUsize::new(0),
+            owner: AtomicUsize::new(SPIN_NO_OWNER),
         }
     }
+    // AGENT: FIFO acquire catches recursive use instead of self-deadlocking.
     pub fn acquire(&self) {
-        while self
-            .v
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        let id = spin_thread_id();
+        assert_ne!(
+            self.owner.load(Ordering::Relaxed),
+            id,
+            "Spin::acquire attempted recursive locking by owner {}",
+            id
+        );
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        while self.serving.load(Ordering::Acquire) != ticket {
             ::core::hint::spin_loop();
         }
+        self.owner.store(id, Ordering::Relaxed);
     }
+    // AGENT: non-blocking acquire only succeeds when no owner or queued waiter
+    // is ahead, preserving ticket-lock fairness for blocking acquirers.
     pub fn try_acquire(&self) -> bool {
-        self.v
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+        let id = spin_thread_id();
+        assert_ne!(
+            self.owner.load(Ordering::Relaxed),
+            id,
+            "Spin::try_acquire attempted recursive locking by owner {}",
+            id
+        );
+        let serving = self.serving.load(Ordering::Acquire);
+        let next = self.next_ticket.load(Ordering::Relaxed);
+        if serving != next {
+            return false;
+        }
+        if self
+            .next_ticket
+            .compare_exchange(
+                next,
+                next.wrapping_add(1),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.owner.store(id, Ordering::Relaxed);
+        true
     }
+    // AGENT: release verifies the current host thread owns this Spin.
     pub fn release(&self) {
-        self.v.store(false, Ordering::Release);
+        let id = spin_thread_id();
+        let owner = self.owner.load(Ordering::Relaxed);
+        assert!(
+            owner != SPIN_NO_OWNER,
+            "Spin::release by thread {} without held lock",
+            id
+        );
+        assert_eq!(
+            owner, id,
+            "Spin::release by non-owner thread {}, owner is {}",
+            id, owner
+        );
+        self.owner.store(SPIN_NO_OWNER, Ordering::Relaxed);
+        self.serving.fetch_add(1, Ordering::Release);
     }
     pub fn is_held(&self) -> bool {
-        self.v.load(Ordering::Relaxed)
+        self.serving.load(Ordering::Acquire) != self.next_ticket.load(Ordering::Relaxed)
+    }
+    pub fn level(&self) -> usize {
+        usize::from(self.owner.load(Ordering::Relaxed) != SPIN_NO_OWNER)
+    }
+    pub fn guard(&self) -> SpinGuard<'_> {
+        self.acquire();
+        SpinGuard {
+            lock: self,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+    pub fn try_guard(&self) -> Option<SpinGuard<'_>> {
+        if self.try_acquire() {
+            Some(SpinGuard {
+                lock: self,
+                _not_send: std::marker::PhantomData,
+            })
+        } else {
+            None
+        }
     }
 }
 unsafe impl Send for Spin {}
 unsafe impl Sync for Spin {}
+
+// AGENT: RAII token for Spin; normal callers should prefer Spin::guard().
+#[must_use = "SpinGuard releases the lock when dropped"]
+pub struct SpinGuard<'a> {
+    lock: &'a Spin,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+// AGENT: drop-based release keeps early returns from leaking the spinlock.
+impl Drop for SpinGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.release();
+    }
+}
+
+// AGENT: optional typed spinlock for future short critical sections that need
+// data tied to a SpinGuard instead of a separate lock plus convention.
+pub struct SpinLock<T> {
+    lock: Spin,
+    data: std::cell::UnsafeCell<T>,
+}
+
+impl<T> SpinLock<T> {
+    pub const fn new(data: T) -> Self {
+        Self {
+            lock: Spin::new(),
+            data: std::cell::UnsafeCell::new(data),
+        }
+    }
+    pub fn lock(&self) -> SpinLockGuard<'_, T> {
+        let guard = self.lock.guard();
+        SpinLockGuard {
+            _guard: guard,
+            data: self.data.get(),
+        }
+    }
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        self.lock.try_guard().map(|guard| SpinLockGuard {
+            _guard: guard,
+            data: self.data.get(),
+        })
+    }
+    pub fn is_locked(&self) -> bool {
+        self.lock.is_held()
+    }
+}
+
+unsafe impl<T: Send> Send for SpinLock<T> {}
+unsafe impl<T: Send> Sync for SpinLock<T> {}
+
+// AGENT: typed guard couples protected data access to SpinGuard lifetime.
+pub struct SpinLockGuard<'a, T> {
+    _guard: SpinGuard<'a>,
+    data: *mut T,
+}
+
+impl<T> Deref for SpinLockGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.data }
+    }
+}
+
+impl<T> DerefMut for SpinLockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.data }
+    }
+}
 
 // pub struct FlgGuard(usize);
 // impl FlgGuard { pub fn enter() -> Self { Self(0) } }
@@ -211,6 +374,10 @@ impl EvFlag {
 
 pub type EvCb = Box<dyn Fn(u32) -> bool + Send>;
 
+// AGENT TODO: EvBus is still a lightweight event-bit store, not a full
+// kernel-style wait/readiness mechanism. It lacks event payloads/counting,
+// atomic sleep/wakeup integration, epoll-ready propagation, and lock-free
+// callback dispatch.
 #[derive(Default)]
 pub struct EvBus {
     pub ev: u32,

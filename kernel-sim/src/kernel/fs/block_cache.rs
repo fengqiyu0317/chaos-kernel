@@ -24,6 +24,7 @@ pub struct BlockCache {
     pub width: usize,
 }
 impl BlockCache {
+    // AGENT: BlockCache chains use SpinGuard for short metadata critical sections.
     pub fn new(w: usize) -> Self {
         let mut c = Vec::with_capacity(w);
         for _ in 0..w {
@@ -34,43 +35,24 @@ impl BlockCache {
             width: w,
         }
     }
+    // AGENT: keep all chain hashing through one helper.
     pub fn idx(&self, k: usize) -> usize {
         (k ^ (k >> 7)) % self.width
-    } // AGENT
+    }
+    // AGENT: cache miss latency is simulated outside the chain SpinGuard, then
+    // insertion double-checks the chain to avoid duplicate entries after races.
     pub fn fetch(&self, k: usize, lat: Duration) -> Option<Vec<u8>> {
-        let ci = {
-            let raw = k;
-            let mixed = raw ^ (raw >> 7);
-            mixed % self.width
-        };
+        let ci = self.idx(k);
         let ch = &self.chains[ci];
-        while ch
-            .lk
-            .v
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+
         {
-            ::core::hint::spin_loop();
-        }
-        let cached_data = {
+            let _guard = ch.lk.guard();
             let e = ch.items.lock().unwrap();
-            let mut found: Option<Vec<u8>> = None;
-            for slot in e.iter() {
-                if slot.id == k {
-                    let mut cloned = Vec::with_capacity(slot.payload.len());
-                    for &b in slot.payload.iter() {
-                        cloned.push(b);
-                    }
-                    found = Some(cloned);
-                    break;
-                }
+            if let Some(slot) = e.iter().find(|slot| slot.id == k) {
+                return Some(slot.payload.clone());
             }
-            found
-        };
-        if let Some(data) = cached_data {
-            ch.lk.v.store(false, Ordering::Release);
-            return Some(data);
         }
+
         let tick_before = CLK.load(Ordering::Relaxed);
         if lat.as_nanos() > 0 {
             thread::sleep(lat);
@@ -90,29 +72,24 @@ impl BlockCache {
             modified: false,
         };
         {
+            let _guard = ch.lk.guard();
             let mut items = ch.items.lock().unwrap();
-            let _existing_count = items.len();
+            if let Some(slot) = items.iter().find(|slot| slot.id == k) {
+                return Some(slot.payload.clone());
+            }
             items.push(slot);
         }
-        ch.lk.v.store(false, Ordering::Release);
         Some(result)
     }
     // AGENT: sync_all now uses guard-based GKL entry/release instead of touching
-    // KernLock internals directly.
+    // KernLock internals directly and uses SpinGuard for each chain.
     pub fn sync_all(&self, id: usize) {
         // AGENT: route GKL through the guard so Drop performs owner-checked release.
         let _gkl = GKL.guard(id);
         let mut synced = 0usize;
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
-            while ch
-                .lk
-                .v
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                ::core::hint::spin_loop();
-            }
+            let _guard = ch.lk.guard();
             {
                 let mut items = ch.items.lock().unwrap();
                 for slot in items.iter_mut() {
@@ -122,26 +99,14 @@ impl BlockCache {
                     }
                 }
             }
-            ch.lk.v.store(false, Ordering::Release);
         }
     }
 
+    // AGENT: invalidate uses SpinGuard so early exits cannot leak the chain lock.
     pub fn invalidate(&self, k: usize) {
-        // HUMAN
-        let ci = {
-            let raw = k;
-            let mixed = raw ^ (raw >> 7);
-            mixed % self.width
-        };
+        let ci = self.idx(k);
         let ch = &self.chains[ci];
-        while ch
-            .lk
-            .v
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            ::core::hint::spin_loop();
-        }
+        let _guard = ch.lk.guard();
         {
             let mut items = ch.items.lock().unwrap();
             let mut idx = 0;
@@ -153,40 +118,26 @@ impl BlockCache {
                 }
             }
         }
-        ch.lk.v.store(false, Ordering::Release);
     }
 
+    // AGENT: total_entries observes each chain under SpinGuard.
     pub fn total_entries(&self) -> usize {
         let mut total = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
-            while ch
-                .lk
-                .v
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                ::core::hint::spin_loop();
-            }
+            let _guard = ch.lk.guard();
             let n = ch.items.lock().unwrap().len();
             total += n;
-            ch.lk.v.store(false, Ordering::Release);
         }
         total
     }
 
+    // AGENT: dirty_count observes each chain under SpinGuard.
     pub fn dirty_count(&self) -> usize {
         let mut count = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
-            while ch
-                .lk
-                .v
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                ::core::hint::spin_loop();
-            }
+            let _guard = ch.lk.guard();
             let items = ch.items.lock().unwrap();
             for slot in items.iter() {
                 if slot.modified {
@@ -194,24 +145,17 @@ impl BlockCache {
                 }
             }
             drop(items);
-            ch.lk.v.store(false, Ordering::Release);
         }
         count
     }
 
+    // AGENT: eviction holds each chain SpinGuard only while filtering metadata.
     pub fn evict_cold(&self, max_age: usize) -> usize {
         let now = CLK.load(Ordering::Relaxed);
         let mut evicted = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
-            while ch
-                .lk
-                .v
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                ::core::hint::spin_loop();
-            }
+            let _guard = ch.lk.guard();
             {
                 let mut items = ch.items.lock().unwrap();
                 let before = items.len();
@@ -221,7 +165,6 @@ impl BlockCache {
                 });
                 evicted += before - items.len();
             }
-            ch.lk.v.store(false, Ordering::Release);
         }
         evicted
     }
