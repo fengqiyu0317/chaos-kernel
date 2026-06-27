@@ -264,6 +264,53 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-27：kernel-sim 锁语义和 TODO 分类推送记录
+
+目标：将本地领先 `origin/master` 的 kernel-sim 锁语义修复、TODO 分类和回归测试更新到 GitHub 仓库。
+
+已完成修改：
+
+- 本地待推送提交包括 `f11e165 Harden kernel-sim GKL release`、`8395ad2 Classify TASK.md TODOs`、`1e53802 Refine kernel-sim spin locking`。
+- GKL / spin lock 相关实现改为更明确的 guard 生命周期和 owner 校验，避免持锁睡眠、非 owner 释放和递归获取等错误语义。
+- `block_cache`、`channel`、runtime tick 路径跟随锁语义调整，减少在 spin guard 内阻塞或执行复杂逻辑。
+- `TASK.md` 重新分类 TODO，并记录本轮已完成的锁相关事项。
+- `kernel-sim/tests/smoke.rs` 扩充锁、channel、block cache、runtime ticker 等回归覆盖。
+
+关键文件：
+
+- `TASK.md`
+- `kernel-sim/src/kernel/core/sync.rs`
+- `kernel-sim/src/kernel/core/kernel_ops/runtime.rs`
+- `kernel-sim/src/kernel/fs/block_cache.rs`
+- `kernel-sim/src/kernel/fs/channel.rs`
+- `kernel-sim/src/kernel/syscall/fs.rs`
+- `kernel-sim/tests/smoke.rs`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；完整 `cargo test` 通过，其中 `tests/smoke.rs` 为 `71 passed; 0 failed`。
+
+未解决问题：
+
+- 本轮只覆盖 `kernel-sim` 的锁/同步模拟路径；外部 `chaos-tests` 仍不作为本次推送的验证目标。
+- `TASK.md` 中其他 syscall、网络、POSIX 语义和真实内核模型差异仍待后续处理。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
+来源：
+
+- 当前本地提交区间：`origin/master..HEAD`。
+- 本轮 Codex 验证命令输出。
+
 ## 2026-06-26：kernel-sim Kernel 辅助方法继续拆分
 
 ### 目标
