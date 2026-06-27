@@ -1,13 +1,13 @@
 // AGENT
 use kernel_sim::{
-    AddrSpace, EpData, EpEvent, ExitReason, FHandle, FLike, FdOpt, Kernel, KernelRuntimeTicker,
-    PageBacking, PageTableEntry, PgFrame, SchedulePolicy, Task, TaskRunState, TaskTable,
-    TimerEntry, VmRegion, WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS,
-    MAP_PRIVATE, MAP_SHARED, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ,
-    PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT,
-    SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ,
-    SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ,
-    VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    compute_inet_checksum, parse_ipv4_header, AddrSpace, EpData, EpEvent, ExitReason, FHandle,
+    FLike, FdOpt, Kernel, KernelRuntimeTicker, PageBacking, PageTableEntry, PgFrame,
+    SchedulePolicy, Task, TaskRunState, TaskTable, TimerEntry, VmRegion, WaitOutcome, WaitToken,
+    AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, N_FRAMES, N_PROC,
+    N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP,
+    SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL,
+    SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE,
+    TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
@@ -19,6 +19,8 @@ const TEST_EXEC_LOAD_OFFSET: usize = PAGE_SZ;
 const ELF_PH_OFF: usize = 64;
 const ELF_PH_SIZE: usize = 56;
 const TEST_EXEC_PAYLOAD: &[u8] = b"kernel-sim exec payload";
+const IPV4_TEST_SRC_IP: u32 = 0x0A00_0001;
+const IPV4_TEST_DST_IP: u32 = 0x0A00_0002;
 
 // AGENT: global TimerWheel tests must not run in parallel because one test's
 // schedule_tick can expire another test's timeout waiter.
@@ -29,6 +31,119 @@ fn lock_timer_tests() -> std::sync::MutexGuard<'static, ()> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap()
+}
+
+// AGENT: write a valid IPv4 header checksum for synthetic parser smoke tests.
+fn write_ipv4_checksum(pkt: &mut [u8], header_len: usize) {
+    pkt[10] = 0;
+    pkt[11] = 0;
+    let checksum = compute_inet_checksum(&pkt[..header_len]);
+    pkt[10..12].copy_from_slice(&checksum.to_be_bytes());
+}
+
+// AGENT: build synthetic IPv4 packets with controllable IHL and fragment bits.
+fn ipv4_packet(
+    header_len: usize,
+    payload: &[u8],
+    ttl: u8,
+    proto: u8,
+    flags_fragment: u16,
+) -> Vec<u8> {
+    assert!(header_len >= 20);
+    assert_eq!(header_len % 4, 0);
+    let total_len = header_len + payload.len();
+    let mut pkt = vec![0u8; total_len];
+    pkt[0] = (4 << 4) | (header_len / 4) as u8;
+    pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    pkt[6..8].copy_from_slice(&flags_fragment.to_be_bytes());
+    pkt[8] = ttl;
+    pkt[9] = proto;
+    pkt[12..16].copy_from_slice(&IPV4_TEST_SRC_IP.to_be_bytes());
+    pkt[16..20].copy_from_slice(&IPV4_TEST_DST_IP.to_be_bytes());
+    for (i, byte) in pkt[20..header_len].iter_mut().enumerate() {
+        *byte = (i + 1) as u8;
+    }
+    pkt[header_len..].copy_from_slice(payload);
+    write_ipv4_checksum(&mut pkt, header_len);
+    pkt
+}
+
+// AGENT: verify parse_ipv4_header exposes packet identity and payload bounds.
+#[test]
+fn parse_ipv4_header_returns_structured_fields() {
+    let pkt = ipv4_packet(20, b"abcd", 64, 6, 0x4000);
+
+    let header = parse_ipv4_header(&pkt).expect("valid IPv4 header should parse");
+
+    assert_eq!(header.src_ip, IPV4_TEST_SRC_IP);
+    assert_eq!(header.dst_ip, IPV4_TEST_DST_IP);
+    assert_eq!(header.protocol, 6);
+    assert_eq!(header.ttl, 64);
+    assert_eq!(header.header_len, 20);
+    assert_eq!(header.total_len, 24);
+    assert_eq!(header.payload, 20..24);
+    assert_eq!(&pkt[header.payload], b"abcd");
+    assert_eq!(header.fragment.raw, 0x4000);
+    assert!(!header.fragment.reserved);
+    assert!(header.fragment.dont_fragment);
+    assert!(!header.fragment.more_fragments);
+    assert_eq!(header.fragment.fragment_offset, 0);
+}
+
+// AGENT: verify IPv4 options contribute to header_len before payload starts.
+#[test]
+fn parse_ipv4_header_accepts_options_and_fragment_offset() {
+    let pkt = ipv4_packet(24, b"xyz", 32, 17, 0x2000 | 0x0012);
+
+    let header = parse_ipv4_header(&pkt).expect("IPv4 options should be included in header_len");
+
+    assert_eq!(header.header_len, 24);
+    assert_eq!(header.total_len, 27);
+    assert_eq!(header.payload, 24..27);
+    assert_eq!(header.ttl, 32);
+    assert_eq!(header.protocol, 17);
+    assert!(header.fragment.more_fragments);
+    assert!(!header.fragment.dont_fragment);
+    assert_eq!(header.fragment.fragment_offset, 0x0012);
+}
+
+// AGENT: reject packets whose total length ends inside the IPv4 header.
+#[test]
+fn parse_ipv4_header_rejects_total_len_shorter_than_header() {
+    let mut pkt = ipv4_packet(24, b"", 64, 6, 0);
+    pkt[2..4].copy_from_slice(&(20u16).to_be_bytes());
+    write_ipv4_checksum(&mut pkt, 24);
+
+    assert!(parse_ipv4_header(&pkt).is_none());
+}
+
+// AGENT: reject packets whose IPv4 total length exceeds received bytes.
+#[test]
+fn parse_ipv4_header_rejects_total_len_beyond_packet() {
+    let mut pkt = ipv4_packet(20, b"a", 64, 6, 0);
+    pkt[2..4].copy_from_slice(&(22u16).to_be_bytes());
+    write_ipv4_checksum(&mut pkt, 20);
+
+    assert!(parse_ipv4_header(&pkt).is_none());
+}
+
+// AGENT: reject packets with IHL options that are not present in the buffer.
+#[test]
+fn parse_ipv4_header_rejects_truncated_options() {
+    let pkt = [
+        0x46, 0, 0, 24, 0, 0, 0, 0, 64, 6, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2,
+    ];
+
+    assert!(parse_ipv4_header(&pkt).is_none());
+}
+
+// AGENT: preserve the existing IPv4 header checksum validation behavior.
+#[test]
+fn parse_ipv4_header_rejects_bad_checksum() {
+    let mut pkt = ipv4_packet(20, b"abcd", 64, 6, 0);
+    pkt[12] ^= 0x01;
+
+    assert!(parse_ipv4_header(&pkt).is_none());
 }
 
 #[repr(C)]

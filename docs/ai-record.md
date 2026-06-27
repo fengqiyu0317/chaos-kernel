@@ -625,6 +625,47 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
+## 2026-06-27：kernel-sim IPv4 header parser 结构化返回
+
+目标：把 `kernel-sim/src/kernel/core/net.rs` 中的 IPv4 header 解析 helper 从 tuple 返回推进到结构化返回，并补齐 total length、payload range、header checksum、TTL 和 flags/fragment 等基础协议边界检查。
+
+已完成修改：
+
+- 新增 `Ipv4HeaderInfo`，显式返回源/目的地址、protocol、TTL、header length、total length、payload range 和 fragment 信息。
+- 新增 `Ipv4FragmentInfo`，解码 raw flags/fragment 字段、reserved、DF、MF 和 13-bit fragment offset。
+- `parse_ipv4_header()` 现在拒绝 `total_len < header_len`、`total_len > pkt.len()`、缺失 options、payload range 越界和 header checksum 错误。
+- `kernel-sim/tests/smoke.rs` 新增 IPv4 synthetic packet helper，并覆盖普通包、options、fragment offset、过短 total length、超过缓冲区 total length、截断 options 和坏 checksum。
+- `TASK.md` 将结构化 IPv4 parser 与边界校验移动到已完成记录，保留 diagnostic error、checksum helper 和真实 socket 数据路径等后续 TODO。
+
+关键文件：
+
+- `kernel-sim/src/kernel/core/net.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+- `docs/ai-record.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test
+git diff --check
+```
+
+结果：`cargo fmt --check` 通过；完整 `cargo test` 通过，其中 `tests/elf.rs` 为 `3 passed`，`tests/smoke.rs` 为 `60 passed`，doc-tests 为 `0 passed`；`git diff --check` 通过。
+
+未解决问题：
+
+- `net.rs` 仍是 helper-only，尚未接入 socket syscall、`FLike::Socket`、loopback/虚拟网卡或真实包收发路径。
+- `parse_ipv4_header()` 仍返回 `Option`，后续应改成可诊断错误类型以区分 too short、not IPv4、bad IHL、bad total length 和 bad checksum。
+- checksum 与 TCP helper 仍需继续收紧为通用协议工具，包括更宽累加、verify helper 和明确 TCP segment 输入语义。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
 ## 2026-06-24：kernel-sim sys_munmap 参数校验
 
 目标：补齐 `TASK.md` 中记录的 `sys_munmap()` syscall 入口参数语义，防止零长度、未对齐地址、长度溢出、地址区间溢出和越过用户空间边界的请求进入地址空间修改路径。

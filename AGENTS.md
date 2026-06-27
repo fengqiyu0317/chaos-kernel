@@ -43,7 +43,7 @@ chaos/
 ### 长任务交接
 - 如果任务很长、对话上下文即将不足，或继续在同一对话中追加会降低稳定性，Codex 必须先更新 handoff summary / 当前状态总结。
 - 总结应写入 `TASK.md`、`NOTES.md`，或对应的 issue/comment；优先使用当前任务已经在维护的文件，没有则创建或补充 `TASK.md`。
-- 每次 github 更新后应当把进度更新到 `docs/ai-record.md` 中。
+- 每次更新到 github 仓库后应当把进度更新到 `docs/ai-record.md` 中。
 - handoff summary 至少包括：
   - 目标：当前要完成什么，成功标准是什么
   - 已完成修改：已经改了哪些行为、接口或实现
