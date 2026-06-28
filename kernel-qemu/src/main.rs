@@ -5,7 +5,11 @@ use core::arch::global_asm;
 use core::panic::PanicInfo;
 
 mod console;
+mod csr;
 mod sbi;
+mod syscall;
+mod timer;
+mod trap;
 
 global_asm!(include_str!("entry.S"));
 
