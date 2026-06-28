@@ -43,16 +43,16 @@ pub fn decode_from_trap_frame(frame: &TrapFrame) -> SyscallRequest {
     }
 }
 
-// AGENT: Complete the RISC-V ABI adapter step while the real migrated semantic entry is still pending.
+// AGENT: Complete the RISC-V ABI adapter step and forward to migrated semantics.
 pub fn dispatch_from_trap_frame(frame: &mut TrapFrame) {
     let request = decode_from_trap_frame(frame);
     let ret = dispatch_migrated_semantics(request);
     write_return(frame, ret);
 }
 
-// AGENT: Placeholder for the future kernel-sim semantic entry; trap.rs must not define syscall behavior.
-fn dispatch_migrated_semantics(_request: SyscallRequest) -> usize {
-    ENOSYS_RET
+// AGENT: Keep syscall behavior behind a semantic entry rather than in the trap layer.
+fn dispatch_migrated_semantics(request: SyscallRequest) -> usize {
+    crate::semantics::dispatch_syscall(request)
 }
 
 // AGENT: Store the architecture-level syscall return value in a0.

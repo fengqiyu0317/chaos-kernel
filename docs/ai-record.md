@@ -1302,6 +1302,54 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
 
+## 2026-06-28：M9 kernel-qemu syscall 第 5 点
+
+目标：完成 RISC-V syscall ABI 层到第一批迁移语义入口的衔接，保持 trap 层只处理 `ecall`、推进 `sepc` 和写回寄存器，不在 trap 分发里实现业务行为。
+
+已完成修改：
+
+- `kernel-qemu/src/main.rs` 注册新的 `semantics` 模块。
+- `kernel-qemu/src/syscall.rs` 保持 `a7` / `a0..a5` 解码、RISC-V 编号到 `kernel-sim` 风格内部编号映射，以及 `a0` 返回值写回；实际行为转发到 `kernel-qemu/src/semantics.rs`。
+- `kernel-qemu/src/semantics.rs` 新增第一批最小语义：`write(1/2)` 直接把用户缓冲区字节输出到 SBI console，`exit(code)` 打印退出码后 SBI shutdown，`getpid()` 暂返回 1，`read(0)` 暂按 EOF 返回 0。
+- `TASK.md` 同步记录第 5 点状态、关键文件和剩余限制。
+
+关键文件：
+
+- `kernel-qemu/src/main.rs`
+- `kernel-qemu/src/syscall.rs`
+- `kernel-qemu/src/semantics.rs`
+- `TASK.md`
+- `docs/ai-record.md`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo build --release
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check -- kernel-qemu TASK.md docs/ai-record.md
+
+cd kernel-sim
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo build --release` 通过；`tools/qemu-smoke.sh` 通过，QEMU 输出 `[kernel-qemu] trap vector installed stvec=0x80200020` 和 `[kernel-qemu] timer tick observed ticks=1`；`git diff --check -- kernel-qemu TASK.md docs/ai-record.md` 通过；`kernel-sim` 完整 `cargo test` 通过，其中 `elf` 测试 `3 passed`、`smoke` 测试 `74 passed`。
+
+未解决问题：
+
+- 尚未启动用户 init，因此 `write` / `exit` / `getpid` / `read` 的运行态用户 ecall smoke 仍待后续里程碑覆盖。
+- `write` 目前通过 S-mode 直接读用户指针；真实 Sv39 页表、`copy_from_user`、精确 `EFAULT` 和 short I/O 语义尚未接入。
+- `read(0)` 没有 UART/stdin 后端，当前只能作为早期 EOF 占位。
+- 尚未迁移真实 task/pid/fd table/open-file-description，`getpid` 和 fd 语义仍是单 init 阶段的最小承载版本。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
+
 ## 2026-06-28：M9 kernel-qemu trap 第 4 点
 
 目标：完成 Rust trap handler 的核心分发，让 `kernel-qemu` 对 timer interrupt、user `ecall`、page fault、非法指令和其他未处理 trap 有清晰独立路径；syscall 层继续只作为 RISC-V ABI 适配和待迁移 `kernel-sim` 语义入口，不在 trap 层定义业务语义。

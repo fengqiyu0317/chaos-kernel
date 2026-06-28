@@ -49,6 +49,7 @@
 - 2026-06-28: 已建立最小 `kernel-qemu/` 承载层：`riscv64gc-unknown-none-elf` 构建、linker script、`entry.S`、`#![no_std]` / `#![no_main]`、panic handler、SBI console、SBI shutdown 和 `tools/qemu-smoke.sh`；该阶段只提供运行环境，不引入与 `kernel-sim` 冲突的业务语义。
 - 2026-06-28：完成 M9 trap 第 3 点承载层：`kernel-qemu` 启动时实际安装 S-mode `stvec`，打开真实 timer interrupt 并在 QEMU smoke 中观测到 tick；同时补出 user trap 入口、`sscratch` 用户栈/内核栈切换、user trap return 和用户初始 trap frame 辅助。该阶段仍不启动用户 init，也不迁移完整 syscall/page fault 业务语义。
 - 2026-06-28：完成 M9 trap 第 4 点 Rust trap handler 核心分发：`kernel-qemu/src/trap.rs` 将 timer interrupt、user `ecall`、page fault、非法指令和其他未处理 trap 拆成独立路径；user `ecall` 只推进 `sepc` 并转入 `kernel-qemu/src/syscall.rs` 的 RISC-V ABI 适配出口，syscall 语义入口仍以 `-ENOSYS` 占位等待后续迁移。
+- 2026-06-28：完成 M9 syscall ABI 第 5 点最小语义入口：`kernel-qemu/src/syscall.rs` 继续只做 RISC-V `a7` / `a0..a5` 解码和 `a0` 写回，新增 `kernel-qemu/src/semantics.rs` 承接第一批 `read` / `write` / `exit` / `getpid` 语义；当前 `write(1/2)` 走 SBI console，`exit` 通过 SBI shutdown 结束单 init 路径，`getpid` 暂返回 1，`read(0)` 暂按 EOF 返回 0。
 
 ## 关键文件
 
@@ -71,13 +72,31 @@
 - `chaos/kernel-qemu/`：M9 QEMU 裸机最小承载层，不作为新的业务语义来源。
 - `chaos/kernel-qemu/src/trap.S`：S-mode 当前栈 trap 入口、user trap `sscratch` 切栈入口和 user `sret` 返回路径。
 - `chaos/kernel-qemu/src/trap.rs`：kernel/user trap vector 安装、trap frame helper 和早期 trap 分发。
-- `chaos/kernel-qemu/src/syscall.rs`：RISC-V `a7` / `a0..a5` syscall ABI 解码、`kernel-sim` 风格内部 syscall 编号映射和待迁移语义入口占位。
+- `chaos/kernel-qemu/src/syscall.rs`：RISC-V `a7` / `a0..a5` syscall ABI 解码、`kernel-sim` 风格内部 syscall 编号映射和返回值写回。
+- `chaos/kernel-qemu/src/semantics.rs`：M9 第一批 `read` / `write` / `exit` / `getpid` 最小 syscall 语义入口，后续替换为迁移后的 `kernel-sim` 进程、fd 和用户内存语义。
 - `chaos/kernel-qemu/src/csr.rs`：`stvec`、`sscratch`、`sstatus`、`scause`、`stval`、`sie`、`time` 等 CSR helper。
 - `chaos/kernel-qemu/src/timer.rs`：QEMU/OpenSBI timer interrupt 初始化、tick 计数和下一 tick 编程。
 - `chaos/tools/qemu-smoke.sh`：构建并运行 `kernel-qemu` 的 QEMU 启动/关机 smoke 脚本。
 - `chaos/kernel/src/kernel.rs`：禁止修改的原始内核文件。
 
 ## 测试结果
+
+本次 M9 syscall ABI 第 5 点修改后执行过：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo build --release
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check -- kernel-qemu TASK.md docs/ai-record.md
+
+cd kernel-sim
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo build --release` 通过；`tools/qemu-smoke.sh` 通过，QEMU 输出 `[kernel-qemu] trap vector installed stvec=0x80200020` 和 `[kernel-qemu] timer tick observed ticks=1`；`git diff --check -- kernel-qemu TASK.md docs/ai-record.md` 通过；`kernel-sim` 完整 `cargo test` 通过，其中 `elf` 测试 `3 passed`、`smoke` 测试 `74 passed`。
 
 本次 M9 trap 第 4 点修改后执行过：
 
