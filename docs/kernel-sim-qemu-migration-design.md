@@ -4,7 +4,7 @@
 
 ## 目标
 
-本文档用于明确 M9 任务的迁移边界和第一阶段实现路线。核心目标是把 `kernel-sim` 已经稳定下来的内核语义迁移到 QEMU 裸机环境，而不是重新设计一套新内核。由于 `kernel-sim` 当前强依赖 host `std`、host 线程、host 锁和模拟地址空间，迁移不能通过简单改 target 完成；`kernel-qemu` 的职责是提供 RISC-V/QEMU 必需的启动、trap、页表、时钟和设备适配层，让 `kernel-sim` 的进程、内存、文件描述符、exec、wait、pipe/epoll 等语义逐步落到真实裸机运行时上。
+本文档用于明确 M9 任务的迁移边界和第一阶段实现路线。核心目标是把 `kernel-sim` 已经稳定下来的内核语义迁移到 QEMU 裸机环境，而不是重新设计一套新内核。迁移策略采用 source-first：每个子系统先直接迁入 `kernel-sim` 的现有代码作为基线，保留结构体、函数名、控制流和错误语义，再在这个基线上替换 host `std`、host 线程、host 锁和模拟地址空间等裸机不可用依赖。`kernel-qemu` 的职责是提供 RISC-V/QEMU 必需的启动、trap、页表、时钟和设备适配层，让迁入的 `kernel-sim` 语义逐步落到真实裸机运行时上。
 
 第一阶段成功标准：
 
@@ -23,6 +23,7 @@
 - 不要求第一阶段实现完整文件系统、网络、virtio-blk、TTY、完整 signal、完整 epoll 或真实 Linux 兼容 ABI。
 - 不以“从零写一个更像 rCore 的内核”为目标；新增裸机代码必须服务于承载和迁移 `kernel-sim` 语义。
 - 不在第一阶段追求把 `kernel-sim` 所有 `std` 依赖一次性抽象干净。
+- 不为了提前获得干净的 QEMU 原生结构而先写一套空骨架替代 `kernel-sim` 现有实现。
 
 ## 当前边界
 
@@ -36,7 +37,18 @@
 - `AddrSpace` 中的模拟用户页内容，例如以宿主堆内存保存页面数据。
 - `cargo test` 作为主要验证入口。
 
-这些能力在裸机 `no_std` 环境中不存在。因此迁移时需要保留 `kernel-sim` 作为语义源和回归基准，同时为 QEMU 新建独立运行时底座。这个底座不是新内核的业务语义来源，而是把真实 RISC-V trap、页表、timer、设备 I/O 映射到 `kernel-sim` 现有语义所需接口上的适配层。
+这些能力在裸机 `no_std` 环境中不存在。因此迁移时需要保留 `kernel-sim` 作为语义源和回归基准，同时先把 `kernel-sim` 代码迁入 QEMU 侧形成可审查的移植基线，再逐步替换裸机不可用依赖。QEMU 底座不是新内核的业务语义来源，而是把真实 RISC-V trap、页表、timer、设备 I/O 映射到迁入的 `kernel-sim` 语义所需接口上的适配层。
+
+## 迁移策略
+
+迁移执行顺序以“先迁入、再替换”为准：
+
+1. 每个子系统先从 `kernel-sim/src/kernel/` 复制对应源码到 `kernel-qemu/src/` 的同名或明确标注的迁移模块中。复制后应尽量保留原有类型名、函数名、错误返回、TODO 和关键控制流，避免先写只有相似名字的新实现。
+2. 复制完成后做 host 依赖清单，逐项标出哪些依赖必须替换，例如 `std::sync`、host thread、`thread_local!`、`Instant`、host 文件对象、模拟页面 `Arc<Mutex<Vec<u8>>>`。
+3. 先让迁入代码在 QEMU crate 中可审查，再分批接入编译。暂时不能编译的批次可以先隔离在未注册模块或显式 `cfg` 下，但每个可执行小闭环最终都必须恢复 `cargo build --release` 和 QEMU smoke。
+4. 修改迁入代码时只替换裸机不可用的运行时承载：host lock 替换为裸机锁或关中断临界区，host thread 等待替换为 task/run queue，模拟地址空间替换为真实 frame/Sv39 页表，host time 替换为 timer interrupt。
+5. QEMU 新写代码只承担硬件适配和 ABI 适配，例如启动、trap、CSR、SBI/UART、页表写入、timer 中断、用户指针翻译。不得在这些适配层重新定义 syscall、fd、进程、等待或地址空间业务语义。
+6. 每次迁移都要能回答：源文件来自 `kernel-sim` 哪里，迁入后改了哪些 host 依赖，对应的 host 回归测试或 smoke 语义是什么，QEMU 侧当前只验证到哪一步。
 
 ## 建议目录
 
@@ -54,10 +66,10 @@ chaos/
 │   │   ├── main.rs
 │   │   ├── arch/riscv64/
 │   │   ├── trap/
-│   │   ├── mm/
-│   │   ├── proc/
-│   │   ├── syscall/
-│   │   ├── fs/
+│   │   ├── mm/             # 先迁入 kernel-sim/src/kernel/mm，再替换真实 frame/Sv39
+│   │   ├── proc/           # 先迁入 kernel-sim/src/kernel/proc，再替换 host task/thread 承载
+│   │   ├── syscall/        # 先迁入 kernel-sim/src/kernel/syscall，再接 RISC-V ABI 映射
+│   │   ├── fs/             # 先迁入 kernel-sim/src/kernel/fs，再替换 host fd 后端
 │   │   └── drivers/
 │   └── tests/
 └── tools/
@@ -74,9 +86,10 @@ chaos/kernel-common/
 
 ## 分层设计
 
-分层时先按“从 `kernel-sim` 迁移什么语义”划线，再决定 QEMU 侧需要补哪些硬件适配。每一层都应标清：
+分层时先按“从 `kernel-sim` 迁移什么语义”划线，再决定 QEMU 侧需要补哪些硬件适配。每一层都应先迁入对应 `kernel-sim` 源码，再在此基础上替换裸机不可用依赖。每一层都应标清：
 
 - `kernel-sim` 中的语义源文件或现有测试。
+- 迁入到 `kernel-qemu` 后保留了哪些原有类型、函数和错误语义。
 - QEMU 侧必须替换的 host 依赖。
 - 可以直接抽取到 `kernel-common` 的纯逻辑。
 - 暂时只能重新实现的裸机适配代码。
@@ -159,9 +172,75 @@ RISC-V trap frame
 - host `FramePool` 中只服务模拟器的资源统计逻辑。
 - 任何依赖 host lock 来保护真实页表状态的路径。
 
+#### M3 可执行步骤
+
+这一阶段的第一目标是把 `kernel-sim` 的地址空间实现迁入 `kernel-qemu`，然后在迁入代码上把“宿主堆模拟页面”替换为“真实物理页 + Sv39 页表”。不要先写一个只有同名接口的 QEMU 原生空骨架，也不要一开始迁移完整文件系统、file-backed `mmap` 或完整 COW。执行时按下面顺序推进，每一步都应尽量保持可构建、可 smoke；确实暂时不能编译的复制批次要明确隔离并尽快完成替换。
+
+1. 直接迁入 `kernel-sim` MM 源码：
+   - 以 `kernel-sim/src/kernel/mm/mod.rs`、`address_space.rs`、`alloc.rs`、`bits.rs`、`memory.rs` 为源。
+   - 迁入到 `kernel-qemu/src/mm/` 的对应文件中，必要时拆出 `sv39.rs`、`usercopy.rs` 作为裸机适配文件。
+   - 保留 `AddrSpace`、`VmRegion`、`VmMap`、`PageTableEntry`、`FramePool`、`map_region()`、`unmap_range()`、`protect()`、`read_user_bytes()`、`write_user_bytes()` 等语义入口，后续在这些入口内部替换实现。
+   - 在 `kernel-qemu/src/main.rs` 注册 `mod mm;` 的时机以可构建为准；不能立即构建的迁入文件必须有明确 TODO 和下一步替换清单。
+
+2. 对迁入代码做 host 依赖清单：
+   - `std::collections` 可迁到 `alloc::collections`。
+   - `Vec`、`String`、`Box`、`BTreeMap` 等可迁到 `alloc`。
+   - `Arc<Mutex<Vec<u8>>>` 只能作为原语义参照，必须替换为真实 frame/PPN、页表项和必要 backing metadata。
+   - `std::sync::Mutex`、host `FramePool`、host 文件对象和测试 helper 不能原样进入最终 QEMU 路径。
+   - 对每个替换点记录“保留的 `kernel-sim` 语义”和“QEMU 侧替换的承载机制”。
+
+3. 在迁入的 `FramePool` 基础上替换物理页分配：
+   - 保留 `alloc_page()` / `dealloc_page()` / `free_count()` 或等价语义入口，不另起一套无法对照的 API。
+   - 从 linker symbol `ekernel` 得到内核镜像结束地址。
+   - 第一版可以固定 QEMU `virt` 内存布局，配合 `tools/qemu-smoke.sh` 显式使用 `-m 128M`。
+   - RAM 范围先按 `0x8000_0000..0x8800_0000` 处理，空闲页起点为 `align_up(ekernel, PAGE_SIZE)`。
+   - 分配器最终返回页对齐物理地址或 PPN；原 `Mutex<Vec<bool>>` 只能作为迁移起点，不能作为裸机最终实现。
+
+4. 在迁入的 `PageTableEntry` / `AddrSpace` 基础上接入 Sv39：
+   - 新增或迁入后改造 PTE flags：`V/R/W/X/U/G/A/D`。
+   - 在保留 `map_region()`、`unmap_range()`、`protect()` 等入口的前提下，把内部页记录替换为 Sv39 page table walk、map、unmap、translate。
+   - 先采用恒等映射 `VA == PA`，降低开启分页后的地址切换风险。
+   - 根据 linker symbols 映射 kernel text、rodata、data、bss、boot stack 和 frame allocator metadata。
+   - 页表页本身从 frame allocator 分配，并清零后再作为下级页表使用。
+
+5. 开启分页并保持早期 smoke 可观察：
+   - 在 `kernel-qemu/src/csr.rs` 增加 `satp` 写入和 `sfence.vma` helper。
+   - 在 `rust_main()` 中按顺序执行：清 BSS、初始化 trap/timer、初始化迁入后改造的 frame allocator、建立 kernel page table、写入 Sv39 `satp`、执行 `sfence.vma`、再次打印分页已开启日志。
+   - `tools/qemu-smoke.sh` 增加对分页后日志的匹配，防止只验证到分页前。
+   - 成功标准是开启分页后仍能输出 boot、timer tick 和 shutdown 日志。
+
+6. 迁入并改造用户拷贝语义：
+   - 以 `kernel-sim` 的 `read_user_bytes()`、`write_user_bytes()`、`readable_user_prefix_len()`、`writable_user_prefix_len()` 为语义源。
+   - QEMU 侧实现 `copy_from_user()` / `copy_to_user()` 时仍遵守这些入口的错误返回、短前缀检查和跨页行为。
+   - 具体访问必须逐页翻译，检查 `U/R/W` 权限，并正确处理跨页 buffer。
+   - 非法地址、未映射页或权限不符应返回可映射到 `EFAULT` 的错误，而不是直接 panic。
+   - 将 `kernel-qemu/src/semantics.rs` 中直接解引用用户指针的 `write` 临时实现改为调用迁入后改造的用户拷贝入口。
+
+7. 保留 `kernel-sim` 的 VMA 生命周期语义：
+   - QEMU 版页表项只记录真实 frame/PPN、权限、present/COW 状态和必要 backing metadata，不能保存 `Arc<Mutex<Vec<u8>>>` 页面内容。
+   - `map_region()`、`unmap_range()`、`protect()`、`release_all_pages()` 的外部语义应与迁入前保持可对照。
+   - `unmap_range()` 必须释放真实 frame，并保留 `kernel-sim` 已经稳定的语义：无效范围先校验，失败时避免半更新，成功时返回已解除映射页数或等价诊断信息。
+
+8. 对齐 `brk` 和用户栈的最小语义：
+   - `brk` 第一版可以保持 `kernel-sim` 现有页粒度模型：增长时映射匿名页，收缩时走 `unmap_range()` 回收 frame。
+   - 需要在 TODO 中明确：byte-granular program break、`start_brk/min_brk`、lazy allocation 仍不是第一版目标。
+   - 用户栈先用匿名页映射，并复用 `kernel-sim` 已验证过的 `argc/argv/envp/auxv` 布局思路；真正进入用户态放到 Milestone 4。
+
+9. 暂缓 file-backed `mmap` 和完整 COW，但保留迁入位置：
+   - 当前 `kernel-sim` 的 file-backed `mmap` 依赖 host 文件对象和 `Arc<Mutex<Vec<u8>>>` backing，M3 不完成最终裸机替换。
+   - M3 迁入相关结构和 backing metadata 位置，实际文件页读入、`MAP_SHARED` 写回和 fd 权限检查放到文件层迁移时完成。
+   - COW 第一阶段迁入现有语义并设计 frame refcount 和只读 PTE fault 路径；完整 `fork` 行为可以在用户进程和调度路径具备后继续迁移。
+
+10. 每一步验证和记录：
+   - `cd kernel-qemu && cargo fmt --check && cargo build --release`。
+   - `bash tools/qemu-smoke.sh`。
+   - `git diff --check -- kernel-qemu tools/qemu-smoke.sh docs/kernel-sim-qemu-migration-design.md TASK.md docs/ai-record.md`。
+   - 如本阶段改动影响共享语义说明，还要运行 `cd kernel-sim && cargo test`，确保 host 端语义基准未被破坏。
+   - 每完成一个小闭环，把“已迁移的 kernel-sim 语义、仍停留在 host 模拟器的语义、QEMU smoke 结果”记录到 `TASK.md` 或 `docs/ai-record.md`。
+
 ### 4. 调度、同步和等待语义迁移层
 
-这一层要迁移 `kernel-sim` 中已经形成的 `TaskRunState`、wait token、timer target、futex、pipe/epoll 唤醒等可观察语义；QEMU 侧替换的是 host thread 承载方式，而不是重新发明等待规则。`kernel-sim` 的等待模型建立在 host thread 上，而 QEMU 裸机路径需要 task 调度模型：
+这一层先迁入 `kernel-sim/src/kernel/proc/`、`kernel-sim/src/kernel/core/sync.rs` 以及相关等待/唤醒代码，再替换 host thread 承载。要保留 `TaskRunState`、wait token、timer target、futex、pipe/epoll 唤醒等可观察语义；QEMU 侧替换的是运行方式，而不是重新发明等待规则。`kernel-sim` 的等待模型建立在 host thread 上，而 QEMU 裸机路径需要 task 调度模型：
 
 - `std::thread::park()` / `unpark()` 替换为修改 `TaskRunState` 和 run queue。
 - `Condvar` 替换为内核 wait queue。
@@ -170,11 +249,11 @@ RISC-V trap frame
 - `KernelRuntimeTicker` 不进入裸机路径，逻辑时间由真实 timer interrupt 推进。
 - 自旋锁需要明确是否关中断，必要时提供 irqsave/irqrestore 版本。
 
-第一阶段可以先实现单核、不可抢占或弱抢占模型，目标是让 `kernel-sim` 的阻塞/唤醒状态转换能在 QEMU 上被观察到。后续再补公平性、多核、抢占、中断嵌套和锁顺序约束。
+第一阶段可以先实现单核、不可抢占或弱抢占模型，目标是让迁入的 `kernel-sim` 阻塞/唤醒状态转换能在 QEMU 上被观察到。后续再补公平性、多核、抢占、中断嵌套和锁顺序约束。
 
 ### 5. 进程模型迁移层
 
-这一层的语义源应来自 `kernel-sim/src/kernel/proc/` 和现有 smoke 测试。第一阶段只需要把最小 task 路径跑通：
+这一层先直接迁入 `kernel-sim/src/kernel/proc/` 的进程、task、wait、resource、signal 相关代码，再在迁入代码上替换 host runtime。第一阶段只需要把最小 task 路径跑通：
 
 - idle task。
 - init user task。
@@ -192,11 +271,11 @@ RISC-V trap frame
 - pipe / epoll wait。
 - signal。
 
-迁移顺序应从 trap 返回用户态、`exit`、`wait4`、`fork/clone` 的可观察行为开始；每迁移一个行为，都应能指出对应的 `kernel-sim` 语义源和回归测试。
+迁移顺序应从 trap 返回用户态、`exit`、`wait4`、`fork/clone` 的可观察行为开始；每迁移一个行为，都应能指出对应的 `kernel-sim` 源文件、迁入后的改动点和回归测试。
 
 ### 6. fd、文件和设备语义迁移层
 
-这一层不应先做完整文件系统，而应先迁移 `kernel-sim` 已有的 fd table、open-file-description、pipe 和 epoll ready/wait 语义。第一阶段建议只实现最小字符设备作为 fd 后端：
+这一层先迁入 `kernel-sim/src/kernel/fs/` 中已有的 fd table、open-file-description、pipe 和 epoll ready/wait 语义，再把 host 文件对象和等待后端替换为 QEMU 可用承载。第一阶段建议只实现最小字符设备作为 fd 后端：
 
 - fd `1` / `2` 写到 SBI console 或 UART。
 - fd `0` 可以先返回 EOF 或阻塞占位，按测试需求决定。
@@ -224,7 +303,8 @@ RISC-V trap frame
 - 本设计文档。
 - `TASK.md` 保留 M9 TODO。
 - 不改 `kernel-sim` 行为。
-- 列出第一批迁移对象及对应源码/测试：syscall 最小集、`Task`/`ProcessState`、`AddrSpace`/ELF/user stack、fd table、timer tick。
+- 列出第一批直接迁入对象及对应源码/测试：syscall 最小集、`Task`/`ProcessState`、`AddrSpace`/ELF/user stack、fd table、timer tick。
+- 为每个对象记录复制目标路径、暂时不能编译的 host 依赖、第一轮替换方案。
 
 验证：
 
@@ -236,7 +316,7 @@ cargo test
 成功标准：
 
 - `kernel-sim` 原有测试继续通过。
-- 每个第一批迁移对象都有明确的 `kernel-sim` 语义源，不把 QEMU 侧实现当作新的语义源。
+- 每个第一批迁移对象都有明确的 `kernel-sim` 语义源、QEMU 复制目标和替换清单，不把 QEMU 侧实现当作新的语义源。
 
 ### Milestone 1：QEMU 最小承载层
 
@@ -273,17 +353,18 @@ cargo test
 
 产物：
 
-- frame allocator。
-- Sv39 kernel page table。
+- 直接迁入的 `kernel-sim/src/kernel/mm/` 代码。
+- 在迁入 `FramePool` / `AddrSpace` 基础上改造出的 frame allocator。
+- 在迁入页表入口基础上改造出的 Sv39 kernel page table。
 - 内核地址空间映射。
-- 基础 `copy_from_user` / `copy_to_user`。
+- 从 `read_user_bytes()` / `write_user_bytes()` 语义改造出的基础 `copy_from_user` / `copy_to_user`。
 - `AddrSpace` 语义适配方案：把模拟页面内容替换为真实 frame 和页表映射，同时保留 VMA 权限、映射生命周期、错误返回和回收语义。
 
 成功标准：
 
 - 内核能在分页开启后继续输出。
 - 非法用户地址能被拒绝或触发可诊断 fault。
-- 能说明 `kernel-sim` 中哪些地址空间行为已迁移，哪些仍停留在 host 模拟器。
+- 能说明 `kernel-sim` 中哪些地址空间代码已直接迁入，哪些 host 依赖已替换，哪些仍停留在 host 模拟器。
 
 ### Milestone 4：迁移第一个用户进程路径
 
@@ -294,7 +375,7 @@ cargo test
 - 用户栈。
 - `sret` 进入用户态。
 - user `ecall` 返回内核。
-- 复用或对齐 `kernel-sim` 的 ELF `PT_LOAD`、用户栈初始化、pid/task 初始化和 `exec` 地址空间替换语义。
+- 直接迁入并改造 `kernel-sim` 的 ELF `PT_LOAD`、用户栈初始化、pid/task 初始化和 `exec` 地址空间替换语义。
 
 成功标准：
 
@@ -307,11 +388,12 @@ cargo test
 产物：
 
 - RISC-V syscall number 映射层。
-- `write` 到 SBI/UART。
-- `exit` 结束 init。
-- `getpid` 返回固定或真实 pid。
-- `read` 的 EOF 或最小输入语义。
-- 每个 syscall 都标出对应的 `kernel-sim` syscall 语义源；QEMU 侧只替换用户指针访问、fd 后端和返回寄存器写回。
+- 直接迁入 `kernel-sim/src/kernel/syscall/` 中对应 syscall 的语义入口。
+- 在迁入入口基础上把 `write` 接到 SBI/UART。
+- 在迁入入口基础上把 `exit` 接到 init task 退出或关机路径。
+- 在迁入入口基础上让 `getpid` 返回固定或真实 pid。
+- 在迁入入口基础上实现 `read` 的 EOF 或最小输入语义。
+- 每个 syscall 都标出对应的 `kernel-sim` syscall 语义源、迁入文件和 QEMU 替换点；QEMU 侧只替换用户指针访问、fd 后端和返回寄存器写回。
 
 成功标准：
 
@@ -336,7 +418,7 @@ cargo test
 
 ## 共享代码策略
 
-优先复用 `kernel-sim` 的语义和可抽取代码，谨慎复用具体实现。
+默认先复制 `kernel-sim` 的具体实现作为迁移起点，再把其中可以长期共用的纯逻辑抽到 `kernel-common`。共享 crate 不是第一步；第一步是让 `kernel-qemu` 中能看到和审查从 `kernel-sim` 迁入的真实代码。
 
 可以考虑共享：
 
@@ -346,7 +428,7 @@ cargo test
 - 用户栈布局算法。
 - fd table 的抽象接口设计。
 
-暂时不要共享：
+迁入到 `kernel-qemu` 后必须替换，暂时不要抽到 `kernel-common`：
 
 - 任何直接使用 `std` 的模块。
 - host lock、host thread、host time 相关代码。
@@ -354,7 +436,7 @@ cargo test
 - 基于 `Arc<Mutex<Vec<u8>>>` 的模拟地址空间。
 - 测试专用 helper。
 
-当某段逻辑需要共享时，先满足三个条件：
+当某段逻辑需要从已迁入代码中抽成共享层时，先满足三个条件：
 
 - 可以在 `#![no_std]` 下编译，最多依赖 `alloc`。
 - 不假设 host thread 或 host filesystem。
@@ -380,9 +462,10 @@ QEMU 端新增 smoke，初始检查：
 
 ## 风险和决策
 
-- 最大风险是过早复用 `kernel-sim` 代码，导致 `std` 依赖渗入裸机路径。
-- 第二个风险是把 syscall 语义和 RISC-V ABI 混在一起，导致后续难以同时维护 host 模拟器和 QEMU 内核。
-- 第三个风险是先做文件系统、网络或完整 epoll，绕过了更基础的 trap、页表、调度和用户态返回路径。
+- 最大风险是绕过 `kernel-sim` 代码，直接写一套看起来相似但语义逐渐偏离的新 QEMU 实现。
+- 第二个风险是直接复制后不做 host 依赖清单，导致 `std`、host thread、host lock、host 文件对象或模拟页面模型渗入最终裸机路径。
+- 第三个风险是把 syscall 语义和 RISC-V ABI 混在一起，导致后续难以同时维护 host 模拟器和 QEMU 内核。
+- 第四个风险是先做文件系统、网络或完整 epoll，绕过了更基础的 trap、页表、调度和用户态返回路径。
 - 初期应接受功能少，但每个里程碑都必须能启动、能观察、能回归。
 
 ## 禁止修改范围
