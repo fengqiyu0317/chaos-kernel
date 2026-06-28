@@ -1302,6 +1302,52 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
 
+## 2026-06-28：M9 kernel-qemu trap 第 6 点
+
+目标：完成 page fault 和非法指令的早期清晰失败路径，让 QEMU 侧在真实 Sv39、COW/lazy fault 和 per-task kill 语义迁移前，也能稳定输出足够定位的架构上下文，而不是落入泛化的未处理 trap。
+
+已完成修改：
+
+- `kernel-qemu/src/trap.rs` 新增 `PageFaultAccess`，把 RISC-V instruction/load/store page fault cause 映射为结构化 access 分类。
+- `kernel-qemu/src/trap.rs` 新增 `FatalTrap`，统一 page fault、illegal instruction 和 unhandled trap 的早期失败诊断。
+- page fault 日志现在输出 origin、access、cause、`sepc`、`stval`、`sstatus` 和 `sp`；非法指令日志单独输出 origin、`sepc`、`stval`、`sstatus` 和 `sp`。
+- 当前尚未迁移 task exit 和 Sv39 fault recovery 时，失败路径会额外输出明确 fallback action，然后通过 SBI shutdown 结束。
+- `TASK.md` 同步记录第 6 点状态、关键文件和测试结果。
+
+关键文件：
+
+- `kernel-qemu/src/trap.rs`
+- `TASK.md`
+- `docs/ai-record.md`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo build --release
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check -- kernel-qemu TASK.md docs/ai-record.md
+
+cd kernel-sim
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo build --release` 通过；`tools/qemu-smoke.sh` 通过，QEMU 输出 `[kernel-qemu] trap vector installed stvec=0x80200020` 和 `[kernel-qemu] timer tick observed ticks=1`；`git diff --check -- kernel-qemu TASK.md docs/ai-record.md` 通过；`kernel-sim` 完整 `cargo test` 通过，其中 `elf` 测试 `3 passed`、`smoke` 测试 `74 passed`。
+
+未解决问题：
+
+- page fault 仍是早期 fatal 路径，尚未接入真实 Sv39 页表遍历、VMA 权限检查、COW、lazy allocation、`mmap`/`brk` fault-in 或用户进程可恢复错误。
+- user trap 触发 page fault / illegal instruction 后，目前还没有按当前 task 退出、发信号或调度下一个任务，只能在日志后 shutdown。
+- 正常 QEMU smoke 不主动制造 fault；后续迁移用户 init 后应增加用户态非法指令/page fault smoke，检查日志与任务退出边界。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
+
 ## 2026-06-28：M9 kernel-qemu syscall 第 5 点
 
 目标：完成 RISC-V syscall ABI 层到第一批迁移语义入口的衔接，保持 trap 层只处理 `ecall`、推进 `sepc` 和写回寄存器，不在 trap 分发里实现业务行为。

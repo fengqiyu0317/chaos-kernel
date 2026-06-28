@@ -41,6 +41,39 @@ enum TrapOrigin {
     User,
 }
 
+// AGENT: Page fault access class derived from RISC-V synchronous exception codes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageFaultAccess {
+    Instruction,
+    Load,
+    Store,
+}
+
+impl PageFaultAccess {
+    // AGENT: Keep page-fault cause decoding separate from the generic trap dispatcher.
+    fn from_exception_code(code: usize) -> Option<Self> {
+        match code {
+            EXCEPTION_INSTRUCTION_PAGE_FAULT => Some(Self::Instruction),
+            EXCEPTION_LOAD_PAGE_FAULT => Some(Self::Load),
+            EXCEPTION_STORE_PAGE_FAULT => Some(Self::Store),
+            _ => None,
+        }
+    }
+}
+
+// AGENT: Structured fatal trap categories for the early no-task-exit QEMU path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FatalTrap {
+    PageFault {
+        access: PageFaultAccess,
+        cause: TrapCause,
+    },
+    IllegalInstruction,
+    Unhandled {
+        cause: TrapCause,
+    },
+}
+
 // AGENT: Install the early direct-mode S-mode trap vector.
 pub fn init_kernel_trap_vector() {
     unsafe {
@@ -117,18 +150,20 @@ fn handle_user_ecall(frame: &mut TrapFrame) {
 
 // AGENT: Early page faults fail with architectural context until Sv39/AddrSpace handling lands.
 fn handle_page_fault(frame: &TrapFrame, origin: TrapOrigin, scause: usize, stval: usize) -> ! {
-    fail_trap(
-        frame,
-        origin,
-        "page fault",
-        Some(decode_scause(scause)),
-        stval,
-    )
+    let cause = decode_scause(scause);
+    let access = match cause {
+        TrapCause::Exception(code) => PageFaultAccess::from_exception_code(code),
+        TrapCause::Interrupt(_) => None,
+    };
+    match access {
+        Some(access) => fail_trap(frame, origin, FatalTrap::PageFault { access, cause }, stval),
+        None => fail_trap(frame, origin, FatalTrap::Unhandled { cause }, stval),
+    }
 }
 
 // AGENT: Illegal instructions are reported explicitly before the later per-task kill path exists.
 fn handle_illegal_instruction(frame: &TrapFrame, origin: TrapOrigin, stval: usize) -> ! {
-    fail_trap(frame, origin, "illegal instruction", None, stval)
+    fail_trap(frame, origin, FatalTrap::IllegalInstruction, stval)
 }
 
 // AGENT: Keep unexpected trap failures centralized so logs stay comparable across milestones.
@@ -138,28 +173,39 @@ fn handle_unhandled_trap(
     cause: TrapCause,
     stval: usize,
 ) -> ! {
-    fail_trap(frame, origin, "unhandled trap", Some(cause), stval)
+    fail_trap(frame, origin, FatalTrap::Unhandled { cause }, stval)
 }
 
 // AGENT: Terminate early trap failures with enough context for QEMU smoke and handoff logs.
-fn fail_trap(
-    frame: &TrapFrame,
-    origin: TrapOrigin,
-    label: &str,
-    cause: Option<TrapCause>,
-    stval: usize,
-) -> ! {
-    match cause {
-        Some(cause) => println!(
-            "[kernel-qemu] {} origin={:?} cause={:?} sepc={:#x} stval={:#x}",
-            label, origin, cause, frame.sepc, stval
+fn fail_trap(frame: &TrapFrame, origin: TrapOrigin, fatal: FatalTrap, stval: usize) -> ! {
+    let sp = frame.regs[2];
+    match fatal {
+        FatalTrap::PageFault { access, cause } => println!(
+            "[kernel-qemu] page fault origin={:?} access={:?} cause={:?} sepc={:#x} stval={:#x} sstatus={:#x} sp={:#x}",
+            origin, access, cause, frame.sepc, stval, frame.sstatus, sp
         ),
-        None => println!(
-            "[kernel-qemu] {} origin={:?} sepc={:#x} stval={:#x}",
-            label, origin, frame.sepc, stval
+        FatalTrap::IllegalInstruction => println!(
+            "[kernel-qemu] illegal instruction origin={:?} sepc={:#x} stval={:#x} sstatus={:#x} sp={:#x}",
+            origin, frame.sepc, stval, frame.sstatus, sp
+        ),
+        FatalTrap::Unhandled { cause } => println!(
+            "[kernel-qemu] unhandled trap origin={:?} cause={:?} sepc={:#x} stval={:#x} sstatus={:#x} sp={:#x}",
+            origin, cause, frame.sepc, stval, frame.sstatus, sp
         ),
     }
+    println!(
+        "[kernel-qemu] trap fallback action={}",
+        early_fatal_trap_action(origin)
+    );
     sbi::shutdown();
+}
+
+// AGENT: Document the current early failure policy until task exit and page fault recovery land.
+fn early_fatal_trap_action(origin: TrapOrigin) -> &'static str {
+    match origin {
+        TrapOrigin::User => "shutdown-until-task-exit-is-migrated",
+        TrapOrigin::Kernel => "shutdown-kernel-fault",
+    }
 }
 
 // AGENT: Return to a prepared user trap frame; the frame must sit at kernel_stack_top - sizeof(TrapFrame).
