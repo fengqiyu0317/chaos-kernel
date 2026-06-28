@@ -1301,3 +1301,49 @@ cargo test
 
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
+
+## 2026-06-28：M9 kernel-qemu trap 第 3 点
+
+目标：完成 QEMU 承载层的第 3 点，即先接通 S-mode 当前栈 trap/timer 验证路径，再补出后续用户态 trap 所需的 `sscratch` 切栈入口和返回辅助；本阶段仍不迁移完整用户进程、页表或 syscall 业务语义。
+
+已完成修改：
+
+- `kernel-qemu/src/main.rs` 启动后实际安装 S-mode `stvec`，初始化 timer interrupt，等待并打印第一个真实 timer tick。
+- `kernel-qemu/src/trap.S` 拆出 `__kernel_trap_entry`、`__user_trap_entry` 和 `__user_trap_return`：kernel trap 使用当前 S-mode 栈；user trap 通过 `csrrw sp, sscratch, sp` 切到内核栈保存 trap frame；user return 恢复 `sepc`、`sstatus` 和通用寄存器后 `sret`。
+- `kernel-qemu/src/trap.rs` 增加 kernel/user trap vector 安装、user trap Rust wrapper、user 初始 trap frame 准备和 `enter_user_mode()` 辅助。
+- `kernel-qemu/src/csr.rs` 增加 `SSTATUS_SPIE` / `SSTATUS_SPP` 常量，供后续用户态 `sret` 配置使用。
+- `tools/qemu-smoke.sh` 增加 `[kernel-qemu] timer tick observed` 检查，防止 timer trap 路径回退。
+
+关键文件：
+
+- `kernel-qemu/src/main.rs`
+- `kernel-qemu/src/trap.S`
+- `kernel-qemu/src/trap.rs`
+- `kernel-qemu/src/csr.rs`
+- `kernel-qemu/src/timer.rs`
+- `tools/qemu-smoke.sh`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo build --release
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check
+```
+
+结果：`cargo fmt --check` 通过；`cargo build --release` 通过；`tools/qemu-smoke.sh` 通过，QEMU 输出 `[kernel-qemu] trap vector installed stvec=0x80200020` 和 `[kernel-qemu] timer tick observed ticks=1`；`git diff --check` 通过。
+
+未解决问题：
+
+- 尚未启动用户 init，`enter_user_mode()` 和 user trap entry 目前是后续用户态路径的承载接口。
+- syscall 仍只做 RISC-V ABI 解码和 `-ENOSYS` 返回，尚未接入迁移后的 `kernel-sim` 语义入口。
+- page fault 和非法指令仍走早期清晰失败路径，尚未接入真实 Sv39 地址空间、COW 或 lazy fault 语义。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。

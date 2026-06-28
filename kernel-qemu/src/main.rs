@@ -2,6 +2,7 @@
 #![no_main]
 
 use core::arch::global_asm;
+use core::hint::spin_loop;
 use core::panic::PanicInfo;
 
 mod console;
@@ -24,6 +25,13 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     clear_bss();
 
     println!("[kernel-qemu] boot hart={} dtb={:#x}", hartid, dtb_pa);
+    trap::init_kernel_trap_vector();
+    println!(
+        "[kernel-qemu] trap vector installed stvec={:#x}",
+        csr::read_stvec()
+    );
+    timer::init();
+    wait_for_first_timer_tick();
     println!("[kernel-qemu] minimal carrier only; kernel-sim semantics not loaded");
     println!("[kernel-qemu] shutdown");
 
@@ -39,6 +47,22 @@ fn clear_bss() {
             (cur as *mut u8).write_volatile(0);
             cur += 1;
         }
+    }
+}
+
+// AGENT: Smoke-check that the early S-mode trap vector receives a real timer interrupt.
+fn wait_for_first_timer_tick() {
+    let start = csr::read_time();
+    let timeout_cycles = timer::CYCLES_PER_TICK * 20;
+    while timer::ticks() == 0 && csr::read_time().wrapping_sub(start) < timeout_cycles {
+        spin_loop();
+    }
+
+    let ticks = timer::ticks();
+    if ticks == 0 {
+        println!("[kernel-qemu] timer tick not observed");
+    } else {
+        println!("[kernel-qemu] timer tick observed ticks={}", ticks);
     }
 }
 

@@ -47,6 +47,7 @@
 - 2026-06-27：`kernel-sim` 的 pipe readiness 已接入 `EvBus::sub()` -> `EpInst::mark_ready()` 路径：`EvBus::sub()` 返回可取消订阅 id，`epoll_ctl(ADD/MOD/DEL)` 会为 pipe fd 注册/取消 readiness callback，`sys_epoll_wait()` 在无 ready fd 时睡入 `EpInst.waiters`，由 pipe 写入/关闭等状态变化唤醒；`PipeNode::poll()` 去掉重复锁定同一 mutex 的自锁风险。新增 `epoll_wait_wakes_when_pipe_becomes_readable` smoke 回归。
 - 2026-06-28：新增 `kernel-qemu/` 最小 QEMU 裸机承载层：独立 `riscv64gc-unknown-none-elf` crate、linker script、`entry.S`、`#![no_std]` / `#![no_main]`、panic handler、SBI console、SBI shutdown，以及 `tools/qemu-smoke.sh` 启动/关机输出检查；该阶段只提供运行环境，不引入 `kernel-sim` 业务语义。
 - 2026-06-28: 已建立最小 `kernel-qemu/` 承载层：`riscv64gc-unknown-none-elf` 构建、linker script、`entry.S`、`#![no_std]` / `#![no_main]`、panic handler、SBI console、SBI shutdown 和 `tools/qemu-smoke.sh`；该阶段只提供运行环境，不引入与 `kernel-sim` 冲突的业务语义。
+- 2026-06-28：完成 M9 trap 第 3 点承载层：`kernel-qemu` 启动时实际安装 S-mode `stvec`，打开真实 timer interrupt 并在 QEMU smoke 中观测到 tick；同时补出 user trap 入口、`sscratch` 用户栈/内核栈切换、user trap return 和用户初始 trap frame 辅助。该阶段仍不启动用户 init，也不迁移完整 syscall/page fault 业务语义。
 
 ## 关键文件
 
@@ -67,10 +68,28 @@
 - `chaos/kernel-sim/tests/smoke.rs`：exec syscall、exit/wait 回归测试。
 - `chaos/kernel-sim/tests/elf.rs`：ELF segment alignment 回归测试。
 - `chaos/kernel-qemu/`：M9 QEMU 裸机最小承载层，不作为新的业务语义来源。
+- `chaos/kernel-qemu/src/trap.S`：S-mode 当前栈 trap 入口、user trap `sscratch` 切栈入口和 user `sret` 返回路径。
+- `chaos/kernel-qemu/src/trap.rs`：kernel/user trap vector 安装、trap frame helper 和早期 trap 分发。
+- `chaos/kernel-qemu/src/csr.rs`：`stvec`、`sscratch`、`sstatus`、`scause`、`stval`、`sie`、`time` 等 CSR helper。
+- `chaos/kernel-qemu/src/timer.rs`：QEMU/OpenSBI timer interrupt 初始化、tick 计数和下一 tick 编程。
 - `chaos/tools/qemu-smoke.sh`：构建并运行 `kernel-qemu` 的 QEMU 启动/关机 smoke 脚本。
 - `chaos/kernel/src/kernel.rs`：禁止修改的原始内核文件。
 
 ## 测试结果
+
+本次 M9 trap 第 3 点修改后执行过：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo build --release
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check
+```
+
+结果：`cargo fmt --check` 通过；`cargo build --release` 通过；`tools/qemu-smoke.sh` 通过，QEMU 输出 `[kernel-qemu] trap vector installed stvec=0x80200020` 和 `[kernel-qemu] timer tick observed ticks=1`；`git diff --check` 通过。
 
 本次 M9 `kernel-qemu` 最小承载层修改后执行过：
 

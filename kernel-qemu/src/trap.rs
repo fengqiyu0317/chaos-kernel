@@ -8,6 +8,8 @@ global_asm!(include_str!("trap.S"));
 
 unsafe extern "C" {
     fn __kernel_trap_entry();
+    fn __user_trap_entry();
+    fn __user_trap_return(frame: *const TrapFrame) -> !;
 }
 
 // AGENT: RISC-V S-mode trap frame saved by trap.S before entering Rust.
@@ -25,11 +27,27 @@ pub enum TrapCause {
     Exception(usize),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrapOrigin {
+    Kernel,
+    User,
+}
+
 // AGENT: Install the early direct-mode S-mode trap vector.
 pub fn init_kernel_trap_vector() {
     unsafe {
         csr::write_stvec(
             __kernel_trap_entry as *const () as usize,
+            csr::STVEC_MODE_DIRECT,
+        );
+    }
+}
+
+// AGENT: Install the direct-mode user trap vector that switches through sscratch.
+pub fn init_user_trap_vector() {
+    unsafe {
+        csr::write_stvec(
+            __user_trap_entry as *const () as usize,
             csr::STVEC_MODE_DIRECT,
         );
     }
@@ -45,9 +63,21 @@ pub fn decode_scause(scause: usize) -> TrapCause {
     }
 }
 
-// AGENT: Rust entry called from trap.S after all general registers are saved.
+// AGENT: Rust entry for traps taken while the kernel is already on a kernel stack.
 #[no_mangle]
-pub extern "C" fn rust_trap(frame: &mut TrapFrame) {
+pub extern "C" fn rust_kernel_trap(frame: &mut TrapFrame) {
+    handle_trap(frame, TrapOrigin::Kernel);
+}
+
+// AGENT: Rust entry for user traps after trap.S has switched from user sp via sscratch.
+#[no_mangle]
+pub extern "C" fn rust_user_trap(frame: &mut TrapFrame) {
+    init_kernel_trap_vector();
+    handle_trap(frame, TrapOrigin::User);
+    init_user_trap_vector();
+}
+
+fn handle_trap(frame: &mut TrapFrame, origin: TrapOrigin) {
     let scause = csr::read_scause();
     let stval = csr::read_stval();
     match decode_scause(scause) {
@@ -62,16 +92,47 @@ pub extern "C" fn rust_trap(frame: &mut TrapFrame) {
         }
         cause => {
             println!(
-                "[kernel-qemu] unhandled trap cause={:?} sepc={:#x} stval={:#x}",
-                cause, frame.sepc, stval
+                "[kernel-qemu] unhandled {:?} trap cause={:?} sepc={:#x} stval={:#x}",
+                origin, cause, frame.sepc, stval
             );
             sbi::shutdown();
         }
     }
 }
 
+// AGENT: Return to a prepared user trap frame; the frame must sit at kernel_stack_top - sizeof(TrapFrame).
+pub unsafe fn enter_user_mode(frame: &TrapFrame) -> ! {
+    init_user_trap_vector();
+    unsafe { __user_trap_return(frame as *const TrapFrame) }
+}
+
+fn user_sstatus() -> usize {
+    let mut value = csr::read_sstatus();
+    value &= !csr::SSTATUS_SPP;
+    value &= !csr::SSTATUS_SIE;
+    value |= csr::SSTATUS_SPIE;
+    value
+}
+
 // AGENT: TrapFrame helpers expose RISC-V syscall ABI slots.
 impl TrapFrame {
+    // AGENT: Build an empty trap frame for first entry into a user task.
+    pub const fn new() -> Self {
+        Self {
+            regs: [0; 32],
+            sstatus: 0,
+            sepc: 0,
+        }
+    }
+
+    // AGENT: Configure the frame so __user_trap_return sret enters U-mode at entry with user_sp.
+    pub fn prepare_user_entry(&mut self, entry: usize, user_sp: usize) {
+        self.regs = [0; 32];
+        self.regs[2] = user_sp;
+        self.sstatus = user_sstatus();
+        self.sepc = entry;
+    }
+
     // AGENT: Read syscall number from the RISC-V a7 slot.
     pub fn syscall_nr(&self) -> usize {
         self.regs[17]

@@ -7,6 +7,8 @@ pub const SCAUSE_INTERRUPT_BIT: usize = 1usize << (usize::BITS as usize - 1);
 pub const SCAUSE_CODE_MASK: usize = !SCAUSE_INTERRUPT_BIT;
 pub const SIE_STIE: usize = 1 << 5;
 pub const SSTATUS_SIE: usize = 1 << 1;
+pub const SSTATUS_SPIE: usize = 1 << 5;
+pub const SSTATUS_SPP: usize = 1 << 8;
 
 // AGENT: Read the current trap vector base and mode from stvec.
 #[inline]
