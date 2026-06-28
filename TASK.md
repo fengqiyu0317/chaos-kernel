@@ -45,6 +45,8 @@
 - 2026-06-27：`kernel-sim/src/kernel/core/current.rs` 的 current-task TLS 存储从 `Cell<usize>` 调整为 `AtomicUsize` relaxed load/store，保持 host-thread 本地隔离；`kernel-sim/tests/smoke.rs` 为直接设置 current-task 的 Spin/SpinLock/BlockCache 低层测试增加串行锁，避免默认并行测试下固定 task id 与 helper thread 假设互相干扰。
 - 2026-06-27：`kernel-sim/src/kernel/core/sync.rs` 的 `EvBus` 已新增基于 `WaitToken` 的等待者队列；顶层 `wait_ev()` 现在在持有 `EvBus` 锁时检查事件位并原子入队，`EvBus::change()` 在事件位变化后唤醒 mask 匹配的等待者，去掉了原先的 `thread::yield_now()` 忙等路径；新增 `ev_bus_wait_ev_returns_existing_event` / `ev_bus_wait_ev_wakes_on_matching_event` smoke 回归。剩余事件模型、epoll 接线和 callback 锁外分发债务见相邻 M8 TODO。
 - 2026-06-27：`kernel-sim` 的 pipe readiness 已接入 `EvBus::sub()` -> `EpInst::mark_ready()` 路径：`EvBus::sub()` 返回可取消订阅 id，`epoll_ctl(ADD/MOD/DEL)` 会为 pipe fd 注册/取消 readiness callback，`sys_epoll_wait()` 在无 ready fd 时睡入 `EpInst.waiters`，由 pipe 写入/关闭等状态变化唤醒；`PipeNode::poll()` 去掉重复锁定同一 mutex 的自锁风险。新增 `epoll_wait_wakes_when_pipe_becomes_readable` smoke 回归。
+- 2026-06-28：新增 `kernel-qemu/` 最小 QEMU 裸机承载层：独立 `riscv64gc-unknown-none-elf` crate、linker script、`entry.S`、`#![no_std]` / `#![no_main]`、panic handler、SBI console、SBI shutdown，以及 `tools/qemu-smoke.sh` 启动/关机输出检查；该阶段只提供运行环境，不引入 `kernel-sim` 业务语义。
+- 2026-06-28: 已建立最小 `kernel-qemu/` 承载层：`riscv64gc-unknown-none-elf` 构建、linker script、`entry.S`、`#![no_std]` / `#![no_main]`、panic handler、SBI console、SBI shutdown 和 `tools/qemu-smoke.sh`；该阶段只提供运行环境，不引入与 `kernel-sim` 冲突的业务语义。
 
 ## 关键文件
 
@@ -64,9 +66,27 @@
 - `chaos/kernel-sim/src/kernel/proc/task.rs`：进程状态、退出原因、进程/线程退出资源释放、reap/reparent 辅助。
 - `chaos/kernel-sim/tests/smoke.rs`：exec syscall、exit/wait 回归测试。
 - `chaos/kernel-sim/tests/elf.rs`：ELF segment alignment 回归测试。
+- `chaos/kernel-qemu/`：M9 QEMU 裸机最小承载层，不作为新的业务语义来源。
+- `chaos/tools/qemu-smoke.sh`：构建并运行 `kernel-qemu` 的 QEMU 启动/关机 smoke 脚本。
 - `chaos/kernel/src/kernel.rs`：禁止修改的原始内核文件。
 
 ## 测试结果
+
+本次 M9 `kernel-qemu` 最小承载层修改后执行过：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo build --release
+
+cd ..
+bash tools/qemu-smoke.sh
+
+cd kernel-sim
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo build --release` 通过；QEMU smoke 通过，OpenSBI 启动后输出 `[kernel-qemu] boot hart=0 dtb=0x87000000` 和 `[kernel-qemu] shutdown`，随后 SBI shutdown 结束 QEMU；`kernel-sim` 完整 `cargo test` 通过，其中 `elf` 测试 `3 passed`、`smoke` 测试 `74 passed`。
 
 本次 `kernel-sim` exec syscall 修改后执行过：
 
@@ -321,7 +341,6 @@ cargo test --test pressure
 - `[M9][重要] TODO`: 迁移设计以 `docs/kernel-sim-qemu-migration-design.md` 为准；核心目标是把 `kernel-sim` 已稳定的进程、地址空间、ELF/exec、fd/open-file-description、exit/wait、timer、pipe/epoll、同步等待等语义迁移到 QEMU 裸机环境，而不是重新设计一套新内核。
 - `[M9][重要] TODO`: 建立迁移清单和语义基线：每个第一批迁移对象都要标出 `kernel-sim` 中的语义源文件或 smoke/elf 测试、QEMU 侧必须替换的 host 依赖、可抽到 `kernel-common/` 的 no_std/alloc 纯逻辑，以及必须留在 `kernel-qemu/` 的裸机适配代码。
 - `[M9][重要] TODO`: 保留 `kernel-sim/` 作为 host 语义回归基准；迁移过程中不得删除或替换 `kernel-sim/`，不得把 host 测试路径改成依赖 QEMU，也不得修改 `chaos/kernel/src/kernel.rs`。
-- `[M9][重要] TODO`: 建立最小 `kernel-qemu/` 承载层：`riscv64gc-unknown-none-elf` 构建、linker script、`entry.S`、`#![no_std]` / `#![no_main]`、panic handler、SBI console、SBI shutdown 和可复现的 `qemu-system-riscv64 -machine virt -nographic ...` smoke 命令；该阶段只提供运行环境，不引入与 `kernel-sim` 冲突的业务语义。
 - `[M9][重要] TODO`: 实现 RISC-V trap / interrupt / syscall ABI 适配层：设置 `stvec`，定义 trap frame，处理 user `ecall`、timer interrupt、page fault 和非法指令；syscall 层只负责从 `a7` / `a0..a5` 解码到迁移后的 `kernel-sim` syscall 语义入口，返回值写回 `a0` 并推进 `sepc`，不要在 trap 层重新定义 syscall 行为。
 - `[M9][重要] TODO`: 用真实 timer interrupt 替换 host 后台时间推进：`KernelRuntimeTicker` 不进入裸机路径，timer tick 需要对接后续 `kernel-sim` 等待/超时语义所需的 deadline、timeout 和 wakeup 接口。
 - `[M9][重要] TODO`: 用真实物理页和 Sv39 页表承载 `kernel-sim` 地址空间语义：从 QEMU 物理内存范围初始化 frame allocator，映射 kernel text/rodata/data/bss、内核栈、trap/trampoline 和用户页；`AddrSpace` 的 VMA 权限、映射生命周期、COW、`mmap`/`munmap`/`brk` 错误返回和 frame 回收语义要保留，底层页内容不能继续依赖 `Arc<Mutex<Vec<u8>>>`。

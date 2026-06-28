@@ -348,11 +348,6 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
 
-来源：
-
-- 当前本地提交区间：`origin/master..HEAD`。
-- 本轮 Codex 验证命令输出。
-
 ## 2026-06-26：kernel-sim Kernel 辅助方法继续拆分
 
 ### 目标
@@ -1253,3 +1248,56 @@ git diff --check
 
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
+## 2026-06-28：M9 kernel-qemu 最小承载层
+
+目标：建立最小 `kernel-qemu/` 裸机运行环境，让后续 `kernel-sim` 语义迁移有独立 QEMU/RISC-V 承载层；本阶段不迁移进程、地址空间、文件系统、trap/syscall 或 timer 语义。
+
+已完成修改：
+
+- 新增独立 `kernel-qemu` crate，默认 target 为 `riscv64gc-unknown-none-elf`，panic 策略为 abort。
+- 新增 `linker-qemu.ld`，把内核放到 QEMU virt/OpenSBI 常用入口 `0x80200000`，定义 text/rodata/data/bss、boot stack 和 kernel 边界符号。
+- 新增 `entry.S`，设置 `gp`、启动栈并跳入 `rust_main(hartid, dtb_pa)`。
+- 新增 `#![no_std]` / `#![no_main]` Rust 入口，清零 `.bss`，通过 SBI console 打印启动 banner，并通过 SBI shutdown 退出 QEMU。
+- 新增 panic handler，通过 SBI console 输出 panic 信息后 shutdown。
+- 新增 `tools/qemu-smoke.sh`，自动构建 release 内核，用 `qemu-system-riscv64 -machine virt -nographic -bios default` 运行并匹配启动/关机输出。
+- `TASK.md` 将 M9 最小承载层标为 DONE；trap/timer/syscall ABI、真实 timer interrupt、用户 init、fd/epoll 等迁移仍保留为后续 TODO。
+
+关键文件：
+
+- `kernel-qemu/Cargo.toml`
+- `kernel-qemu/.cargo/config.toml`
+- `kernel-qemu/linker-qemu.ld`
+- `kernel-qemu/src/entry.S`
+- `kernel-qemu/src/main.rs`
+- `kernel-qemu/src/console.rs`
+- `kernel-qemu/src/sbi.rs`
+- `tools/qemu-smoke.sh`
+- `TASK.md`
+- `docs/ai-record.md`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo build --release
+
+cd ..
+tools/qemu-smoke.sh
+
+cd kernel-sim
+cargo test
+```
+
+结果：`cargo fmt --check` 通过；`cargo build --release` 通过；`tools/qemu-smoke.sh` 通过，OpenSBI 启动后输出 `[kernel-qemu] boot hart=0 dtb=0x87000000` 和 `[kernel-qemu] shutdown`，随后 SBI shutdown 结束 QEMU；`kernel-sim` 完整 `cargo test` 通过，其中 `elf` 测试 `3 passed`、`smoke` 测试 `74 passed`。
+
+未解决问题：
+
+- 尚未实现 RISC-V trap frame、`stvec`、timer interrupt 或 syscall ABI 适配。
+- 尚未启动用户 init，也未迁移 `write` / `exit` / `getpid` / `read` 语义。
+- 尚未接入真实物理页、Sv39 页表、调度、fd 表、pipe/epoll 或 `kernel-sim` 的等待语义。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
