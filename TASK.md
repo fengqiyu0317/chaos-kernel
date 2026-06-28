@@ -1,6 +1,6 @@
 # Chaos 项目交接状态
 
-更新日期：2026-06-27
+更新日期：2026-06-28
 
 ## 目标
 
@@ -219,6 +219,7 @@ cargo test --test pressure
 - `M6`: timer、timeout 与 runtime ticker
 - `M7`: 网络协议 helper 与 socket 路径
 - `M8`: 同步原语、锁与 futex
+- `M9`: `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
 
 ### M0 仓库维护 / 交接记录
 
@@ -314,6 +315,22 @@ cargo test --test pressure
 - `[M8][普通] TODO`: `EvBus` 与文件 readiness / semaphore 统计的连接仍是简化模型：pipe 已开始维护 `READABLE` / `WRITABLE` / `CLOSED` / `ERROR` 到 epoll 的唤醒映射，但其他文件对象、semaphore 统计和真实等待者计数仍未统一；`Sema::get_ncnt()` 依赖 `cb_len()` 但 acquire 路径没有登记真实等待者。
 - `[M8][普通] TODO`: `Spin` 剩余真实内核语义债务：当前 ticket-lock 仍是 userspace simulator 模型，没有接入抢占关闭、中断屏蔽、CPU 本地状态或调度器临界区约束；后续若继续贴近内核语义，应定义 spin 临界区是否允许 host mutex、是否需要 irqsave/irqrestore 变体，并逐步把适合短临界区的数据从“`Spin` + 其他锁”迁移到 `SpinLock<T>`。
 - `[M8][重要] TODO`: `kernel-sim` 的 `KernLock` 目前仍只是可重入自旋式模拟锁，缺少公平性、阻塞等待、抢占/中断控制等真实内核大锁语义；当前 guard 只解决 owner-checked 释放和 guard 路径的自动释放，若后续要把它作为真实大内核锁模型，应继续补齐这些语义或在接口文档中明确它只是 simulator 简化实现。
+
+### M9 `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
+
+- `[M9][重要] TODO`: 迁移设计以 `docs/kernel-sim-qemu-migration-design.md` 为准；核心目标是把 `kernel-sim` 已稳定的进程、地址空间、ELF/exec、fd/open-file-description、exit/wait、timer、pipe/epoll、同步等待等语义迁移到 QEMU 裸机环境，而不是重新设计一套新内核。
+- `[M9][重要] TODO`: 建立迁移清单和语义基线：每个第一批迁移对象都要标出 `kernel-sim` 中的语义源文件或 smoke/elf 测试、QEMU 侧必须替换的 host 依赖、可抽到 `kernel-common/` 的 no_std/alloc 纯逻辑，以及必须留在 `kernel-qemu/` 的裸机适配代码。
+- `[M9][重要] TODO`: 保留 `kernel-sim/` 作为 host 语义回归基准；迁移过程中不得删除或替换 `kernel-sim/`，不得把 host 测试路径改成依赖 QEMU，也不得修改 `chaos/kernel/src/kernel.rs`。
+- `[M9][重要] TODO`: 建立最小 `kernel-qemu/` 承载层：`riscv64gc-unknown-none-elf` 构建、linker script、`entry.S`、`#![no_std]` / `#![no_main]`、panic handler、SBI console、SBI shutdown 和可复现的 `qemu-system-riscv64 -machine virt -nographic ...` smoke 命令；该阶段只提供运行环境，不引入与 `kernel-sim` 冲突的业务语义。
+- `[M9][重要] TODO`: 实现 RISC-V trap / interrupt / syscall ABI 适配层：设置 `stvec`，定义 trap frame，处理 user `ecall`、timer interrupt、page fault 和非法指令；syscall 层只负责从 `a7` / `a0..a5` 解码到迁移后的 `kernel-sim` syscall 语义入口，返回值写回 `a0` 并推进 `sepc`，不要在 trap 层重新定义 syscall 行为。
+- `[M9][重要] TODO`: 用真实 timer interrupt 替换 host 后台时间推进：`KernelRuntimeTicker` 不进入裸机路径，timer tick 需要对接后续 `kernel-sim` 等待/超时语义所需的 deadline、timeout 和 wakeup 接口。
+- `[M9][重要] TODO`: 用真实物理页和 Sv39 页表承载 `kernel-sim` 地址空间语义：从 QEMU 物理内存范围初始化 frame allocator，映射 kernel text/rodata/data/bss、内核栈、trap/trampoline 和用户页；`AddrSpace` 的 VMA 权限、映射生命周期、COW、`mmap`/`munmap`/`brk` 错误返回和 frame 回收语义要保留，底层页内容不能继续依赖 `Arc<Mutex<Vec<u8>>>`。
+- `[M9][重要] TODO`: 迁移第一个用户进程路径：内嵌 init ELF 或 initramfs 只作为启动载体，ELF `PT_LOAD`、用户栈 `argc/argv/envp/auxv`、pid/task 初始化和 `exec` 地址空间替换语义应对齐 `kernel-sim`；第一阶段成功标准是 init 能通过 `write` 输出并 `exit`。
+- `[M9][普通] TODO`: 把等待、同步和调度从 host-thread 承载改成 task 承载：`WaitToken`、futex、epoll、pipe、timer timeout 的可观察唤醒语义要迁移到 `TaskRunState`、run queue、wait queue 和 trap/tick 调度边界，而不是 `std::thread::park()` / `unpark()`。
+- `[M9][普通] TODO`: fd/文件层先迁移 `kernel-sim` 的 fd table、open-file-description、共享 offset、`FD_CLOEXEC`、dup/dup2/fcntl、pipe readiness、epoll ready list 和 waiter 唤醒语义；SBI/UART 只是 fd `1`/`2` 的最小字符设备后端，不要先扩展完整文件系统、网络或 virtio-blk。
+- `[M9][普通] TODO`: `kernel-common/` 只能放不依赖 `std`、host 线程、host 锁、host 文件系统的代码，例如 syscall 常量、ELF 解析结构、地址对齐 helper、纯数据结构和部分错误码定义；暂时不要共享 `KernelRuntimeTicker`、host lock/thread/time、模拟地址空间或测试专用 helper。
+- `[M9][普通] TODO`: 保留 `kernel-sim` 的 `cargo test` / `smoke.rs` 作为 host 语义回归，同时新增 QEMU smoke 测试脚本，至少自动检查裸机启动打印、timer trap 生效、内嵌 init 输出、`exit` 后关机；不要把 `chaos-tests` 直接当成 QEMU 移植的回归标准，除非后续明确接入该测试体系。
+- `[M9][普通] TODO`: 每完成一个 M9 里程碑后，同步更新 `TASK.md` / `docs/ai-record.md`，记录目标、已完成修改、关键文件、QEMU 命令、host 测试结果、QEMU smoke 结果、剩余限制和禁止修改范围；新增 QEMU 行为时必须说明对应的 `kernel-sim` 语义是否已经存在，不存在则进入 TODO。
 
 ## 不要改的部分
 
