@@ -6,9 +6,10 @@ use kernel_sim::{
     Task, TaskRunState, TaskTable, TimerEntry, VmRegion, WaitOutcome, WaitToken, AT_ENTRY,
     AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MAX_THREAD_ID, N_FRAMES, N_PROC,
     N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP,
-    SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL,
-    SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE,
-    TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX,
+    SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION, SYS_SIGRETURN,
+    SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED,
+    VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
@@ -26,9 +27,20 @@ const IPV4_TEST_DST_IP: u32 = 0x0A00_0002;
 // AGENT: global TimerWheel tests must not run in parallel because one test's
 // schedule_tick can expire another test's timeout waiter.
 static TIMER_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+// AGENT: focused low-level Spin tests mutate thread-local current-task context
+// and spawn helper threads with fixed task ids; serialize them to avoid
+// harness-level interleavings from leaking current-task assumptions.
+static CURRENT_TASK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn lock_timer_tests() -> std::sync::MutexGuard<'static, ()> {
     TIMER_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap()
+}
+
+fn lock_current_task_tests() -> std::sync::MutexGuard<'static, ()> {
+    CURRENT_TASK_TEST_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap()
@@ -116,6 +128,7 @@ fn kern_lock_try_guard_respects_owner() {
 // cannot acquire it while the guard is live.
 #[test]
 fn spin_guard_releases_and_try_guard_respects_owner() {
+    let _current_task_guard = lock_current_task_tests();
     let lock = Arc::new(Spin::new());
     let owner = set_test_current_task(1);
     assert!(!lock.is_held());
@@ -141,6 +154,7 @@ fn spin_guard_releases_and_try_guard_respects_owner() {
 // AGENT: same-thread recursive Spin acquisition is rejected instead of spinning forever.
 #[test]
 fn spin_rejects_recursive_acquire() {
+    let _current_task_guard = lock_current_task_tests();
     let lock = Spin::new();
     let owner = set_test_current_task(1);
     let _guard = lock.guard();
@@ -157,6 +171,7 @@ fn spin_rejects_recursive_acquire() {
 // AGENT: Spin release checks the owning simulator task id.
 #[test]
 fn spin_rejects_non_owner_release() {
+    let _current_task_guard = lock_current_task_tests();
     let lock = Arc::new(Spin::new());
     let owner = set_test_current_task(1);
     let guard = lock.guard();
@@ -181,6 +196,7 @@ fn spin_rejects_non_owner_release() {
 // AGENT: releasing an unlocked Spin is a detected bug.
 #[test]
 fn spin_rejects_unheld_release() {
+    let _current_task_guard = lock_current_task_tests();
     let lock = Spin::new();
     set_test_current_task(1);
 
@@ -193,6 +209,7 @@ fn spin_rejects_unheld_release() {
 // AGENT: SpinLock<T> ties mutable data access to the SpinGuard lifetime.
 #[test]
 fn spin_lock_guard_protects_data() {
+    let _current_task_guard = lock_current_task_tests();
     let lock = SpinLock::new(Vec::<usize>::new());
     set_test_current_task(1);
     {
@@ -211,6 +228,7 @@ fn spin_lock_guard_protects_data() {
 // AGENT: BlockCache miss latency must not keep the chain Spin held while sleeping.
 #[test]
 fn block_cache_fetch_sleeps_outside_spin_guard() {
+    let _current_task_guard = lock_current_task_tests();
     let cache = Arc::new(BlockCache::new(1));
     let worker_cache = cache.clone();
     let worker = thread::spawn(move || {
@@ -1068,6 +1086,71 @@ fn sys_read_and_write_use_pipe_file_objects() {
         .dispatch_syscall(SYS_READ, rd_fd, DST, 1, 0, 0, 0)
         .expect_err("empty pipe with a live writer reports again");
     assert_eq!(empty, "again");
+}
+
+#[test]
+// AGENT: pipe readiness changes should wake a blocked epoll_wait through the
+// EvBus -> EpInst wait queue path instead of relying on epoll polling/yielding.
+fn epoll_wait_wakes_when_pipe_becomes_readable() {
+    let kernel = Arc::new(Kernel::new(N_FRAMES));
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init should be current");
+    const SRC: usize = 0x2500_0000;
+    map_user_region(&kernel, &task, SRC, PAGE_SZ, VM_READ | VM_WRITE);
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .write_user_bytes(SRC, b"x", &kernel.pool)
+        .expect("source byte should be writable");
+
+    let (rd_fd, wr_fd) = kernel.do_pipe(1).expect("pipe should create fds");
+    let epfd = kernel
+        .dispatch_syscall(SYS_EPOLL_CREATE, 1, 0, 0, 0, 0, 0)
+        .expect("epoll_create should create epoll fd");
+    let ev = EpEvent {
+        events: EpEvent::IN,
+        data: EpData { ptr: 0xfeed },
+    };
+    kernel
+        .dispatch_syscall(
+            SYS_EPOLL_CTL,
+            epfd,
+            1,
+            rd_fd,
+            &ev as *const EpEvent as usize,
+            0,
+            0,
+        )
+        .expect("epoll_ctl should register the pipe read end");
+
+    let out_ptr = Box::into_raw(Box::new(EpEvent {
+        events: 0,
+        data: EpData { ptr: 0 },
+    })) as usize;
+    let waiter_kernel = kernel.clone();
+    let waiter = thread::spawn(move || {
+        waiter_kernel.dispatch_syscall(SYS_EPOLL_WAIT, epfd, out_ptr, 1, 1_000, 0, 0)
+    });
+
+    thread::sleep(Duration::from_millis(20));
+    assert!(
+        !waiter.is_finished(),
+        "epoll_wait should block until pipe readability changes"
+    );
+
+    let written = kernel
+        .dispatch_syscall(SYS_WRITE, wr_fd, SRC, 1, 0, 0, 0)
+        .expect("pipe write should wake epoll_wait");
+    assert_eq!(written, 1);
+    let ready = waiter
+        .join()
+        .expect("epoll_wait thread should not panic")
+        .expect("epoll_wait syscall should succeed");
+    assert_eq!(ready, 1);
+    let out = unsafe { Box::from_raw(out_ptr as *mut EpEvent) };
+    assert_eq!(out.events & EpEvent::IN, EpEvent::IN);
+    assert_eq!(out.data.ptr, 0xfeed);
 }
 
 #[test]

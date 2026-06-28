@@ -42,7 +42,9 @@
 - 2026-06-27：`kernel-sim/src/kernel/core/net.rs` 的 `parse_ipv4_header()` 已改为返回结构化 `Ipv4HeaderInfo`，包含 header length、total length、payload range、TTL、protocol、源/目的地址和 flags/fragment 信息，并显式拒绝 `total_len < header_len`、`total_len > pkt.len()`、payload range 越界和 header checksum 错误；相关回归放在 `kernel-sim/tests/smoke.rs`。
 - 2026-06-27：`kernel-sim/src/kernel/core/sync.rs` 的 `KernLock` 已改为 owner-checked `leave(id)`，新增 `KernLockGuard` RAII 释放路径并收紧 `flag` / `holder` / `depth` 字段可见性；`Kernel::tick()` 和 `BlockCache::sync_all()` 已统一改走 `GKL.guard(id)`，新增 smoke 回归覆盖递归深度、非 owner 释放、未持锁释放和 `try_guard()`。
 - 2026-06-27：`kernel-sim/src/kernel/core/sync.rs` 的 `Spin` 已从裸 `AtomicBool` 改为私有 ticket-lock 状态，新增 `SpinGuard` RAII 释放、owner/depth 检查和 `SpinLock<T>`；`kernel-sim/src/kernel/core/current.rs` 负责维护由 `Kernel::set_cur()` 安装的 CPU-local current task id，避免 `Spin` 直接依赖全局 `Kernel`；`BlockCache`、`Channel`、runtime tick、`sys_close()` 已移除 `Spin.v` 直接访问，`BlockCache::fetch()` 不再持 chain 自旋锁执行 `thread::sleep()`，`Channel::recv()` 不再持自旋锁执行 `WaitToken::wait()`。
+- 2026-06-27：`kernel-sim/src/kernel/core/current.rs` 的 current-task TLS 存储从 `Cell<usize>` 调整为 `AtomicUsize` relaxed load/store，保持 host-thread 本地隔离；`kernel-sim/tests/smoke.rs` 为直接设置 current-task 的 Spin/SpinLock/BlockCache 低层测试增加串行锁，避免默认并行测试下固定 task id 与 helper thread 假设互相干扰。
 - 2026-06-27：`kernel-sim/src/kernel/core/sync.rs` 的 `EvBus` 已新增基于 `WaitToken` 的等待者队列；顶层 `wait_ev()` 现在在持有 `EvBus` 锁时检查事件位并原子入队，`EvBus::change()` 在事件位变化后唤醒 mask 匹配的等待者，去掉了原先的 `thread::yield_now()` 忙等路径；新增 `ev_bus_wait_ev_returns_existing_event` / `ev_bus_wait_ev_wakes_on_matching_event` smoke 回归。剩余事件模型、epoll 接线和 callback 锁外分发债务见相邻 M8 TODO。
+- 2026-06-27：`kernel-sim` 的 pipe readiness 已接入 `EvBus::sub()` -> `EpInst::mark_ready()` 路径：`EvBus::sub()` 返回可取消订阅 id，`epoll_ctl(ADD/MOD/DEL)` 会为 pipe fd 注册/取消 readiness callback，`sys_epoll_wait()` 在无 ready fd 时睡入 `EpInst.waiters`，由 pipe 写入/关闭等状态变化唤醒；`PipeNode::poll()` 去掉重复锁定同一 mutex 的自锁风险。新增 `epoll_wait_wakes_when_pipe_becomes_readable` smoke 回归。
 
 ## 关键文件
 
@@ -304,12 +306,12 @@ cargo test --test pressure
 - `[M8][重要] TODO`: `kernel-sim/src/kernel/core/sync.rs` 的 `SyncQueue` 通用等待 helper 尚未实现真实 condition-variable / wait-queue 原子语义；`park_on()` / `wait_ev()` / `wait_events()` 会在检查条件后释放条件锁，再把 `WaitToken` 放入队列，存在条件变化与 `signal()` 发生在入队前导致 lost wakeup 的风险。
 - `[M8][重要] TODO`: `SyncQueue::wait_guard()` / `SyncQueue::wait_timeout()` 当前只接收 `&Mutex<T>` 并在内部重新 `lock()` 后立即 `drop()`，不能释放调用者已经持有的 `MutexGuard`，也不能在唤醒后重新持有该 guard；后续应改成接收 guard/token registration 的 API，明确“入队、释放锁、睡眠、唤醒后重拿锁”的边界，避免自死锁和误用。
 - `[M8][普通] TODO`: `SyncQueue::wait_timeout()` 仍通过 `WaitToken::wait(Some(timeout))` 使用 host `Instant` / `thread::park_timeout`；后续应接入已有 `WaitToken::wait_with_timer()` / timer wheel deadline，并与 `WaitQueue::sleep_timeout`、`epoll_wait(timeout)` 的超时语义统一。
-- `[M8][普通] TODO`: `SyncQueue` 的 `RegEp` / `eq` 目前只是本地登记表，`signal()` / `broadcast()` / `signal_n()` 不会向 `EpInst` 或 `sys_epoll_wait()` 发布 readiness；当前 epoll syscall 仍靠轮询 `FLike::poll()` 和 `thread::yield_now()`，后续应把 readiness、等待队列和 epoll wakeup 接成同一条路径，或删除未接线的 `RegEp` 接口。
+- `[M8][普通] TODO`: `SyncQueue` 的 `RegEp` / `eq` 目前只是本地登记表，`signal()` / `broadcast()` / `signal_n()` 不会向 `EpInst` 或 `sys_epoll_wait()` 发布 readiness；当前 pipe-backed epoll 已有 `EvBus` callback 唤醒路径，但 `SyncQueue` 自身仍未接线，后续应把 readiness、等待队列和 epoll wakeup 接成同一条路径，或删除未接线的 `RegEp` 接口。
 - `[M8][普通] TODO`: `Channel` 目前绕过 `SyncQueue` 通用 helper，直接访问 `wq.q` 并依赖 `buf` 锁与队列锁的手写顺序避免丢失唤醒；后续应为该模式提供安全封装或专用 API，避免其他调用者复制裸队列访问方式，并补充 send/recv/close 并发回归。
 - `[M8][普通] TODO`: `kernel-sim/src/kernel/core/sync.rs` 的 `EvBus` 目前只是 `u32` 事件位图加 callback 列表，缺少事件来源、事件类型载荷、事件计数、一次性/持续性事件、边沿触发/水平触发等完整事件模型；连续同类事件会被同一个 bit 合并。
-- `[M8][普通] TODO`: `EvBus::sub()` / 顶层 `wait_ev()` 目前没有接入主要等待路径；实际阻塞等待更多走 `WaitToken` / `SyncQueue` / `WaitQueue`。后续应统一 readiness state、wait queue、epoll registration、取消注册、timeout 和 wake one/all 语义。
+- `[M8][普通] TODO`: `EvBus::sub()` 已用于 pipe -> epoll readiness 唤醒，顶层 `wait_ev()` 仍没有接入主要 syscall 等待路径；实际阻塞等待仍分散在 `WaitToken` / `SyncQueue` / `WaitQueue` / `EpInst.waiters`。后续应继续统一 readiness state、wait queue、epoll registration、取消注册、timeout 和 wake one/all 语义。
 - `[M8][普通] TODO`: `EvBus::change()` 在事件状态更新过程中同步执行 callbacks，且通常发生在外层 `Mutex<EvBus>` 持锁期间；后续应拆分状态更新、待唤醒对象收集和锁外分发，降低 callback 重入、锁顺序反转或死锁风险。
-- `[M8][普通] TODO`: `EvBus` 与文件 readiness / semaphore 统计的连接仍是简化模型：`WRITABLE` / `ERROR` 基本只是预留，pipe 只维护部分 `READABLE` / `CLOSED` 状态，`Sema::get_ncnt()` 依赖 `cb_len()` 但 acquire 路径没有登记真实等待者；后续应补齐 pipe/poll/epoll readiness、错误状态和真实等待者计数。
+- `[M8][普通] TODO`: `EvBus` 与文件 readiness / semaphore 统计的连接仍是简化模型：pipe 已开始维护 `READABLE` / `WRITABLE` / `CLOSED` / `ERROR` 到 epoll 的唤醒映射，但其他文件对象、semaphore 统计和真实等待者计数仍未统一；`Sema::get_ncnt()` 依赖 `cb_len()` 但 acquire 路径没有登记真实等待者。
 - `[M8][普通] TODO`: `Spin` 剩余真实内核语义债务：当前 ticket-lock 仍是 userspace simulator 模型，没有接入抢占关闭、中断屏蔽、CPU 本地状态或调度器临界区约束；后续若继续贴近内核语义，应定义 spin 临界区是否允许 host mutex、是否需要 irqsave/irqrestore 变体，并逐步把适合短临界区的数据从“`Spin` + 其他锁”迁移到 `SpinLock<T>`。
 - `[M8][重要] TODO`: `kernel-sim` 的 `KernLock` 目前仍只是可重入自旋式模拟锁，缺少公平性、阻塞等待、抢占/中断控制等真实内核大锁语义；当前 guard 只解决 owner-checked 释放和 guard 路径的自动释放，若后续要把它作为真实大内核锁模型，应继续补齐这些语义或在接口文档中明确它只是 simulator 简化实现。
 

@@ -11,7 +11,7 @@ use super::*;
 //   panic-safe and callers cannot touch the atomic state directly; ownership is
 //   keyed by simulator Task::id() values instead of host std::thread identity.
 // - EvBus/EvFlag is used as event-bit storage by pipe, process exit/signal,
-//   and semaphore state transitions.
+//   semaphore state transitions, and pipe-backed epoll readiness notification.
 // - WaitToken is the common host-thread wait token used by Channel,
 //   proc::WaitQueue, SyncQueue helpers, and FutexBucket.
 // - SyncQueue is used by Channel through new(), signal(), broadcast(), and
@@ -26,7 +26,7 @@ use super::*;
 // - KernLock::enter/try_enter/held/owner/level are available for focused tests
 //   or future paths that cannot use the guard API; Spin::try_acquire/is_held
 //   and SpinLock<T> are available for short non-blocking critical sections.
-// - EvCb, EvBus::sub(), and EvFlag::WRITABLE/ERROR.
+// - EvFlag::WRITABLE/ERROR.
 // - top-level wait_ev() is available for EvBus readiness waits, but has no
 //   active syscall path yet.
 // - RegEp and SyncQueue's generic wait/timeout/epoll-registration helpers.
@@ -390,6 +390,13 @@ impl EvFlag {
 
 pub type EvCb = Box<dyn Fn(u32) -> bool + Send>;
 
+// AGENT: cancellable EvBus subscriptions let epoll_ctl(DEL/MOD) detach a
+// readiness callback without knowing the callback body.
+struct EvSub {
+    id: usize,
+    cb: EvCb,
+}
+
 // AGENT: EvBus waiters pair an event mask with the host-thread wait token that
 // should be woken once the bus reaches a matching readiness state.
 struct EvWaiter {
@@ -403,8 +410,9 @@ struct EvWaiter {
 #[derive(Default)]
 pub struct EvBus {
     pub ev: u32,
-    pub cbs: Vec<Box<dyn Fn(u32) -> bool + Send>>,
+    cbs: Vec<EvSub>,
     waiters: VecDeque<EvWaiter>,
+    next_sub_id: usize,
 }
 impl EvBus {
     pub fn make() -> Arc<Mutex<Self>> {
@@ -431,14 +439,25 @@ impl EvBus {
                     true
                 }
             });
-            self.cbs.retain(|f| !f(self.ev));
+            self.cbs.retain(|sub| !(sub.cb)(ev));
             for token in ready {
                 token.wake();
             }
         }
     }
-    pub fn sub(&mut self, cb: Box<dyn Fn(u32) -> bool + Send>) {
-        self.cbs.push(cb);
+    // AGENT: return a subscription id so higher-level readiness users can
+    // cancel epoll registrations when epoll_ctl removes or replaces them.
+    pub fn sub(&mut self, cb: EvCb) -> usize {
+        let id = self.next_sub_id;
+        self.next_sub_id = self.next_sub_id.wrapping_add(1);
+        self.cbs.push(EvSub { id, cb });
+        id
+    }
+    // AGENT: remove a previously installed callback subscription.
+    pub fn unsub(&mut self, id: usize) -> bool {
+        let before = self.cbs.len();
+        self.cbs.retain(|sub| sub.id != id);
+        self.cbs.len() != before
     }
     pub fn cb_len(&self) -> usize {
         self.cbs.len()

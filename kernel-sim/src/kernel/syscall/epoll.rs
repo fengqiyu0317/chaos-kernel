@@ -21,6 +21,8 @@ pub(super) fn sys_epoll_create(kernel: &Kernel, a0: usize) -> Result<usize, &'st
     Ok(epfd)
 }
 
+// AGENT: epoll_ctl mirrors source-backed registrations into cancellable EvBus
+// subscriptions after updating the epoll interest table.
 pub(super) fn sys_epoll_ctl(
     kernel: &Kernel,
     a0: usize,
@@ -51,9 +53,7 @@ pub(super) fn sys_epoll_ctl(
     if fd == epfd {
         return Err("einval");
     }
-    if task.get_file(fd).is_none() {
-        return Err("eperm");
-    }
+    let file = task.get_file(fd).ok_or("eperm")?;
 
     let ev = if ev_addr == 0 {
         EpEvent {
@@ -65,11 +65,39 @@ pub(super) fn sys_epoll_ctl(
         unsafe { std::ptr::read_unaligned(ev_addr as *const EpEvent) }
     };
 
-    // AGENT: mutate the registered epoll instance in place under Task::ep_inst.
+    // AGENT: mutate the registered epoll instance first, then mirror ADD/MOD/DEL
+    // into the source object's cancellable readiness subscription when present.
     task.with_ep_mut(epfd, |inst| inst.control(op, fd, &ev))?;
+    let inst = {
+        let ep = task.process.ep_inst.lock().unwrap();
+        ep.get(&epfd).cloned().ok_or("eperm")?
+    };
+    match op {
+        EpCtlOp::ADD => {
+            if let Some(sub_id) = file.register_epoll(fd, inst.clone(), &ev) {
+                inst.set_source_sub(fd, sub_id);
+            }
+        }
+        EpCtlOp::MOD => {
+            if let Some(sub_id) = inst.take_source_sub(fd) {
+                file.unregister_epoll(sub_id);
+            }
+            if let Some(sub_id) = file.register_epoll(fd, inst.clone(), &ev) {
+                inst.set_source_sub(fd, sub_id);
+            }
+        }
+        EpCtlOp::DEL => {
+            if let Some(sub_id) = inst.take_source_sub(fd) {
+                file.unregister_epoll(sub_id);
+            }
+        }
+        _ => {}
+    }
     Ok(0)
 }
 
+// AGENT: epoll_wait now sleeps on EpInst.waiters and is woken by registered
+// source readiness callbacks instead of spinning with thread::yield_now().
 pub(super) fn sys_epoll_wait(
     kernel: &Kernel,
     a0: usize,
@@ -98,19 +126,18 @@ pub(super) fn sys_epoll_wait(
     };
 
     loop {
+        let inst = {
+            let ep = task.process.ep_inst.lock().unwrap();
+            ep.get(&epfd).cloned().ok_or("eperm")?
+        };
+        inst.clear_ready();
         let registrations: Vec<(usize, EpEvent)> = {
-            let events = {
-                let ep = task.process.ep_inst.lock().unwrap();
-                let inst = ep.get(&epfd).ok_or("eperm")?;
-                inst.events.clone()
-            };
-            let registrations = events
+            inst.events
                 .lock()
                 .unwrap()
                 .iter()
                 .map(|(&fd, ev)| (fd, ev.clone()))
-                .collect();
-            registrations
+                .collect()
         };
 
         let mut nready = 0usize;
@@ -150,14 +177,8 @@ pub(super) fn sys_epoll_wait(
             nready += 1;
         }
 
-        {
-            let ep = task.process.ep_inst.lock().unwrap();
-            let inst = ep.get(&epfd).ok_or("eperm")?;
-            let mut ready = inst.ready.lock().unwrap();
-            *ready = ready_fds;
-        }
-
         if nready > 0 {
+            inst.replace_ready(ready_fds);
             return Ok(nready);
         }
         if timeout == 0 {
@@ -168,6 +189,23 @@ pub(super) fn sys_epoll_wait(
                 return Ok(0);
             }
         }
-        thread::yield_now();
+        let Some(token) = inst.prepare_wait() else {
+            continue;
+        };
+        let outcome = match deadline {
+            Some(deadline) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    inst.remove_waiter(&token);
+                    return Ok(0);
+                }
+                token.wait(Some(deadline - now))
+            }
+            None => token.wait(None),
+        };
+        if outcome == WaitOutcome::Timeout {
+            inst.remove_waiter(&token);
+            return Ok(0);
+        }
     }
 }

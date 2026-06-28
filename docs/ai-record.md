@@ -1206,3 +1206,50 @@ cargo test
 
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。
+
+## 2026-06-28：kernel-sim pipe-backed epoll 唤醒发布
+
+目标：把 pipe readiness 接入 `epoll_wait()` 的阻塞唤醒路径，避免仅依赖轮询/yield，并将当前 `kernel-sim` 修改提交推送到 GitHub。
+
+已完成修改：
+
+- `EvBus::sub()` 改为返回可取消订阅 id，新增 `EvBus::unsub()`，供 epoll 注册/删除 readiness callback。
+- `EpInst` 新增 `waiters` 队列和 source subscription 表，`mark_ready()` 可唤醒阻塞的 `epoll_wait()`。
+- `PipeNode` 根据读写端状态计算 readiness，并通过 `EvBus` 注册 pipe -> epoll 的唤醒 callback；`poll()` 改为单次持锁计算，避免重复锁同一 mutex。
+- `sys_epoll_ctl()` 在 ADD/MOD/DEL 时同步维护 pipe source subscription；`sys_epoll_wait()` 无 ready fd 时睡入 `EpInst.waiters`，由 pipe readiness 变化唤醒。
+- `kernel-sim/tests/smoke.rs` 新增 `epoll_wait_wakes_when_pipe_becomes_readable` 回归，并串行化低层 current-task/Spin 相关测试，降低并行测试干扰。
+- `TASK.md` 同步更新当前 pipe-backed epoll 状态和剩余 M8 TODO。
+
+关键文件：
+
+- `kernel-sim/src/kernel/core/current.rs`
+- `kernel-sim/src/kernel/core/sync.rs`
+- `kernel-sim/src/kernel/fs/epoll.rs`
+- `kernel-sim/src/kernel/fs/pipe.rs`
+- `kernel-sim/src/kernel/syscall/epoll.rs`
+- `kernel-sim/tests/smoke.rs`
+- `TASK.md`
+- `docs/ai-record.md`
+
+测试结果：
+
+```bash
+cd kernel-sim
+cargo fmt --check
+cargo test --test smoke
+cargo test
+git diff --check
+```
+
+结果：`cargo fmt --check` 通过；`cargo test --test smoke` 通过 `74 passed`；完整 `cargo test` 通过 `elf` 3 个和 `smoke` 74 个测试；`git diff --check` 通过。
+
+未解决问题：
+
+- `SyncQueue` 通用等待 helper 仍未统一接入 `EpInst` / readiness wakeup 路径。
+- `EvBus::change()` 仍在状态更新过程中同步执行 callback，后续需要拆分为锁内收集、锁外分发。
+- 当前 pipe readiness 已覆盖 `READABLE` / `WRITABLE` / `CLOSED` / `ERROR` 到 epoll 的映射，但其他文件对象、semaphore 统计和真实等待者计数仍未统一。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- `kernel-sim` 相关修复应进入 `chaos/kernel-sim/`。

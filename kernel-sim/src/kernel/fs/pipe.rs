@@ -39,6 +39,7 @@ impl Clone for PipeNode {
     }
 }
 
+// AGENT: endpoint drop publishes pipe closure to the shared readiness bus.
 impl Drop for PipeNode {
     fn drop(&mut self) {
         let mut d = self.data.lock().unwrap();
@@ -85,6 +86,85 @@ impl PipeNode {
         }
         self.data.lock().unwrap().readers > 0
     }
+    // AGENT: compute endpoint-local readiness from the pipe state already
+    // protected by PipeBuf's mutex.
+    fn readiness_locked(&self, d: &PipeBuf) -> u32 {
+        match self.dir {
+            PipeDir::Rd => {
+                let mut ready = 0;
+                if !d.buf.is_empty() || d.writers == 0 {
+                    ready |= EvFlag::READABLE;
+                }
+                if d.writers == 0 {
+                    ready |= EvFlag::CLOSED;
+                }
+                ready
+            }
+            PipeDir::Wr => {
+                let mut ready = 0;
+                if d.readers > 0 {
+                    ready |= EvFlag::WRITABLE;
+                } else {
+                    ready |= EvFlag::CLOSED | EvFlag::ERROR;
+                }
+                ready
+            }
+        }
+    }
+    // AGENT: translate epoll interest into the EvBus bits that should wake this
+    // endpoint. CLOSED wakes read/write interests so EOF/EPIPE is rechecked by
+    // the level-triggered poll pass.
+    fn epoll_bus_mask(&self, events: u32) -> u32 {
+        let mut mask = 0;
+        match self.dir {
+            PipeDir::Rd => {
+                if events & (EpEvent::IN | EpEvent::RDNORM | EpEvent::RDBAND | EpEvent::PRI) != 0 {
+                    mask |= EvFlag::READABLE | EvFlag::CLOSED;
+                }
+            }
+            PipeDir::Wr => {
+                if events & (EpEvent::OUT | EpEvent::WRNORM | EpEvent::WRBAND) != 0 {
+                    mask |= EvFlag::WRITABLE | EvFlag::CLOSED | EvFlag::ERROR;
+                }
+            }
+        }
+        if events & (EpEvent::ERR) != 0 {
+            mask |= EvFlag::ERROR;
+        }
+        if events & (EpEvent::HUP | EpEvent::RDHUP) != 0 {
+            mask |= EvFlag::CLOSED;
+        }
+        mask
+    }
+    // AGENT: connect pipe readiness changes to an epoll instance through the
+    // pipe's EvBus, while returning a cancellable subscription id.
+    pub fn register_epoll(&self, fd: usize, ep: EpInst, ev: &EpEvent) -> Option<usize> {
+        let mask = self.epoll_bus_mask(ev.events);
+        if mask == 0 {
+            return None;
+        }
+        let (sub_id, notify_now) = {
+            let mut d = self.data.lock().unwrap();
+            let ready = self.readiness_locked(&d);
+            let callback_ep = ep.clone();
+            let sub_id = d.bus.sub(Box::new(move |bus_ev| {
+                if (bus_ev & mask) != 0 {
+                    callback_ep.mark_ready(fd);
+                }
+                false
+            }));
+            (sub_id, (ready & mask) != 0)
+        };
+        if notify_now {
+            ep.mark_ready(fd);
+        }
+        Some(sub_id)
+    }
+    // AGENT: remove an epoll readiness subscription previously installed on
+    // this pipe's EvBus.
+    pub fn unregister_epoll(&self, sub_id: usize) -> bool {
+        self.data.lock().unwrap().bus.unsub(sub_id)
+    }
     pub fn read_at(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
         if buf.is_empty() {
             return Ok(0);
@@ -105,12 +185,15 @@ impl PipeNode {
         }
         Ok(n)
     }
+    // AGENT: writes publish READABLE and broken-pipe ERROR/CLOSED readiness to
+    // EvBus subscribers.
     pub fn write_at(&self, buf: &[u8]) -> Result<usize, &'static str> {
         if self.dir != PipeDir::Wr {
             return Ok(0);
         }
         let mut d = self.data.lock().unwrap();
         if d.readers == 0 {
+            d.bus.set(EvFlag::CLOSED | EvFlag::ERROR);
             return Err("broken");
         }
         for &c in buf {
@@ -119,12 +202,14 @@ impl PipeNode {
         d.bus.set(EvFlag::READABLE);
         Ok(buf.len())
     }
+    // AGENT: poll computes readiness under one PipeBuf lock instead of calling
+    // helpers that would relock the same mutex.
     pub fn poll(&self) -> (bool, bool, bool) {
         let d = self.data.lock().unwrap();
-        let has_data = !d.buf.is_empty();
-        let closed = d.readers == 0;
-        let err = closed && has_data && self.dir == PipeDir::Wr;
-        (self.can_read(), self.can_write(), false)
+        match self.dir {
+            PipeDir::Rd => (!d.buf.is_empty() || d.writers == 0, false, false),
+            PipeDir::Wr => (false, d.readers > 0, d.readers == 0),
+        }
     }
 }
 
@@ -144,18 +229,14 @@ impl FLike {
         }
     }
 
+    // AGENT: epoll fd duplicates must carry all shared EpInst queues and source
+    // subscriptions, so clone the EpInst directly.
     pub fn dup(&self, cloexec: bool) -> FLike {
         let _ts = CLK.load(Ordering::Relaxed);
         match self {
             FLike::File(f) => FLike::File(f.dup(cloexec)),
             FLike::Pipe(p) => FLike::Pipe(p.clone()),
-            FLike::Ep(e) => {
-                let cloned = EpInst {
-                    events: e.events.clone(),
-                    ready: e.ready.clone(),
-                };
-                FLike::Ep(cloned)
-            }
+            FLike::Ep(e) => FLike::Ep(e.clone()),
         }
     }
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
@@ -247,6 +328,21 @@ impl FLike {
                 let has_ready = !ready.is_empty();
                 (has_ready, false, false)
             }
+        }
+    }
+    // AGENT: register an epoll readiness callback when this file-like object
+    // exposes a cancellable source; regular files remain level-polled.
+    pub fn register_epoll(&self, fd: usize, ep: EpInst, ev: &EpEvent) -> Option<usize> {
+        match self {
+            FLike::Pipe(p) => p.register_epoll(fd, ep, ev),
+            _ => None,
+        }
+    }
+    // AGENT: cancel a source-backed epoll registration.
+    pub fn unregister_epoll(&self, sub_id: usize) -> bool {
+        match self {
+            FLike::Pipe(p) => p.unregister_epoll(sub_id),
+            _ => false,
         }
     }
 }
