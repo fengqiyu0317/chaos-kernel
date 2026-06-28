@@ -6,6 +6,14 @@ use crate::{csr, println, sbi, timer};
 
 global_asm!(include_str!("trap.S"));
 
+// AGENT: Architectural scause codes used by the early Rust trap dispatcher.
+const INTERRUPT_SUPERVISOR_TIMER: usize = 5;
+const EXCEPTION_ILLEGAL_INSTRUCTION: usize = 2;
+const EXCEPTION_USER_ECALL: usize = 8;
+const EXCEPTION_INSTRUCTION_PAGE_FAULT: usize = 12;
+const EXCEPTION_LOAD_PAGE_FAULT: usize = 13;
+const EXCEPTION_STORE_PAGE_FAULT: usize = 15;
+
 unsafe extern "C" {
     fn __kernel_trap_entry();
     fn __user_trap_entry();
@@ -77,27 +85,81 @@ pub extern "C" fn rust_user_trap(frame: &mut TrapFrame) {
     init_user_trap_vector();
 }
 
+// AGENT: Dispatch raw RISC-V trap causes to narrow handlers without defining syscall semantics.
 fn handle_trap(frame: &mut TrapFrame, origin: TrapOrigin) {
     let scause = csr::read_scause();
     let stval = csr::read_stval();
     match decode_scause(scause) {
-        TrapCause::Interrupt(5) => {
-            timer::on_timer_interrupt();
+        TrapCause::Interrupt(INTERRUPT_SUPERVISOR_TIMER) => handle_timer_interrupt(),
+        TrapCause::Exception(EXCEPTION_USER_ECALL) => handle_user_ecall(frame),
+        TrapCause::Exception(EXCEPTION_ILLEGAL_INSTRUCTION) => {
+            handle_illegal_instruction(frame, origin, stval)
         }
-        TrapCause::Exception(8) => {
-            frame.sepc = frame.sepc.wrapping_add(4);
-            let request = crate::syscall::decode_from_trap_frame(frame);
-            let _ = request;
-            crate::syscall::write_return(frame, crate::syscall::ENOSYS_RET);
-        }
-        cause => {
-            println!(
-                "[kernel-qemu] unhandled {:?} trap cause={:?} sepc={:#x} stval={:#x}",
-                origin, cause, frame.sepc, stval
-            );
-            sbi::shutdown();
-        }
+        TrapCause::Exception(
+            EXCEPTION_INSTRUCTION_PAGE_FAULT
+            | EXCEPTION_LOAD_PAGE_FAULT
+            | EXCEPTION_STORE_PAGE_FAULT,
+        ) => handle_page_fault(frame, origin, scause, stval),
+        cause => handle_unhandled_trap(frame, origin, cause, stval),
     }
+}
+
+// AGENT: Timer interrupts advance only the QEMU-side tick source for now.
+fn handle_timer_interrupt() {
+    timer::on_timer_interrupt();
+}
+
+// AGENT: User ecall follows the RISC-V ABI boundary and leaves syscall semantics out of trap.rs.
+fn handle_user_ecall(frame: &mut TrapFrame) {
+    frame.sepc = frame.sepc.wrapping_add(4);
+    crate::syscall::dispatch_from_trap_frame(frame);
+}
+
+// AGENT: Early page faults fail with architectural context until Sv39/AddrSpace handling lands.
+fn handle_page_fault(frame: &TrapFrame, origin: TrapOrigin, scause: usize, stval: usize) -> ! {
+    fail_trap(
+        frame,
+        origin,
+        "page fault",
+        Some(decode_scause(scause)),
+        stval,
+    )
+}
+
+// AGENT: Illegal instructions are reported explicitly before the later per-task kill path exists.
+fn handle_illegal_instruction(frame: &TrapFrame, origin: TrapOrigin, stval: usize) -> ! {
+    fail_trap(frame, origin, "illegal instruction", None, stval)
+}
+
+// AGENT: Keep unexpected trap failures centralized so logs stay comparable across milestones.
+fn handle_unhandled_trap(
+    frame: &TrapFrame,
+    origin: TrapOrigin,
+    cause: TrapCause,
+    stval: usize,
+) -> ! {
+    fail_trap(frame, origin, "unhandled trap", Some(cause), stval)
+}
+
+// AGENT: Terminate early trap failures with enough context for QEMU smoke and handoff logs.
+fn fail_trap(
+    frame: &TrapFrame,
+    origin: TrapOrigin,
+    label: &str,
+    cause: Option<TrapCause>,
+    stval: usize,
+) -> ! {
+    match cause {
+        Some(cause) => println!(
+            "[kernel-qemu] {} origin={:?} cause={:?} sepc={:#x} stval={:#x}",
+            label, origin, cause, frame.sepc, stval
+        ),
+        None => println!(
+            "[kernel-qemu] {} origin={:?} sepc={:#x} stval={:#x}",
+            label, origin, frame.sepc, stval
+        ),
+    }
+    sbi::shutdown();
 }
 
 // AGENT: Return to a prepared user trap frame; the frame must sit at kernel_stack_top - sizeof(TrapFrame).

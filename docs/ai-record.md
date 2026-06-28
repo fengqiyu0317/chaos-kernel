@@ -1302,6 +1302,53 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
 
+## 2026-06-28：M9 kernel-qemu trap 第 4 点
+
+目标：完成 Rust trap handler 的核心分发，让 `kernel-qemu` 对 timer interrupt、user `ecall`、page fault、非法指令和其他未处理 trap 有清晰独立路径；syscall 层继续只作为 RISC-V ABI 适配和待迁移 `kernel-sim` 语义入口，不在 trap 层定义业务语义。
+
+已完成修改：
+
+- `kernel-qemu/src/trap.rs` 新增 RISC-V `scause` 常量，并将 `handle_trap()` 分派拆成 `handle_timer_interrupt()`、`handle_user_ecall()`、`handle_page_fault()`、`handle_illegal_instruction()` 和 `handle_unhandled_trap()`。
+- user `ecall` 路径保持 `sepc += 4`，随后调用 `kernel-qemu/src/syscall.rs` 的 ABI 适配出口写回 `a0`。
+- page fault 和非法指令暂时保持早期清晰失败路径，输出 origin、cause、`sepc`、`stval` 后 shutdown；后续真实 Sv39 / `AddrSpace` / per-task kill 语义尚未接入。
+- `kernel-qemu/src/syscall.rs` 新增 `dispatch_from_trap_frame()` 和 `dispatch_migrated_semantics()` 占位，确保 trap 层不直接决定 syscall 行为；当前语义入口仍返回 `-ENOSYS`。
+- `TASK.md` 同步记录第 4 点状态、关键文件和测试结果。
+
+关键文件：
+
+- `kernel-qemu/src/trap.rs`
+- `kernel-qemu/src/syscall.rs`
+- `TASK.md`
+- `docs/ai-record.md`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo fmt
+cargo build --release
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check -- kernel-qemu TASK.md docs/ai-record.md
+
+cd kernel-sim
+cargo test
+```
+
+结果：`cargo fmt` 通过；`cargo build --release` 通过；`tools/qemu-smoke.sh` 通过，QEMU 输出 `[kernel-qemu] trap vector installed stvec=0x80200020` 和 `[kernel-qemu] timer tick observed ticks=1`；`git diff --check -- kernel-qemu TASK.md docs/ai-record.md` 通过；`kernel-sim` 完整 `cargo test` 通过，其中 `elf` 测试 `3 passed`、`smoke` 测试 `74 passed`。
+
+未解决问题：
+
+- 尚未启动用户 init，user `ecall` 分支目前没有运行态 smoke 覆盖。
+- syscall 语义入口仍返回 `-ENOSYS`，尚未迁移 `write` / `exit` / `getpid` / `read`。
+- page fault 和非法指令仍是早期失败路径，尚未接入真实页表、COW、lazy fault 或按任务退出。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
+
 ## 2026-06-28：M9 kernel-qemu trap 第 3 点
 
 目标：完成 QEMU 承载层的第 3 点，即先接通 S-mode 当前栈 trap/timer 验证路径，再补出后续用户态 trap 所需的 `sscratch` 切栈入口和返回辅助；本阶段仍不迁移完整用户进程、页表或 syscall 业务语义。
