@@ -9,7 +9,8 @@ mod console;
 mod csr;
 mod sbi;
 mod semantics;
-mod syscall;
+// AGENT: Keep the QEMU RISC-V syscall ABI adapter separate from the migrated kernel-sim syscall directory.
+mod syscall_abi;
 mod timer;
 mod trap;
 

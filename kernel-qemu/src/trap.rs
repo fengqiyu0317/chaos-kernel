@@ -145,7 +145,7 @@ fn handle_timer_interrupt() {
 // AGENT: User ecall follows the RISC-V ABI boundary and leaves syscall semantics out of trap.rs.
 fn handle_user_ecall(frame: &mut TrapFrame) {
     frame.sepc = frame.sepc.wrapping_add(4);
-    crate::syscall::dispatch_from_trap_frame(frame);
+    crate::syscall_abi::dispatch_from_trap_frame(frame);
 }
 
 // AGENT: Early page faults fail with architectural context until Sv39/AddrSpace handling lands.

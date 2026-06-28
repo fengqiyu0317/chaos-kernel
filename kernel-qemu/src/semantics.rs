@@ -2,10 +2,10 @@
 
 use core::cmp::min;
 
-use crate::syscall::{
+use crate::syscall_abi::{
     SyscallRequest, INTERNAL_SYS_EXIT, INTERNAL_SYS_GETPID, INTERNAL_SYS_READ, INTERNAL_SYS_WRITE,
 };
-use crate::{println, sbi, syscall};
+use crate::{println, sbi, syscall_abi};
 
 const STDIN_FD: usize = 0;
 const STDOUT_FD: usize = 1;
@@ -23,7 +23,7 @@ pub fn dispatch_syscall(request: SyscallRequest) -> usize {
         Some(INTERNAL_SYS_WRITE) => sys_write(&request.args),
         Some(INTERNAL_SYS_EXIT) => sys_exit(&request.args),
         Some(INTERNAL_SYS_GETPID) => sys_getpid(&request.args),
-        Some(_) | None => syscall::ENOSYS_RET,
+        Some(_) | None => syscall_abi::ENOSYS_RET,
     }
 }
 

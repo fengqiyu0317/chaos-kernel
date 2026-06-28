@@ -8,9 +8,12 @@
 - **仓库**: `chaos/` — 基于 rCore 的内核调试与重写作业
 - **当前目标目录**: `kernel-sim/`
 - **任务**: 修 bug → 通过全部测试 → 重写提升代码质量
+- **kernel-sim 当前验收目标**: 以通过 `chaos-tests` 测试为目标定位与阶段性完成标准
 - **M9 迁移目标**: 以 `docs/kernel-sim-qemu-migration-design.md` 为准，把 `kernel-sim` 已稳定的内核语义迁移到 QEMU 裸机环境，而不是重新设计一套新内核
 
 ### 测试
+- 当前 `kernel-sim` 的实现与重写优先围绕 `chaos-tests` 的 basic 测试收敛；除非任务明确改变边界，不把目标转回旧 `kernel/src/kernel.rs`。
+
 ```bash
 cargo test --test basic     # 基础测试
 cargo test --test advanced  # 进阶测试
