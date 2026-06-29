@@ -11,6 +11,13 @@ use core::panic::PanicInfo;
 mod console;
 mod csr;
 mod heap;
+mod irq_lock;
+// AGENT: Directly connect the migrated kernel-sim module tree under the
+// crate::kernel path expected by migrated modules; follow-up QEMU work can
+// replace host-only pieces incrementally from compile errors.
+#[allow(dead_code)]
+#[path = "mod.rs"]
+mod kernel;
 #[allow(dead_code)]
 #[path = "mm/bits.rs"]
 mod mm_bits;
@@ -33,6 +40,7 @@ unsafe extern "C" {
 pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     clear_bss();
     heap::init();
+    kernel::core::init_timer_wheel();
 
     println!("[kernel-qemu] boot hart={} dtb={:#x}", hartid, dtb_pa);
     heap::smoke_check();

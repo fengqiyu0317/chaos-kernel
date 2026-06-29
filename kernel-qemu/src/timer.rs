@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::{csr, sbi};
+use crate::{csr, kernel::core::qemu_wait_timer_tick, sbi};
 
 pub const TIMEBASE_HZ: usize = 10_000_000;
 pub const TICKS_PER_SEC: usize = 100;
@@ -22,6 +22,7 @@ pub fn init() {
 // AGENT: Advance the kernel-qemu tick counter after an S-mode timer interrupt.
 pub fn on_timer_interrupt() {
     TICKS.fetch_add(1, Ordering::Relaxed);
+    qemu_wait_timer_tick();
     schedule_next_tick();
 }
 

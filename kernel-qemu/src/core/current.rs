@@ -3,11 +3,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) const NO_CURRENT_TASK_ID: usize = 0;
 
-// AGENT: keep host-test-thread isolation while storing the task id in a core
-// atomic cell instead of std::cell::Cell.
-std::thread_local! {
-    static CURRENT_TASK_ID: AtomicUsize = const { AtomicUsize::new(NO_CURRENT_TASK_ID) };
-}
+// AGENT: QEMU carrier currently runs as a single-hart scheduler path, so the
+// current task id is a CPU-local stand-in stored without host thread-local
+// storage. A later multi-hart scheduler should split this per hart.
+static CURRENT_TASK_ID: AtomicUsize = AtomicUsize::new(NO_CURRENT_TASK_ID);
 
 // AGENT: scheduler-owned current task marker. The value is a simulator
 // Task::id() installed by Kernel::set_cur() or focused tests; it is
@@ -21,13 +20,13 @@ pub fn set_current_task_id(task_id: Option<usize>) {
         }
         None => NO_CURRENT_TASK_ID,
     };
-    CURRENT_TASK_ID.with(|slot| slot.store(id, Ordering::Relaxed));
+    CURRENT_TASK_ID.store(id, Ordering::Relaxed);
 }
 
 // AGENT: expose the current simulator task id for diagnostics and focused
 // tests without exposing the sentinel value.
 pub fn current_task_id() -> Option<usize> {
-    let id = CURRENT_TASK_ID.with(|slot| slot.load(Ordering::Relaxed));
+    let id = CURRENT_TASK_ID.load(Ordering::Relaxed);
     match id {
         NO_CURRENT_TASK_ID => None,
         id => Some(id),

@@ -1,13 +1,28 @@
 // AGENT
 use super::*;
+use crate::irq_lock::IrqOnceCell;
+pub(crate) use crate::irq_lock::IrqSafeMutex;
 
-// AGENT: global timer wheel storage; TimerWheel owns Vec slots, so it is lazily
-// initialized instead of built directly in a const static.
-pub static TIMER_WHEEL: std::sync::OnceLock<Mutex<TimerWheel>> = std::sync::OnceLock::new();
+// AGENT: QEMU timer wheel storage; TimerWheel owns Vec slots, so it is
+// explicitly initialized after heap setup and before timer interrupts are
+// enabled.
+pub static TIMER_WHEEL: IrqOnceCell<IrqSafeMutex<TimerWheel>> = IrqOnceCell::new();
 
-// AGENT: single access point for the simulator-wide logical timer wheel.
-pub fn global_timer_wheel() -> &'static Mutex<TimerWheel> {
-    TIMER_WHEEL.get_or_init(|| Mutex::new(TimerWheel::new()))
+// AGENT: initialize the QEMU logical timer wheel once heap allocation is ready.
+pub fn init_timer_wheel() {
+    if TIMER_WHEEL
+        .init(IrqSafeMutex::new(TimerWheel::new()))
+        .is_err()
+    {
+        panic!("QEMU timer wheel initialized more than once");
+    }
+}
+
+// AGENT: single access point for the QEMU logical timer wheel.
+pub fn global_timer_wheel() -> &'static IrqSafeMutex<TimerWheel> {
+    TIMER_WHEEL
+        .get()
+        .expect("QEMU timer wheel must be initialized before use")
 }
 
 // AGENT: typed timer targets let expiry dispatch route through real kernel-sim
