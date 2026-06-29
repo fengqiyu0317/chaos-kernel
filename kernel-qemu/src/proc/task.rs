@@ -133,14 +133,14 @@ impl ProcessState {
 // holding the mutex guard.
 fn take_mutex_default<T: Default>(slot: &Mutex<T>) -> T {
     let mut guard = slot.lock().unwrap();
-    std::mem::take(&mut *guard)
+    mem::take(&mut *guard)
 }
 
 // AGENT: replace a non-Default mutex value while still dropping the old value
 // outside the mutex guard.
 fn replace_mutex_value<T>(slot: &Mutex<T>, value: T) -> T {
     let mut guard = slot.lock().unwrap();
-    std::mem::replace(&mut *guard, value)
+    mem::replace(&mut *guard, value)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

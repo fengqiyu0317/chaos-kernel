@@ -19,7 +19,7 @@ pub(super) fn sys_futex(
     if !check_access(uaddr, 4) {
         return Err("efault");
     }
-    if uaddr % std::mem::size_of::<u32>() != 0 {
+    if uaddr % mem::size_of::<u32>() != 0 {
         return Err("einval");
     }
     let _private = (op & 0x80) != 0;
@@ -52,7 +52,7 @@ pub(super) fn sys_futex(
             if !check_access(uaddr2, 4) {
                 return Err("efault");
             }
-            if uaddr2 % std::mem::size_of::<u32>() != 0 {
+            if uaddr2 % mem::size_of::<u32>() != 0 {
                 return Err("einval");
             }
             let requeue_count = timeout_addr;
@@ -66,7 +66,7 @@ pub(super) fn sys_futex(
             if !check_access(uaddr2, 4) {
                 return Err("efault");
             }
-            if uaddr2 % std::mem::size_of::<u32>() != 0 {
+            if uaddr2 % mem::size_of::<u32>() != 0 {
                 return Err("einval");
             }
             let val2 = timeout_addr;
@@ -85,7 +85,7 @@ pub(super) fn sys_futex(
             if !check_access(uaddr2, 4) {
                 return Err("efault");
             }
-            if uaddr2 % std::mem::size_of::<u32>() != 0 {
+            if uaddr2 % mem::size_of::<u32>() != 0 {
                 return Err("einval");
             }
             let current = kernel.cur_task(0).ok_or("esrch")?;
@@ -102,10 +102,9 @@ pub(super) fn sys_futex(
 }
 
 fn read_futex_timeout(timeout_addr: usize) -> Result<Duration, &'static str> {
-    let tv_sec = unsafe { std::ptr::read_unaligned(timeout_addr as *const usize) };
-    let tv_nsec = unsafe {
-        std::ptr::read_unaligned((timeout_addr + std::mem::size_of::<usize>()) as *const usize)
-    };
+    let tv_sec = unsafe { ptr::read_unaligned(timeout_addr as *const usize) };
+    let tv_nsec =
+        unsafe { ptr::read_unaligned((timeout_addr + mem::size_of::<usize>()) as *const usize) };
     if tv_nsec >= 1_000_000_000 {
         return Err("einval");
     }

@@ -324,7 +324,7 @@ impl AddrSpace {
     }
 
     pub fn read_user_usize(&self, addr: usize) -> Result<usize, &'static str> {
-        let mut bytes = [0u8; std::mem::size_of::<usize>()];
+        let mut bytes = [0u8; mem::size_of::<usize>()];
         self.read_user_bytes(addr, &mut bytes)?;
         Ok(usize::from_ne_bytes(bytes))
     }

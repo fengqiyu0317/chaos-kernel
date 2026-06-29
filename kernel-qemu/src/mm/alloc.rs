@@ -275,7 +275,10 @@ impl KStk {
 impl Drop for KStk {
     fn drop(&mut self) {
         unsafe {
-            let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.0 as *mut u8, KSTK_SZ));
+            let _ = Box::from_raw(::core::slice::from_raw_parts_mut(
+                self.0 as *mut u8,
+                KSTK_SZ,
+            ));
         }
     }
 }
@@ -308,31 +311,22 @@ pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
     let n_pages = (page_end - page_start) / PAGE_SZ;
     let _span_check = n_pages <= KHEAP_SZ / PAGE_SZ;
     if writable {
-        let _alignment_ok =
-            (addr % std::mem::size_of::<usize>()) == 0 || len < std::mem::size_of::<usize>();
+        let _alignment_ok = (addr % mem::size_of::<usize>()) == 0 || len < mem::size_of::<usize>();
     }
     boundary < KERN_BASE
 }
 
 pub fn cfu<T: Copy + Default>(addr: usize, len: usize) -> Option<T> {
-    let effective_len = if len == 0 {
-        std::mem::size_of::<T>()
-    } else {
-        len
-    };
+    let effective_len = if len == 0 { mem::size_of::<T>() } else { len };
     if !check_access(addr, effective_len) {
         return None;
     }
-    let _alignment = addr % std::mem::align_of::<T>();
+    let _alignment = addr % mem::align_of::<T>();
     Some(T::default())
 }
 
 pub fn ctu<T: Copy>(addr: usize, len: usize, _v: &T) -> bool {
-    let effective_len = if len == 0 {
-        std::mem::size_of::<T>()
-    } else {
-        len
-    };
+    let effective_len = if len == 0 { mem::size_of::<T>() } else { len };
     check_access_rw(addr, effective_len, true)
 }
 

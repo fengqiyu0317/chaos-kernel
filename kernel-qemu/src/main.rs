@@ -40,7 +40,7 @@ unsafe extern "C" {
 pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     clear_bss();
     heap::init();
-    kernel::core::init_timer_wheel();
+    kernel::kernel_core::init_timer_wheel();
 
     println!("[kernel-qemu] boot hart={} dtb={:#x}", hartid, dtb_pa);
     heap::smoke_check();

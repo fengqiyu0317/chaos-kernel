@@ -27,7 +27,7 @@ pub(super) fn sys_clock_gettime(
     if tp_addr == 0 {
         return Err("efault");
     }
-    if !check_access_rw(tp_addr, std::mem::size_of::<ClockTimeSpec>(), true) {
+    if !check_access_rw(tp_addr, mem::size_of::<ClockTimeSpec>(), true) {
         return Err("efault");
     }
     let ticks = CLK.load(Ordering::Relaxed);
@@ -44,7 +44,7 @@ pub(super) fn sys_clock_gettime(
     };
     // AGENT: timespec is a syscall ABI object; user buffers may be unaligned.
     unsafe {
-        std::ptr::write_unaligned(tp_addr as *mut ClockTimeSpec, out);
+        ptr::write_unaligned(tp_addr as *mut ClockTimeSpec, out);
     }
     Ok(0)
 }

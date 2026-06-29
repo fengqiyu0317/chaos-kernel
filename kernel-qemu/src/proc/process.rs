@@ -13,7 +13,7 @@ impl ProcInit {
         pool: &FramePool,
         top: usize,
     ) -> Result<usize, &'static str> {
-        let word = std::mem::size_of::<usize>();
+        let word = mem::size_of::<usize>();
         let mut sp = top;
         let mut arg_locs = Vec::with_capacity(self.args.len());
         let mut env_locs = Vec::with_capacity(self.envs.len());
@@ -71,7 +71,7 @@ impl ProcInit {
             sz += e.len() + 1;
         }
         sz += (self.auxv.len() * 2 + 2 + self.args.len() + 1 + self.envs.len() + 1 + 1)
-            * std::mem::size_of::<usize>();
+            * mem::size_of::<usize>();
         (sz + 15) & !15
     }
 
@@ -82,7 +82,7 @@ impl ProcInit {
         value: usize,
     ) -> Result<(), &'static str> {
         addr_space.write_user_bytes(*cur, &value.to_ne_bytes(), pool)?;
-        *cur += std::mem::size_of::<usize>();
+        *cur += mem::size_of::<usize>();
         Ok(())
     }
 }

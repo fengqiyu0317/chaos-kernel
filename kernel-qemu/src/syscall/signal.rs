@@ -94,7 +94,7 @@ pub(super) fn sys_sigaction(
     let signo = a0;
     let act_addr = a1;
     let oldact_addr = a2;
-    let act_size = std::mem::size_of::<UserSigAction>();
+    let act_size = mem::size_of::<UserSigAction>();
     if signo == 0 || signo >= NSIG as usize {
         return Err("einval");
     }
@@ -122,12 +122,12 @@ pub(super) fn sys_sigaction(
             sa_flags: action.flags as i32,
         };
         unsafe {
-            std::ptr::write_unaligned(oldact_addr as *mut UserSigAction, old);
+            ptr::write_unaligned(oldact_addr as *mut UserSigAction, old);
         }
     }
 
     if act_addr != 0 {
-        let act = unsafe { std::ptr::read_unaligned(act_addr as *const UserSigAction) };
+        let act = unsafe { ptr::read_unaligned(act_addr as *const UserSigAction) };
         let sa_flags = if a3 != 0 { a3 } else { act.sa_flags as usize };
         let sa_mask = if a4 != 0 { a4 as u64 } else { act.sa_mask };
         let handler = if (sa_flags & 1) != 0 {
@@ -172,12 +172,12 @@ pub(super) fn sys_sigprocmask(
     if oldset_addr != 0 {
         // AGENT: expose the previous blocked-set value back to userspace.
         unsafe {
-            std::ptr::write_unaligned(oldset_addr as *mut u64, old_mask);
+            ptr::write_unaligned(oldset_addr as *mut u64, old_mask);
         }
     }
     if set_addr != 0 {
         // AGENT: userspace passes a pointer to sigset_t, not the mask value itself.
-        let new_set = unsafe { std::ptr::read_unaligned(set_addr as *const u64) };
+        let new_set = unsafe { ptr::read_unaligned(set_addr as *const u64) };
         let mut mask = t.sig_mask.lock().unwrap();
         match how {
             SIG_BLOCK_HOW => {

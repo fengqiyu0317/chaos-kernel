@@ -61,7 +61,7 @@ fn read_user_string_array(
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    let word = std::mem::size_of::<usize>();
+    let word = mem::size_of::<usize>();
     for idx in 0..max_items {
         let ptr_addr = array_addr
             .checked_add(idx.checked_mul(word).ok_or("efault")?)

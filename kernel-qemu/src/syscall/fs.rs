@@ -239,13 +239,13 @@ pub(super) fn sys_ioctl(
     let arg = a2;
     match cmd {
         TCGETS => {
-            if !check_access(arg, std::mem::size_of::<TrmIO>()) {
+            if !check_access(arg, mem::size_of::<TrmIO>()) {
                 return Err("efault");
             }
             Ok(0)
         }
         TCSETS => {
-            if !check_access(arg, std::mem::size_of::<TrmIO>()) {
+            if !check_access(arg, mem::size_of::<TrmIO>()) {
                 return Err("efault");
             }
             Ok(0)
@@ -263,7 +263,7 @@ pub(super) fn sys_ioctl(
             Ok(0)
         }
         TIOCGWINSZ => {
-            if !check_access(arg, std::mem::size_of::<WinSz>()) {
+            if !check_access(arg, mem::size_of::<WinSz>()) {
                 return Err("efault");
             }
             Ok(0)
@@ -286,7 +286,7 @@ pub(super) fn sys_pipe(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
     if fds_addr == 0 {
         return Err("efault");
     }
-    if !check_access(fds_addr, 2 * std::mem::size_of::<i32>()) {
+    if !check_access(fds_addr, 2 * mem::size_of::<i32>()) {
         return Err("efault");
     }
     let cur = kernel.cur_task(0);

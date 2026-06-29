@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::{csr, kernel::core::qemu_wait_timer_tick, sbi};
+use crate::{csr, kernel::kernel_core::qemu_wait_timer_tick, sbi};
 
 pub const TIMEBASE_HZ: usize = 10_000_000;
 pub const TICKS_PER_SEC: usize = 100;

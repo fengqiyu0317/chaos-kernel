@@ -9,16 +9,16 @@
     unused_mut
 )]
 
-pub mod core;
 pub mod fs;
+pub mod kernel_core;
 pub mod mm;
 pub mod proc;
 pub mod syscall;
 pub mod util;
 
 // AGENT: keep the former flat public API while giving rust-analyzer real modules.
-pub use self::core::*;
 pub use self::fs::*;
+pub use self::kernel_core::*;
 pub use self::mm::*;
 pub use self::proc::*;
 pub use self::syscall::*;
