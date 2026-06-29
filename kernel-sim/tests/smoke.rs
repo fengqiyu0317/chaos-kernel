@@ -5,11 +5,11 @@ use kernel_sim::{
     FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking, PageTableEntry, PgFrame,
     SchedulePolicy, Spin, SpinLock, Task, TaskRunState, TaskTable, TimerEntry, VmMap, VmRegion,
     WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED,
-    MAX_THREAD_ID, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE,
-    SIGUSR1, SYS_BRK, SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT,
-    SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ,
-    SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ,
-    VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK,
+    SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT, SYS_FORK,
+    SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION,
+    SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC,
+    VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
@@ -61,25 +61,25 @@ fn kern_lock_guard_releases_reentrant_lock_by_depth() {
     let lock = KernLock::new();
     assert!(!lock.held());
 
-    let outer = lock.guard(7);
+    let outer = lock.guard(1001);
     assert!(lock.held());
-    assert_eq!(lock.owner(), 7);
+    assert_eq!(lock.owner(), 1001);
     assert_eq!(lock.level(), 1);
 
     {
-        let _inner = lock.guard(7);
+        let _inner = lock.guard(1001);
         assert!(lock.held());
-        assert_eq!(lock.owner(), 7);
+        assert_eq!(lock.owner(), 1001);
         assert_eq!(lock.level(), 2);
     }
 
     assert!(lock.held());
-    assert_eq!(lock.owner(), 7);
+    assert_eq!(lock.owner(), 1001);
     assert_eq!(lock.level(), 1);
 
     drop(outer);
     assert!(!lock.held());
-    assert_eq!(lock.owner(), MAX_THREAD_ID + 1);
+    assert_eq!(lock.owner(), usize::MAX);
     assert_eq!(lock.level(), 0);
 }
 

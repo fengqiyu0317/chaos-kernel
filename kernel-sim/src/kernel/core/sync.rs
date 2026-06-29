@@ -40,23 +40,23 @@ pub struct KernLock {
     holder: AtomicUsize,
     depth: AtomicUsize,
 }
+
+// AGENT: no-owner sentinel is independent from task/thread id limits.
+const KERNLOCK_NO_OWNER: usize = usize::MAX;
+
 impl KernLock {
+    // AGENT: initialize holder with the owner-token sentinel, not MAX_THREAD_ID.
     pub const fn new() -> Self {
         Self {
             flag: AtomicBool::new(false),
-            holder: AtomicUsize::new(MAX_THREAD_ID + 1), // AGENT
+            holder: AtomicUsize::new(KERNLOCK_NO_OWNER), // AGENT
             depth: AtomicUsize::new(0),
         }
     }
+    // AGENT: KernLock owner ids are lock-owner tokens, not TaskTable indexes.
     pub fn enter(&self, id: usize) {
-        assert!(
-            id <= MAX_THREAD_ID,
-            "thread id {} exceeds MAX_THREAD_ID {}",
-            id,
-            MAX_THREAD_ID
-        );
+        assert_ne!(id, KERNLOCK_NO_OWNER, "KernLock owner id is reserved");
         if self.holder.load(Ordering::Relaxed) == id {
-            // AGENT: sentinel is MAX_THREAD_ID+1, no need for id != 0 guard
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -73,28 +73,23 @@ impl KernLock {
     // AGENT: release requires the caller id so incorrect owner/depth state is
     // caught at the lock boundary instead of silently unlocking GKL.
     pub fn leave(&self, id: usize) {
-        assert!(
-            id <= MAX_THREAD_ID,
-            "thread id {} exceeds MAX_THREAD_ID {}",
-            id,
-            MAX_THREAD_ID
-        );
+        assert_ne!(id, KERNLOCK_NO_OWNER, "KernLock owner id is reserved");
         let owner = self.holder.load(Ordering::Relaxed);
         let depth = self.depth.load(Ordering::Relaxed);
         assert!(
             self.flag.load(Ordering::Relaxed) && depth > 0,
-            "KernLock::leave by thread {} without held lock",
+            "KernLock::leave by owner {} without held lock",
             id
         );
         assert_eq!(
             owner, id,
-            "KernLock::leave by non-owner thread {}, owner is {}",
+            "KernLock::leave by non-owner {}, owner is {}",
             id, owner
         );
         if depth > 1 {
             self.depth.store(depth - 1, Ordering::Relaxed);
         } else {
-            self.holder.store(MAX_THREAD_ID + 1, Ordering::Relaxed); // AGENT
+            self.holder.store(KERNLOCK_NO_OWNER, Ordering::Relaxed); // AGENT
             self.depth.store(0, Ordering::Relaxed);
             self.flag.store(false, Ordering::Release);
         }
@@ -108,15 +103,10 @@ impl KernLock {
     pub fn level(&self) -> usize {
         self.depth.load(Ordering::Relaxed)
     }
+    // AGENT: try_enter follows the same owner-token rule as enter().
     pub fn try_enter(&self, id: usize) -> bool {
-        assert!(
-            id <= MAX_THREAD_ID,
-            "thread id {} exceeds MAX_THREAD_ID {}",
-            id,
-            MAX_THREAD_ID
-        );
+        assert_ne!(id, KERNLOCK_NO_OWNER, "KernLock owner id is reserved");
         if self.holder.load(Ordering::Relaxed) == id {
-            // AGENT: sentinel is MAX_THREAD_ID+1, no need for id != 0 guard
             self.depth.fetch_add(1, Ordering::Relaxed);
             return true;
         }
