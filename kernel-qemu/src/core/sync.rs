@@ -27,8 +27,6 @@ use super::*;
 //   or future paths that cannot use the guard API; Spin::try_acquire/is_held
 //   and SpinLock<T> are available for short non-blocking critical sections.
 // - EvFlag::WRITABLE/ERROR.
-// - top-level wait_ev() is available for EvBus readiness waits, but has no
-//   active syscall path yet.
 // - RegEp and SyncQueue's generic wait/timeout/epoll-registration helpers.
 // - WaitToken::id() and SocketState.
 // AGENT TODO: KernLock is still a simulator recursive spin lock, not full
@@ -255,22 +253,14 @@ impl Spin {
     pub fn guard(&self) -> SpinGuard<'_> {
         self.acquire();
         let owner = self.owner.load(Ordering::Relaxed);
-        SpinGuard {
-            lock: self,
-            owner,
-            _not_send: std::marker::PhantomData,
-        }
+        SpinGuard { lock: self, owner }
     }
     // AGENT: try_guard reuses try_acquire() and captures the stored owner only
     // after the non-blocking acquisition succeeds.
     pub fn try_guard(&self) -> Option<SpinGuard<'_>> {
         if self.try_acquire() {
             let owner = self.owner.load(Ordering::Relaxed);
-            Some(SpinGuard {
-                lock: self,
-                owner,
-                _not_send: std::marker::PhantomData,
-            })
+            Some(SpinGuard { lock: self, owner })
         } else {
             None
         }
@@ -284,7 +274,6 @@ unsafe impl Sync for Spin {}
 pub struct SpinGuard<'a> {
     lock: &'a Spin,
     owner: usize,
-    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 // AGENT: drop-based release keeps early returns from leaking the spinlock and
@@ -311,14 +300,14 @@ impl Drop for SpinGuard<'_> {
 // data tied to a SpinGuard instead of a separate lock plus convention.
 pub struct SpinLock<T> {
     lock: Spin,
-    data: std::cell::UnsafeCell<T>,
+    data: ::core::cell::UnsafeCell<T>,
 }
 
 impl<T> SpinLock<T> {
     pub const fn new(data: T) -> Self {
         Self {
             lock: Spin::new(),
-            data: std::cell::UnsafeCell::new(data),
+            data: ::core::cell::UnsafeCell::new(data),
         }
     }
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
@@ -378,20 +367,14 @@ impl EvFlag {
     pub const SEM_ACQ: u32 = 1 << 21;
 }
 
+// AGENT: use alloc::boxed::Box explicitly because kernel-qemu is no_std.
 pub type EvCb = Box<dyn Fn(u32) -> bool + Send>;
 
-// AGENT: cancellable EvBus subscriptions let epoll_ctl(DEL/MOD) detach a
-// readiness callback without knowing the callback body.
-struct EvSub {
-    id: usize,
-    cb: EvCb,
-}
-
-// AGENT: EvBus waiters pair an event mask with the host-thread wait token that
-// should be woken once the bus reaches a matching readiness state.
-struct EvWaiter {
+// AGENT: persistent event-source subscription used by pipe readiness
+// notifications feeding an EpInst.
+struct EventWaitEntry {
     mask: u32,
-    token: WaitToken,
+    cb: EvCb,
 }
 
 // AGENT TODO: EvBus is still a lightweight event-bit store, not a full
@@ -400,8 +383,7 @@ struct EvWaiter {
 #[derive(Default)]
 pub struct EvBus {
     pub ev: u32,
-    cbs: Vec<EvSub>,
-    waiters: VecDeque<EvWaiter>,
+    entries: BTreeMap<usize, EventWaitEntry>,
     next_sub_id: usize,
 }
 impl EvBus {
@@ -414,62 +396,37 @@ impl EvBus {
     pub fn clear(&mut self, s: u32) {
         self.change(s, 0);
     }
-    // AGENT: event changes wake every queued waiter whose mask is now ready.
+    // AGENT: event changes drive persistent subscriptions; an entry stays
+    // installed until its callback asks to be removed or unsub() removes it.
     pub fn change(&mut self, rst: u32, s: u32) {
         let orig = self.ev;
         self.ev = (self.ev & !rst) | s;
         if self.ev != orig {
             let ev = self.ev;
-            let mut ready = Vec::new();
-            self.waiters.retain(|waiter| {
-                if (ev & waiter.mask) != 0 {
-                    ready.push(waiter.token.clone());
-                    false
-                } else {
-                    true
+            self.entries.retain(|_, entry| {
+                if (ev & entry.mask) == 0 {
+                    return true;
                 }
+
+                !(entry.cb)(ev)
             });
-            self.cbs.retain(|sub| !(sub.cb)(ev));
-            for token in ready {
-                token.wake();
-            }
         }
     }
     // AGENT: return a subscription id so higher-level readiness users can
     // cancel epoll registrations when epoll_ctl removes or replaces them.
-    pub fn sub(&mut self, cb: EvCb) -> usize {
+    pub fn sub(&mut self, mask: u32, cb: EvCb) -> usize {
         let id = self.next_sub_id;
         self.next_sub_id = self.next_sub_id.wrapping_add(1);
-        self.cbs.push(EvSub { id, cb });
+        self.entries.insert(id, EventWaitEntry { mask, cb });
         id
     }
     // AGENT: remove a previously installed callback subscription.
     pub fn unsub(&mut self, id: usize) -> bool {
-        let before = self.cbs.len();
-        self.cbs.retain(|sub| sub.id != id);
-        self.cbs.len() != before
+        self.entries.remove(&id).is_some()
     }
+    // AGENT: subscription-only EvBus keeps callback count as entry count.
     pub fn cb_len(&self) -> usize {
-        self.cbs.len()
-    }
-}
-
-// AGENT: check readiness and enqueue the WaitToken while holding the EvBus lock
-// so a concurrent event change cannot happen between the check and sleep setup.
-pub fn wait_ev(bus: &Arc<Mutex<EvBus>>, mask: u32) -> u32 {
-    loop {
-        let token = WaitToken::current();
-        {
-            let mut g = bus.lock().unwrap();
-            if (g.ev & mask) != 0 {
-                return g.ev;
-            }
-            g.waiters.push_back(EvWaiter {
-                mask,
-                token: token.clone(),
-            });
-        }
-        token.wait(None);
+        self.entries.len()
     }
 }
 
