@@ -13,9 +13,9 @@ use super::*;
 // - EvBus/EvFlag is used as event-bit storage by pipe, process exit/signal,
 //   semaphore state transitions, and pipe-backed epoll readiness notification.
 // - WaitToken is the common task wait token used by Channel,
-//   proc::WaitQueue, SyncQueue helpers, and FutexBucket.
-// - SyncQueue is used by Channel through new(), signal(), broadcast(), and
-//   direct access to q.
+//   proc::WaitQueue, ConditionWait/CountingEvent helpers, and FutexBucket.
+// - ConditionWait is used by Channel through wait_until(), signal(), and
+//   broadcast().
 // - FutexBucket is wired to SYS_FUTEX and process-exit cleanup.
 //
 // Partially wired paths:
@@ -27,7 +27,7 @@ use super::*;
 //   or future paths that cannot use the guard API; Spin::try_acquire/is_held
 //   and SpinLock<T> are available for short non-blocking critical sections.
 // - EvFlag::WRITABLE/ERROR.
-// - RegEp and SyncQueue's generic wait/timeout/epoll-registration helpers.
+// - ConditionWait's generic condition-check helpers.
 // - WaitToken::id() and SocketState.
 // AGENT TODO: KernLock is still a simulator recursive spin lock, not full
 // real-kernel locking: it lacks fairness, blocking wait, preemption control,
@@ -654,85 +654,41 @@ impl WaitToken {
 #[cfg(any(test, feature = "qemu-sync-selftest"))]
 pub mod tests;
 
-pub struct RegEp {
-    pub task_id: usize,
-    pub epfd: usize,
-    pub fd: usize,
+// AGENT: local WaitToken queue only; condition checks, saved wake credits, and
+// higher-level waiting policies live in ConditionWait / CountingEvent.
+pub(crate) struct WaitQueue {
+    q: Mutex<VecDeque<WaitToken>>,
 }
 
-// AGENT TODO: SyncQueue's generic helpers are not yet a full
-// condition-variable/wait-queue abstraction. park_on() preserves unmatched
-// signal wakeups, but the other helpers do not atomically pair condition
-// checks, waiter enqueue, and release/reacquire of the caller's guard;
-// wait_timeout still uses host time; RegEp is not wired into epoll readiness
-// wakeups. Channel currently uses q directly with its own lock ordering.
-pub struct SyncQueue {
-    pub(crate) q: Mutex<VecDeque<WaitToken>>,
-    pending_wakes: AtomicUsize,
-    eq: Mutex<VecDeque<RegEp>>,
-}
-impl SyncQueue {
+impl WaitQueue {
     pub fn new() -> Self {
         Self {
             q: Mutex::new(VecDeque::new()),
-            pending_wakes: AtomicUsize::new(0),
-            eq: Mutex::new(VecDeque::new()),
         }
     }
-    // AGENT: called with q locked, so the waiter queue and cached signal credits
-    // are observed as one logical SyncQueue state.
-    fn take_pending_wake_locked(&self) -> bool {
-        let pending = self.pending_wakes.load(Ordering::Relaxed);
-        if pending == 0 {
-            return false;
-        }
-        self.pending_wakes.store(pending - 1, Ordering::Relaxed);
-        true
+
+    // AGENT: enqueue the current task while the caller still holds the condition
+    // state lock, then let the caller drop that state lock before blocking.
+    pub fn enqueue_current_locked(&self) -> WaitToken {
+        let token = WaitToken::current();
+        let mut q = self.q.lock().unwrap();
+        q.push_back(token.clone());
+        token
     }
-    // AGENT: called with q locked to preserve signal-before-wait ordering.
-    fn add_pending_wakes_locked(&self, count: usize) {
-        if count == 0 {
-            return;
-        }
-        let pending = self.pending_wakes.load(Ordering::Relaxed);
-        self.pending_wakes.store(
-            pending
-                .checked_add(count)
-                .expect("SyncQueue pending wake credit overflow"),
-            Ordering::Relaxed,
-        );
+    // AGENT: remove a token that is no longer waiting.
+    pub fn remove_waiter(&self, token: &WaitToken) {
+        let mut q = self.q.lock().unwrap();
+        q.retain(|queued| !queued.same(token));
     }
-    pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
-        let d = g.lock().unwrap();
-        let satisfied = pred(&d);
-        drop(d);
-        if satisfied {
-            return true;
-        }
-        let token = {
-            let mut wq = self.q.lock().unwrap();
-            if self.take_pending_wake_locked() {
-                None
-            } else {
-                let token = WaitToken::current();
-                wq.push_back(token.clone());
-                Some(token)
-            }
-        };
-        if let Some(token) = token {
-            token.wait(None);
-        }
-        let d = g.lock().unwrap();
-        pred(&d)
-    }
-    pub fn signal(&self) {
+
+    fn signal_or_else(&self, mut on_empty: impl FnMut()) {
         loop {
             let token = {
                 let mut q = self.q.lock().unwrap();
                 match q.pop_front() {
                     Some(token) => Some(token),
                     None => {
-                        self.add_pending_wakes_locked(1);
+                        on_empty();
                         None
                     }
                 }
@@ -744,6 +700,11 @@ impl SyncQueue {
             }
         }
     }
+
+    pub fn signal(&self) {
+        self.signal_or_else(|| {});
+    }
+
     pub fn broadcast(&self) {
         let mut q = self.q.lock().unwrap();
         let batch: Vec<WaitToken> = q.drain(..).collect();
@@ -753,7 +714,7 @@ impl SyncQueue {
         }
     }
     // AGENT: wake up to n live tokens and skip stale tokens already completed by timeout.
-    pub fn signal_n(&self, n: usize) -> usize {
+    fn signal_n_or_else(&self, n: usize, mut on_short: impl FnMut(usize)) -> usize {
         let mut woken = 0;
         while woken < n {
             let token = {
@@ -761,7 +722,7 @@ impl SyncQueue {
                 match q.pop_front() {
                     Some(token) => Some(token),
                     None => {
-                        self.add_pending_wakes_locked(n - woken);
+                        on_short(n - woken);
                         None
                     }
                 }
@@ -774,90 +735,136 @@ impl SyncQueue {
         }
         woken
     }
+
+    pub fn signal_n(&self, n: usize) -> usize {
+        self.signal_n_or_else(n, |_| {})
+    }
+
     pub fn pending(&self) -> usize {
         let q = self.q.lock().unwrap();
         q.len()
     }
+}
+
+// AGENT: condition-variable style helper: check caller state under its mutex,
+// enqueue while that state is still protected, then wait after releasing it.
+pub struct ConditionWait {
+    waiters: WaitQueue,
+}
+
+impl ConditionWait {
+    pub fn new() -> Self {
+        Self {
+            waiters: WaitQueue::new(),
+        }
+    }
+
+    pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
+        self.wait_until(g, |d| if pred(d) { Some(true) } else { None })
+    }
+
     pub fn wait_ev<T>(&self, g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
+        self.wait_until(g, |d| cond(d))
+    }
+
+    pub fn wait_until<T, R>(&self, g: &Mutex<T>, mut cond: impl FnMut(&mut T) -> Option<R>) -> R {
         loop {
-            {
-                let d = g.lock().unwrap();
-                if let Some(r) = cond(&d) {
+            let token = {
+                let mut d = g.lock().unwrap();
+                if let Some(r) = cond(&mut d) {
                     return r;
                 }
-            }
-            let token = WaitToken::current();
-            {
-                let mut q = self.q.lock().unwrap();
-                q.push_back(token.clone());
-            }
+                self.waiters.enqueue_current_locked()
+            };
             token.wait(None);
         }
     }
-    pub fn wait_events<T>(
-        queues: &[&SyncQueue],
-        g: &Mutex<T>,
-        mut cond: impl FnMut(&T) -> Option<bool>,
-    ) -> bool {
-        loop {
-            {
-                let d = g.lock().unwrap();
-                if let Some(r) = cond(&d) {
-                    return r;
-                }
-            }
+
+    pub fn signal(&self) {
+        self.waiters.signal();
+    }
+
+    pub fn signal_n(&self, n: usize) -> usize {
+        self.waiters.signal_n(n)
+    }
+
+    pub fn broadcast(&self) {
+        self.waiters.broadcast();
+    }
+
+    pub fn pending(&self) -> usize {
+        self.waiters.pending()
+    }
+}
+
+// AGENT: counting event helper; unlike ConditionWait, signal-before-wait is
+// remembered through pending_wakes and consumed by later waiters.
+pub struct CountingEvent {
+    waiters: WaitQueue,
+    pending_wakes: AtomicUsize,
+}
+
+impl CountingEvent {
+    pub fn new() -> Self {
+        Self {
+            waiters: WaitQueue::new(),
+            pending_wakes: AtomicUsize::new(0),
+        }
+    }
+
+    // AGENT: called while waiters.q is locked, so pending credits and queued
+    // waiters are observed as one event state.
+    fn take_pending_wake_locked(&self) -> bool {
+        let pending = self.pending_wakes.load(Ordering::Relaxed);
+        if pending == 0 {
+            return false;
+        }
+        self.pending_wakes.store(pending - 1, Ordering::Relaxed);
+        true
+    }
+
+    // AGENT: called while waiters.q is locked to preserve signal-before-wait
+    // ordering.
+    fn add_pending_wakes_locked(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let pending = self.pending_wakes.load(Ordering::Relaxed);
+        self.pending_wakes.store(
+            pending
+                .checked_add(count)
+                .expect("CountingEvent pending wake credit overflow"),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn prepare_wait_locked(&self) -> Option<WaitToken> {
+        let mut q = self.waiters.q.lock().unwrap();
+        if self.take_pending_wake_locked() {
+            None
+        } else {
             let token = WaitToken::current();
-            for wq in queues {
-                let mut q = wq.q.lock().unwrap();
-                q.push_back(token.clone());
-            }
-            token.wait(None);
-            for wq in queues {
-                let mut q = wq.q.lock().unwrap();
-                q.retain(|queued| !queued.same(&token));
-            }
-        }
-    }
-    pub fn wait_guard<T>(&self, g: &Mutex<T>) {
-        let token = WaitToken::current();
-        {
-            let mut q = self.q.lock().unwrap();
             q.push_back(token.clone());
-        }
-        drop(g.lock().unwrap());
-        token.wait(None);
-    }
-    pub fn wait_timeout<T>(&self, g: &Mutex<T>, timeout: Duration) -> bool {
-        let token = WaitToken::current();
-        {
-            let mut q = self.q.lock().unwrap();
-            q.push_back(token.clone());
-        }
-        drop(g.lock().unwrap());
-        match token.wait(Some(timeout)) {
-            WaitOutcome::Event => true,
-            WaitOutcome::Timeout => {
-                let mut q = self.q.lock().unwrap();
-                q.retain(|queued| !queued.same(&token));
-                false
-            }
+            Some(token)
         }
     }
-    pub fn reg_epoll(&self, task_id: usize, epfd: usize, fd: usize) {
-        self.eq
-            .lock()
-            .unwrap()
-            .push_back(RegEp { task_id, epfd, fd });
+
+    pub fn signal(&self) {
+        self.waiters
+            .signal_or_else(|| self.add_pending_wakes_locked(1));
     }
-    pub fn unreg_epoll(&self, task_id: usize, epfd: usize, fd: usize) -> bool {
-        let mut eql = self.eq.lock().unwrap();
-        for i in 0..eql.len() {
-            if eql[i].task_id == task_id && eql[i].epfd == epfd && eql[i].fd == fd {
-                eql.remove(i);
-                return true;
-            }
-        }
-        false
+
+    pub fn signal_n(&self, n: usize) -> usize {
+        self.waiters
+            .signal_n_or_else(n, |left| self.add_pending_wakes_locked(left))
+    }
+
+    pub fn broadcast(&self) {
+        self.waiters.broadcast();
+    }
+
+    pub fn pending(&self) -> usize {
+        self.waiters.pending()
     }
 }
 

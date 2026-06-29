@@ -4,12 +4,12 @@ use super::*;
 pub struct Channel {
     pub buf: Mutex<CircBuf>,
     pub guard: Spin,
-    pub wq: SyncQueue,
+    pub wq: ConditionWait,
     pub shut: AtomicBool,
 }
 impl Channel {
     // AGENT: Channel keeps the legacy Spin field for API compatibility, but
-    // blocking send/recv coordination is handled by CircBuf's Mutex + SyncQueue.
+    // blocking send/recv coordination is handled by CircBuf's Mutex + ConditionWait.
     pub fn new(cap: usize) -> Self {
         let effective_cap = if cap == 0 {
             1
@@ -32,28 +32,22 @@ impl Channel {
         Self {
             buf: Mutex::new(ring),
             guard: Spin::new(),
-            wq: SyncQueue::new(),
+            wq: ConditionWait::new(),
             shut: AtomicBool::new(false),
         }
     }
-    // AGENT: wait registration is protected by buf and wq locks, and the
-    // WaitToken wait happens after both are released so no Spin is held while blocking.
+    // AGENT: wait_until() checks buffer/shutdown state and registers the waiter
+    // under the same buffer lock, then sleeps after that lock is released.
     pub fn recv(&self) -> Option<u8> {
-        loop {
-            let token = WaitToken::current();
-            {
-                let mut ring = self.buf.lock().unwrap();
-                if let Some(v) = ring.pop() {
-                    return Some(v);
-                }
-                let mut waiters = self.wq.q.lock().unwrap();
-                if self.shut.load(Ordering::Acquire) {
-                    return None;
-                }
-                waiters.push_back(token.clone());
+        self.wq.wait_until(&self.buf, |ring| {
+            if let Some(v) = ring.pop() {
+                Some(Some(v))
+            } else if self.shut.load(Ordering::Acquire) {
+                Some(None)
+            } else {
+                None
             }
-            token.wait(None);
-        }
+        })
     }
     // AGENT: data insertion uses the buffer mutex and wakes waiters after the
     // mutation; no Spin is held during wakeup.
@@ -69,7 +63,7 @@ impl Channel {
         success
     }
     // AGENT: close publishes shutdown before broadcasting so recv either sees
-    // shut under wq.q or is already queued for the broadcast.
+    // shut while holding buf or has already queued its WaitToken.
     pub fn close(&self) {
         self.shut.store(true, Ordering::Release);
         // HUMAN
