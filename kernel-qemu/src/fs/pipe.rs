@@ -147,12 +147,13 @@ impl PipeNode {
             let mut d = self.data.lock().unwrap();
             let ready = self.readiness_locked(&d);
             let callback_ep = ep.clone();
-            let sub_id = d.bus.sub(Box::new(move |bus_ev| {
-                if (bus_ev & mask) != 0 {
+            let sub_id = d.bus.sub(
+                mask,
+                Box::new(move |_bus_ev| {
                     callback_ep.mark_ready(fd);
-                }
-                false
-            }));
+                    false
+                }),
+            );
             (sub_id, (ready & mask) != 0)
         };
         if notify_now {

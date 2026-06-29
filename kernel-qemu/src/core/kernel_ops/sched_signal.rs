@@ -1,6 +1,48 @@
 use super::*;
 
 impl Kernel {
+    // AGENT: common QEMU wait-token wake path. Event, futex, epoll, and timer
+    // wakeups should make a sleeping task runnable through the run queue instead
+    // of unparking a host thread.
+    pub(crate) fn wake_task_for_wait(&self, task_id: usize) -> bool {
+        let Some(task) = self.tasks.find(task_id) else {
+            return false;
+        };
+        if task.done() {
+            return false;
+        }
+        if task.sched_state() == TaskRunState::Sleeping {
+            task.set_sched_state(TaskRunState::Runnable);
+            self.run_queue.enqueue(task.id(), task.sched_policy());
+        }
+        true
+    }
+
+    // AGENT: common QEMU wait-token block path. This records the task as
+    // sleeping and removes it from runnable/current scheduler state; the later
+    // context-switch milestone will make this transition actually suspend the
+    // current kernel stack.
+    pub(crate) fn block_task_for_wait(&self, task_id: usize) -> bool {
+        let Some(task) = self.tasks.find(task_id) else {
+            return false;
+        };
+        if task.done() {
+            return false;
+        }
+        task.set_sched_state(TaskRunState::Sleeping);
+        self.run_queue.remove(task_id);
+        let is_current = self
+            .cur_task(0)
+            .map(|current| current.id() == task_id)
+            .unwrap_or(false);
+        if is_current {
+            self.run_queue.clear_current();
+            self.set_cur(0, None);
+            self.schedule_next_runnable(0);
+        }
+        true
+    }
+
     // AGENT: central signal enqueue path so sleeping tasks can be made runnable.
     pub fn send_signal_to_task(&self, task: &Arc<Task>, signo: i32, sender_tid: isize) {
         task.send_sig(signo, sender_tid);
@@ -8,8 +50,7 @@ impl Kernel {
             return;
         }
         if task.sched_state() == TaskRunState::Sleeping {
-            task.set_sched_state(TaskRunState::Runnable);
-            self.run_queue.enqueue(task.id(), task.sched_policy());
+            self.wake_task_for_wait(task.id());
         }
     }
 
@@ -78,7 +119,7 @@ impl Kernel {
     // AGENT: advance global timers after CPU0 has advanced the logical clock.
     pub(crate) fn advance_timers(&self) {
         let fired = {
-            let mut timers = self.timers.lock().unwrap();
+            let mut timers = self.timers.lock();
             timers.advance()
         };
 
@@ -96,16 +137,7 @@ impl Kernel {
                 token.wake_timeout();
             }
             TimerTarget::WakeTask { task_id } => {
-                let Some(task) = self.tasks.find(task_id) else {
-                    return;
-                };
-                if task.done() {
-                    return;
-                }
-                if task.sched_state() == TaskRunState::Sleeping {
-                    task.set_sched_state(TaskRunState::Runnable);
-                    self.run_queue.enqueue(task.id(), task.sched_policy());
-                }
+                self.wake_task_for_wait(task_id);
             }
             TimerTarget::SignalTask {
                 task_id,
