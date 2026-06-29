@@ -160,14 +160,16 @@ impl TrapCtl {
         dispatched
     }
 
-    pub fn on_pgfault(&self, _va: usize) -> Result<(), &'static str> {
+    // AGENT: Allow first-level page faults from normal process context and
+    // reject faults that occur while another trap is already active.
+    pub fn on_pgfault(&self, va: usize) -> Result<(), &'static str> {
         let is_active = self.active.load(Ordering::SeqCst);
         let nest_level = self.nest.load(Ordering::SeqCst);
-        if !is_active && nest_level == 0 {
-            return Err("fault");
+        if is_active || nest_level > 0 {
+            return Err("nested fault");
         }
-        let _page = _va & !(PAGE_SZ - 1);
-        let _offset = _va & (PAGE_SZ - 1);
+        let _page = va & !(PAGE_SZ - 1);
+        let _offset = va & (PAGE_SZ - 1);
         Ok(())
     }
 

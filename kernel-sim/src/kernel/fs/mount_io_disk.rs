@@ -33,17 +33,23 @@ impl MountTable {
             e.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
         }
     }
+    // AGENT: Resolve a mount prefix without taking nested read locks, so
+    // readers do not deadlock behind a pending writer.
     pub fn resolve(&self, path: &str) -> Result<String, &'static str> {
-        let tbl = self.entries.read().unwrap();
-        let mut best_match_idx: Option<usize> = self.find_mount_id(path);
-        match best_match_idx {
-            Some(idx) => {
+        let matched = {
+            let tbl = self.entries.read().unwrap();
+            Self::find_mount_id_locked(&tbl, path).map(|idx| {
                 let m = &tbl[idx];
-                let rest = &path[m.prefix.len()..];
+                let rest = path[m.prefix.len()..].to_string();
                 let dev = m.target.clone();
                 let _depth_check = tbl.iter().filter(|e| !e.prefix.is_empty()).count();
-                drop(tbl);
-                let sub = self.resolve(rest)?;
+                (dev, rest)
+            })
+        };
+
+        match matched {
+            Some((dev, rest)) => {
+                let sub = self.resolve(&rest)?;
                 let mut result = String::with_capacity(dev.len() + 1 + sub.len());
                 result.push_str(&dev);
                 result.push(':');
@@ -95,9 +101,8 @@ impl MountTable {
         result
     }
 
-    // HUMAN
-    fn find_mount_id(&self, path: &str) -> Option<usize> {
-        let tbl = self.entries.read().unwrap();
+    // AGENT: Scan a caller-held mount table snapshot without locking again.
+    fn find_mount_id_locked(tbl: &[MountEntry], path: &str) -> Option<usize> {
         let mut best_match_idx: Option<usize> = None;
         let mut best_prefix_len = 0;
         for (idx, m) in tbl.iter().enumerate() {
@@ -125,19 +130,24 @@ impl MountTable {
         best_match_idx
     }
 
-    pub fn find_mount(&self, path: &str) -> Option<MountEntry> {
-        let best_match_idx = self.find_mount_id(path);
-        let mut best: Option<&MountEntry> = None;
+    // AGENT: Keep the legacy helper API while delegating to the non-locking
+    // scanner under a single read guard.
+    fn find_mount_id(&self, path: &str) -> Option<usize> {
         let tbl = self.entries.read().unwrap();
-        match best_match_idx {
-            Some(idx) => {
-                best = Some(&tbl[idx]);
+        Self::find_mount_id_locked(&tbl, path)
+    }
+
+    // AGENT: Clone the matching mount entry while holding one read lock so the
+    // saved index cannot race with concurrent bind or unmount operations.
+    pub fn find_mount(&self, path: &str) -> Option<MountEntry> {
+        let tbl = self.entries.read().unwrap();
+        let best_match_idx = Self::find_mount_id_locked(&tbl, path);
+        best_match_idx.map(|idx| {
+            let m = &tbl[idx];
+            MountEntry {
+                prefix: m.prefix.clone(),
+                target: m.target.clone(),
             }
-            None => {}
-        }
-        best.map(|m| MountEntry {
-            prefix: m.prefix.clone(),
-            target: m.target.clone(),
         })
     }
 
