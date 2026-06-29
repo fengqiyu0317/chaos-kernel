@@ -303,5 +303,8 @@ fn blocks_overlap(a: usize, a_order: usize, b: usize, b_order: usize) -> Option<
     Some(a < b_end && b < a_end)
 }
 
+// AGENT: keep the MM selftest module in src/mm/tests.rs even when bits.rs is
+// compiled through the standalone mm_bits path in kernel-qemu/src/main.rs.
 #[cfg(any(test, feature = "qemu-mm-selftest"))]
+#[path = "tests.rs"]
 pub mod tests;

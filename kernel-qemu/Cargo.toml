@@ -5,6 +5,8 @@ edition = "2021"
 
 [features]
 qemu-mm-selftest = []
+qemu-sync-selftest = []
+qemu-selftest = ["qemu-mm-selftest", "qemu-sync-selftest"]
 
 [profile.dev]
 panic = "abort"

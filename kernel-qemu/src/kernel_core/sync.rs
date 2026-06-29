@@ -649,6 +649,11 @@ impl WaitToken {
     }
 }
 
+// AGENT: expose WaitToken-focused regressions to both Rust tests and the optional
+// QEMU boot self-test feature, matching the mm/tests.rs pattern.
+#[cfg(any(test, feature = "qemu-sync-selftest"))]
+pub mod tests;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SocketState {
     Closed,

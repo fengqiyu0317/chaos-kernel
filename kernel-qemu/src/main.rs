@@ -50,6 +50,13 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         mm_bits::tests::run_all();
         println!("[kernel-qemu] mm bits selftest passed");
     }
+    // AGENT: mirror the MM optional boot self-test path for QEMU sync primitives.
+    #[cfg(feature = "qemu-sync-selftest")]
+    {
+        println!("[kernel-qemu] sync selftest start");
+        kernel::kernel_core::sync::tests::run_all();
+        println!("[kernel-qemu] sync selftest passed");
+    }
     trap::init_kernel_trap_vector();
     println!(
         "[kernel-qemu] trap vector installed stvec={:#x}",
