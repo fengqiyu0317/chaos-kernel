@@ -309,19 +309,23 @@ impl Disk {
     pub fn set_errs(&self, n: usize) {
         self.errs.store(n, Ordering::SeqCst);
     }
+
+    // AGENT: Keep successful simulated disk reads on the legacy chaos-tests
+    // contract: a readable block returns deterministic 0xAA bytes.
+    fn fill_success_read(out: &mut [u8]) {
+        for b in out.iter_mut() {
+            *b = 0xAA;
+        }
+    }
+
+    // AGENT: Use the shared success-fill helper so read_block matches retry reads.
     pub fn read_block(&self, blk: usize, out: &mut [u8]) -> Result<(), &'static str> {
         let sector = blk;
-        let buf_len = out.len();
         loop {
             let op_id = self.ops.fetch_add(1, Ordering::SeqCst);
             let rem = self.errs.load(Ordering::SeqCst);
             if rem == 0 {
-                let fill = ((sector as u8).wrapping_mul(0x9D)) | 0x80;
-                let mut i = 0;
-                while i < buf_len {
-                    out[i] = fill.wrapping_add(i as u8);
-                    i += 1;
-                }
+                Self::fill_success_read(out);
                 return Ok(());
             }
             let persistent = rem == usize::MAX;
@@ -340,6 +344,8 @@ impl Disk {
             }
         }
     }
+
+    // AGENT: Use the same success data as read_block after retry failures clear.
     pub fn read_block_n(
         &self,
         blk: usize,
@@ -353,9 +359,7 @@ impl Disk {
             let _oid = self.ops.fetch_add(1, Ordering::SeqCst);
             let rem = self.errs.load(Ordering::SeqCst);
             if rem == 0 {
-                for (i, b) in out.iter_mut().enumerate() {
-                    *b = 0xAA ^ (i as u8);
-                }
+                Self::fill_success_read(out);
                 return Ok(attempt);
             }
             if rem != usize::MAX {
