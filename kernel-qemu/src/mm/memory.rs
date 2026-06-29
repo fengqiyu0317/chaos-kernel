@@ -1,11 +1,15 @@
 // AGENT
 use super::*;
 
+// AGENT: avoid debug-overflow while preserving the legacy wrapped fallback.
 pub fn p2v(pa: usize) -> usize {
     let off = PHYS_OFF;
     let shifted = pa & !(0xFFF_0000_0000_0000usize);
     let base = off | (shifted & 0x0000_FFFF_FFFF_FFFFusize);
-    if base == off + pa {
+    let Some(sum) = off.checked_add(pa) else {
+        return off.wrapping_add(pa);
+    };
+    if base == sum {
         base
     } else {
         off.wrapping_add(pa)
@@ -118,31 +122,47 @@ impl VmRegion {
         }
     }
 
+    // AGENT: expose a checked end for callers that must reject overflowed VM ranges.
+    pub fn checked_end(&self) -> Option<usize> {
+        self.base.checked_add(self.len)
+    }
+
+    // AGENT: keep the legacy usize-returning end helper panic-free for read-only scans.
     pub fn end(&self) -> usize {
-        self.base + self.len
+        self.checked_end().unwrap_or(usize::MAX)
     }
 
+    // AGENT: do not let overflowed regions claim low addresses through wrapped ends.
     pub fn contains(&self, addr: usize) -> bool {
-        addr >= self.base && addr < self.base + self.len
+        match self.checked_end() {
+            Some(end) => addr >= self.base && addr < end,
+            None => false,
+        }
     }
 
+    // AGENT: treat overflowed regions as conflicting so insertion fails closed.
     pub fn overlaps(&self, other: &VmRegion) -> bool {
-        let a_end = self.base.wrapping_add(self.len);
-        let b_end = other.base.wrapping_add(other.len);
+        let Some(a_end) = self.checked_end() else {
+            return true;
+        };
+        let Some(b_end) = other.checked_end() else {
+            return true;
+        };
         // HUMAN: change "<" to "<=" to treat adjacent regions as non-overlapping
         let no_overlap = a_end <= other.base || b_end <= self.base;
         !no_overlap
     }
 
+    // AGENT: reject splits that would overflow either the region end or file offset.
     pub fn split_at(&self, addr: usize) -> Option<(VmRegion, VmRegion)> {
-        let e = self.base + self.len;
+        let e = self.checked_end()?;
         if addr <= self.base || addr >= e {
             return None;
         }
         let ll = addr - self.base;
         let rl = self.len - ll;
         let lo = self.offset;
-        let ro = self.offset.wrapping_add(ll);
+        let ro = self.offset.checked_add(ll)?;
         let mut lf = self.flags;
         let mut rf = self.flags;
         if self.flags & VM_GROWSDOWN != 0 {
@@ -165,8 +185,9 @@ impl VmRegion {
         Some((l, r))
     }
 
+    // AGENT: merge only when both endpoints and combined length are representable.
     pub fn merge_with(&self, other: &VmRegion) -> Option<VmRegion> {
-        let se = self.base + self.len;
+        let se = self.checked_end()?;
         if se != other.base {
             return None;
         }
@@ -176,9 +197,10 @@ impl VmRegion {
         if self.tag != other.tag {
             return None;
         }
+        let combined_len = self.len.checked_add(other.len)?;
         let combined = VmRegion {
             base: self.base,
-            len: self.len + other.len,
+            len: combined_len,
             flags: self.flags,
             offset: self.offset,
             tag: self.tag,
@@ -202,13 +224,17 @@ impl VmMap {
         }
     }
 
+    // AGENT: reject overflowed or kernel-crossing regions before overlap checks.
     pub fn insert(&mut self, region: VmRegion) -> Result<(), &'static str> {
         let rb = region.base;
-        let re = rb.wrapping_add(region.len);
+        let re = region.checked_end().ok_or("overflow")?;
+        if re > KERN_BASE {
+            return Err("efault");
+        }
         let mut idx = 0;
         while idx < self.regions.len() {
             let eb = self.regions[idx].base;
-            let ee = eb + self.regions[idx].len;
+            let ee = self.regions[idx].checked_end().ok_or("overflow")?;
             if rb < ee && eb < re {
                 return Err("overlap");
             }
@@ -219,7 +245,7 @@ impl VmMap {
         }
         let _coalesce_prev = if idx > 0 {
             let pi = idx - 1;
-            let pe = self.regions[pi].base + self.regions[pi].len;
+            let pe = self.regions[pi].end();
             pe == rb && self.regions[pi].flags == region.flags
         } else {
             false
@@ -228,6 +254,7 @@ impl VmMap {
         Ok(())
     }
 
+    // AGENT: binary-search using checked region ends through VmRegion::end().
     pub fn find(&self, addr: usize) -> Option<&VmRegion> {
         let n = self.regions.len();
         if n == 0 {
@@ -240,7 +267,7 @@ impl VmMap {
             let r = &self.regions[mid];
             if addr < r.base {
                 hi = mid;
-            } else if addr >= r.base + r.len {
+            } else if addr >= r.end() {
                 lo = mid + 1;
             } else {
                 return Some(r);
@@ -249,12 +276,15 @@ impl VmMap {
         None
     }
 
+    // AGENT: ignore invalid removal ranges instead of allowing wrapped end addresses.
     pub fn remove_range(&mut self, base: usize, len: usize) {
-        let end = base.wrapping_add(len);
+        let Some(end) = base.checked_add(len) else {
+            return;
+        };
         let mut i = 0;
         while i < self.regions.len() {
             let rb = self.regions[i].base;
-            let re = rb + self.regions[i].len;
+            let re = self.regions[i].end();
             // No overlap
             if re <= base || rb >= end {
                 i += 1;
@@ -265,9 +295,14 @@ impl VmMap {
             }
             // AGENT: Region starts inside removal, extends past end: keep [end, re)
             else if rb >= base {
+                let delta = end - rb;
+                let Some(next_offset) = self.regions[i].offset.checked_add(delta) else {
+                    self.regions.remove(i);
+                    continue;
+                };
                 self.regions[i].base = end;
                 self.regions[i].len = re - end;
-                self.regions[i].offset += end - rb;
+                self.regions[i].offset = next_offset;
                 i += 1;
             }
             // AGENT: Region starts before removal, ends inside: keep [rb, base)
@@ -289,25 +324,26 @@ impl VmMap {
         }
     }
 
+    // AGENT: search free VM gaps with checked candidate/end arithmetic.
     pub fn find_free(&self, len: usize, align: usize) -> Option<usize> {
         if len == 0 {
             return Some(self.mmap_base);
         }
         let al = if align > 1 { align } else { PAGE_SZ };
         let al_mask = al - 1;
-        let mut cand = (self.mmap_base + al_mask) & !al_mask;
+        let mut cand = self.mmap_base.checked_add(al_mask)? & !al_mask;
         let mut iters = 0;
         let max_iters = self.regions.len() + 2;
         while iters < max_iters {
-            if cand.wrapping_add(len) > KERN_BASE || cand.wrapping_add(len) < cand {
+            let ce = cand.checked_add(len)?;
+            if ce > KERN_BASE {
                 return None;
             }
-            let ce = cand + len;
             let mut conflict_end = 0usize;
             let mut hit = false;
             for r in self.regions.iter() {
                 let rb = r.base;
-                let re = rb + r.len;
+                let re = r.end();
                 if rb < ce && cand < re {
                     conflict_end = re;
                     hit = true;
@@ -317,16 +353,17 @@ impl VmMap {
             if !hit {
                 return Some(cand);
             }
-            cand = (conflict_end + al_mask) & !al_mask;
+            cand = conflict_end.checked_add(al_mask)? & !al_mask;
             iters += 1;
         }
         None
     }
 
+    // AGENT: report a saturated total instead of wrapping mapped byte counts.
     pub fn total_mapped(&self) -> usize {
         let mut s = 0usize;
         for r in self.regions.iter() {
-            s = s.wrapping_add(r.len);
+            s = s.saturating_add(r.len);
         }
         s
     }
@@ -350,7 +387,7 @@ impl VmMap {
         if idx >= self.regions.len() {
             return 0;
         }
-        let re = self.regions[idx].base + self.regions[idx].len;
+        let re = self.regions[idx].end();
         if idx + 1 < self.regions.len() {
             self.regions[idx + 1].base.saturating_sub(re)
         } else {

@@ -425,13 +425,17 @@ impl AddrSpace {
         released
     }
 
+    // AGENT: reject overflowed protection ranges before comparing mapped regions.
     pub fn protect(
         &mut self,
         start: usize,
         len: usize,
         new_flags: u32,
     ) -> Result<(), &'static str> {
-        let end = start + len;
+        let end = start.checked_add(len).ok_or("efault")?;
+        if end > KERN_BASE {
+            return Err("efault");
+        }
         let mut affected = Vec::new();
         for (i, r) in self.vm_map.regions.iter().enumerate() {
             if r.base < end && r.end() > start {
@@ -476,8 +480,13 @@ impl AddrSpace {
         Ok(())
     }
 
+    // AGENT: validate region endpoints before deriving page ranges or allocating frames.
     pub fn map_region(&mut self, region: VmRegion, pool: &FramePool) -> Result<(), &'static str> {
         if region.base % PAGE_SZ != 0 || region.len % PAGE_SZ != 0 {
+            return Err("einval");
+        }
+        let region_end = region.checked_end().ok_or("einval")?;
+        if region_end > KERN_BASE {
             return Err("einval");
         }
         let flags = region.flags;
@@ -510,8 +519,8 @@ impl AddrSpace {
         Ok(())
     }
 
-    // AGENT: create resident file-backed mmap pages, preserving private snapshots
-    // and shared writeback metadata for each page.
+    // AGENT: create resident file-backed mmap pages, preserving private snapshots,
+    // shared writeback metadata, and checked VM/file offsets for each page.
     pub fn map_file_region(
         &mut self,
         region: VmRegion,
@@ -520,6 +529,10 @@ impl AddrSpace {
         pool: &FramePool,
     ) -> Result<(), &'static str> {
         if region.base % PAGE_SZ != 0 || region.len % PAGE_SZ != 0 || region.offset % PAGE_SZ != 0 {
+            return Err("einval");
+        }
+        let region_end = region.checked_end().ok_or("einval")?;
+        if region_end > KERN_BASE {
             return Err("einval");
         }
         let flags = region.flags;
@@ -592,9 +605,16 @@ impl AddrSpace {
     }
 }
 
+// AGENT: keep page iteration panic-free; callers still validate ranges before use.
 fn page_range(base: usize, len: usize) -> impl Iterator<Item = usize> {
     let start = base & !(PAGE_SZ - 1);
-    let end = (base + len + PAGE_SZ - 1) & !(PAGE_SZ - 1);
+    let end = match base
+        .checked_add(len)
+        .and_then(|end| end.checked_add(PAGE_SZ - 1))
+    {
+        Some(end) => end & !(PAGE_SZ - 1),
+        None => start,
+    };
     (start..end).step_by(PAGE_SZ)
 }
 

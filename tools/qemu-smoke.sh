@@ -22,5 +22,6 @@ timeout 15s qemu-system-riscv64 \
     -kernel "$KERNEL" 2>&1 | tee "$LOG"
 
 grep -F "[kernel-qemu] boot" "$LOG"
+grep -F "[kernel-qemu] heap alloc smoke" "$LOG"
 grep -F "[kernel-qemu] timer tick observed" "$LOG"
 grep -F "[kernel-qemu] shutdown" "$LOG"

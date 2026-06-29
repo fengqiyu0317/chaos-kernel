@@ -1,15 +1,15 @@
 // AGENT
 use kernel_sim::{
-    compute_inet_checksum, parse_ipv4_header, set_current_task_id, wait_ev, AddrSpace, BlockCache,
-    Channel, EpData, EpEvent, EvBus, EvFlag, ExitReason, FHandle, FLike, FdOpt, KernLock, Kernel,
-    KernelRuntimeTicker, PageBacking, PageTableEntry, PgFrame, SchedulePolicy, Spin, SpinLock,
-    Task, TaskRunState, TaskTable, TimerEntry, VmRegion, WaitOutcome, WaitToken, AT_ENTRY,
-    AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MAX_THREAD_ID, N_FRAMES, N_PROC,
-    N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP,
-    SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX,
-    SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION, SYS_SIGRETURN,
-    SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED,
-    VM_WRITE,
+    check_access, compute_inet_checksum, parse_ipv4_header, set_current_task_id, wait_ev,
+    AddrSpace, BlockCache, Channel, EpData, EpEvent, EvBus, EvFlag, ExitReason, FHandle, FLike,
+    FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking, PageTableEntry, PgFrame,
+    SchedulePolicy, Spin, SpinLock, Task, TaskRunState, TaskTable, TimerEntry, VmMap, VmRegion,
+    WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED,
+    MAX_THREAD_ID, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE,
+    SIGUSR1, SYS_BRK, SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT,
+    SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ,
+    SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ,
+    VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
@@ -479,6 +479,31 @@ fn map_user_region(kernel: &Kernel, task: &Arc<Task>, addr: usize, len: usize, f
         .unwrap()
         .map_region(VmRegion::new(addr, len, flags), &kernel.pool)
         .expect("user test region should map");
+}
+
+// AGENT: user access checks must reject ranges whose end would wrap around usize.
+#[test]
+fn check_access_rejects_overflowing_ranges() {
+    assert!(check_access(0x1000, 0x100));
+    assert!(!check_access(0x1000, usize::MAX));
+    assert!(!check_access(KERN_BASE - 1, usize::MAX));
+}
+
+// AGENT: VM map insertion and free-space search must not accept wrapped region ends.
+#[test]
+fn vm_map_rejects_overflowing_ranges() {
+    let mut map = VmMap::new();
+
+    assert!(map
+        .insert(VmRegion::new(KERN_BASE - PAGE_SZ, PAGE_SZ, VM_READ))
+        .is_ok());
+    assert!(map
+        .insert(VmRegion::new(KERN_BASE - PAGE_SZ, PAGE_SZ + 1, VM_READ))
+        .is_err());
+    assert!(map
+        .insert(VmRegion::new(0x1000, usize::MAX, VM_READ))
+        .is_err());
+    assert!(map.find_free(usize::MAX, PAGE_SZ).is_none());
 }
 
 // AGENT: drive logical timers in tests that intentionally wait for timer-wheel

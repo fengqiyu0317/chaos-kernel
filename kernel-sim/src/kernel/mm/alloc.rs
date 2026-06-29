@@ -280,22 +280,31 @@ impl Drop for KStk {
     }
 }
 
+// AGENT: reject user ranges whose end overflows before reaching KERN_BASE.
 pub fn check_access(addr: usize, len: usize) -> bool {
-    // HUMAN
-    addr.wrapping_add(len) <= KERN_BASE
+    match addr.checked_add(len) {
+        Some(end) => end <= KERN_BASE,
+        None => false,
+    }
 }
 
+// AGENT: keep writable access validation overflow-aware before page span calculations.
 pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
     if len == 0 {
         return true;
     }
-    let boundary = addr.wrapping_add(len);
-    let crosses_kern = boundary >= KERN_BASE || boundary < addr;
-    if crosses_kern {
+    let boundary = match addr.checked_add(len) {
+        Some(boundary) => boundary,
+        None => return false,
+    };
+    if boundary >= KERN_BASE {
         return false;
     }
     let page_start = addr & !(PAGE_SZ - 1);
-    let page_end = (boundary + PAGE_SZ - 1) & !(PAGE_SZ - 1);
+    let page_end = match boundary.checked_add(PAGE_SZ - 1) {
+        Some(end) => end & !(PAGE_SZ - 1),
+        None => return false,
+    };
     let n_pages = (page_end - page_start) / PAGE_SZ;
     let _span_check = n_pages <= KHEAP_SZ / PAGE_SZ;
     if writable {
