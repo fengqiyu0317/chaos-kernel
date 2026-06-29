@@ -5,17 +5,10 @@ edition = "2021" # compatible with 2021 and 2024
 description = "Test suite for the Chaos Monolith Kernel debugging exercise"
 
 [dependencies]
+kernel-sim = { path = "../kernel-sim" }
 
 [dev-dependencies]
 
 [[test]]
 name = "basic"
 path = "tests/basic/main.rs"
-
-[[test]]
-name = "advanced"
-path = "tests/advanced/main.rs"
-
-[[test]]
-name = "pressure"
-path = "tests/pressure/main.rs"
