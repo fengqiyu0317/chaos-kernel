@@ -4,9 +4,11 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use core::arch::global_asm;
 use core::hint::spin_loop;
 use core::panic::PanicInfo;
+use core::sync::atomic::Ordering;
 
 mod console;
 mod csr;
@@ -57,6 +59,8 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         kernel::kernel_core::sync::tests::run_all();
         println!("[kernel-qemu] sync selftest passed");
     }
+    let _kernel = init_qemu_kernel_backend();
+    let timer_probe = arm_timer_wheel_probe();
     trap::init_kernel_trap_vector();
     println!(
         "[kernel-qemu] trap vector installed stvec={:#x}",
@@ -64,10 +68,47 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     );
     timer::init();
     wait_for_first_timer_tick();
+    wait_for_timer_wheel_probe(&timer_probe);
     println!("[kernel-qemu] minimal carrier only; kernel-sim semantics not loaded");
     println!("[kernel-qemu] shutdown");
 
     sbi::shutdown()
+}
+
+// AGENT: Install a leaked Kernel as the QEMU scheduler/timer backend so real
+// timer interrupts can drive migrated Kernel::schedule_tick() state.
+fn init_qemu_kernel_backend() -> &'static kernel::Kernel {
+    let kernel = Box::leak(Box::new(kernel::Kernel::new(kernel::N_FRAMES)));
+    kernel.proc_init();
+    kernel::install_qemu_wait_kernel(kernel);
+    let current = kernel.cur_task(0).map(|task| task.id()).unwrap_or(0);
+    println!(
+        "[kernel-qemu] kernel timer backend installed current_task={}",
+        current
+    );
+    kernel
+}
+
+// AGENT: Arm a one-tick logical timer target before hardware timer interrupts
+// are enabled; the real interrupt path must expire it through schedule_tick().
+fn arm_timer_wheel_probe() -> kernel::WaitToken {
+    let token = kernel::WaitToken::current();
+    let deadline = kernel::CLK.load(Ordering::Relaxed).saturating_add(1);
+    let timer_id = {
+        let mut timers = kernel::global_timer_wheel().lock();
+        timers.register_timer(
+            deadline,
+            0,
+            kernel::TimerTarget::WakeToken {
+                token: token.clone(),
+            },
+        )
+    };
+    println!(
+        "[kernel-qemu] timer wheel target armed id={} deadline={}",
+        timer_id, deadline
+    );
+    token
 }
 
 // AGENT: Clear .bss before any later Rust state is introduced.
@@ -95,6 +136,30 @@ fn wait_for_first_timer_tick() {
         println!("[kernel-qemu] timer tick not observed");
     } else {
         println!("[kernel-qemu] timer tick observed ticks={}", ticks);
+    }
+}
+
+// AGENT: Smoke-check that a real QEMU timer interrupt also advances the migrated
+// Kernel timer wheel, not just the carrier-layer tick counter.
+fn wait_for_timer_wheel_probe(token: &kernel::WaitToken) {
+    let start = csr::read_time();
+    let timeout_cycles = timer::CYCLES_PER_TICK * 20;
+    while !token.is_timeout() && csr::read_time().wrapping_sub(start) < timeout_cycles {
+        spin_loop();
+    }
+
+    let clk = kernel::CLK.load(Ordering::Relaxed);
+    let active = kernel::global_timer_wheel().lock().active_count();
+    if token.is_timeout() {
+        println!(
+            "[kernel-qemu] timer wheel target observed clk={} active={}",
+            clk, active
+        );
+    } else {
+        println!(
+            "[kernel-qemu] timer wheel target not observed clk={} active={}",
+            clk, active
+        );
     }
 }
 
