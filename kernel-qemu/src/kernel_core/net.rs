@@ -1,6 +1,6 @@
 // AGENT
 use super::*;
-use std::ops::Range;
+use ::core::ops::Range;
 
 // AGENT TODO: These protocol helpers are not wired into the simulator yet.
 // Future AF_INET socket support should call them from a Socket/FLike data path

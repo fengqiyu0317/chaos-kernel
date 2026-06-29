@@ -1,17 +1,26 @@
 // AGENT
+pub(crate) use crate::irq_lock::{thread, Condvar, Mutex, RwLock};
 pub(crate) use alloc::boxed::Box;
-pub(crate) use alloc::collections::BTreeMap;
+pub(crate) use alloc::collections::{BTreeMap, BTreeSet, LinkedList, VecDeque};
+pub(crate) use alloc::format;
+pub(crate) use alloc::string::{String, ToString};
+pub(crate) use alloc::sync::{Arc, Weak};
+pub(crate) use alloc::vec;
+pub(crate) use alloc::vec::Vec;
+pub(crate) use core::any::Any;
+pub(crate) use core::cmp::{max, min, Ordering as CmpOrd};
+pub(crate) use core::fmt;
+pub(crate) use core::mem;
 pub(crate) use core::ops::{Deref, DerefMut, Index};
+pub(crate) use core::ptr;
 pub(crate) use core::sync::atomic::{
     AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
-pub(crate) use core::sync::{Arc, Condvar, Mutex, RwLock, Weak};
-pub(crate) use core::thread;
 pub(crate) use core::time::Duration;
-pub(crate) use std::any::Any;
-pub(crate) use std::cmp::{max, min, Ordering as CmpOrd};
-pub(crate) use std::collections::{BTreeMap, BTreeSet, HashMap, LinkedList, VecDeque};
-pub(crate) use std::fmt;
+
+// AGENT: temporary no_std map alias while the migrated code still names
+// HashMap; QEMU can switch hot paths to a real hash map later if needed.
+pub(crate) use BTreeMap as HashMap;
 
 // AGENT: simulated realtime starts at this Unix epoch second.
 pub const BOOT_EPOCH: usize = 0;
