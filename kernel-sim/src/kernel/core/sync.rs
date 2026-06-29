@@ -1,5 +1,4 @@
 // AGENT
-use super::current::{require_current_task_id, NO_CURRENT_TASK_ID};
 use super::*;
 
 // AGENT: Usage map for this module in the current kernel-sim code.
@@ -9,7 +8,8 @@ use super::*;
 //   KernLockGuard so release stays caller-checked and panic-safe.
 // - Spin backs cache-chain locking and Channel through SpinGuard so release is
 //   panic-safe and callers cannot touch the atomic state directly; ownership is
-//   keyed by simulator Task::id() values instead of host std::thread identity.
+//   keyed by host-thread tokens so legacy chaos-tests can exercise it outside
+//   scheduler-installed current-task context.
 // - EvBus/EvFlag is used as event-bit storage by pipe, process exit/signal,
 //   semaphore state transitions, and pipe-backed epoll readiness notification.
 // - WaitToken is the common host-thread wait token used by Channel,
@@ -154,17 +154,29 @@ impl Drop for KernLockGuard<'_> {
     }
 }
 
-const SPIN_NO_OWNER: usize = NO_CURRENT_TASK_ID;
+const SPIN_NO_OWNER: usize = 0;
+static NEXT_SPIN_OWNER: AtomicUsize = AtomicUsize::new(1);
 
-// AGENT: Spin derives its owner from the current-task context maintained by
-// Kernel::set_cur(), so callers do not pass owner ids through every lock call
-// and Spin does not depend on the full Kernel object.
+std::thread_local! {
+    static SPIN_OWNER: usize = allocate_spin_owner();
+}
+
+// AGENT: allocate nonzero host-thread owner tokens without relying on unstable
+// ThreadId integer conversion.
+fn allocate_spin_owner() -> usize {
+    let owner = NEXT_SPIN_OWNER.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(owner, SPIN_NO_OWNER, "Spin owner token space exhausted");
+    owner
+}
+
+// AGENT: Spin derives ownership from the host thread again so low-level
+// chaos-tests can use it without first installing a simulator Task::id().
 fn spin_owner() -> usize {
-    require_current_task_id("Spin")
+    SPIN_OWNER.with(|owner| *owner)
 }
 
 // AGENT: ticket-based simulator spinlock with private state, FIFO acquisition,
-// RAII guard support, and task-id owner checks. It still models only short
+// RAII guard support, and host-thread owner checks. It still models only short
 // non-blocking critical sections; it does not mask interrupts or preemption.
 pub struct Spin {
     next_ticket: AtomicUsize,
@@ -186,7 +198,7 @@ impl Spin {
         assert_ne!(
             self.owner.load(Ordering::Relaxed),
             owner,
-            "Spin::acquire attempted recursive locking by task {}",
+            "Spin::acquire attempted recursive locking by host owner {}",
             owner
         );
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
@@ -203,7 +215,7 @@ impl Spin {
         assert_ne!(
             self.owner.load(Ordering::Relaxed),
             owner,
-            "Spin::try_acquire attempted recursive locking by task {}",
+            "Spin::try_acquire attempted recursive locking by host owner {}",
             owner
         );
         let serving = self.serving.load(Ordering::Acquire);
@@ -226,19 +238,19 @@ impl Spin {
         self.owner.store(owner, Ordering::Relaxed);
         true
     }
-    // AGENT: release verifies the current simulator task owns this Spin without
+    // AGENT: release verifies the current host thread owns this Spin without
     // delegating through a private owner-parameter wrapper.
     pub fn release(&self) {
         let owner = spin_owner();
         let current_owner = self.owner.load(Ordering::Relaxed);
         assert!(
             current_owner != SPIN_NO_OWNER,
-            "Spin::release by task {} without held lock",
+            "Spin::release by host owner {} without held lock",
             owner
         );
         assert_eq!(
             current_owner, owner,
-            "Spin::release by non-owner task {}, owner is {}",
+            "Spin::release by non-owner host owner {}, owner is {}",
             owner, current_owner
         );
         self.owner.store(SPIN_NO_OWNER, Ordering::Relaxed);

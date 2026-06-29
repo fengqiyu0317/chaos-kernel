@@ -27,9 +27,8 @@ const IPV4_TEST_DST_IP: u32 = 0x0A00_0002;
 // AGENT: global TimerWheel tests must not run in parallel because one test's
 // schedule_tick can expire another test's timeout waiter.
 static TIMER_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-// AGENT: focused low-level Spin tests mutate thread-local current-task context
-// and spawn helper threads with fixed task ids; serialize them to avoid
-// harness-level interleavings from leaking current-task assumptions.
+// AGENT: focused low-level Spin tests share timing-sensitive helper threads;
+// serialize them to avoid harness-level interleavings in lock-state assertions.
 static CURRENT_TASK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn lock_timer_tests() -> std::sync::MutexGuard<'static, ()> {
@@ -46,8 +45,8 @@ fn lock_current_task_tests() -> std::sync::MutexGuard<'static, ()> {
         .unwrap()
 }
 
-// AGENT: direct Spin tests run outside Kernel::set_cur(), so they install a
-// simulator task id explicitly before exercising the no-argument Spin API.
+// AGENT: helper for tests that still need current-task context for nearby
+// scheduler/syscall paths; Spin itself no longer depends on this context.
 fn set_test_current_task(id: usize) -> usize {
     let task = Task::make(id, "spin-test");
     let id = task.id();
@@ -122,6 +121,29 @@ fn kern_lock_try_guard_respects_owner() {
         assert_eq!(lock.level(), 2);
     }
     assert_eq!(lock.level(), 1);
+}
+
+// AGENT: Spin is again usable as a low-level host-thread lock without requiring
+// Kernel::set_cur() or a manually installed simulator Task::id().
+#[test]
+fn spin_host_threads_do_not_require_current_task() {
+    let _current_task_guard = lock_current_task_tests();
+    set_current_task_id(None);
+    let lock = Arc::new(Spin::new());
+    let worker_lock = lock.clone();
+    let (held_tx, held_rx) = mpsc::channel();
+
+    let worker = thread::spawn(move || {
+        worker_lock.acquire();
+        held_tx.send(()).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        worker_lock.release();
+    });
+
+    held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(lock.try_guard().is_none());
+    worker.join().unwrap();
+    assert!(lock.try_guard().is_some());
 }
 
 // AGENT: SpinGuard releases a ticket-lock Spin on drop, and another thread
