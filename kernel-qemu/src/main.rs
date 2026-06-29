@@ -11,6 +11,9 @@ use core::panic::PanicInfo;
 mod console;
 mod csr;
 mod heap;
+#[allow(dead_code)]
+#[path = "mm/bits.rs"]
+mod mm_bits;
 mod sbi;
 mod semantics;
 // AGENT: Keep the QEMU RISC-V syscall ABI adapter separate from the migrated kernel-sim syscall directory.
@@ -33,6 +36,12 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
 
     println!("[kernel-qemu] boot hart={} dtb={:#x}", hartid, dtb_pa);
     heap::smoke_check();
+    #[cfg(feature = "qemu-mm-selftest")]
+    {
+        println!("[kernel-qemu] mm bits selftest start");
+        mm_bits::tests::run_all();
+        println!("[kernel-qemu] mm bits selftest passed");
+    }
     trap::init_kernel_trap_vector();
     println!(
         "[kernel-qemu] trap vector installed stvec={:#x}",

@@ -5,12 +5,9 @@ pub fn bitwise_merge(a: u64, b: u64, mask: u64) -> u64 {
     (a & !mask) | (b & mask)
 }
 
+// AGENT: keep zero-distance rotations masked to the requested bit width.
 pub fn rotate_bits(value: u64, amount: u32, width: u32) -> u64 {
     if width == 0 || width > 64 {
-        return value;
-    }
-    let actual = amount % width;
-    if actual == 0 {
         return value;
     }
     let mask = if width == 64 {
@@ -19,6 +16,10 @@ pub fn rotate_bits(value: u64, amount: u32, width: u32) -> u64 {
         (1u64 << width) - 1
     };
     let v = value & mask;
+    let actual = amount % width;
+    if actual == 0 {
+        return v;
+    }
     ((v << actual) | (v >> (width - actual))) & mask
 }
 
@@ -69,21 +70,17 @@ pub fn ffs64(v: u64) -> Option<u32> {
 }
 
 pub fn align_up(addr: usize, align: usize) -> usize {
-    if align == 0 || (align & (align - 1)) != 0 {
+    if !align.is_power_of_two() {
         return addr;
     }
     (addr + align - 1) & !(align - 1)
 }
 
 pub fn align_down(addr: usize, align: usize) -> usize {
-    if align == 0 || (align & (align - 1)) != 0 {
+    if !align.is_power_of_two() {
         return addr;
     }
     addr & !(align - 1)
-}
-
-pub fn is_power_of_two(v: usize) -> bool {
-    v != 0 && (v & (v - 1)) == 0
 }
 
 pub fn log2_floor(v: usize) -> usize {
@@ -115,6 +112,19 @@ pub struct BuddyAllocator {
     pub base_addr: usize,
     pub total_pages: usize,
     pub allocated: AtomicUsize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // AGENT: rotate helpers must not leak bits outside the requested field.
+    #[test]
+    fn rotate_bits_masks_zero_distance_rotation() {
+        assert_eq!(rotate_bits(0x1234, 0, 8), 0x34);
+        assert_eq!(rotate_bits(0x1234, 8, 8), 0x34);
+        assert_eq!(rotate_bits(0b1011, 1, 4), 0b0111);
+    }
 }
 
 impl BuddyAllocator {

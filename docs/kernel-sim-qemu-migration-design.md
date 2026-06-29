@@ -1,6 +1,6 @@
 # kernel-sim 到 QEMU 裸机内核的迁移设计
 
-更新时间：2026-06-28
+更新时间：2026-06-29
 
 ## 目标
 
@@ -50,6 +50,19 @@
 5. 每个阶段允许出现“代码已迁入但尚未可编译 / 尚未接入运行路径”的中间状态；只要记录清楚未接入原因、缺失前置依赖和下一步替换点即可。目标是改完整后自然接上，而不是用并行新实现绕开迁入代码。
 6. QEMU 新写代码只承担硬件适配和 ABI 适配，例如启动、trap、CSR、SBI/UART、页表写入、timer 中断、用户指针翻译。不得在这些适配层重新定义 syscall、fd、进程、等待或地址空间业务语义。
 7. 每次迁移都要能回答：源文件来自 `kernel-sim` 哪里，迁入后改了哪些 host 依赖，对应的 host 回归测试或 smoke 语义是什么，QEMU 侧当前只验证到哪一步。
+
+### 功能代码块级迁移工作流
+
+后续实现改为按用户指定的 `kernel-sim` 功能代码块逐步推进。这里的“代码块”可以是一个结构体、函数、impl 方法组，或一个明确的 syscall / MM / fd 子路径。除非用户明确扩大范围，每次只处理当前指定代码块，不顺手重构相邻 TODO 或提前迁移整个子系统。
+
+每个代码块按下面顺序处理：
+
+1. 标出源代码块，例如 `kernel-sim/src/kernel/mm/alloc.rs::FramePool`、`AddrSpace::resize_brk()` 或 `sys_brk()`。
+2. 说明该块当前在 `kernel-sim` 中提供的语义、直接调用者和依赖的下游入口。
+3. 列出该块不能直接进入 QEMU 的 host 依赖，例如 `std`、host lock、host thread、模拟页 `Arc<Mutex<Vec<u8>>>`、模拟地址偏移或测试 helper。
+4. 只在当前代码块或它必须接触的最小适配边界内修改；如果发现需要先补 `heap`、`sync`、`FramePool`、Sv39 或 usercopy 前置能力，先记录阻塞点和下一块建议，不临时写一套平行实现绕过。
+5. 修改后记录验证边界：至少说明 `kernel-qemu` 是否能 build / smoke；如果触及 `kernel-sim` 共享语义，再运行对应 host 回归。
+6. 交接记录要写清“本轮只处理了哪个代码块”和“明确未处理哪些相邻功能”，避免后续误以为整个子系统已经完成。
 
 ## 建议目录
 
@@ -175,7 +188,7 @@ RISC-V trap frame
 
 #### M3 可执行步骤
 
-这一阶段的第一目标是把 `kernel-sim` 的地址空间实现迁入 `kernel-qemu`，然后在迁入代码上把“宿主堆模拟页面”替换为“真实物理页 + Sv39 页表”。不要先写一个只有同名接口的 QEMU 原生空骨架，也不要一开始迁移完整文件系统、file-backed `mmap` 或完整 COW。执行时按下面顺序推进，每一步都应尽量保持可构建、可 smoke；确实暂时不能编译或不能接入 `main.rs` 的复制批次要明确隔离、继续在原迁入文件上替换依赖，并在前置 heap/sync/frame/Sv39/usercopy 补齐后再接入。
+这一阶段的第一目标是把 `kernel-sim` 的地址空间实现迁入 `kernel-qemu`，然后在迁入代码上把“宿主堆模拟页面”替换为“真实物理页 + Sv39 页表”。不要先写一个只有同名接口的 QEMU 原生空骨架，也不要一开始迁移完整文件系统、file-backed `mmap` 或完整 COW。下面顺序是总体依赖路线；实际执行仍按用户指定的功能代码块逐块推进。每一步都应尽量保持可构建、可 smoke；确实暂时不能编译或不能接入 `main.rs` 的复制批次要明确隔离、继续在原迁入文件上替换依赖，并在前置 heap/sync/frame/Sv39/usercopy 补齐后再接入。
 
 1. 直接迁入 `kernel-sim` MM 源码：
    - 以 `kernel-sim/src/kernel/mm/mod.rs`、`address_space.rs`、`alloc.rs`、`bits.rs`、`memory.rs` 为源。
