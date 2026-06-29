@@ -10,7 +10,7 @@ pub struct Kernel {
     pub cpus: Mutex<[Option<Arc<Task>>; MAX_CPU]>,
     pub mnt: MountTable,
     // AGENT: handle to the QEMU timer wheel driven from real timer interrupts.
-    pub timers: &'static IrqSafeMutex<TimerWheel>,
+    pub timers: &'static Mutex<TimerWheel>,
     // AGENT: unified path-backed file table shared by open-like handles and exec.
     pub file_nodes: RwLock<BTreeMap<String, Arc<FileNode>>>,
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,

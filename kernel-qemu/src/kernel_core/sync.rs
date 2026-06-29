@@ -654,21 +654,6 @@ impl WaitToken {
 #[cfg(any(test, feature = "qemu-sync-selftest"))]
 pub mod tests;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SocketState {
-    Closed,
-    Listen,
-    SynSent,
-    SynRecvd,
-    Established,
-    FinWait1,
-    FinWait2,
-    TimeWait,
-    CloseWait,
-    LastAck,
-    Closing,
-}
-
 pub struct RegEp {
     pub task_id: usize,
     pub epfd: usize,

@@ -1,17 +1,16 @@
 // AGENT
 use super::*;
-use crate::irq_lock::IrqOnceCell;
-pub(crate) use crate::irq_lock::IrqSafeMutex;
+use crate::irq_lock::{IrqOnceCell, Mutex};
 
 // AGENT: QEMU timer wheel storage; TimerWheel owns Vec slots, so it is
 // explicitly initialized after heap setup and before timer interrupts are
 // enabled.
-pub static TIMER_WHEEL: IrqOnceCell<IrqSafeMutex<TimerWheel>> = IrqOnceCell::new();
+pub static TIMER_WHEEL: IrqOnceCell<Mutex<TimerWheel>> = IrqOnceCell::new();
 
 // AGENT: initialize the QEMU logical timer wheel once heap allocation is ready.
 pub fn init_timer_wheel() {
     if TIMER_WHEEL
-        .init(IrqSafeMutex::new(TimerWheel::new()))
+        .init(Mutex::new(TimerWheel::new()))
         .is_err()
     {
         panic!("QEMU timer wheel initialized more than once");
@@ -19,7 +18,7 @@ pub fn init_timer_wheel() {
 }
 
 // AGENT: single access point for the QEMU logical timer wheel.
-pub fn global_timer_wheel() -> &'static IrqSafeMutex<TimerWheel> {
+pub fn global_timer_wheel() -> &'static Mutex<TimerWheel> {
     TIMER_WHEEL
         .get()
         .expect("QEMU timer wheel must be initialized before use")
