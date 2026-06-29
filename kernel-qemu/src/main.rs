@@ -1,5 +1,8 @@
+#![feature(alloc_error_handler)]
 #![no_std]
 #![no_main]
+
+extern crate alloc;
 
 use core::arch::global_asm;
 use core::hint::spin_loop;
@@ -7,6 +10,7 @@ use core::panic::PanicInfo;
 
 mod console;
 mod csr;
+mod heap;
 mod sbi;
 mod semantics;
 // AGENT: Keep the QEMU RISC-V syscall ABI adapter separate from the migrated kernel-sim syscall directory.
@@ -25,8 +29,10 @@ unsafe extern "C" {
 #[no_mangle]
 pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     clear_bss();
+    heap::init();
 
     println!("[kernel-qemu] boot hart={} dtb={:#x}", hartid, dtb_pa);
+    heap::smoke_check();
     trap::init_kernel_trap_vector();
     println!(
         "[kernel-qemu] trap vector installed stvec={:#x}",

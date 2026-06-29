@@ -50,6 +50,15 @@ SECTIONS
     }
 
     . = ALIGN(4K);
+    sheap = .;
+    .bss.heap (NOLOAD) : {
+        . += 1M;
+    }
+
+    . = ALIGN(4K);
+    eheap = .;
+
+    . = ALIGN(4K);
     ekernel = .;
 
     /DISCARD/ : {

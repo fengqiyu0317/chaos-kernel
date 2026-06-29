@@ -45,10 +45,11 @@
 
 1. 每个子系统先从 `kernel-sim/src/kernel/` 复制对应源码到 `kernel-qemu/src/` 的同名或明确标注的迁移模块中。复制后应尽量保留原有类型名、函数名、错误返回、TODO 和关键控制流，避免先写只有相似名字的新实现。
 2. 复制完成后做 host 依赖清单，逐项标出哪些依赖必须替换，例如 `std::sync`、host thread、`thread_local!`、`Instant`、host 文件对象、模拟页面 `Arc<Mutex<Vec<u8>>>`。
-3. 先让迁入代码在 QEMU crate 中可审查，再分批接入编译。暂时不能编译的批次可以先隔离在未注册模块或显式 `cfg` 下，但每个可执行小闭环最终都必须恢复 `cargo build --release` 和 QEMU smoke。
-4. 修改迁入代码时只替换裸机不可用的运行时承载：host lock 替换为裸机锁或关中断临界区，host thread 等待替换为 task/run queue，模拟地址空间替换为真实 frame/Sv39 页表，host time 替换为 timer interrupt。
-5. QEMU 新写代码只承担硬件适配和 ABI 适配，例如启动、trap、CSR、SBI/UART、页表写入、timer 中断、用户指针翻译。不得在这些适配层重新定义 syscall、fd、进程、等待或地址空间业务语义。
-6. 每次迁移都要能回答：源文件来自 `kernel-sim` 哪里，迁入后改了哪些 host 依赖，对应的 host 回归测试或 smoke 语义是什么，QEMU 侧当前只验证到哪一步。
+3. 先让迁入代码在 QEMU crate 中可审查，再分批接入编译。暂时不能编译或暂时不能从 `main.rs` 注册的批次可以先隔离在未注册模块或显式 `cfg` 下，但隔离不是废弃；这些已迁入文件就是后续修改的主要位置。
+4. 修改迁入代码时应尽可能在原有结构体、函数和控制流内部替换实现，不因为当前接不上裸机入口就另写一套“更干净”的 QEMU 空骨架。缺少 heap、sync、frame allocator、Sv39、usercopy 等承载时，先补窄适配层或 TODO，再回到已迁入代码中替换对应 host 依赖。
+5. 每个阶段允许出现“代码已迁入但尚未可编译 / 尚未接入运行路径”的中间状态；只要记录清楚未接入原因、缺失前置依赖和下一步替换点即可。目标是改完整后自然接上，而不是用并行新实现绕开迁入代码。
+6. QEMU 新写代码只承担硬件适配和 ABI 适配，例如启动、trap、CSR、SBI/UART、页表写入、timer 中断、用户指针翻译。不得在这些适配层重新定义 syscall、fd、进程、等待或地址空间业务语义。
+7. 每次迁移都要能回答：源文件来自 `kernel-sim` 哪里，迁入后改了哪些 host 依赖，对应的 host 回归测试或 smoke 语义是什么，QEMU 侧当前只验证到哪一步。
 
 ## 建议目录
 
@@ -174,17 +175,18 @@ RISC-V trap frame
 
 #### M3 可执行步骤
 
-这一阶段的第一目标是把 `kernel-sim` 的地址空间实现迁入 `kernel-qemu`，然后在迁入代码上把“宿主堆模拟页面”替换为“真实物理页 + Sv39 页表”。不要先写一个只有同名接口的 QEMU 原生空骨架，也不要一开始迁移完整文件系统、file-backed `mmap` 或完整 COW。执行时按下面顺序推进，每一步都应尽量保持可构建、可 smoke；确实暂时不能编译的复制批次要明确隔离并尽快完成替换。
+这一阶段的第一目标是把 `kernel-sim` 的地址空间实现迁入 `kernel-qemu`，然后在迁入代码上把“宿主堆模拟页面”替换为“真实物理页 + Sv39 页表”。不要先写一个只有同名接口的 QEMU 原生空骨架，也不要一开始迁移完整文件系统、file-backed `mmap` 或完整 COW。执行时按下面顺序推进，每一步都应尽量保持可构建、可 smoke；确实暂时不能编译或不能接入 `main.rs` 的复制批次要明确隔离、继续在原迁入文件上替换依赖，并在前置 heap/sync/frame/Sv39/usercopy 补齐后再接入。
 
 1. 直接迁入 `kernel-sim` MM 源码：
    - 以 `kernel-sim/src/kernel/mm/mod.rs`、`address_space.rs`、`alloc.rs`、`bits.rs`、`memory.rs` 为源。
    - 迁入到 `kernel-qemu/src/mm/` 的对应文件中，必要时拆出 `sv39.rs`、`usercopy.rs` 作为裸机适配文件。
    - 保留 `AddrSpace`、`VmRegion`、`VmMap`、`PageTableEntry`、`FramePool`、`map_region()`、`unmap_range()`、`protect()`、`read_user_bytes()`、`write_user_bytes()` 等语义入口，后续在这些入口内部替换实现。
-   - 在 `kernel-qemu/src/main.rs` 注册 `mod mm;` 的时机以可构建为准；不能立即构建的迁入文件必须有明确 TODO 和下一步替换清单。
+   - 在 `kernel-qemu/src/main.rs` 注册 `mod mm;` 的时机以可构建为准；不能立即构建的迁入文件必须有明确 TODO 和下一步替换清单，但仍优先在这些迁入文件里完成 `std`、host lock、模拟页面和 host frame 依赖替换。
 
 2. 对迁入代码做 host 依赖清单：
    - `std::collections` 可迁到 `alloc::collections`。
    - `Vec`、`String`、`Box`、`BTreeMap` 等可迁到 `alloc`。
+   - QEMU 全局堆只作为 `alloc` crate 的早期承载入口；实现时应尽量复用或改造已迁入 `kernel-qemu/src/mm/alloc.rs` 中的 `heap_init()`、`heap_grow()`、`KStk` 等边界，不另写一套与迁入 `FramePool` 平行的 MM 语义。
    - `Arc<Mutex<Vec<u8>>>` 只能作为原语义参照，必须替换为真实 frame/PPN、页表项和必要 backing metadata。
    - `std::sync::Mutex`、host `FramePool`、host 文件对象和测试 helper 不能原样进入最终 QEMU 路径。
    - 对每个替换点记录“保留的 `kernel-sim` 语义”和“QEMU 侧替换的承载机制”。

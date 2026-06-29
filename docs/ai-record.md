@@ -1302,6 +1302,52 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
 
+## 2026-06-28：M9 kernel-qemu early heap
+
+目标：先让 `kernel-qemu` 的 `#![no_std]` crate 拥有最小全局堆承载，使 `extern crate alloc`、`Vec`、`Box`、`BTreeMap`、`Arc` 能在 QEMU 启动路径中实际工作；该阶段不迁移最终用户页、页表页或 `FramePool` / Sv39 语义。
+
+已完成修改：
+
+- `kernel-qemu/src/main.rs` 启用 `#![feature(alloc_error_handler)]` 和 `extern crate alloc`，注册 `heap` 模块，并在 `.bss` 清零后初始化 early heap。
+- `kernel-qemu/src/heap.rs` 新增单调 bump allocator、`#[global_allocator]`、OOM handler、`heap_init()` 命名入口和 `smoke_check()`。
+- `kernel-qemu/linker-qemu.ld` 预留 `sheap..eheap` 1 MiB early heap 区间，并让 `ekernel` 位于该保留区之后，避免后续 frame allocator 从 `ekernel` 后接管时重叠。
+- `tools/qemu-smoke.sh` 增加 `[kernel-qemu] heap alloc smoke` 检查。
+
+关键文件：
+
+- `kernel-qemu/src/main.rs`
+- `kernel-qemu/src/heap.rs`
+- `kernel-qemu/linker-qemu.ld`
+- `tools/qemu-smoke.sh`
+- `TASK.md`
+- `docs/ai-record.md`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo build --release
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check -- kernel-qemu/src/heap.rs kernel-qemu/src/main.rs kernel-qemu/linker-qemu.ld tools/qemu-smoke.sh
+```
+
+结果：`cargo fmt --check` 通过；`cargo build --release` 通过；`tools/qemu-smoke.sh` 通过，QEMU 输出 `[kernel-qemu] heap ready base=0x80216000 end=0x80316000 bytes=1048576`、`[kernel-qemu] heap alloc smoke vec=2 box=41 map=2 arc_strong=1 used=360/1048576`、`[kernel-qemu] timer tick observed ticks=1` 和 `[kernel-qemu] shutdown`；`git diff --check -- kernel-qemu/src/heap.rs kernel-qemu/src/main.rs kernel-qemu/linker-qemu.ld tools/qemu-smoke.sh` 通过。
+
+未解决问题：
+
+- early heap 是不回收的 bump allocator，只用于早期 `alloc` 类型和迁移元数据；不能作为最终用户页或页表页分配器。
+- `kernel-qemu/src/mm/` 中的迁入 MM 文件仍未整体注册到 `main.rs`，后续还要补 QEMU 版 prelude、`SpinMutex` / `Mutex` 兼容层、`core` / `alloc` 替换和 `crate::timer::ticks()` 适配。
+- `FramePool` 仍需在迁入接口基础上改造成真实 QEMU 物理页分配器，再接 Sv39 页表和用户拷贝。
+- 本轮未修改 `kernel-sim` 源码路径，因此未重跑 host `kernel-sim` 测试。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
+
 ## 2026-06-28：M9 kernel-qemu trap 第 6 点
 
 目标：完成 page fault 和非法指令的早期清晰失败路径，让 QEMU 侧在真实 Sv39、COW/lazy fault 和 per-task kill 语义迁移前，也能稳定输出足够定位的架构上下文，而不是落入泛化的未处理 trap。
