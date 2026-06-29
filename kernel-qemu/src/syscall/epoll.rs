@@ -6,7 +6,7 @@ pub(super) fn sys_epoll_create(kernel: &Kernel, a0: usize) -> Result<usize, &'st
     if size == 0 {
         return Err("einval");
     }
-    let _backing = size.checked_mul(std::mem::size_of::<EpEvent>());
+    let _backing = size.checked_mul(::core::mem::size_of::<EpEvent>());
     if _backing.is_none() {
         return Err("enomem");
     }
@@ -34,7 +34,7 @@ pub(super) fn sys_epoll_ctl(
     let op = a1 as i32;
     let fd = a2;
     let ev_addr = a3;
-    let event_sz = std::mem::size_of::<EpEvent>();
+    let event_sz = ::core::mem::size_of::<EpEvent>();
     if ev_addr != 0 && !check_access(ev_addr, event_sz) {
         return Err("efault");
     }
@@ -62,7 +62,7 @@ pub(super) fn sys_epoll_ctl(
         }
     } else {
         // AGENT: EpEvent is an explicit C-layout kernel ABI struct.
-        unsafe { std::ptr::read_unaligned(ev_addr as *const EpEvent) }
+        unsafe { ::core::ptr::read_unaligned(ev_addr as *const EpEvent) }
     };
 
     // AGENT: mutate the registered epoll instance first, then mirror ADD/MOD/DEL
@@ -97,7 +97,8 @@ pub(super) fn sys_epoll_ctl(
 }
 
 // AGENT: epoll_wait now sleeps on EpInst.waiters and is woken by registered
-// source readiness callbacks instead of spinning with thread::yield_now().
+// source readiness callbacks. QEMU timeouts use the logical timer wheel instead
+// of host Instant/park_timeout.
 pub(super) fn sys_epoll_wait(
     kernel: &Kernel,
     a0: usize,
@@ -112,15 +113,17 @@ pub(super) fn sys_epoll_wait(
     if events_addr == 0 || max_events == 0 {
         return Err("einval");
     }
-    let event_sz = std::mem::size_of::<EpEvent>();
+    let event_sz = ::core::mem::size_of::<EpEvent>();
     let total_buf = max_events.checked_mul(event_sz).ok_or("einval")?;
     if !check_access(events_addr, total_buf) {
         return Err("efault");
     }
 
     let task = kernel.cur_task(0).ok_or("esrch")?;
+    // AGENT: epoll timeout is an absolute logical tick deadline in QEMU.
     let deadline = if timeout > 0 {
-        Some(std::time::Instant::now() + Duration::from_millis(timeout as u64))
+        let ticks = duration_to_ticks(Duration::from_millis(timeout as u64));
+        Some(CLK.load(Ordering::Relaxed).saturating_add(ticks))
     } else {
         None
     };
@@ -172,7 +175,7 @@ pub(super) fn sys_epoll_wait(
             let dst = (events_addr + nready * event_sz) as *mut EpEvent;
             // AGENT: EpEvent is a C-layout syscall ABI object; user buffers may be unaligned.
             unsafe {
-                std::ptr::write_unaligned(dst, out);
+                ::core::ptr::write_unaligned(dst, out);
             }
             nready += 1;
         }
@@ -185,7 +188,7 @@ pub(super) fn sys_epoll_wait(
             return Ok(0);
         }
         if let Some(deadline) = deadline {
-            if std::time::Instant::now() >= deadline {
+            if CLK.load(Ordering::Relaxed) >= deadline {
                 return Ok(0);
             }
         }
@@ -194,12 +197,11 @@ pub(super) fn sys_epoll_wait(
         };
         let outcome = match deadline {
             Some(deadline) => {
-                let now = std::time::Instant::now();
-                if now >= deadline {
+                if CLK.load(Ordering::Relaxed) >= deadline {
                     inst.remove_waiter(&token);
                     return Ok(0);
                 }
-                token.wait(Some(deadline - now))
+                token.wait_until_tick(deadline)
             }
             None => token.wait(None),
         };
