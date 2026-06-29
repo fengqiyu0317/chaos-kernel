@@ -12,6 +12,8 @@ use crate::csr;
 const ONCE_UNINIT: usize = 0;
 const ONCE_INITING: usize = 1;
 const ONCE_INIT: usize = 2;
+const RWLOCK_WRITER: usize = 1usize << (usize::BITS - 1);
+const RWLOCK_READER_MASK: usize = !RWLOCK_WRITER;
 
 // AGENT: no_std once cell for QEMU globals that must be explicitly initialized
 // after heap setup instead of lazily constructed through std::sync::OnceLock.
@@ -143,46 +145,110 @@ impl<T> Deref for IrqSafeMutexGuard<'_, T> {
     }
 }
 
-// AGENT: temporary no_std RwLock compatibility layer. It is exclusive under the
-// hood for now; later QEMU milestones can split read-mostly state to a real
-// reader/writer lock without touching migrated call sites again.
+impl<T> DerefMut for IrqSafeMutexGuard<'_, T> {
+    // AGENT: expose mutable access while the interrupt-safe lock is held.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for IrqSafeMutexGuard<'_, T> {
+    // AGENT: release the lock and restore SIE only if this guard disabled it.
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
+        if self.restore_sie {
+            unsafe {
+                csr::set_sstatus_bits(csr::SSTATUS_SIE);
+            }
+        }
+    }
+}
+
+// AGENT: no_std reader/writer lock for migrated kernel-sim state; it disables
+// local S-mode interrupts while a guard is held and allows concurrent readers.
 pub struct IrqSafeRwLock<T> {
-    inner: IrqSafeMutex<T>,
+    state: AtomicUsize,
+    data: UnsafeCell<T>,
 }
 
 // AGENT: compatibility name for migrated kernel-sim code.
 pub type RwLock<T> = IrqSafeRwLock<T>;
 
 impl<T> IrqSafeRwLock<T> {
-    // AGENT: build a QEMU rw-lock wrapper around data.
+    // AGENT: build a QEMU rw-lock around data.
     pub const fn new(data: T) -> Self {
         Self {
-            inner: IrqSafeMutex::new(data),
+            state: AtomicUsize::new(0),
+            data: UnsafeCell::new(data),
         }
     }
 
-    // AGENT: read access currently takes the same irq-safe exclusive lock.
+    // AGENT: take a shared read lock unless a writer owns the lock.
     pub fn read(&self) -> IrqSafeRwLockReadGuard<'_, T> {
-        IrqSafeRwLockReadGuard {
-            guard: self.inner.lock(),
+        let sstatus = csr::read_sstatus();
+        let restore_sie = sstatus & csr::SSTATUS_SIE != 0;
+        unsafe {
+            csr::clear_sstatus_bits(csr::SSTATUS_SIE);
+        }
+
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state & RWLOCK_WRITER != 0 || state == RWLOCK_READER_MASK {
+                spin_loop();
+                continue;
+            }
+
+            if self
+                .state
+                .compare_exchange_weak(
+                    state,
+                    state + 1,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return IrqSafeRwLockReadGuard {
+                    lock: self,
+                    restore_sie,
+                };
+            }
+
+            spin_loop();
         }
     }
 
-    // AGENT: write access takes the irq-safe exclusive lock.
+    // AGENT: take an exclusive write lock once all readers and writers are gone.
     pub fn write(&self) -> IrqSafeRwLockWriteGuard<'_, T> {
+        let sstatus = csr::read_sstatus();
+        let restore_sie = sstatus & csr::SSTATUS_SIE != 0;
+        unsafe {
+            csr::clear_sstatus_bits(csr::SSTATUS_SIE);
+        }
+
+        while self
+            .state
+            .compare_exchange(0, RWLOCK_WRITER, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
+        }
+
         IrqSafeRwLockWriteGuard {
-            guard: self.inner.lock(),
+            lock: self,
+            restore_sie,
         }
     }
 }
 
 unsafe impl<T: Send> Send for IrqSafeRwLock<T> {}
-unsafe impl<T: Send> Sync for IrqSafeRwLock<T> {}
+unsafe impl<T: Send + Sync> Sync for IrqSafeRwLock<T> {}
 
-// AGENT: read guard for the temporary exclusive RwLock shim.
+// AGENT: read guard that releases one reader slot and restores SIE on drop.
 #[must_use = "IrqSafeRwLockReadGuard releases the lock when dropped"]
 pub struct IrqSafeRwLockReadGuard<'a, T> {
-    guard: IrqSafeMutexGuard<'a, T>,
+    lock: &'a IrqSafeRwLock<T>,
+    restore_sie: bool,
 }
 
 impl<T> IrqSafeRwLockReadGuard<'_, T> {
@@ -195,16 +261,31 @@ impl<T> IrqSafeRwLockReadGuard<'_, T> {
 impl<T> Deref for IrqSafeRwLockReadGuard<'_, T> {
     type Target = T;
 
-    // AGENT: expose shared access while the temporary rw-lock is held.
+    // AGENT: expose shared access while a reader slot is held.
     fn deref(&self) -> &Self::Target {
-        &self.guard
+        unsafe { &*self.lock.data.get() }
     }
 }
 
-// AGENT: write guard for the temporary exclusive RwLock shim.
+impl<T> Drop for IrqSafeRwLockReadGuard<'_, T> {
+    // AGENT: release this reader slot before restoring the saved SIE state.
+    fn drop(&mut self) {
+        let prev = self.lock.state.fetch_sub(1, Ordering::Release);
+        debug_assert_eq!(prev & RWLOCK_WRITER, 0);
+        debug_assert!(prev & RWLOCK_READER_MASK > 0);
+        if self.restore_sie {
+            unsafe {
+                csr::set_sstatus_bits(csr::SSTATUS_SIE);
+            }
+        }
+    }
+}
+
+// AGENT: write guard that clears writer ownership and restores SIE on drop.
 #[must_use = "IrqSafeRwLockWriteGuard releases the lock when dropped"]
 pub struct IrqSafeRwLockWriteGuard<'a, T> {
-    guard: IrqSafeMutexGuard<'a, T>,
+    lock: &'a IrqSafeRwLock<T>,
+    restore_sie: bool,
 }
 
 impl<T> IrqSafeRwLockWriteGuard<'_, T> {
@@ -217,16 +298,29 @@ impl<T> IrqSafeRwLockWriteGuard<'_, T> {
 impl<T> Deref for IrqSafeRwLockWriteGuard<'_, T> {
     type Target = T;
 
-    // AGENT: expose shared access while the temporary rw-lock is held.
+    // AGENT: expose shared access while the writer owns the lock.
     fn deref(&self) -> &Self::Target {
-        &self.guard
+        unsafe { &*self.lock.data.get() }
     }
 }
 
 impl<T> DerefMut for IrqSafeRwLockWriteGuard<'_, T> {
-    // AGENT: expose mutable access while the temporary rw-lock is held.
+    // AGENT: expose mutable access while the writer owns the lock.
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for IrqSafeRwLockWriteGuard<'_, T> {
+    // AGENT: release writer ownership before restoring the saved SIE state.
+    fn drop(&mut self) {
+        let prev = self.lock.state.swap(0, Ordering::Release);
+        debug_assert_eq!(prev, RWLOCK_WRITER);
+        if self.restore_sie {
+            unsafe {
+                csr::set_sstatus_bits(csr::SSTATUS_SIE);
+            }
+        }
     }
 }
 
@@ -310,24 +404,5 @@ pub mod thread {
     // AGENT: QEMU cannot sleep a host thread; timer waits must use WaitToken.
     pub fn sleep(_duration: Duration) {
         spin_loop();
-    }
-}
-
-impl<T> DerefMut for IrqSafeMutexGuard<'_, T> {
-    // AGENT: expose mutable access while the interrupt-safe lock is held.
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.lock.data.get() }
-    }
-}
-
-impl<T> Drop for IrqSafeMutexGuard<'_, T> {
-    // AGENT: release the lock and restore SIE only if this guard disabled it.
-    fn drop(&mut self) {
-        self.lock.locked.store(false, Ordering::Release);
-        if self.restore_sie {
-            unsafe {
-                csr::set_sstatus_bits(csr::SSTATUS_SIE);
-            }
-        }
     }
 }
