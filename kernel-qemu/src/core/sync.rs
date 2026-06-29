@@ -12,7 +12,7 @@ use super::*;
 //   keyed by simulator Task::id() values instead of host std::thread identity.
 // - EvBus/EvFlag is used as event-bit storage by pipe, process exit/signal,
 //   semaphore state transitions, and pipe-backed epoll readiness notification.
-// - WaitToken is the common host-thread wait token used by Channel,
+// - WaitToken is the common task wait token used by Channel,
 //   proc::WaitQueue, SyncQueue helpers, and FutexBucket.
 // - SyncQueue is used by Channel through new(), signal(), broadcast(), and
 //   direct access to q.
@@ -430,9 +430,39 @@ impl EvBus {
     }
 }
 
-// AGENT: keep host-thread parking behind a token so kernel wait queues do not
-// store std::thread::Thread directly.
+// AGENT: keep QEMU scheduler wakeups behind a token so kernel wait queues store
+// task identities instead of host std::thread handles.
 static WAIT_TOKEN_SEQ: AtomicUsize = AtomicUsize::new(1);
+// AGENT: QEMU wait tokens need a scheduler owner to move tasks between
+// Sleeping and Runnable without threading a Kernel parameter through every
+// migrated kernel-sim wait queue. The pointer must be installed from a leaked
+// or static Kernel before real QEMU task waits are exercised.
+static WAIT_KERNEL: AtomicUsize = AtomicUsize::new(0);
+
+// AGENT: install the QEMU scheduler backend used by WaitToken wake/block paths.
+pub fn install_qemu_wait_kernel(kernel: &'static Kernel) {
+    WAIT_KERNEL.store(kernel as *const Kernel as usize, Ordering::Release);
+}
+
+// AGENT: return the installed QEMU scheduler backend, if this early carrier
+// stage has one. Without it, waits fall back to interrupt-friendly spinning.
+fn qemu_wait_kernel() -> Option<&'static Kernel> {
+    let ptr = WAIT_KERNEL.load(Ordering::Acquire);
+    if ptr == 0 {
+        None
+    } else {
+        // SAFETY: install_qemu_wait_kernel only accepts a 'static Kernel.
+        Some(unsafe { &*(ptr as *const Kernel) })
+    }
+}
+
+// AGENT: QEMU timer interrupts use this hook to drive the migrated logical
+// kernel clock and timer wheel once a Kernel has been installed.
+pub(crate) fn qemu_wait_timer_tick() {
+    if let Some(kernel) = qemu_wait_kernel() {
+        kernel.schedule_tick(0);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitOutcome {
@@ -452,46 +482,29 @@ pub struct WaitToken {
 
 struct WaitState {
     outcome: AtomicU8,
-    host: HostWaiter,
-}
-
-struct HostWaiter {
-    thread: thread::Thread,
-}
-
-impl HostWaiter {
-    fn current() -> Self {
-        Self {
-            thread: thread::current(),
-        }
-    }
-
-    fn park(&self) {
-        thread::park();
-    }
-
-    fn park_timeout(&self, timeout: Duration) {
-        thread::park_timeout(timeout);
-    }
-
-    fn wake(&self) {
-        self.thread.unpark();
-    }
+    task_id: usize,
 }
 
 impl WaitToken {
+    // AGENT: QEMU wait ownership is the current simulator task, not a host
+    // thread. Kernel::set_cur() publishes this id before syscall/wait code runs.
     pub fn current() -> Self {
         Self {
             id: WAIT_TOKEN_SEQ.fetch_add(1, Ordering::Relaxed),
             state: Arc::new(WaitState {
                 outcome: AtomicU8::new(WAIT_PENDING),
-                host: HostWaiter::current(),
+                task_id: require_current_task_id("WaitToken"),
             }),
         }
     }
 
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    // AGENT: expose the scheduler task carried by this QEMU wait token.
+    pub fn task_id(&self) -> usize {
+        self.state.task_id
     }
 
     pub fn wake(&self) -> bool {
@@ -512,7 +525,7 @@ impl WaitToken {
             )
             .is_ok()
         {
-            self.state.host.wake();
+            self.wake_waiter_task();
             true
         } else {
             false
@@ -532,31 +545,46 @@ impl WaitToken {
             )
             .is_ok()
         {
-            self.state.host.wake();
+            self.wake_waiter_task();
             true
         } else {
             false
         }
     }
 
+    // AGENT: wake the task that owns this token through the installed QEMU
+    // scheduler backend. In early carrier smoke paths without a backend, the
+    // atomic outcome alone lets a spinning waiter observe completion.
+    fn wake_waiter_task(&self) {
+        if let Some(kernel) = qemu_wait_kernel() {
+            kernel.wake_task_for_wait(self.state.task_id);
+        }
+    }
+
+    // AGENT: park the owning task in scheduler state. The full context switch is
+    // supplied by a later QEMU scheduler milestone; until then this function
+    // records the semantic state transition and the loop below spins.
+    fn block_waiter_task(&self) {
+        if let Some(kernel) = qemu_wait_kernel() {
+            kernel.block_task_for_wait(self.state.task_id);
+        }
+    }
+
+    // AGENT: QEMU has no host Instant/park_timeout. Optional timeouts are routed
+    // through the kernel timer wheel, while indefinite waits block the current
+    // task and spin until the eventual scheduler/context-switch layer resumes it.
     pub fn wait(&self, timeout: Option<Duration>) -> WaitOutcome {
-        match timeout {
-            Some(d) => {
-                let deadline = std::time::Instant::now() + d;
-                while !self.is_woken() {
-                    let now = std::time::Instant::now();
-                    if now >= deadline {
-                        self.wake_timeout();
-                        break;
-                    }
-                    self.state.host.park_timeout(deadline - now);
-                }
+        if let Some(timeout) = timeout {
+            return self.wait_with_timer(timeout);
+        }
+
+        let mut blocked = false;
+        while !self.is_woken() {
+            if !blocked {
+                self.block_waiter_task();
+                blocked = true;
             }
-            None => {
-                while !self.is_woken() {
-                    self.state.host.park();
-                }
-            }
+            ::core::hint::spin_loop();
         }
         self.outcome()
     }
@@ -570,9 +598,22 @@ impl WaitToken {
             return self.outcome();
         }
         let deadline = CLK.load(Ordering::Relaxed).saturating_add(ticks);
+        self.wait_until_tick(deadline)
+    }
+
+    // AGENT: wait until an absolute logical tick deadline, using the same typed
+    // timer target that QEMU timer interrupts will dispatch.
+    pub fn wait_until_tick(&self, deadline: usize) -> WaitOutcome {
+        if self.is_woken() {
+            return self.outcome();
+        }
+        if CLK.load(Ordering::Relaxed) >= deadline {
+            self.wake_timeout();
+            return self.outcome();
+        }
         let timers = global_timer_wheel();
         let timer_id = {
-            let mut wheel = timers.lock().unwrap();
+            let mut wheel = timers.lock();
             wheel.register_timer(
                 deadline,
                 0,
@@ -583,7 +624,7 @@ impl WaitToken {
         };
         let outcome = self.wait(None);
         if outcome == WaitOutcome::Event {
-            timers.lock().unwrap().cancel(timer_id);
+            timers.lock().cancel(timer_id);
         }
         outcome
     }
@@ -952,7 +993,7 @@ impl FutexRequeueResult {
 // AGENT: distinguish futex timeout backends while sharing the waiter setup.
 #[derive(Clone, Copy)]
 enum FutexWaitClock {
-    Host,
+    TokenDefault,
     KernelTimer,
 }
 
@@ -973,7 +1014,7 @@ impl FutexBucket {
         val: &AtomicU32,
         timeout: Option<Duration>,
     ) -> Result<(), &'static str> {
-        self.wait_inner(addr, expected, val, timeout, FutexWaitClock::Host)
+        self.wait_inner(addr, expected, val, timeout, FutexWaitClock::TokenDefault)
     }
 
     // AGENT: futex syscall timeouts use the kernel timer wheel so timeout wakeup
