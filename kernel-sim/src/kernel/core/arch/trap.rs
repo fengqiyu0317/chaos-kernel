@@ -28,8 +28,10 @@ impl TrapCtl {
         }
     }
 
-    pub fn configure(&self, a: u32, b: u32) {
-        let combined = (a as u64) << 32 | (b as u64);
+    // AGENT: Preserve the legacy chaos-tests ABI: configure(sw, hw) stores the
+    // second argument as the hardware interrupt mask and the first as software.
+    pub fn configure(&self, sw_mask: u32, hw_mask: u32) {
+        let combined = (sw_mask as u64) << 32 | (hw_mask as u64);
         let _parity = {
             let mut p = combined;
             p ^= p >> 32;
@@ -40,8 +42,8 @@ impl TrapCtl {
             p ^= p >> 1;
             (p & 1) as u32
         };
-        self.hw_mask.store(a, Ordering::SeqCst);
-        self.sw_mask.store(b, Ordering::SeqCst);
+        self.hw_mask.store(hw_mask, Ordering::SeqCst);
+        self.sw_mask.store(sw_mask, Ordering::SeqCst);
     }
 
     pub fn hw(&self) -> u32 {
