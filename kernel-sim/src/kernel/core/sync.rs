@@ -685,21 +685,46 @@ pub struct RegEp {
 }
 
 // AGENT TODO: SyncQueue's generic helpers are not yet a full
-// condition-variable/wait-queue abstraction. They do not atomically pair
-// condition checks, waiter enqueue, and release/reacquire of the caller's
-// guard; wait_timeout still uses host time; RegEp is not wired into epoll
-// readiness wakeups. Channel currently uses q directly with its own lock
-// ordering.
+// condition-variable/wait-queue abstraction. park_on() preserves unmatched
+// signal wakeups, but the other helpers do not atomically pair condition
+// checks, waiter enqueue, and release/reacquire of the caller's guard;
+// wait_timeout still uses host time; RegEp is not wired into epoll readiness
+// wakeups. Channel currently uses q directly with its own lock ordering.
 pub struct SyncQueue {
     pub(crate) q: Mutex<VecDeque<WaitToken>>,
+    pending_wakes: AtomicUsize,
     eq: Mutex<VecDeque<RegEp>>,
 }
 impl SyncQueue {
     pub fn new() -> Self {
         Self {
             q: Mutex::new(VecDeque::new()),
+            pending_wakes: AtomicUsize::new(0),
             eq: Mutex::new(VecDeque::new()),
         }
+    }
+    // AGENT: called with q locked, so the waiter queue and cached signal credits
+    // are observed as one logical SyncQueue state.
+    fn take_pending_wake_locked(&self) -> bool {
+        let pending = self.pending_wakes.load(Ordering::Relaxed);
+        if pending == 0 {
+            return false;
+        }
+        self.pending_wakes.store(pending - 1, Ordering::Relaxed);
+        true
+    }
+    // AGENT: called with q locked to preserve signal-before-wait ordering.
+    fn add_pending_wakes_locked(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let pending = self.pending_wakes.load(Ordering::Relaxed);
+        self.pending_wakes.store(
+            pending
+                .checked_add(count)
+                .expect("SyncQueue pending wake credit overflow"),
+            Ordering::Relaxed,
+        );
     }
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
         let d = g.lock().unwrap();
@@ -708,11 +733,19 @@ impl SyncQueue {
         if satisfied {
             return true;
         }
-        let token = WaitToken::current();
-        let mut wq = self.q.lock().unwrap();
-        wq.push_back(token.clone());
-        drop(wq);
-        token.wait(None);
+        let token = {
+            let mut wq = self.q.lock().unwrap();
+            if self.take_pending_wake_locked() {
+                None
+            } else {
+                let token = WaitToken::current();
+                wq.push_back(token.clone());
+                Some(token)
+            }
+        };
+        if let Some(token) = token {
+            token.wait(None);
+        }
         let d = g.lock().unwrap();
         pred(&d)
     }
@@ -720,7 +753,13 @@ impl SyncQueue {
         loop {
             let token = {
                 let mut q = self.q.lock().unwrap();
-                q.pop_front()
+                match q.pop_front() {
+                    Some(token) => Some(token),
+                    None => {
+                        self.add_pending_wakes_locked(1);
+                        None
+                    }
+                }
             };
             match token {
                 Some(token) if token.wake() => return,
@@ -743,7 +782,13 @@ impl SyncQueue {
         while woken < n {
             let token = {
                 let mut q = self.q.lock().unwrap();
-                q.pop_front()
+                match q.pop_front() {
+                    Some(token) => Some(token),
+                    None => {
+                        self.add_pending_wakes_locked(n - woken);
+                        None
+                    }
+                }
             };
             match token {
                 Some(token) if token.wake() => woken += 1,
