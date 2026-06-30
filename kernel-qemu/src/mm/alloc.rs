@@ -155,31 +155,6 @@ impl FramePool {
         }
     }
 
-    pub fn get_zone_aware(&self, zone: &ZoneInfo) -> Option<usize> {
-        if !zone.zone_can_alloc() {
-            return None;
-        }
-        let mut s = self.slots.lock().unwrap();
-        let base = zone.base_pfn;
-        let limit = base + zone.page_count;
-        for i in base..min(limit, s.len()) {
-            if s[i] {
-                s[i] = false;
-                zone.free_count.fetch_sub(1, Ordering::Relaxed);
-                return Some(i);
-            }
-        }
-        None
-    }
-
-    pub fn put_zone_aware(&self, idx: usize, zone: &ZoneInfo) {
-        let mut s = self.slots.lock().unwrap();
-        if idx < s.len() && !s[idx] {
-            s[idx] = true;
-            zone.free_count.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     pub fn batch_alloc(&self, count: usize) -> Vec<usize> {
         let mut s = self.slots.lock().unwrap();
         let mut result = Vec::with_capacity(count);
@@ -193,59 +168,6 @@ impl FramePool {
             }
         }
         result
-    }
-}
-
-pub struct ZoneInfo {
-    pub zone_id: usize,
-    pub base_pfn: usize,
-    pub page_count: usize,
-    pub free_count: AtomicUsize,
-    pub low_watermark: usize,
-    pub high_watermark: usize,
-    pub managed: AtomicBool,
-}
-
-impl ZoneInfo {
-    pub fn new(id: usize, base: usize, count: usize, low: usize, high: usize) -> Self {
-        Self {
-            zone_id: id,
-            base_pfn: base,
-            page_count: count,
-            free_count: AtomicUsize::new(count),
-            low_watermark: low,
-            high_watermark: high,
-            managed: AtomicBool::new(true),
-        }
-    }
-
-    pub fn zone_can_alloc(&self) -> bool {
-        self.free_count.load(Ordering::Relaxed) > self.low_watermark
-    }
-
-    pub fn zone_pressure(&self) -> usize {
-        let free = self.free_count.load(Ordering::Relaxed);
-        if free >= self.high_watermark {
-            return 0;
-        }
-        if free <= self.low_watermark {
-            return 100;
-        }
-        let range = self.high_watermark - self.low_watermark;
-        let deficit = self.high_watermark - free;
-        (deficit * 100) / range
-    }
-
-    pub fn reclaim_target(&self) -> usize {
-        let free = self.free_count.load(Ordering::Relaxed);
-        if free >= self.high_watermark {
-            return 0;
-        }
-        self.high_watermark - free
-    }
-
-    pub fn contains_pfn(&self, pfn: usize) -> bool {
-        pfn >= self.base_pfn && pfn < self.base_pfn + self.page_count
     }
 }
 
