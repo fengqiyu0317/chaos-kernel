@@ -89,6 +89,18 @@ impl Sv39PageTable {
         }
     }
 
+    // AGENT: avoid returning page-table frames while satp still points at this root.
+    fn deactivate_if_current(&self) {
+        if self.root_paddr != 0
+            && crate::csr::read_satp() == crate::csr::make_satp_sv39(self.root_paddr)
+        {
+            unsafe {
+                crate::csr::write_satp(0);
+            }
+            crate::csr::sfence_vma();
+        }
+    }
+
     // AGENT: lazily allocate the real Sv39 root on the first mapping operation.
     fn ensure_root(&mut self, pool: &FramePool) -> Result<usize, &'static str> {
         if self.root_paddr != 0 {
@@ -450,16 +462,39 @@ impl AddrSpace {
         Ok(pages_to_unmap.len())
     }
 
-    // AGENT: process teardown drops resident metadata before clearing the
-    // separately owned Sv39 page-table frames.
+    // AGENT: process teardown removes hardware leaves before resident frames can
+    // drop, then releases the now-inactive Sv39 page-table frames.
     pub fn release_all_pages(&mut self, _pool: &FramePool) -> usize {
         self.vm_map.regions.clear();
-        let entries = self.resident_pages.take_all();
-        let mut released = 0;
-        for pte in entries.into_values() {
-            if pte.frame.is_unique() {
-                released += 1;
+
+        let released = {
+            let entries = self.resident_pages.entries.lock().unwrap();
+            let mut released = 0;
+            for (&addr, pte) in entries.iter() {
+                if pte.frame.is_unique() {
+                    released += 1;
+                }
+                let paddr = self
+                    .sv39
+                    .leaf_paddr(addr)
+                    .expect("resident page should have an Sv39 leaf");
+                assert_eq!(
+                    paddr,
+                    pte.frame.paddr(),
+                    "resident page and Sv39 leaf disagree"
+                );
+                self.sv39
+                    .unmap_leaf_if_present(addr)
+                    .expect("resident Sv39 leaf should unmap");
             }
+            released
+        };
+
+        crate::csr::sfence_vma();
+        self.sv39.deactivate_if_current();
+        {
+            let entries = self.resident_pages.take_all();
+            drop(entries);
         }
         self.sv39.clear();
         crate::csr::sfence_vma();
@@ -543,21 +578,6 @@ impl AddrSpace {
         }
         crate::csr::sfence_vma();
         Ok(())
-    }
-
-    // AGENT: report software-resident pages, not Sv39 intermediate table pages.
-    pub fn rss_pages(&self) -> usize {
-        self.resident_pages.len()
-    }
-
-    // AGENT: count COW sharing in resident page metadata rather than walking the
-    // hardware page table.
-    pub fn cow_sharers(&self) -> usize {
-        let entries = self.resident_pages.entries.lock().unwrap();
-        entries
-            .values()
-            .filter(|pte| pte.cow && pte.frame.sharers() > 1)
-            .count()
     }
 
     // AGENT: split only VmMap region metadata; resident pages and Sv39 leaves are
