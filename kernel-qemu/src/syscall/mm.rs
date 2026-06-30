@@ -129,14 +129,12 @@ pub(super) fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str>
     if new_brk >= KERN_BASE {
         return Err("enomem");
     }
-    let aligned = (new_brk + PAGE_SZ - 1) & !(PAGE_SZ - 1);
-    let cur = kernel.cur_task(0);
-    if let Some(t) = cur {
-        t.process
-            .addr_space
-            .lock()
-            .unwrap()
-            .resize_brk(aligned, &kernel.pool)?;
-    }
+    let aligned = new_brk.checked_add(PAGE_SZ - 1).ok_or("enomem")? & !(PAGE_SZ - 1);
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .resize_brk(aligned, &kernel.pool)?;
     Ok(aligned)
 }

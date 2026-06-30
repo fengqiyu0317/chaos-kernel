@@ -194,12 +194,6 @@ impl ResidentPageTable {
         let mut entries = self.entries.lock().unwrap();
         mem::take(&mut *entries)
     }
-
-    // AGENT: report resident page count without exposing the backing BTreeMap as
-    // the address space's hardware page table.
-    fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
-    }
 }
 
 // AGENT: coordinate VmMap, resident page metadata, and the owned Sv39 page table
@@ -492,10 +486,7 @@ impl AddrSpace {
 
         crate::csr::sfence_vma();
         self.sv39.deactivate_if_current();
-        {
-            let entries = self.resident_pages.take_all();
-            drop(entries);
-        }
+        drop(self.resident_pages.take_all());
         self.sv39.clear();
         crate::csr::sfence_vma();
         released
@@ -598,35 +589,33 @@ impl AddrSpace {
     // AGENT: validate VmMap metadata, allocate resident frames, and install Sv39
     // leaves through the split page-table owner.
     pub fn map_region(&mut self, region: VmRegion, pool: &FramePool) -> Result<(), &'static str> {
-        if region.base % PAGE_SZ != 0 || region.len % PAGE_SZ != 0 {
+        if region.len == 0 || region.base % PAGE_SZ != 0 || region.len % PAGE_SZ != 0 {
             return Err("einval");
         }
         let region_end = region.checked_end().ok_or("einval")?;
         if region_end > KERN_BASE {
             return Err("einval");
         }
+
         let flags = region.flags;
         let region_base = region.base;
         let region_len = region.len;
-        let pages: Vec<usize> = page_range(region.base, region.len).collect();
-        let mut allocated = Vec::with_capacity(pages.len());
-        for _ in pages.iter() {
-            match pool.alloc_pg_frame() {
-                Some(frame) => {
-                    zero_page(frame.paddr());
-                    allocated.push(frame);
-                }
-                None => {
-                    return Err("enomem");
-                }
-            }
+        let pte_flags = vm_flags_to_pte_flags(flags);
+        let pages: Vec<usize> = page_range(region_base, region_len).collect();
+
+        let mut frames = Vec::with_capacity(pages.len());
+        for _ in 0..pages.len() {
+            let frame = pool.alloc_pg_frame().ok_or("enomem")?;
+            zero_page(frame.paddr());
+            frames.push(frame);
         }
+
         if let Err(err) = self.vm_map.insert(region) {
             return Err(err);
         }
-        let mut mapped: Vec<(usize, PgFrame)> = Vec::with_capacity(pages.len());
-        for (page_addr, frame) in pages.into_iter().zip(allocated.into_iter()) {
-            let pte_flags = vm_flags_to_pte_flags(flags);
+
+        let mut mapped = Vec::with_capacity(pages.len());
+        for (page_addr, frame) in pages.into_iter().zip(frames.into_iter()) {
             if let Err(err) = self
                 .sv39
                 .map_leaf(page_addr, frame.paddr(), pte_flags, pool)
@@ -639,6 +628,7 @@ impl AddrSpace {
             }
             mapped.push((page_addr, frame));
         }
+
         let mut entries = self.resident_pages.entries.lock().unwrap();
         for (page_addr, frame) in mapped.into_iter() {
             entries.insert(page_addr, PageTableEntry::new(frame, flags));
@@ -675,10 +665,13 @@ fn page_range(base: usize, len: usize) -> impl Iterator<Item = usize> {
     (start..end).step_by(PAGE_SZ)
 }
 
-// AGENT: translate migrated VM flags into Sv39 user leaf permissions.
+// AGENT: translate migrated VM flags into legal Sv39 leaf permissions.
 fn vm_flags_to_pte_flags(flags: u32) -> usize {
-    let mut pte_flags = PTE_U | PTE_A;
-    if flags & VM_READ != 0 {
+    let mut pte_flags = PTE_A;
+    if flags & (VM_READ | VM_WRITE | VM_EXEC) != 0 {
+        pte_flags |= PTE_U;
+    }
+    if flags & (VM_READ | VM_WRITE) != 0 {
         pte_flags |= PTE_R;
     }
     if flags & VM_WRITE != 0 {
@@ -686,6 +679,9 @@ fn vm_flags_to_pte_flags(flags: u32) -> usize {
     }
     if flags & VM_EXEC != 0 {
         pte_flags |= PTE_X;
+    }
+    if pte_flags & (PTE_R | PTE_W | PTE_X) == 0 {
+        pte_flags |= PTE_R;
     }
     pte_flags
 }
