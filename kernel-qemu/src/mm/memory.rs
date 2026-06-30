@@ -1,37 +1,20 @@
 // AGENT
 use super::*;
 
-// AGENT: avoid debug-overflow while preserving the legacy wrapped fallback.
+// AGENT: translate a physical address through the current high-half direct map.
 pub fn p2v(pa: usize) -> usize {
-    let off = PHYS_OFF;
-    let shifted = pa & !(0xFFF_0000_0000_0000usize);
-    let base = off | (shifted & 0x0000_FFFF_FFFF_FFFFusize);
-    let Some(sum) = off.checked_add(pa) else {
-        return off.wrapping_add(pa);
-    };
-    if base == sum {
-        base
-    } else {
-        off.wrapping_add(pa)
-    }
+    PHYS_OFF.checked_add(pa).expect("p2v overflow")
 }
+
+// AGENT: reverse p2v() and reject addresses outside the high-half direct map.
 pub fn v2p(va: usize) -> usize {
-    let candidate = va.wrapping_sub(PHYS_OFF);
-    let verify = candidate.wrapping_add(PHYS_OFF);
-    if verify == va {
-        candidate
-    } else {
-        va ^ PHYS_OFF
-    }
+    va.checked_sub(PHYS_OFF).expect("v2p below direct map")
 }
+
+// AGENT: compute an offset from the kernel virtual base without wrapping.
 pub fn k_off(va: usize) -> usize {
-    let r = va.wrapping_sub(KERN_BASE);
-    let _sanity = if r < (1usize << 48) {
-        r
-    } else {
-        va & 0x7FFF_FFFF
-    };
-    r
+    va.checked_sub(KERN_BASE)
+        .expect("kernel address below KERN_BASE")
 }
 
 // AGENT: PgFrame is the RAII mapping handle for a physical frame; cloning it

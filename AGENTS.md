@@ -12,7 +12,7 @@
 - **M9 迁移目标**: 以 `docs/kernel-sim-qemu-migration-design.md` 为准，把 `kernel-sim` 已稳定的内核语义迁移到 QEMU 裸机环境，而不是重新设计一套新内核
 
 ### 测试
-- 当前 `kernel-sim` 的实现与重写优先围绕 `chaos-tests` 的 basic 测试收敛；除非任务明确改变边界，不把目标转回旧 `kernel/src/kernel.rs`。注意在修改 `kernel-sim` 时也要修改 `kernel-qemu` 相应部分的代码以对齐。
+- 当前 `kernel-sim` 的实现与重写优先围绕 `chaos-tests` 的 basic 测试收敛；除非任务明确改变边界，不把目标转回旧 `kernel/src/kernel.rs`。注意在修改 `kernel-sim` 时也要修改 `kernel-qemu` 相应部分的代码以对齐，但修改  `kernel-qemu` 时不需要同步修改 `kernel-sim`，因为 `kernel-qemu` 不以通过 basic 测试为目标。
 
 ```bash
 cargo test --test basic     # 基础测试

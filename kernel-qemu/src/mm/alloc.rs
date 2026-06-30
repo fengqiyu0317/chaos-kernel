@@ -283,43 +283,57 @@ pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<u
     }
 }
 
+// AGENT: SharedPage is the resident page object shared by forked PTEs; cloning
+// it shares both the physical frame handle and the simulated page bytes.
+#[derive(Clone)]
 pub struct SharedPage {
-    pub frame: AtomicUsize,
-    pub w: AtomicBool,
-    pub pending: AtomicBool,
+    frame: PgFrame,
+    data: Arc<Mutex<Vec<u8>>>,
 }
+
 impl SharedPage {
-    pub fn new(f: usize) -> Self {
+    pub fn new(frame: PgFrame) -> Self {
+        Self::with_data(frame, vec![0; PAGE_SZ])
+    }
+
+    pub fn with_data(frame: PgFrame, mut data: Vec<u8>) -> Self {
+        data.resize(PAGE_SZ, 0);
         Self {
-            frame: AtomicUsize::new(f),
-            w: AtomicBool::new(false),
-            pending: AtomicBool::new(true),
+            frame,
+            data: Arc::new(Mutex::new(data)),
         }
     }
-    // AGENT: accept PgFrame as the COW source handle; PgFrame drop owns
-    // lifetime cleanup instead of manual refcount mutation here.
-    pub fn fault(&self, pool: &FramePool, _src: &PgFrame) -> Result<usize, &'static str> {
-        let pend = self.pending.load(Ordering::Relaxed);
-        let cur = self.frame.load(Ordering::Relaxed);
-        if !pend {
-            let _verify = self.w.load(Ordering::Relaxed);
-            return Ok(cur);
-        }
-        // AGENT: reuse frame_alloc instead of inline slot scan
-        let nf = {
-            let pa = frame_alloc(pool).ok_or("oom")?;
-            pool.paddr_to_frame_id(pa).ok_or("oom")?
-        };
-        self.frame.store(nf, Ordering::Relaxed);
-        self.w.store(true, Ordering::Relaxed);
-        self.pending.store(false, Ordering::Relaxed);
-        Ok(nf)
-    }
-    pub fn is_cow_resolved(&self) -> bool {
-        !self.pending.load(Ordering::Relaxed) && self.w.load(Ordering::Relaxed)
-    }
+
     pub fn frame_id(&self) -> usize {
-        self.frame.load(Ordering::Relaxed)
+        self.frame.id()
+    }
+
+    pub fn paddr(&self) -> usize {
+        self.frame.paddr()
+    }
+
+    pub fn data(&self) -> Arc<Mutex<Vec<u8>>> {
+        self.data.clone()
+    }
+
+    pub fn is_unique(&self) -> bool {
+        self.frame.is_unique()
+    }
+
+    pub fn sharers(&self) -> usize {
+        self.frame.count()
+    }
+
+    pub fn fault(&mut self, pool: &FramePool) -> Result<usize, &'static str> {
+        if self.is_unique() {
+            return Ok(self.paddr());
+        }
+
+        let old_data = self.data.lock().unwrap().clone();
+        let new_frame = pool.alloc_pg_frame().ok_or("oom")?;
+        let new_paddr = new_frame.paddr();
+        *self = SharedPage::with_data(new_frame, old_data);
+        Ok(new_paddr)
     }
 }
 

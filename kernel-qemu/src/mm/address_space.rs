@@ -45,11 +45,10 @@ impl PageBacking {
     }
 }
 
-// AGENT: page-table entries own a RAII frame handle plus backing metadata for
-// mmap writeback.
+// AGENT: page-table entries reference a SharedPage for resident frame/data
+// ownership and keep only PTE-local permission plus backing metadata here.
 pub struct PageTableEntry {
-    pub frame: PgFrame,
-    pub data: Arc<Mutex<Vec<u8>>>,
+    pub page: SharedPage,
     pub backing: PageBacking,
     pub flags: u32,
     pub writable: bool,
@@ -60,14 +59,13 @@ pub struct PageTableEntry {
 impl PageTableEntry {
     // AGENT: default page-table entries are anonymous zero-filled pages.
     pub fn new(frame: PgFrame, flags: u32) -> Self {
-        Self::with_backing(frame, flags, PageBacking::Anonymous)
+        Self::with_backing(SharedPage::new(frame), flags, PageBacking::Anonymous)
     }
 
     // AGENT: allow mmap to seed resident pages with file backing metadata.
-    pub fn with_backing(frame: PgFrame, flags: u32, backing: PageBacking) -> Self {
+    pub fn with_backing(page: SharedPage, flags: u32, backing: PageBacking) -> Self {
         Self {
-            frame,
-            data: Arc::new(Mutex::new(vec![0; PAGE_SZ])),
+            page,
             backing,
             flags,
             writable: flags & VM_WRITE != 0,
@@ -81,12 +79,12 @@ impl PageTableEntry {
         self.cow = true;
     }
 
-    fn resolve_write(&mut self, frame: PgFrame, data: Vec<u8>) {
-        self.frame = frame;
-        self.data = Arc::new(Mutex::new(data));
+    fn resolve_write(&mut self, pool: &FramePool) -> Result<usize, &'static str> {
+        let paddr = self.page.fault(pool)?;
         self.writable = self.flags & VM_WRITE != 0;
         self.cow = false;
         self.present = true;
+        Ok(paddr)
     }
 
     fn set_flags(&mut self, flags: u32) {
@@ -95,14 +93,13 @@ impl PageTableEntry {
     }
 
     pub fn frame_id(&self) -> usize {
-        self.frame.id()
+        self.page.frame_id()
     }
 
     // AGENT: clone only when a new PTE mapping should share the same frame.
     fn clone_mapping(&self) -> Self {
         Self {
-            frame: self.frame.clone(),
-            data: self.data.clone(),
+            page: self.page.clone(),
             backing: self.backing.clone(),
             flags: self.flags,
             writable: self.writable,
@@ -113,7 +110,8 @@ impl PageTableEntry {
 
     // AGENT: flush a full resident page before unmap or address-space teardown.
     fn flush_shared_file_page(&self) -> Result<(), &'static str> {
-        let page = self.data.lock().unwrap();
+        let page_data = self.page.data();
+        let page = page_data.lock().unwrap();
         self.backing.flush_range(&page, 0, PAGE_SZ)
     }
 }
@@ -200,23 +198,13 @@ impl AddrSpace {
             return Err("segfault");
         }
         if pte.writable && !pte.cow {
-            return Ok(pte.frame.paddr());
+            return Ok(pte.page.paddr());
         }
         if !pte.cow {
             return Err("segfault");
         }
 
-        let old_data = pte.data.lock().unwrap().clone();
-        if pte.frame.is_unique() {
-            pte.writable = pte.flags & VM_WRITE != 0;
-            pte.cow = false;
-            return Ok(pte.frame.paddr());
-        }
-
-        let new_frame = pool.alloc_pg_frame().ok_or("oom")?;
-        let new_paddr = new_frame.paddr();
-        pte.resolve_write(new_frame, old_data);
-        Ok(new_paddr)
+        pte.resolve_write(pool)
     }
 
     fn checked_user_end(addr: usize, len: usize) -> Result<usize, &'static str> {
@@ -245,7 +233,7 @@ impl AddrSpace {
                 if !pte.present {
                     return Err("efault");
                 }
-                pte.data.clone()
+                pte.page.data()
             };
             let page = page_data.lock().unwrap();
             dst[copied..copied + chunk].copy_from_slice(&page[page_off..page_off + chunk]);
@@ -363,7 +351,7 @@ impl AddrSpace {
                 if !pte.present || !pte.writable {
                     return Err("efault");
                 }
-                (pte.data.clone(), pte.backing.clone())
+                (pte.page.data(), pte.backing.clone())
             };
             let mut page = page_data.lock().unwrap();
             page[page_off..page_off + chunk].copy_from_slice(&src[written..written + chunk]);
@@ -413,7 +401,7 @@ impl AddrSpace {
                 continue;
             }
             let _ = pte.flush_shared_file_page();
-            if pte.frame.is_unique() {
+            if pte.page.is_unique() {
                 released += 1;
             }
         }
@@ -458,7 +446,7 @@ impl AddrSpace {
     pub fn cow_sharers(&self) -> usize {
         let pt = self.page_table.lock().unwrap();
         pt.values()
-            .filter(|pte| pte.cow && pte.frame.count() > 1)
+            .filter(|pte| pte.cow && pte.page.sharers() > 1)
             .count()
     }
 
@@ -562,9 +550,10 @@ impl AddrSpace {
                 valid_len,
                 shared,
             };
-            let pte = PageTableEntry::with_backing(frame, flags, backing);
+            let pte = PageTableEntry::with_backing(SharedPage::new(frame), flags, backing);
             if valid_len > 0 {
-                pte.data.lock().unwrap()[..valid_len]
+                let page_data = pte.page.data();
+                page_data.lock().unwrap()[..valid_len]
                     .copy_from_slice(&file_snapshot[file_offset..file_offset + valid_len]);
             }
             pt.insert(page_addr, pte);
