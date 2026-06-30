@@ -14,6 +14,11 @@ pub fn run_all() {
     wait_token_expired_deadline_times_out_immediately();
     wait_token_timer_target_times_out_on_schedule_tick();
     wait_token_event_wake_uses_installed_scheduler_backend();
+    futex_wait_returns_changed_without_queueing();
+    futex_wait_propagates_word_read_fault();
+    futex_wait_timeout_removes_published_waiter();
+    futex_cmp_requeue_propagates_word_read_fault();
+    futex_requeue_skips_completed_waiters_when_moving();
 }
 
 // AGENT: reset simulator-global wait state so QEMU boot selftests are
@@ -39,6 +44,15 @@ fn ensure_timer_wheel() {
     if TIMER_WHEEL.get().is_none() {
         init_timer_wheel();
     }
+}
+
+// AGENT: build a tiny fully-free frame pool for scheduler-only selftests that
+// do not exercise QEMU physical-memory discovery.
+fn test_frame_pool(pages: usize) -> FramePool {
+    let pool = FramePool::new(pages, MEM_OFF);
+    let end = MEM_OFF + pages * PAGE_SZ;
+    pool.mark_free_range(MEM_OFF, end);
+    pool
 }
 
 // AGENT: WaitToken::current must bind to the current simulator task id and give
@@ -137,7 +151,7 @@ fn wait_token_expired_deadline_times_out_immediately() {
 fn wait_token_timer_target_times_out_on_schedule_tick() {
     reset_wait_token_state(16);
 
-    let kernel = Kernel::new(8);
+    let kernel = Kernel::new(test_frame_pool(8));
     let token = WaitToken::current();
     let deadline = CLK.load(Ordering::Relaxed) + 1;
 
@@ -168,7 +182,7 @@ fn wait_token_timer_target_times_out_on_schedule_tick() {
 fn wait_token_event_wake_uses_installed_scheduler_backend() {
     reset_wait_token_state(17);
 
-    let kernel = Box::leak(Box::new(Kernel::new(8)));
+    let kernel = Box::leak(Box::new(Kernel::new(test_frame_pool(8))));
     let task = kernel.tasks.spawn_root();
     task.set_sched_state(TaskRunState::Sleeping);
     set_current_task_id(Some(task.id()));
@@ -178,6 +192,127 @@ fn wait_token_event_wake_uses_installed_scheduler_backend() {
     assert!(token.wake_event());
     assert_eq!(task.sched_state(), TaskRunState::Runnable);
     assert_eq!(kernel.run_queue.pick_next(), Some(task.id()));
+
+    clear_wait_token_state();
+}
+
+// AGENT: FutexBucket::wait must compare the current futex word before enqueueing
+// and return the syscall-layer "changed" marker when it differs.
+#[cfg_attr(test, test)]
+fn futex_wait_returns_changed_without_queueing() {
+    reset_wait_token_state(18);
+
+    let futex = FutexBucket::new();
+    let addr = 0x4000;
+    let calls = AtomicUsize::new(0);
+
+    let err = futex
+        .wait(addr, 1, None, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(0)
+        })
+        .expect_err("different futex word should not sleep");
+
+    assert_eq!(err, "changed");
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(futex.pending_at(addr), 0);
+
+    clear_wait_token_state();
+}
+
+// AGENT: failed userspace copy-in should bubble out of wait setup without
+// publishing a stale waiter or panicking inside the futex bucket.
+#[cfg_attr(test, test)]
+fn futex_wait_propagates_word_read_fault() {
+    reset_wait_token_state(19);
+
+    let futex = FutexBucket::new();
+    let addr = 0x5000;
+
+    let err = futex
+        .wait(addr, 1, None, || Err("efault"))
+        .expect_err("read fault should abort wait setup");
+
+    assert_eq!(err, "efault");
+    assert_eq!(futex.pending_at(addr), 0);
+
+    clear_wait_token_state();
+}
+
+// AGENT: a matching word with an immediate timeout proves the waiter is
+// published first, then removed by finish_wait() when the token times out.
+#[cfg_attr(test, test)]
+fn futex_wait_timeout_removes_published_waiter() {
+    reset_wait_token_state(20);
+
+    let futex = FutexBucket::new();
+    let addr = 0x6000;
+    let calls = AtomicUsize::new(0);
+
+    let err = futex
+        .wait(addr, 1, Some(Duration::from_nanos(0)), || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(1)
+        })
+        .expect_err("zero timeout should finish as timeout");
+
+    assert_eq!(err, "timeout");
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(futex.pending_at(addr), 0);
+
+    clear_wait_token_state();
+}
+
+// AGENT: cmp_requeue now reads the source futex word through a caller-supplied
+// copy-in closure; read errors should be returned instead of panicking.
+#[cfg_attr(test, test)]
+fn futex_cmp_requeue_propagates_word_read_fault() {
+    reset_wait_token_state(21);
+
+    let futex = FutexBucket::new();
+    let src = 0x7000;
+    let dst = 0x8000;
+
+    let err = futex
+        .cmp_requeue(src, dst, 1, 1, 1, || Err("efault"))
+        .expect_err("cmp_requeue should propagate read faults");
+
+    assert_eq!(err, "efault");
+    assert_eq!(futex.pending_at(src), 0);
+    assert_eq!(futex.pending_at(dst), 0);
+
+    clear_wait_token_state();
+}
+
+// AGENT: completed timeout entries must be discarded before requeue counts move
+// slots, otherwise a stale waiter can consume move_n and leave a live waiter on src.
+#[cfg_attr(test, test)]
+fn futex_requeue_skips_completed_waiters_when_moving() {
+    reset_wait_token_state(22);
+
+    let src = 0x9000;
+    let dst = 0xA000;
+    let stale = WaitToken::current();
+    let live = WaitToken::current();
+    let mut waiters = VecDeque::new();
+
+    assert!(stale.wake_timeout());
+    waiters.push_back(FutexWaiter {
+        addr: src,
+        token: stale,
+    });
+    waiters.push_back(FutexWaiter {
+        addr: src,
+        token: live.clone(),
+    });
+
+    let result = FutexBucket::requeue_locked(&mut waiters, src, dst, 0, 1);
+
+    assert_eq!(result.woken, 0);
+    assert_eq!(result.moved, 1);
+    assert_eq!(waiters.len(), 1);
+    assert_eq!(waiters[0].addr, dst);
+    assert!(waiters[0].token.same(&live));
 
     clear_wait_token_state();
 }

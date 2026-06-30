@@ -1000,13 +1000,6 @@ impl FutexRequeueResult {
     }
 }
 
-// AGENT: distinguish futex timeout backends while sharing the waiter setup.
-#[derive(Clone, Copy)]
-enum FutexWaitClock {
-    TokenDefault,
-    KernelTimer,
-}
-
 pub struct FutexBucket {
     waiters: Mutex<VecDeque<FutexWaiter>>,
 }
@@ -1028,34 +1021,7 @@ impl FutexBucket {
     where
         R: FnOnce() -> Result<u32, &'static str>,
     {
-        self.wait_inner(
-            addr,
-            expected,
-            timeout,
-            FutexWaitClock::TokenDefault,
-            read_word,
-        )
-    }
-
-    // AGENT: futex syscall timeouts use the kernel timer wheel so timeout wakeup
-    // follows the same logical clock as scheduler ticks.
-    pub fn wait_with_timer<R>(
-        &self,
-        addr: usize,
-        expected: u32,
-        timeout: Option<Duration>,
-        read_word: R,
-    ) -> Result<(), &'static str>
-    where
-        R: FnOnce() -> Result<u32, &'static str>,
-    {
-        self.wait_inner(
-            addr,
-            expected,
-            timeout,
-            FutexWaitClock::KernelTimer,
-            read_word,
-        )
+        self.wait_inner(addr, expected, timeout, read_word)
     }
 
     // AGENT: compare and enqueue under one queue lock so a wake cannot slip
@@ -1065,7 +1031,6 @@ impl FutexBucket {
         addr: usize,
         expected: u32,
         timeout: Option<Duration>,
-        clock: FutexWaitClock,
         read_word: R,
     ) -> Result<(), &'static str>
     where
@@ -1083,10 +1048,7 @@ impl FutexBucket {
             });
         }
 
-        let outcome = match (clock, timeout) {
-            (FutexWaitClock::KernelTimer, Some(timeout)) => token.wait_with_timer(timeout),
-            _ => token.wait(timeout),
-        };
+        let outcome = token.wait(timeout);
         self.finish_wait(&token, outcome)
     }
 
@@ -1184,6 +1146,10 @@ impl FutexBucket {
         wake_n: usize,
         move_n: usize,
     ) -> FutexRequeueResult {
+        // AGENT: drop completed waiters before counting wake/move quotas so stale
+        // timeout entries cannot consume a FUTEX_REQUEUE move slot.
+        waiters.retain(|waiter| !waiter.token.is_woken());
+
         let (mut wk, mut mv) = (0, 0);
         for waiter in waiters.iter_mut() {
             if waiter.addr == src {
