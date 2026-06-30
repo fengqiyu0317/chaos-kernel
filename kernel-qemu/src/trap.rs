@@ -150,17 +150,34 @@ fn handle_user_ecall(frame: &mut TrapFrame) {
     crate::syscall_abi::dispatch_from_trap_frame(frame);
 }
 
-// AGENT: Early page faults fail with architectural context until Sv39/AddrSpace handling lands.
-fn handle_page_fault(frame: &TrapFrame, origin: TrapOrigin, scause: usize, stval: usize) -> ! {
+// AGENT: route recoverable user store faults through migrated AddrSpace COW
+// handling, while keeping other early faults on the structured fatal path.
+fn handle_page_fault(frame: &TrapFrame, origin: TrapOrigin, scause: usize, stval: usize) {
     let cause = decode_scause(scause);
     let access = match cause {
         TrapCause::Exception(code) => PageFaultAccess::from_exception_code(code),
         TrapCause::Interrupt(_) => None,
     };
-    match access {
-        Some(access) => fail_trap(frame, origin, FatalTrap::PageFault { access, cause }, stval),
-        None => fail_trap(frame, origin, FatalTrap::Unhandled { cause }, stval),
+    let Some(access) = access else {
+        fail_trap(frame, origin, FatalTrap::Unhandled { cause }, stval);
+    };
+    if origin == TrapOrigin::User
+        && access == PageFaultAccess::Store
+        && recover_user_store_page_fault(stval).is_ok()
+    {
+        return;
     }
+    fail_trap(frame, origin, FatalTrap::PageFault { access, cause }, stval);
+}
+
+// AGENT: keep trap recovery as an architecture dispatch step; the COW semantics
+// remain in AddrSpace::handle_cow_fault via the installed migrated Kernel.
+fn recover_user_store_page_fault(addr: usize) -> Result<(), &'static str> {
+    let kernel = crate::kernel::qemu_wait_kernel().ok_or("esrch")?;
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    let addr_space = task.process.addr_space.lock().unwrap();
+    addr_space.handle_cow_fault(addr, &kernel.pool)?;
+    Ok(())
 }
 
 // AGENT: Illegal instructions are reported explicitly before the later per-task kill path exists.

@@ -14,6 +14,14 @@ pub enum PageBacking {
 }
 
 impl PageBacking {
+    // AGENT: once a private file-backed COW page is dirtied, keep future flush
+    // decisions from treating the resident page as a clean file mapping.
+    fn detach_private_file_copy(&mut self) {
+        if matches!(self, PageBacking::File { shared: false, .. }) {
+            *self = PageBacking::Anonymous;
+        }
+    }
+
     // AGENT: flush MAP_SHARED page bytes back into the valid file-backed range.
     fn flush_range(&self, page: &[u8], page_off: usize, len: usize) -> Result<(), &'static str> {
         let PageBacking::File {
@@ -81,6 +89,7 @@ impl PageTableEntry {
         let paddr = self.frame.fault(pool)?;
         self.pte_flags = vm_flags_to_pte_flags(flags);
         self.cow = false;
+        self.backing.detach_private_file_copy();
         Ok(paddr)
     }
 
@@ -175,6 +184,12 @@ impl Sv39PageTable {
     // AGENT: update an existing hardware leaf through the owned Sv39 root.
     fn update_leaf(&self, va: usize, pa: usize, flags: usize) -> Result<(), &'static str> {
         update_leaf(self.root_paddr()?, va, pa, flags)
+    }
+
+    // AGENT: validate that resident metadata still has a matching hardware leaf
+    // before mutating COW ownership.
+    fn leaf_paddr(&self, va: usize) -> Result<usize, &'static str> {
+        leaf_paddr(self.root_paddr()?, va)
     }
 
     // AGENT: keep callers simple when a not-yet-mapped address space has no root.
@@ -331,8 +346,8 @@ impl AddrSpace {
         Ok(child)
     }
 
-    // AGENT: COW fault resolution updates resident metadata first, then mirrors
-    // the changed leaf into the owned Sv39 page table.
+    // AGENT: COW fault resolution preflights the Sv39 leaf before mutating
+    // resident metadata, then mirrors the changed leaf into the hardware table.
     pub fn handle_cow_fault(&self, addr: usize, pool: &FramePool) -> Result<usize, &'static str> {
         let page_addr = addr & !(PAGE_SZ - 1);
         let region = self.vm_map.find(addr).ok_or("segfault")?;
@@ -347,6 +362,10 @@ impl AddrSpace {
         }
         if !pte.cow {
             return Err("segfault");
+        }
+        let old_paddr = pte.frame.paddr();
+        if self.sv39.leaf_paddr(page_addr)? != old_paddr {
+            return Err("efault");
         }
 
         let paddr = pte.resolve_write(flags, pool)?;
@@ -390,83 +409,6 @@ impl AddrSpace {
             copied += chunk;
         }
         Ok(())
-    }
-
-    // AGENT: report the contiguous readable prefix of a user buffer so syscalls
-    // can return short I/O instead of faulting after partial progress.
-    pub fn readable_user_prefix_len(&self, addr: usize, len: usize) -> Result<usize, &'static str> {
-        self.accessible_user_prefix_len(addr, len, VM_READ)
-    }
-
-    // AGENT: report the contiguous writable prefix of a user buffer; COW pages
-    // count as writable because write_user_bytes can resolve them later.
-    pub fn writable_user_prefix_len(&self, addr: usize, len: usize) -> Result<usize, &'static str> {
-        self.accessible_user_prefix_len(addr, len, VM_WRITE)
-    }
-
-    // AGENT: shared prefix scanner for syscall copy-in/copy-out validation.
-    fn accessible_user_prefix_len(
-        &self,
-        addr: usize,
-        len: usize,
-        required: u32,
-    ) -> Result<usize, &'static str> {
-        if len == 0 {
-            return Ok(0);
-        }
-        let end = Self::checked_user_end(addr, len)?;
-        let mut checked = 0usize;
-        while checked < len {
-            let cur = addr + checked;
-            let Some(region) = self.vm_map.find(cur) else {
-                return if checked == 0 {
-                    Err("efault")
-                } else {
-                    Ok(checked)
-                };
-            };
-            if region.flags & required == 0 {
-                return if checked == 0 {
-                    Err("efault")
-                } else {
-                    Ok(checked)
-                };
-            }
-            let page_addr = cur & !(PAGE_SZ - 1);
-            let page_off = cur & (PAGE_SZ - 1);
-            let chunk = min(end - cur, min(PAGE_SZ - page_off, region.end() - cur));
-            let access = {
-                let entries = self.resident_pages.entries.lock().unwrap();
-                match entries.get(&page_addr) {
-                    Some(pte) => {
-                        if required & VM_WRITE != 0 {
-                            if pte.is_writable() {
-                                Some(PageAccess::Write)
-                            } else if pte.cow {
-                                Some(PageAccess::Read)
-                            } else {
-                                None
-                            }
-                        } else {
-                            Some(PageAccess::Read)
-                        }
-                    }
-                    _ => None,
-                }
-            };
-            let translated = access
-                .map(|access| self.sv39.translate(cur, access).is_ok())
-                .unwrap_or(false);
-            if !translated {
-                return if checked == 0 {
-                    Err("efault")
-                } else {
-                    Ok(checked)
-                };
-            }
-            checked += chunk;
-        }
-        Ok(checked)
     }
 
     // AGENT: read scalar user data through the unified byte-copy path.

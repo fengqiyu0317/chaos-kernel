@@ -174,6 +174,19 @@ pub fn update_leaf(
     Ok(())
 }
 
+// AGENT: expose leaf lookup without permissions checks so higher-level MM code
+// can validate metadata/table coherence before changing resident page state.
+pub fn leaf_paddr(root_paddr: usize, va: usize) -> Result<usize, &'static str> {
+    if root_paddr == 0 || va % PAGE_SZ != 0 {
+        return Err("einval");
+    }
+    let (_, _, pte) = walk_existing(root_paddr, va)?;
+    if !pte_is_valid(pte) || !pte_is_leaf(pte) {
+        return Err("efault");
+    }
+    Ok(pte_paddr(pte))
+}
+
 pub fn unmap(root_paddr: usize, va: usize) -> Result<usize, &'static str> {
     if root_paddr == 0 || va % PAGE_SZ != 0 {
         return Err("einval");
