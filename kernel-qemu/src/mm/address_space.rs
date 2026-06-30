@@ -140,10 +140,12 @@ impl Sv39PageTable {
     }
 
     // AGENT: remove a hardware leaf if this address space has already allocated
-    // a real Sv39 root.
-    fn unmap_leaf_if_present(&self, va: usize) {
-        if self.root_paddr != 0 {
-            let _ = unmap(self.root_paddr, va);
+    // a real Sv39 root and report page-table inconsistencies to the caller.
+    fn unmap_leaf_if_present(&self, va: usize) -> Result<(), &'static str> {
+        if self.root_paddr == 0 {
+            Ok(())
+        } else {
+            unmap(self.root_paddr, va).map(|_| ())
         }
     }
 
@@ -420,17 +422,29 @@ impl AddrSpace {
         len: usize,
         _pool: &FramePool,
     ) -> Result<usize, &'static str> {
+        if len == 0 || start % PAGE_SZ != 0 || len % PAGE_SZ != 0 {
+            return Err("einval");
+        }
         let end = start.checked_add(len).ok_or("efault")?;
+        if end > KERN_BASE {
+            return Err("efault");
+        }
         let mut entries = self.resident_pages.entries.lock().unwrap();
-        let pages_to_unmap: Vec<usize> = entries
-            .keys()
-            .filter(|&&addr| addr >= start && addr < end)
-            .copied()
+        let pages_to_unmap: Vec<(usize, usize)> = entries
+            .iter()
+            .filter_map(|(&addr, pte)| {
+                (addr >= start && addr < end).then(|| (addr, pte.frame.paddr()))
+            })
             .collect();
+        for &(addr, paddr) in &pages_to_unmap {
+            if self.sv39.leaf_paddr(addr)? != paddr {
+                return Err("efault");
+            }
+        }
         self.vm_map.remove_range(start, len);
-        for addr in &pages_to_unmap {
-            self.sv39.unmap_leaf_if_present(*addr);
-            let _dropped = entries.remove(addr);
+        for &(addr, _) in &pages_to_unmap {
+            self.sv39.unmap_leaf_if_present(addr)?;
+            let _dropped = entries.remove(&addr);
         }
         crate::csr::sfence_vma();
         Ok(pages_to_unmap.len())
@@ -452,32 +466,77 @@ impl AddrSpace {
         released
     }
 
-    // AGENT: reject overflowed protection ranges before comparing mapped regions.
+    // AGENT: split VmMap metadata only when a protection boundary falls inside a
+    // mapped region; resident pages and Sv39 leaves stay page-granular.
+    fn split_protection_boundary(&mut self, addr: usize) -> Result<(), &'static str> {
+        let Some(idx) = self
+            .vm_map
+            .regions
+            .iter()
+            .position(|region| region.contains(addr))
+        else {
+            return Ok(());
+        };
+        if self.vm_map.regions[idx].base == addr {
+            return Ok(());
+        }
+        let (left, right) = self.vm_map.regions[idx].split_at(addr).ok_or("einval")?;
+        self.vm_map.regions[idx] = left;
+        self.vm_map.regions.insert(idx + 1, right);
+        Ok(())
+    }
+
+    // AGENT: apply page-aligned protection changes to VmMap metadata and mirror
+    // them into already-resident Sv39 leaves.
     pub fn protect(
         &mut self,
         start: usize,
         len: usize,
         new_flags: u32,
     ) -> Result<(), &'static str> {
+        if len == 0 || start % PAGE_SZ != 0 || len % PAGE_SZ != 0 {
+            return Err("einval");
+        }
         let end = start.checked_add(len).ok_or("efault")?;
         if end > KERN_BASE {
             return Err("efault");
         }
-        let mut affected = Vec::new();
-        for (i, r) in self.vm_map.regions.iter().enumerate() {
-            if r.base < end && r.end() > start {
-                affected.push(i);
+
+        let mut covered = start;
+        while covered < end {
+            let region = self.vm_map.find(covered).ok_or("efault")?;
+            let region_end = min(region.end(), end);
+            if region_end <= covered {
+                return Err("efault");
+            }
+            covered = region_end;
+        }
+
+        {
+            let entries = self.resident_pages.entries.lock().unwrap();
+            for (&addr, pte) in entries.iter() {
+                if addr >= start && addr < end && self.sv39.leaf_paddr(addr)? != pte.frame.paddr() {
+                    return Err("efault");
+                }
             }
         }
-        for &idx in affected.iter().rev() {
-            if idx < self.vm_map.regions.len() {
-                self.vm_map.regions[idx].flags = new_flags;
+
+        self.split_protection_boundary(end)?;
+        self.split_protection_boundary(start)?;
+
+        let prot_mask = VM_READ | VM_WRITE | VM_EXEC;
+        let requested_prot = new_flags & prot_mask;
+        for region in self.vm_map.regions.iter_mut() {
+            if region.base >= start && region.end() <= end {
+                region.flags = (region.flags & !prot_mask) | requested_prot;
             }
         }
+
         let mut entries = self.resident_pages.entries.lock().unwrap();
         for (addr, pte) in entries.iter_mut() {
             if *addr >= start && *addr < end {
-                pte.set_flags(new_flags);
+                let flags = self.vm_map.find(*addr).ok_or("efault")?.flags;
+                pte.set_flags(flags);
                 self.sv39
                     .update_leaf_if_present(*addr, pte.frame.paddr(), pte.pte_flags)?;
             }
@@ -553,7 +612,7 @@ impl AddrSpace {
                 .map_leaf(page_addr, frame.paddr(), pte_flags, pool)
             {
                 for (mapped_addr, _) in mapped.iter() {
-                    self.sv39.unmap_leaf_if_present(*mapped_addr);
+                    let _ = self.sv39.unmap_leaf_if_present(*mapped_addr);
                 }
                 self.vm_map.remove_range(region_base, region_len);
                 return Err(err);
