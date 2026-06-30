@@ -868,9 +868,10 @@ impl CountingEvent {
     }
 }
 
+// AGENT: keep only semaphore state that is currently wired; last-operator PID
+// can return with semop/semctl semantics if those syscalls are implemented.
 struct SemaInner {
     cnt: isize,
-    pid: usize,
     rm: bool,
     bus: EvBus,
 }
@@ -884,23 +885,34 @@ pub struct SemaGuard<'a> {
 }
 
 impl Sema {
+    // AGENT: initialize active semaphore state only; last-operator PID is not
+    // modeled until System V semaphore syscall semantics are wired.
     pub fn new(c: isize) -> Self {
         Sema {
             inner: Arc::new(Mutex::new(SemaInner {
                 cnt: c,
                 rm: false,
-                pid: 0,
                 bus: EvBus::default(),
             })),
         }
     }
+    // AGENT: mark the simplified semaphore removed and make removed state win
+    // over any stale acquire-ready bit.
     pub fn remove(&self) {
         let mut i = self.inner.lock().unwrap();
+        if i.rm {
+            return;
+        }
         i.rm = true;
-        i.bus.set(EvFlag::SEM_RM);
+        i.bus.change(EvFlag::SEM_ACQ, EvFlag::SEM_RM);
     }
+    // AGENT: release is a no-op after remove(); Drop callers cannot propagate a
+    // Result, and removed semaphores must not become acquire-ready again.
     pub fn release(&self) {
         let mut i = self.inner.lock().unwrap();
+        if i.rm {
+            return;
+        }
         i.cnt += 1;
         if i.cnt >= 1 {
             i.bus.set(EvFlag::SEM_ACQ);
@@ -939,17 +951,18 @@ impl Sema {
     pub fn get_ncnt(&self) -> usize {
         self.inner.lock().unwrap().bus.cb_len()
     }
-    pub fn get_pid(&self) -> usize {
-        self.inner.lock().unwrap().pid
-    }
-    pub fn set_pid(&self, p: usize) {
-        self.inner.lock().unwrap().pid = p;
-    }
+    // AGENT: keep SEM_ACQ synchronized with the current simplified count value
+    // and avoid reviving semaphores after remove().
     pub fn set_val(&self, v: isize) {
         let mut i = self.inner.lock().unwrap();
+        if i.rm {
+            return;
+        }
         i.cnt = v;
         if i.cnt >= 1 {
             i.bus.set(EvFlag::SEM_ACQ);
+        } else {
+            i.bus.clear(EvFlag::SEM_ACQ);
         }
     }
 }
@@ -1003,44 +1016,65 @@ impl FutexBucket {
             waiters: Mutex::new(VecDeque::new()),
         }
     }
-    // AGENT: added assert to enforce addr == val address
-    pub fn wait(
+    // AGENT: read the futex word while holding the wait-queue lock so a wake
+    // cannot slip between the value check and waiter publication.
+    pub fn wait<R>(
         &self,
         addr: usize,
         expected: u32,
-        val: &AtomicU32,
         timeout: Option<Duration>,
-    ) -> Result<(), &'static str> {
-        self.wait_inner(addr, expected, val, timeout, FutexWaitClock::TokenDefault)
+        read_word: R,
+    ) -> Result<(), &'static str>
+    where
+        R: FnOnce() -> Result<u32, &'static str>,
+    {
+        self.wait_inner(
+            addr,
+            expected,
+            timeout,
+            FutexWaitClock::TokenDefault,
+            read_word,
+        )
     }
 
     // AGENT: futex syscall timeouts use the kernel timer wheel so timeout wakeup
     // follows the same logical clock as scheduler ticks.
-    pub fn wait_with_timer(
+    pub fn wait_with_timer<R>(
         &self,
         addr: usize,
         expected: u32,
-        val: &AtomicU32,
         timeout: Option<Duration>,
-    ) -> Result<(), &'static str> {
-        self.wait_inner(addr, expected, val, timeout, FutexWaitClock::KernelTimer)
+        read_word: R,
+    ) -> Result<(), &'static str>
+    where
+        R: FnOnce() -> Result<u32, &'static str>,
+    {
+        self.wait_inner(
+            addr,
+            expected,
+            timeout,
+            FutexWaitClock::KernelTimer,
+            read_word,
+        )
     }
 
     // AGENT: compare and enqueue under one queue lock so a wake cannot slip
     // between seeing the expected value and publishing this waiter.
-    fn wait_inner(
+    fn wait_inner<R>(
         &self,
         addr: usize,
         expected: u32,
-        val: &AtomicU32,
         timeout: Option<Duration>,
         clock: FutexWaitClock,
-    ) -> Result<(), &'static str> {
-        assert_eq!(val.as_ptr() as usize, addr, "addr must match val address");
+        read_word: R,
+    ) -> Result<(), &'static str>
+    where
+        R: FnOnce() -> Result<u32, &'static str>,
+    {
         let token = WaitToken::current();
         {
             let mut w = self.waiters.lock().unwrap();
-            if val.load(Ordering::SeqCst) != expected {
+            if read_word()? != expected {
                 return Err("changed");
             }
             w.push_back(FutexWaiter {
@@ -1101,18 +1135,22 @@ impl FutexBucket {
         let mut w = self.waiters.lock().unwrap();
         Self::requeue_locked(&mut w, src, dst, wake_n, move_n).woken
     }
-    pub fn cmp_requeue(
+    // AGENT: compare the source futex word through a caller-supplied reader
+    // while holding the futex queue lock, matching wait_inner's ordering.
+    pub fn cmp_requeue<R>(
         &self,
         src: usize,
         dst: usize,
         wake_n: usize,
         move_n: usize,
-        val: &AtomicU32,
         expected: u32,
-    ) -> Result<usize, &'static str> {
-        assert_eq!(val.as_ptr() as usize, src, "addr must match val address");
+        read_word: R,
+    ) -> Result<usize, &'static str>
+    where
+        R: FnOnce() -> Result<u32, &'static str>,
+    {
         let mut w = self.waiters.lock().unwrap();
-        if val.load(Ordering::SeqCst) != expected {
+        if read_word()? != expected {
             return Err("changed");
         }
         Ok(Self::requeue_locked(&mut w, src, dst, wake_n, move_n).affected())

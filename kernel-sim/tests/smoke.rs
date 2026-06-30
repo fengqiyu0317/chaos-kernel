@@ -3,13 +3,13 @@ use kernel_sim::{
     check_access, compute_inet_checksum, parse_ipv4_header, set_current_task_id, wait_ev,
     AddrSpace, BlockCache, Channel, EpData, EpEvent, EvBus, EvFlag, ExitReason, FHandle, FLike,
     FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking, PageTableEntry, PgFrame,
-    SchedulePolicy, Spin, SpinLock, SyncQueue, Task, TaskRunState, TaskTable, TimerEntry, VmMap,
-    VmRegion, WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE,
-    MAP_SHARED, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE,
-    SIGUSR1, SYS_BRK, SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT,
-    SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ,
-    SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ,
-    VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    SchedulePolicy, Sema, Spin, SpinLock, SyncQueue, Task, TaskRunState, TaskTable, TimerEntry,
+    VmMap, VmRegion, WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS,
+    MAP_PRIVATE, MAP_SHARED, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ,
+    PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT,
+    SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN,
+    SYS_READ, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF,
+    USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
@@ -347,6 +347,29 @@ fn ev_bus_wait_ev_wakes_on_matching_event() {
 
     assert_eq!(ev & EvFlag::READABLE, EvFlag::READABLE);
     waiter.join().unwrap();
+}
+
+// AGENT: simplified semaphore state should not advertise acquire readiness when
+// the count is zero or after remove() has made the object invalid.
+#[test]
+fn semaphore_remove_and_set_val_keep_acquire_state_consistent() {
+    let sem = Sema::new(0);
+    assert_eq!(sem.try_acquire(), Ok(false));
+
+    sem.set_val(1);
+    assert_eq!(sem.try_acquire(), Ok(true));
+    assert_eq!(sem.try_acquire(), Ok(false));
+
+    sem.set_val(1);
+    sem.set_val(0);
+    assert_eq!(sem.try_acquire(), Ok(false));
+
+    sem.set_val(1);
+    sem.remove();
+    assert_eq!(sem.try_acquire(), Err("removed"));
+    sem.release();
+    assert_eq!(sem.get_val(), 1);
+    assert_eq!(sem.try_acquire(), Err("removed"));
 }
 
 // AGENT: write a valid IPv4 header checksum for synthetic parser smoke tests.

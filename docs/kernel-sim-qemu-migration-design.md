@@ -1,6 +1,6 @@
 # kernel-sim 到 QEMU 裸机内核的迁移设计
 
-更新时间：2026-06-29
+更新时间：2026-06-30
 
 ## 目标
 
@@ -309,6 +309,41 @@ RISC-V trap frame
 - 设备文件和 TTY。
 - 更完整的权限和 credential 检查。
 
+### 7. CRIU-like checkpoint / restore 长期层
+
+该能力定义为 guest 内核中的进程级 checkpoint / restore，而不是 QEMU `savevm` / `loadvm` 这类整机虚拟机快照。它应保存和恢复迁移后的 `kernel-sim` task/process 语义，QEMU 侧只负责提供真实 frame、Sv39 页表、trap frame、usercopy 和设备后端承载。
+
+该层不应早于 M9 核心迁移推进。前置条件包括：
+
+- 用户地址空间已经由真实物理页和 Sv39 页表承载。
+- QEMU 侧已经能启动用户 init，并能通过 trap frame / `sret` 返回用户态。
+- `Task` / `ProcessState`、run queue、当前 task、`exit` / `wait4` 基础路径已经迁入。
+- fd table、open-file-description、基础 `read` / `write` 后端和用户缓冲区复制已经稳定。
+- timer / wait 后端已经能由真实 timer interrupt 推进，阻塞与超时边界可观察。
+
+第一版建议限制为单进程、单线程、syscall 安全点或显式 quiescent point checkpoint，不尝试序列化任意内核栈或持锁临界区。保存内容包括：
+
+- 用户 trap frame、通用寄存器、`sepc`、用户 `sp` 和必要 CSR 返回状态。
+- VMA 列表、权限、匿名页内容、brk、用户栈和必要 mapping metadata。
+- 基础 fd entry、`FD_CLOEXEC`、open-file-description offset / flags，以及可序列化的内存文件或字符设备状态。
+- 必要的 timer deadline 或 alarm 状态；无法稳定恢复的等待状态先拒绝 checkpoint。
+
+明确后置的范围：
+
+- 多线程进程、线程组 leader / 非 leader wait 语义。
+- pid namespace、原 pid 复用、父子关系完整重建。
+- futex / epoll / pipe 等阻塞中的等待现场恢复。
+- socket、TTY、virtio-blk 文件系统、namespace、cgroup、seccomp、ptrace、credential / capability 完整状态。
+- 跨内核版本或跨 image 格式版本的兼容恢复。
+
+实现顺序仍应遵守 source-first：
+
+1. 先在 `kernel-sim` 定义 checkpoint / restore 的可观察语义和 smoke 回归。
+2. 抽取 image header、section tag、错误码、对齐 helper 等纯数据结构到 `kernel-common/` 或迁移模块，保持 `no_std` / `alloc` 可用。
+3. 在 `kernel-qemu` 中新增 checkpoint 模块时，从已迁入的 `Task`、`ProcessState`、`AddrSpace`、fd table 和 timer state 读取状态，不绕过这些语义源另写平行状态。
+4. restore 先允许创建新 pid 和新地址空间，重放用户页、VMA、trap frame 和基础 fd 状态后放回 run queue。
+5. 验收同时保留 `kernel-sim` smoke 和 QEMU smoke：QEMU 侧至少覆盖 init 触发 checkpoint、修改用户内存或 fd offset 后 restore、恢复态继续执行并输出预期日志。
+
 ## 阶段计划
 
 ### Milestone 0：建立迁移清单和语义基线
@@ -430,6 +465,24 @@ cargo test
 - host 语义回归和 QEMU smoke 可以分别运行。
 - 两条路径失败时能判断是模拟器语义问题还是裸机 runtime 问题。
 - 新增 QEMU 行为时，必须先说明对应的 `kernel-sim` 语义是否已经存在；不存在时进入 TODO，而不是顺手设计一套新语义。
+
+### Milestone 7：进程级 checkpoint / restore
+
+该里程碑属于 M9 核心迁移之后的长期目标，不作为第一阶段 QEMU 裸机迁移成功标准。
+
+产物：
+
+- `kernel-sim` 中的 checkpoint / restore 语义入口和 smoke 回归。
+- 可审查的 checkpoint image 格式：header、section、版本号、地址空间段、寄存器段、fd 段和 timer 段。
+- `kernel-qemu` 中从迁移后的 `Task` / `ProcessState` / `AddrSpace` / fd table 导出 image 的路径。
+- `kernel-qemu` 中 restore 到新 task / 新地址空间 / 新 run queue entry 的路径。
+- 明确拒绝不支持状态的错误返回，例如多线程、正在阻塞的 futex / epoll、不可序列化设备 fd。
+
+成功标准：
+
+- `kernel-sim` smoke 能证明 checkpoint 后修改用户内存、brk 或 fd offset，再 restore 可回到 checkpoint 时状态。
+- QEMU smoke 能证明 init 触发 checkpoint，随后改变用户态可观察状态，再 restore 并继续从恢复后的 PC/SP 执行。
+- 所有 QEMU 新行为都能映射回 `kernel-sim` 中的 checkpoint / restore 语义源，而不是依赖 QEMU 整机快照。
 
 ## 共享代码策略
 

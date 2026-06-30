@@ -1,6 +1,8 @@
 // AGENT
 use super::*;
 
+// AGENT: futex syscall now reads futex words and timeout structures through the
+// current task address space instead of directly dereferencing user pointers.
 pub(super) fn sys_futex(
     kernel: &Kernel,
     a0: usize,
@@ -29,15 +31,16 @@ pub(super) fn sys_futex(
             if timeout_addr != 0 && !check_access(timeout_addr, 16) {
                 return Err("efault");
             }
+            let current = kernel.cur_task(0).ok_or("esrch")?;
             let timeout = if timeout_addr == 0 {
                 None
             } else {
-                Some(read_futex_timeout(timeout_addr)?)
+                Some(read_futex_timeout(&current, timeout_addr)?)
             };
-            let current = kernel.cur_task(0).ok_or("esrch")?;
             let futex = current.get_futex();
-            let word = unsafe { &*(uaddr as *const AtomicU32) };
-            match futex.wait_with_timer(uaddr, val as u32, word, timeout) {
+            match futex.wait_with_timer(uaddr, val as u32, timeout, || {
+                read_user_u32(&current, uaddr)
+            }) {
                 Ok(()) => Ok(0),
                 Err("changed") => Err("eagain"),
                 Err(e) => Err(e),
@@ -77,7 +80,7 @@ pub(super) fn sys_futex(
                 val,
                 uaddr2,
                 val2,
-                || futex_wake_op_apply(uaddr2, val3),
+                || futex_wake_op_apply(kernel, &current, uaddr2, val3),
                 |old| futex_wake_op_cmp(old, val3),
             )
         }
@@ -90,8 +93,9 @@ pub(super) fn sys_futex(
             }
             let current = kernel.cur_task(0).ok_or("esrch")?;
             let futex = current.get_futex();
-            let word = unsafe { &*(uaddr as *const AtomicU32) };
-            match futex.cmp_requeue(uaddr, uaddr2, val, timeout_addr, word, val3 as u32) {
+            match futex.cmp_requeue(uaddr, uaddr2, val, timeout_addr, val3 as u32, || {
+                read_user_u32(&current, uaddr)
+            }) {
                 Ok(n) => Ok(n),
                 Err("changed") => Err("eagain"),
                 Err(e) => Err(e),
@@ -101,10 +105,42 @@ pub(super) fn sys_futex(
     }
 }
 
-fn read_futex_timeout(timeout_addr: usize) -> Result<Duration, &'static str> {
-    let tv_sec = unsafe { ptr::read_unaligned(timeout_addr as *const usize) };
-    let tv_nsec =
-        unsafe { ptr::read_unaligned((timeout_addr + mem::size_of::<usize>()) as *const usize) };
+// AGENT: futex words are user memory; route reads through the current
+// address-space copy-in path instead of directly dereferencing user pointers.
+fn read_user_u32(task: &Task, addr: usize) -> Result<u32, &'static str> {
+    let mut bytes = [0u8; mem::size_of::<u32>()];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(addr, &mut bytes)?;
+    Ok(u32::from_ne_bytes(bytes))
+}
+
+// AGENT: FUTEX_WAKE_OP mutates a user futex word through copy-out so invalid
+// userspace pointers return syscall errors instead of trapping in the kernel.
+fn write_user_u32(
+    kernel: &Kernel,
+    task: &Task,
+    addr: usize,
+    value: u32,
+) -> Result<(), &'static str> {
+    task.process.addr_space.lock().unwrap().write_user_bytes(
+        addr,
+        &value.to_ne_bytes(),
+        &kernel.pool,
+    )
+}
+
+// AGENT: copy the userspace timespec fields through AddrSpace so unmapped
+// timeout pointers return efault.
+fn read_futex_timeout(task: &Task, timeout_addr: usize) -> Result<Duration, &'static str> {
+    let tv_nsec_addr = timeout_addr
+        .checked_add(mem::size_of::<usize>())
+        .ok_or("efault")?;
+    let addr_space = task.process.addr_space.lock().unwrap();
+    let tv_sec = addr_space.read_user_usize(timeout_addr)?;
+    let tv_nsec = addr_space.read_user_usize(tv_nsec_addr)?;
     if tv_nsec >= 1_000_000_000 {
         return Err("einval");
     }
@@ -113,7 +149,14 @@ fn read_futex_timeout(timeout_addr: usize) -> Result<Duration, &'static str> {
     Ok(Duration::new(secs, nanos))
 }
 
-fn futex_wake_op_apply(uaddr2: usize, encoded: usize) -> Result<u32, &'static str> {
+// AGENT: apply FUTEX_WAKE_OP with explicit copy-in/copy-out instead of an
+// AtomicU32 reference forged from a user virtual address.
+fn futex_wake_op_apply(
+    kernel: &Kernel,
+    task: &Task,
+    uaddr2: usize,
+    encoded: usize,
+) -> Result<u32, &'static str> {
     const FUTEX_OP_SET: usize = 0;
     const FUTEX_OP_ADD: usize = 1;
     const FUTEX_OP_OR: usize = 2;
@@ -130,19 +173,17 @@ fn futex_wake_op_apply(uaddr2: usize, encoded: usize) -> Result<u32, &'static st
         }
         oparg = 1i32 << oparg;
     }
-    let word = unsafe { &*(uaddr2 as *const AtomicU32) };
-    word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
-        let new = match op_kind {
-            FUTEX_OP_SET => oparg as u32,
-            FUTEX_OP_ADD => old.wrapping_add(oparg as u32),
-            FUTEX_OP_OR => old | oparg as u32,
-            FUTEX_OP_ANDN => old & !(oparg as u32),
-            FUTEX_OP_XOR => old ^ oparg as u32,
-            _ => return None,
-        };
-        Some(new)
-    })
-    .map_err(|_| "einval")
+    let old = read_user_u32(task, uaddr2)?;
+    let new = match op_kind {
+        FUTEX_OP_SET => oparg as u32,
+        FUTEX_OP_ADD => old.wrapping_add(oparg as u32),
+        FUTEX_OP_OR => old | oparg as u32,
+        FUTEX_OP_ANDN => old & !(oparg as u32),
+        FUTEX_OP_XOR => old ^ oparg as u32,
+        _ => return Err("einval"),
+    };
+    write_user_u32(kernel, task, uaddr2, new)?;
+    Ok(old)
 }
 
 fn futex_wake_op_cmp(old: u32, encoded: usize) -> Result<bool, &'static str> {

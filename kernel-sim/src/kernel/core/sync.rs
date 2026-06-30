@@ -885,9 +885,10 @@ impl SyncQueue {
     }
 }
 
+// AGENT: keep only semaphore state that is currently wired; last-operator PID
+// can return with semop/semctl semantics if those syscalls are implemented.
 struct SemaInner {
     cnt: isize,
-    pid: usize,
     rm: bool,
     bus: EvBus,
 }
@@ -901,23 +902,34 @@ pub struct SemaGuard<'a> {
 }
 
 impl Sema {
+    // AGENT: initialize active semaphore state only; last-operator PID is not
+    // modeled until System V semaphore syscall semantics are wired.
     pub fn new(c: isize) -> Self {
         Sema {
             inner: Arc::new(Mutex::new(SemaInner {
                 cnt: c,
                 rm: false,
-                pid: 0,
                 bus: EvBus::default(),
             })),
         }
     }
+    // AGENT: mark the simplified semaphore removed and make removed state win
+    // over any stale acquire-ready bit.
     pub fn remove(&self) {
         let mut i = self.inner.lock().unwrap();
+        if i.rm {
+            return;
+        }
         i.rm = true;
-        i.bus.set(EvFlag::SEM_RM);
+        i.bus.change(EvFlag::SEM_ACQ, EvFlag::SEM_RM);
     }
+    // AGENT: release is a no-op after remove(); Drop callers cannot propagate a
+    // Result, and removed semaphores must not become acquire-ready again.
     pub fn release(&self) {
         let mut i = self.inner.lock().unwrap();
+        if i.rm {
+            return;
+        }
         i.cnt += 1;
         if i.cnt >= 1 {
             i.bus.set(EvFlag::SEM_ACQ);
@@ -956,17 +968,18 @@ impl Sema {
     pub fn get_ncnt(&self) -> usize {
         self.inner.lock().unwrap().bus.cb_len()
     }
-    pub fn get_pid(&self) -> usize {
-        self.inner.lock().unwrap().pid
-    }
-    pub fn set_pid(&self, p: usize) {
-        self.inner.lock().unwrap().pid = p;
-    }
+    // AGENT: keep SEM_ACQ synchronized with the current simplified count value
+    // and avoid reviving semaphores after remove().
     pub fn set_val(&self, v: isize) {
         let mut i = self.inner.lock().unwrap();
+        if i.rm {
+            return;
+        }
         i.cnt = v;
         if i.cnt >= 1 {
             i.bus.set(EvFlag::SEM_ACQ);
+        } else {
+            i.bus.clear(EvFlag::SEM_ACQ);
         }
     }
 }
