@@ -24,7 +24,7 @@ impl Kernel {
             let cpus = self.cpus.lock().unwrap();
             cpus.iter()
                 .enumerate()
-                .find_map(|(i, slot)| slot.as_ref().map(|t| t.vm_token()))
+                .find_map(|(i, slot)| slot.as_ref().and_then(|t| t.vm_token().ok()))
                 .unwrap_or(0)
         };
         let result = match nr {

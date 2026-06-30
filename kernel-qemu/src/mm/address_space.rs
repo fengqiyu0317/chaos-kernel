@@ -119,57 +119,153 @@ impl PageTableEntry {
     }
 }
 
-pub struct AddrSpace {
-    pub vm_map: VmMap,
-    pub page_table_root: usize,
-    pub asid: u16,
-    pub page_table: Mutex<BTreeMap<usize, PageTableEntry>>,
+// AGENT: isolate ownership of the real Sv39 page-table root and intermediate
+// table frames from higher-level address-space metadata.
+struct Sv39PageTable {
+    root_paddr: usize,
     root_frame: Option<PgFrame>,
-    page_table_frames: Vec<PgFrame>,
-    vm_token_id: usize,
+    table_frames: Vec<PgFrame>,
 }
 
-static ADDR_SPACE_TOKEN_SEQ: AtomicUsize = AtomicUsize::new(1);
-
-impl AddrSpace {
-    pub fn new() -> Self {
-        let vm_token_id = next_vm_token();
+impl Sv39PageTable {
+    // AGENT: start without a hardware root because early ProcessState creation
+    // does not yet have access to the FramePool.
+    fn new() -> Self {
         Self {
-            vm_map: VmMap::new(),
-            page_table_root: 0,
-            asid: asid_from_token(vm_token_id),
-            page_table: Mutex::new(BTreeMap::new()),
+            root_paddr: 0,
             root_frame: None,
-            page_table_frames: Vec::new(),
-            vm_token_id,
+            table_frames: Vec::new(),
         }
     }
 
-    pub fn vm_token(&self) -> usize {
-        self.vm_token_id
+    // AGENT: expose the live root only after the first mapping allocates it.
+    fn root_paddr(&self) -> Result<usize, &'static str> {
+        if self.root_paddr == 0 {
+            Err("efault")
+        } else {
+            Ok(self.root_paddr)
+        }
     }
 
-    // AGENT: lazily allocate the real Sv39 root because ProcessState creation
-    // does not have a FramePool until the first mapping operation.
-    fn ensure_page_table_root(&mut self, pool: &FramePool) -> Result<usize, &'static str> {
-        if self.page_table_root != 0 {
-            return Ok(self.page_table_root);
+    // AGENT: lazily allocate the real Sv39 root on the first mapping operation.
+    fn ensure_root(&mut self, pool: &FramePool) -> Result<usize, &'static str> {
+        if self.root_paddr != 0 {
+            return Ok(self.root_paddr);
         }
         let frame = pool.alloc_pg_frame().ok_or("enomem")?;
         zero_page(frame.paddr());
-        self.page_table_root = frame.paddr();
+        self.root_paddr = frame.paddr();
         self.root_frame = Some(frame);
-        Ok(self.page_table_root)
+        Ok(self.root_paddr)
     }
 
-    fn root_paddr(&self) -> Result<usize, &'static str> {
-        if self.page_table_root == 0 {
-            Err("efault")
+    // AGENT: create a hardware leaf mapping while keeping intermediate table
+    // frame ownership inside Sv39PageTable.
+    fn map_leaf(
+        &mut self,
+        va: usize,
+        pa: usize,
+        flags: usize,
+        pool: &FramePool,
+    ) -> Result<(), &'static str> {
+        let root = self.ensure_root(pool)?;
+        map(root, va, pa, flags, pool, &mut self.table_frames)
+    }
+
+    // AGENT: update an existing hardware leaf through the owned Sv39 root.
+    fn update_leaf(&self, va: usize, pa: usize, flags: usize) -> Result<(), &'static str> {
+        update_leaf(self.root_paddr()?, va, pa, flags)
+    }
+
+    // AGENT: keep callers simple when a not-yet-mapped address space has no root.
+    fn update_leaf_if_present(
+        &self,
+        va: usize,
+        pa: usize,
+        flags: usize,
+    ) -> Result<(), &'static str> {
+        if self.root_paddr == 0 {
+            Ok(())
         } else {
-            Ok(self.page_table_root)
+            update_leaf(self.root_paddr, va, pa, flags)
         }
     }
 
+    // AGENT: remove a hardware leaf if this address space has already allocated
+    // a real Sv39 root.
+    fn unmap_leaf_if_present(&self, va: usize) {
+        if self.root_paddr != 0 {
+            let _ = unmap(self.root_paddr, va);
+        }
+    }
+
+    // AGENT: route user memory translation through the owned Sv39 tree.
+    fn translate(&self, va: usize, access: PageAccess) -> Result<usize, &'static str> {
+        translate(self.root_paddr()?, va, access)
+    }
+
+    // AGENT: drop all hardware page-table frames during exec or process teardown.
+    fn clear(&mut self) {
+        self.table_frames.clear();
+        self.root_frame = None;
+        self.root_paddr = 0;
+    }
+}
+
+// AGENT: store software resident-page metadata separately from the real Sv39
+// page table so the BTreeMap is not mistaken for hardware page-table storage.
+struct ResidentPageTable {
+    entries: Mutex<BTreeMap<usize, PageTableEntry>>,
+}
+
+impl ResidentPageTable {
+    // AGENT: initialize the software resident-page table independently of VmMap
+    // and Sv39 root allocation.
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    // AGENT: atomically detach all resident metadata before dropping pages.
+    fn take_all(&self) -> BTreeMap<usize, PageTableEntry> {
+        let mut entries = self.entries.lock().unwrap();
+        mem::take(&mut *entries)
+    }
+
+    // AGENT: report resident page count without exposing the backing BTreeMap as
+    // the address space's hardware page table.
+    fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+}
+
+// AGENT: coordinate VmMap, resident page metadata, and the owned Sv39 page table
+// without storing page-table implementation fields directly on AddrSpace.
+pub struct AddrSpace {
+    pub vm_map: VmMap,
+    resident_pages: ResidentPageTable,
+    sv39: Sv39PageTable,
+}
+
+impl AddrSpace {
+    // AGENT: construct an address space with VM metadata but no allocated Sv39 root.
+    pub fn new() -> Self {
+        Self {
+            vm_map: VmMap::new(),
+            resident_pages: ResidentPageTable::new(),
+            sv39: Sv39PageTable::new(),
+        }
+    }
+
+    // AGENT: derive the switch token from the live Sv39 root instead of storing
+    // a simulator-only vm_token_id.
+    pub fn vm_token(&self) -> Result<usize, &'static str> {
+        self.sv39.root_paddr().map(crate::csr::make_satp_sv39)
+    }
+
+    // AGENT: fork copies VmMap separately from resident-page metadata and then
+    // mirrors each resident leaf into the child's owned Sv39 page table.
     pub fn fork_from(parent: &AddrSpace, pool: &FramePool) -> Result<Self, &'static str> {
         let mut child = Self::new();
         child.vm_map.brk = parent.vm_map.brk;
@@ -195,10 +291,9 @@ impl AddrSpace {
             .filter(|region| region.flags & VM_DONTCOPY == 0)
             .map(|region| (region.base, region.end(), region.flags))
             .collect();
-        let parent_root = parent.page_table_root;
-        let mut parent_pt = parent.page_table.lock().unwrap();
+        let mut parent_entries = parent.resident_pages.entries.lock().unwrap();
         let mut child_entries = Vec::new();
-        for (&page_addr, parent_entry) in parent_pt.iter_mut() {
+        for (&page_addr, parent_entry) in parent_entries.iter_mut() {
             let Some((_, _, flags)) = copyable_regions
                 .iter()
                 .find(|(base, end, _)| page_addr >= *base && page_addr < *end)
@@ -207,50 +302,42 @@ impl AddrSpace {
             };
             if flags & VM_WRITE != 0 && flags & VM_SHARED == 0 {
                 parent_entry.as_cow();
-                if parent_root != 0 {
-                    update_leaf(
-                        parent_root,
-                        page_addr,
-                        parent_entry.frame.paddr(),
-                        parent_entry.pte_flags,
-                    )?;
-                }
+                parent.sv39.update_leaf_if_present(
+                    page_addr,
+                    parent_entry.frame.paddr(),
+                    parent_entry.pte_flags,
+                )?;
             }
             child_entries.push((page_addr, parent_entry.clone_mapping()));
         }
-        drop(parent_pt);
+        drop(parent_entries);
 
         if !child_entries.is_empty() {
-            let child_root = child.ensure_page_table_root(pool)?;
             for (page_addr, entry) in child_entries.iter() {
-                map(
-                    child_root,
-                    *page_addr,
-                    entry.frame.paddr(),
-                    entry.pte_flags,
-                    pool,
-                    &mut child.page_table_frames,
-                )?;
+                child
+                    .sv39
+                    .map_leaf(*page_addr, entry.frame.paddr(), entry.pte_flags, pool)?;
             }
-            let mut child_pt = child.page_table.lock().unwrap();
+            let mut child_resident = child.resident_pages.entries.lock().unwrap();
             for (page_addr, entry) in child_entries {
-                child_pt.insert(page_addr, entry);
+                child_resident.insert(page_addr, entry);
             }
         }
         crate::csr::sfence_vma();
         Ok(child)
     }
 
+    // AGENT: COW fault resolution updates resident metadata first, then mirrors
+    // the changed leaf into the owned Sv39 page table.
     pub fn handle_cow_fault(&self, addr: usize, pool: &FramePool) -> Result<usize, &'static str> {
-        let root = self.root_paddr()?;
         let page_addr = addr & !(PAGE_SZ - 1);
         let region = self.vm_map.find(addr).ok_or("segfault")?;
         let flags = region.flags;
         if flags & VM_WRITE == 0 {
             return Err("segfault");
         }
-        let mut pt = self.page_table.lock().unwrap();
-        let pte = pt.get_mut(&page_addr).ok_or("segfault")?;
+        let mut entries = self.resident_pages.entries.lock().unwrap();
+        let pte = entries.get_mut(&page_addr).ok_or("segfault")?;
         if pte.is_writable() && !pte.cow {
             return Ok(pte.frame.paddr());
         }
@@ -259,11 +346,12 @@ impl AddrSpace {
         }
 
         let paddr = pte.resolve_write(flags, pool)?;
-        update_leaf(root, page_addr, paddr, pte.pte_flags)?;
+        self.sv39.update_leaf(page_addr, paddr, pte.pte_flags)?;
         crate::csr::sfence_vma();
         Ok(paddr)
     }
 
+    // AGENT: validate user copy boundaries before touching VmMap or Sv39 state.
     fn checked_user_end(addr: usize, len: usize) -> Result<usize, &'static str> {
         let end = addr.checked_add(len).ok_or("efault")?;
         if end > KERN_BASE {
@@ -272,11 +360,12 @@ impl AddrSpace {
         Ok(end)
     }
 
+    // AGENT: read through VmMap permissions, resident-page metadata, and the
+    // actual Sv39 translation layer in that order.
     pub fn read_user_bytes(&self, addr: usize, dst: &mut [u8]) -> Result<(), &'static str> {
         if dst.is_empty() {
             return Ok(());
         }
-        let root = self.root_paddr()?;
         let end = Self::checked_user_end(addr, dst.len())?;
         let mut copied = 0usize;
         while copied < dst.len() {
@@ -289,10 +378,10 @@ impl AddrSpace {
             let page_off = cur & (PAGE_SZ - 1);
             let chunk = min(end - cur, min(PAGE_SZ - page_off, region.end() - cur));
             {
-                let pt = self.page_table.lock().unwrap();
-                pt.get(&page_addr).ok_or("efault")?;
+                let entries = self.resident_pages.entries.lock().unwrap();
+                entries.get(&page_addr).ok_or("efault")?;
             }
-            let paddr = translate(root, cur, PageAccess::Read)?;
+            let paddr = self.sv39.translate(cur, PageAccess::Read)?;
             copy_from_phys(paddr, &mut dst[copied..copied + chunk]);
             copied += chunk;
         }
@@ -342,38 +431,28 @@ impl AddrSpace {
             let page_addr = cur & !(PAGE_SZ - 1);
             let page_off = cur & (PAGE_SZ - 1);
             let chunk = min(end - cur, min(PAGE_SZ - page_off, region.end() - cur));
-            let page_accessible = {
-                let pt = self.page_table.lock().unwrap();
-                match pt.get(&page_addr) {
+            let access = {
+                let entries = self.resident_pages.entries.lock().unwrap();
+                match entries.get(&page_addr) {
                     Some(pte) => {
                         if required & VM_WRITE != 0 {
-                            pte.is_writable() || pte.cow
+                            if pte.is_writable() {
+                                Some(PageAccess::Write)
+                            } else if pte.cow {
+                                Some(PageAccess::Read)
+                            } else {
+                                None
+                            }
                         } else {
-                            true
+                            Some(PageAccess::Read)
                         }
                     }
-                    _ => false,
+                    _ => None,
                 }
             };
-            let translated = if page_accessible {
-                let access = if required & VM_WRITE != 0 {
-                    if {
-                        let pt = self.page_table.lock().unwrap();
-                        pt.get(&page_addr).map(|pte| pte.cow).unwrap_or(false)
-                    } {
-                        PageAccess::Read
-                    } else {
-                        PageAccess::Write
-                    }
-                } else {
-                    PageAccess::Read
-                };
-                self.root_paddr()
-                    .and_then(|root| translate(root, cur, access))
-                    .is_ok()
-            } else {
-                false
-            };
+            let translated = access
+                .map(|access| self.sv39.translate(cur, access).is_ok())
+                .unwrap_or(false);
             if !translated {
                 return if checked == 0 {
                     Err("efault")
@@ -386,13 +465,15 @@ impl AddrSpace {
         Ok(checked)
     }
 
+    // AGENT: read scalar user data through the unified byte-copy path.
     pub fn read_user_usize(&self, addr: usize) -> Result<usize, &'static str> {
         let mut bytes = [0u8; mem::size_of::<usize>()];
         self.read_user_bytes(addr, &mut bytes)?;
         Ok(usize::from_ne_bytes(bytes))
     }
 
-    // AGENT: user writes to MAP_SHARED file pages are reflected in FileNode data.
+    // AGENT: user writes resolve COW through resident metadata, translate through
+    // Sv39, and then reflect MAP_SHARED file pages in FileNode data.
     pub fn write_user_bytes(
         &mut self,
         addr: usize,
@@ -402,7 +483,6 @@ impl AddrSpace {
         if src.is_empty() {
             return Ok(());
         }
-        let root = self.root_paddr()?;
         let end = Self::checked_user_end(addr, src.len())?;
         let mut written = 0usize;
         while written < src.len() {
@@ -415,22 +495,22 @@ impl AddrSpace {
             let page_off = cur & (PAGE_SZ - 1);
             let chunk = min(end - cur, min(PAGE_SZ - page_off, region.end() - cur));
             let need_cow = {
-                let pt = self.page_table.lock().unwrap();
-                let pte = pt.get(&page_addr).ok_or("efault")?;
+                let entries = self.resident_pages.entries.lock().unwrap();
+                let pte = entries.get(&page_addr).ok_or("efault")?;
                 !pte.is_writable() && pte.cow
             };
             if need_cow {
                 self.handle_cow_fault(cur, pool).map_err(|_| "efault")?;
             }
             let (frame_paddr, backing) = {
-                let pt = self.page_table.lock().unwrap();
-                let pte = pt.get(&page_addr).ok_or("efault")?;
+                let entries = self.resident_pages.entries.lock().unwrap();
+                let pte = entries.get(&page_addr).ok_or("efault")?;
                 if !pte.is_writable() {
                     return Err("efault");
                 }
                 (pte.frame.paddr(), pte.backing.clone())
             };
-            let paddr = translate(root, cur, PageAccess::Write)?;
+            let paddr = self.sv39.translate(cur, PageAccess::Write)?;
             copy_to_phys(paddr, &src[written..written + chunk]);
             let page = phys_page_slice(frame_paddr);
             backing.flush_range(page, page_off, chunk)?;
@@ -448,36 +528,31 @@ impl AddrSpace {
         _pool: &FramePool,
     ) -> Result<usize, &'static str> {
         let end = start.checked_add(len).ok_or("efault")?;
-        let root = self.page_table_root;
-        let mut pt = self.page_table.lock().unwrap();
-        let pages_to_unmap: Vec<usize> = pt
+        let mut entries = self.resident_pages.entries.lock().unwrap();
+        let pages_to_unmap: Vec<usize> = entries
             .keys()
             .filter(|&&addr| addr >= start && addr < end)
             .copied()
             .collect();
         for addr in &pages_to_unmap {
-            if let Some(pte) = pt.get(addr) {
+            if let Some(pte) = entries.get(addr) {
                 pte.flush_shared_file_page()?;
             }
         }
         self.vm_map.remove_range(start, len);
         for addr in &pages_to_unmap {
-            if root != 0 {
-                let _ = unmap(root, *addr);
-            }
-            let _dropped = pt.remove(addr);
+            self.sv39.unmap_leaf_if_present(*addr);
+            let _dropped = entries.remove(addr);
         }
         crate::csr::sfence_vma();
         Ok(pages_to_unmap.len())
     }
 
-    // AGENT: process teardown flushes shared file-backed pages before dropping frames.
+    // AGENT: process teardown flushes resident metadata before clearing the
+    // separately owned Sv39 page-table frames.
     pub fn release_all_pages(&mut self, _pool: &FramePool) -> usize {
         self.vm_map.regions.clear();
-        let entries = {
-            let mut pt = self.page_table.lock().unwrap();
-            mem::take(&mut *pt)
-        };
+        let entries = self.resident_pages.take_all();
         let mut released = 0;
         for pte in entries.into_values() {
             let _ = pte.flush_shared_file_page();
@@ -485,9 +560,7 @@ impl AddrSpace {
                 released += 1;
             }
         }
-        self.page_table_frames.clear();
-        self.root_frame = None;
-        self.page_table_root = 0;
+        self.sv39.clear();
         crate::csr::sfence_vma();
         released
     }
@@ -514,35 +587,35 @@ impl AddrSpace {
                 self.vm_map.regions[idx].flags = new_flags;
             }
         }
-        let mut pt = self.page_table.lock().unwrap();
-        for (addr, pte) in pt.iter_mut() {
+        let mut entries = self.resident_pages.entries.lock().unwrap();
+        for (addr, pte) in entries.iter_mut() {
             if *addr >= start && *addr < end {
                 pte.set_flags(new_flags);
-                if self.page_table_root != 0 {
-                    update_leaf(
-                        self.page_table_root,
-                        *addr,
-                        pte.frame.paddr(),
-                        pte.pte_flags,
-                    )?;
-                }
+                self.sv39
+                    .update_leaf_if_present(*addr, pte.frame.paddr(), pte.pte_flags)?;
             }
         }
         crate::csr::sfence_vma();
         Ok(())
     }
 
+    // AGENT: report software-resident pages, not Sv39 intermediate table pages.
     pub fn rss_pages(&self) -> usize {
-        self.page_table.lock().unwrap().len()
+        self.resident_pages.len()
     }
 
+    // AGENT: count COW sharing in resident page metadata rather than walking the
+    // hardware page table.
     pub fn cow_sharers(&self) -> usize {
-        let pt = self.page_table.lock().unwrap();
-        pt.values()
+        let entries = self.resident_pages.entries.lock().unwrap();
+        entries
+            .values()
             .filter(|pte| pte.cow && pte.frame.sharers() > 1)
             .count()
     }
 
+    // AGENT: split only VmMap region metadata; resident pages and Sv39 leaves are
+    // already page-granular and stay unchanged.
     pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> {
         let idx = self
             .vm_map
@@ -556,7 +629,8 @@ impl AddrSpace {
         Ok(())
     }
 
-    // AGENT: validate region endpoints before deriving page ranges or allocating frames.
+    // AGENT: validate VmMap metadata, allocate resident frames, and install Sv39
+    // leaves through the split page-table owner.
     pub fn map_region(&mut self, region: VmRegion, pool: &FramePool) -> Result<(), &'static str> {
         if region.base % PAGE_SZ != 0 || region.len % PAGE_SZ != 0 {
             return Err("einval");
@@ -584,36 +658,31 @@ impl AddrSpace {
         if let Err(err) = self.vm_map.insert(region) {
             return Err(err);
         }
-        let root = self.ensure_page_table_root(pool)?;
         let mut mapped: Vec<(usize, PgFrame)> = Vec::with_capacity(pages.len());
         for (page_addr, frame) in pages.into_iter().zip(allocated.into_iter()) {
             let pte_flags = vm_flags_to_pte_flags(flags);
-            if let Err(err) = map(
-                root,
-                page_addr,
-                frame.paddr(),
-                pte_flags,
-                pool,
-                &mut self.page_table_frames,
-            ) {
+            if let Err(err) = self
+                .sv39
+                .map_leaf(page_addr, frame.paddr(), pte_flags, pool)
+            {
                 for (mapped_addr, _) in mapped.iter() {
-                    let _ = unmap(root, *mapped_addr);
+                    self.sv39.unmap_leaf_if_present(*mapped_addr);
                 }
                 self.vm_map.remove_range(region_base, region_len);
                 return Err(err);
             }
             mapped.push((page_addr, frame));
         }
-        let mut pt = self.page_table.lock().unwrap();
+        let mut entries = self.resident_pages.entries.lock().unwrap();
         for (page_addr, frame) in mapped.into_iter() {
-            pt.insert(page_addr, PageTableEntry::new(frame, flags));
+            entries.insert(page_addr, PageTableEntry::new(frame, flags));
         }
         crate::csr::sfence_vma();
         Ok(())
     }
 
-    // AGENT: create resident file-backed mmap pages, preserving private snapshots,
-    // shared writeback metadata, and checked VM/file offsets for each page.
+    // AGENT: create resident file-backed mmap pages, preserving VmMap metadata,
+    // software backing records, and the corresponding Sv39 leaves separately.
     pub fn map_file_region(
         &mut self,
         region: VmRegion,
@@ -657,7 +726,6 @@ impl AddrSpace {
             return Err(err);
         }
 
-        let root = self.ensure_page_table_root(pool)?;
         let mut mapped: Vec<(usize, PgFrame, PageBacking)> = Vec::with_capacity(pages.len());
         for ((page_addr, frame), file_offset) in pages
             .into_iter()
@@ -682,25 +750,21 @@ impl AddrSpace {
                 );
             }
             let pte_flags = vm_flags_to_pte_flags(flags);
-            if let Err(err) = map(
-                root,
-                page_addr,
-                frame.paddr(),
-                pte_flags,
-                pool,
-                &mut self.page_table_frames,
-            ) {
+            if let Err(err) = self
+                .sv39
+                .map_leaf(page_addr, frame.paddr(), pte_flags, pool)
+            {
                 for (mapped_addr, _, _) in mapped.iter() {
-                    let _ = unmap(root, *mapped_addr);
+                    self.sv39.unmap_leaf_if_present(*mapped_addr);
                 }
                 self.vm_map.remove_range(region_base, region_len);
                 return Err(err);
             }
             mapped.push((page_addr, frame, backing));
         }
-        let mut pt = self.page_table.lock().unwrap();
+        let mut entries = self.resident_pages.entries.lock().unwrap();
         for (page_addr, frame, backing) in mapped.into_iter() {
-            pt.insert(
+            entries.insert(
                 page_addr,
                 PageTableEntry::with_backing(frame, flags, backing),
             );
@@ -709,6 +773,8 @@ impl AddrSpace {
         Ok(())
     }
 
+    // AGENT: resize heap through the public mapping helpers so VmMap, resident
+    // metadata, and Sv39 leaves stay synchronized.
     pub fn resize_brk(&mut self, new_brk: usize, pool: &FramePool) -> Result<(), &'static str> {
         let old_brk = self.vm_map.brk;
         if new_brk < old_brk {
@@ -735,21 +801,6 @@ fn page_range(base: usize, len: usize) -> impl Iterator<Item = usize> {
     (start..end).step_by(PAGE_SZ)
 }
 
-fn next_vm_token() -> usize {
-    // AGENT: keep a stable software identity for migrated task bookkeeping; the
-    // hardware root now lives in AddrSpace::page_table_root once mappings exist.
-    ADDR_SPACE_TOKEN_SEQ
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
-            token.checked_add(1)
-        })
-        .expect("address-space token exhausted")
-}
-
-fn asid_from_token(token: usize) -> u16 {
-    let max_asid = u16::MAX as usize;
-    ((token - 1) % max_asid + 1) as u16
-}
-
 // AGENT: translate migrated VM flags into Sv39 user leaf permissions.
 fn vm_flags_to_pte_flags(flags: u32) -> usize {
     let mut pte_flags = PTE_U | PTE_A;
@@ -765,6 +816,7 @@ fn vm_flags_to_pte_flags(flags: u32) -> usize {
     pte_flags
 }
 
+// AGENT: strip write/dirty bits when software COW owns the next write fault.
 fn pte_flags_without_write(flags: usize) -> usize {
     flags & !(PTE_W | PTE_D)
 }

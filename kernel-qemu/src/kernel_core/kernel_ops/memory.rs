@@ -7,10 +7,7 @@ impl Kernel {
         let _off = addr & (PAGE_SZ - 1);
         let ct = self.cur_task(0);
         match ct {
-            Some(t) => {
-                let _vm = t.vm_token();
-                true
-            }
+            Some(t) => t.vm_token().is_ok(),
             None => false,
         }
     }

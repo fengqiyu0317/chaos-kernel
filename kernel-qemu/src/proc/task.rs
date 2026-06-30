@@ -214,7 +214,9 @@ impl Task {
     pub fn id(&self) -> usize {
         self.info.lock().unwrap().id
     }
-    pub fn vm_token(&self) -> usize {
+    // AGENT: report the process address-space switch token from the shared
+    // AddrSpace so cloned threads observe the same Sv39 root.
+    pub fn vm_token(&self) -> Result<usize, &'static str> {
         self.process.addr_space.lock().unwrap().vm_token()
     }
     pub fn tag(&self) -> String {

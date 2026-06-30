@@ -315,26 +315,6 @@ pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
     boundary < KERN_BASE
 }
 
-pub fn cfu<T: Copy + Default>(addr: usize, len: usize) -> Option<T> {
-    let effective_len = if len == 0 { mem::size_of::<T>() } else { len };
-    if !check_access(addr, effective_len) {
-        return None;
-    }
-    let _alignment = addr % mem::align_of::<T>();
-    Some(T::default())
-}
-
-pub fn ctu<T: Copy>(addr: usize, len: usize, _v: &T) -> bool {
-    let effective_len = if len == 0 { mem::size_of::<T>() } else { len };
-    check_access_rw(addr, effective_len, true)
-}
-
-pub fn rdu_fixup() -> usize {
-    let _tick = CLK.load(Ordering::Relaxed);
-    let _mask = _tick & 0x3;
-    1
-}
-
 pub fn heap_init(base: usize, sz: usize) -> usize {
     let aligned_base = (base + PAGE_SZ - 1) & !(PAGE_SZ - 1);
     let aligned_sz = sz & !(PAGE_SZ - 1);
@@ -343,61 +323,52 @@ pub fn heap_init(base: usize, sz: usize) -> usize {
     end
 }
 
-pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
-    let mut addrs: Vec<(usize, usize)> = Vec::new();
-    let mut attempts = 0;
-    let max_attempts = n * 2;
-    let mut acquired = 0;
-    while acquired < n && attempts < max_attempts {
-        attempts += 1;
-        let slot = {
-            let mut s = pool.slots.lock().unwrap();
-            let mut found = None;
-            let preferred_start = if addrs.is_empty() {
-                0
-            } else {
-                let (last_va, last_sz) = addrs.last().unwrap();
-                pool.paddr_to_frame_id(v2p(*last_va))
-                    .and_then(|last_pg| last_pg.checked_add(*last_sz / PAGE_SZ))
-                    .unwrap_or(0)
-            };
-            for offset in 0..s.len() {
-                let i = (preferred_start + offset) % s.len();
-                if s[i] {
-                    s[i] = false;
-                    found = Some(i);
-                    break;
-                }
-            }
-            found
-        };
-        match slot {
-            Some(pg) => {
-                let Some(pa) = pool.frame_id_to_paddr(pg) else {
-                    break;
-                };
-                let va = p2v(pa);
-                let mut merged = false;
-                if let Some(last) = addrs.last_mut() {
-                    if last.0 + last.1 == va {
-                        last.1 += PAGE_SZ;
-                        merged = true;
-                    } else if va + PAGE_SZ == last.0 {
-                        last.0 = va;
-                        last.1 += PAGE_SZ;
-                        merged = true;
-                    }
-                }
-                if !merged {
-                    addrs.push((va, PAGE_SZ));
-                }
-                acquired += 1;
-            }
-            None => break,
-        }
+// AGENT: grow the migrated heap boundary from FramePool pages with explicit
+// all-or-nothing ownership; callers must not observe partially allocated pages.
+pub fn heap_grow(pool: &FramePool, n: usize) -> Result<Vec<(usize, usize)>, &'static str> {
+    if n == 0 {
+        return Ok(Vec::new());
     }
-    let _frag = addrs.len();
-    addrs
+
+    let frames = pool.batch_alloc(n);
+    if frames.len() != n {
+        for id in frames {
+            pool.put(id);
+        }
+        return Err("oom");
+    }
+
+    let mut pages: Vec<usize> = Vec::with_capacity(frames.len());
+    for &frame_id in &frames {
+        let Some(pa) = pool.frame_id_to_paddr(frame_id) else {
+            for id in frames {
+                pool.put(id);
+            }
+            return Err("bad frame");
+        };
+        pages.push(p2v(pa));
+    }
+    Ok(coalesce_heap_pages(pages))
+}
+
+// AGENT: sort and coalesce direct-map heap pages after allocation so this helper
+// does not depend on the allocator returning frame ids in address order.
+fn coalesce_heap_pages(mut pages: Vec<usize>) -> Vec<(usize, usize)> {
+    pages.sort_unstable();
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for va in pages {
+        if let Some(last) = ranges.last_mut() {
+            if last.0.checked_add(last.1) == Some(va) {
+                last.1 += PAGE_SZ;
+                continue;
+            }
+        }
+
+        ranges.push((va, PAGE_SZ));
+    }
+
+    ranges
 }
 
 // AGENT: align physical range starts without wrapping on overflow.

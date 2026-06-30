@@ -173,10 +173,10 @@ pub fn sfence_vma() {
     }
 }
 
-// AGENT: Build an Sv39 satp value from an ASID and a page-table root physical address.
+// AGENT: Build an Sv39 satp value from a page-table root physical address.
 #[inline]
-pub fn make_satp_sv39(asid: u16, root_paddr: usize) -> usize {
-    SATP_MODE_SV39 | ((asid as usize) << 44) | (root_paddr >> 12)
+pub fn make_satp_sv39(root_paddr: usize) -> usize {
+    SATP_MODE_SV39 | (root_paddr >> 12)
 }
 
 // AGENT: Read the platform time CSR used to schedule the next SBI timer event.
