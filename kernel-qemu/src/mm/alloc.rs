@@ -231,69 +231,38 @@ impl ZoneInfo {
     }
 }
 
+// AGENT: keep the legacy physical-address API as a thin wrapper over FramePool.
 pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
-    let maybe = {
-        let mut s = pool.slots.lock().unwrap();
-        let mut found = None;
-        let scan_start = CLK.load(Ordering::Relaxed) % s.len().max(1);
-        for offset in 0..s.len() {
-            let i = (scan_start + offset) % s.len();
-            if s[i] {
-                s[i] = false;
-                found = Some(i);
-                break;
-            }
+    let frame_id = pool.get_inner()?;
+    match pool.frame_id_to_paddr(frame_id) {
+        Some(paddr) => Some(paddr),
+        None => {
+            pool.put(frame_id);
+            None
         }
-        found
-    };
-    match maybe {
-        Some(id) => {
-            let pa = pool.frame_id_to_paddr(id);
-            pa
-        }
-        None => None,
     }
 }
 
+// AGENT: return a physical frame through the FramePool release path.
 pub fn frame_dealloc(pool: &FramePool, target: usize) {
     let Some(idx) = pool.paddr_to_frame_id(target) else {
         return;
     };
-    let mut s = pool.slots.lock().unwrap();
-    if idx < s.len() && !s[idx] {
-        s[idx] = true;
-    }
+    pool.put(idx);
 }
 
+// AGENT: keep contiguous physical allocation behind FramePool's aligned scanner.
 pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<usize> {
-    if sz == 0 {
-        return None;
-    }
-    let mut s = pool.slots.lock().unwrap();
-    let alignment = if align < 1 { 1 } else { 1usize << align };
-    let total = s.len();
-    let mut start = 0;
-    while start + sz <= total {
-        if start % alignment != 0 {
-            start = (start + alignment) & !(alignment - 1);
-            continue;
-        }
-        let mut ok = true;
-        for j in start..start + sz {
-            if !s[j] {
-                ok = false;
-                start = j + 1;
-                break;
+    let frame_id = pool.get_contig(sz, align)?;
+    match pool.frame_id_to_paddr(frame_id) {
+        Some(paddr) => Some(paddr),
+        None => {
+            for id in frame_id..frame_id + sz {
+                pool.put(id);
             }
-        }
-        if ok {
-            for j in start..start + sz {
-                s[j] = false;
-            }
-            return pool.frame_id_to_paddr(start);
+            None
         }
     }
-    None
 }
 
 pub struct SharedPage {
