@@ -270,60 +270,64 @@ impl AddrSpace {
         let mut child = Self::new();
         child.vm_map.brk = parent.vm_map.brk;
         child.vm_map.mmap_base = parent.vm_map.mmap_base;
-        for region in parent.vm_map.regions.iter() {
+        for region in parent.vm_map.clone_regions() {
             if region.flags & VM_DONTCOPY != 0 {
                 continue;
             }
-            let new_region = VmRegion {
-                base: region.base,
-                len: region.len,
-                flags: region.flags,
-                offset: region.offset,
-                tag: region.tag,
-            };
-            let _ = child.vm_map.insert(new_region);
+            child.vm_map.insert(region)?;
         }
 
-        let copyable_regions: Vec<(usize, usize, u32)> = parent
-            .vm_map
-            .regions
-            .iter()
-            .filter(|region| region.flags & VM_DONTCOPY == 0)
-            .map(|region| (region.base, region.end(), region.flags))
-            .collect();
+        let mut parent_leaf_changed = false;
         let mut parent_entries = parent.resident_pages.entries.lock().unwrap();
         let mut child_entries = Vec::new();
         for (&page_addr, parent_entry) in parent_entries.iter_mut() {
-            let Some((_, _, flags)) = copyable_regions
-                .iter()
-                .find(|(base, end, _)| page_addr >= *base && page_addr < *end)
-            else {
+            let Some(region) = parent.vm_map.find(page_addr) else {
                 continue;
             };
+            if region.flags & VM_DONTCOPY != 0 {
+                continue;
+            }
+            let flags = region.flags;
             if flags & VM_WRITE != 0 && flags & VM_SHARED == 0 {
-                parent_entry.as_cow();
-                parent.sv39.update_leaf_if_present(
+                let cow_flags = pte_flags_without_write(parent_entry.pte_flags);
+                if let Err(err) = parent.sv39.update_leaf_if_present(
                     page_addr,
                     parent_entry.frame.paddr(),
-                    parent_entry.pte_flags,
-                )?;
+                    cow_flags,
+                ) {
+                    if parent_leaf_changed {
+                        crate::csr::sfence_vma();
+                    }
+                    return Err(err);
+                }
+                parent_entry.as_cow();
+                parent_leaf_changed = true;
             }
             child_entries.push((page_addr, parent_entry.clone_mapping()));
         }
         drop(parent_entries);
 
-        if !child_entries.is_empty() {
-            for (page_addr, entry) in child_entries.iter() {
+        for (page_addr, entry) in child_entries.iter() {
+            let mapped =
                 child
                     .sv39
-                    .map_leaf(*page_addr, entry.frame.paddr(), entry.pte_flags, pool)?;
+                    .map_leaf(*page_addr, entry.frame.paddr(), entry.pte_flags, pool);
+            if let Err(err) = mapped {
+                if parent_leaf_changed {
+                    crate::csr::sfence_vma();
+                }
+                return Err(err);
             }
+        }
+        {
             let mut child_resident = child.resident_pages.entries.lock().unwrap();
             for (page_addr, entry) in child_entries {
                 child_resident.insert(page_addr, entry);
             }
         }
-        crate::csr::sfence_vma();
+        if parent_leaf_changed {
+            crate::csr::sfence_vma();
+        }
         Ok(child)
     }
 
