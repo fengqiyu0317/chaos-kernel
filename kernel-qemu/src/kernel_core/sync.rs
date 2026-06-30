@@ -444,9 +444,9 @@ pub fn install_qemu_wait_kernel(kernel: &'static Kernel) {
     WAIT_KERNEL.store(kernel as *const Kernel as usize, Ordering::Release);
 }
 
-// AGENT: return the installed QEMU scheduler backend, if this early carrier
-// stage has one. Without it, waits fall back to interrupt-friendly spinning.
-fn qemu_wait_kernel() -> Option<&'static Kernel> {
+// AGENT: return the installed QEMU kernel backend, if this early carrier stage
+// has one. Wait paths and the RISC-V syscall ABI share this single leaked Kernel.
+pub(crate) fn qemu_wait_kernel() -> Option<&'static Kernel> {
     let ptr = WAIT_KERNEL.load(Ordering::Acquire);
     if ptr == 0 {
         None

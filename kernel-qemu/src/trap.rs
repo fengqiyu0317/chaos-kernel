@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
 use core::arch::global_asm;
+use core::mem;
 
+use crate::kernel::Task;
 use crate::{csr, println, sbi, timer};
 
 global_asm!(include_str!("trap.S"));
@@ -212,6 +214,53 @@ fn early_fatal_trap_action(origin: TrapOrigin) -> &'static str {
 pub unsafe fn enter_user_mode(frame: &TrapFrame) -> ! {
     init_user_trap_vector();
     unsafe { __user_trap_return(frame as *const TrapFrame) }
+}
+
+// AGENT: materialize a task's saved user context as a RISC-V trap frame at the
+// top of its owned kernel stack.
+pub unsafe fn prepare_task_user_trap_frame(task: &Task) -> Result<*mut TrapFrame, &'static str> {
+    let stack_top = task.kernel_stack_top().ok_or("ekstk")?;
+    let frame_addr = stack_top
+        .checked_sub(mem::size_of::<TrapFrame>())
+        .ok_or("ekstk")?;
+    if frame_addr % mem::align_of::<TrapFrame>() != 0 {
+        return Err("ekstk");
+    }
+
+    let (entry, user_sp) = {
+        let thd = task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_ref().ok_or("enoctx")?;
+        (
+            ctx.uctx.ip as usize,
+            ctx.uctx.r[crate::kernel::N_REGS - 1] as usize,
+        )
+    };
+    if entry == 0 || user_sp == 0 {
+        return Err("enoexec");
+    }
+
+    let frame = frame_addr as *mut TrapFrame;
+    unsafe {
+        frame.write(TrapFrame::new());
+        (*frame).prepare_user_entry(entry, user_sp);
+    }
+    Ok(frame)
+}
+
+// AGENT: enter a task's first user frame through the same trap-return path used
+// after later user traps.
+pub unsafe fn enter_task_user_mode(task: &Task) -> ! {
+    match unsafe { prepare_task_user_trap_frame(task) } {
+        Ok(frame) => unsafe { enter_user_mode(&*frame) },
+        Err(err) => {
+            println!(
+                "[kernel-qemu] cannot enter task {} user mode: {}",
+                task.id(),
+                err
+            );
+            sbi::shutdown();
+        }
+    }
 }
 
 fn user_sstatus() -> usize {

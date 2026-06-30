@@ -6,8 +6,6 @@ impl Kernel {
         let root = self.tasks.spawn_root();
         let rid = root.id();
         root.process.threads.lock().unwrap().push(rid);
-        let _kstk = KStk::new();
-        *root.kstk.lock().unwrap() = Some(_kstk);
         root.set_sched_state(TaskRunState::Running);
         root.reset_slice();
         self.set_cur(0, Some(root));

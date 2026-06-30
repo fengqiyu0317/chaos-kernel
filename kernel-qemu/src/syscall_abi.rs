@@ -52,7 +52,60 @@ pub fn dispatch_from_trap_frame(frame: &mut TrapFrame) {
 
 // AGENT: Keep syscall behavior behind a semantic entry rather than in the trap layer.
 fn dispatch_migrated_semantics(request: SyscallRequest) -> usize {
-    crate::semantics::dispatch_syscall(request)
+    match crate::kernel::qemu_wait_kernel() {
+        Some(kernel) => dispatch_installed_kernel(kernel, request),
+        None => crate::semantics::dispatch_syscall(request),
+    }
+}
+
+// AGENT: route RISC-V syscalls into the installed migrated Kernel instead of
+// keeping behavior in the early carrier-only semantics shim.
+fn dispatch_installed_kernel(kernel: &crate::kernel::Kernel, request: SyscallRequest) -> usize {
+    let Some(nr) = request.internal_nr else {
+        return ENOSYS_RET;
+    };
+    let [a0, a1, a2, a3, a4, a5] = request.args;
+    match kernel.dispatch_syscall(nr, a0, a1, a2, a3, a4, a5) {
+        Ok(value) => {
+            if nr == INTERNAL_SYS_EXIT {
+                crate::sbi::shutdown();
+            }
+            value
+        }
+        Err(err) => errno_ret(err),
+    }
+}
+
+// AGENT: translate the migrated kernel-sim string errors into Linux-style
+// negative syscall return values for the RISC-V ABI boundary.
+fn errno_ret(err: &'static str) -> usize {
+    let errno = match err {
+        "eperm" => 1,
+        "enoent" => 2,
+        "esrch" => 3,
+        "eio" => 5,
+        "e2big" => 7,
+        "echild" => 10,
+        "eagain" | "changed" => 11,
+        "enomem" | "oom" => 12,
+        "eacces" => 13,
+        "efault" => 14,
+        "ebusy" => 16,
+        "eexist" => 17,
+        "enodev" => 19,
+        "enotdir" => 20,
+        "eisdir" => 21,
+        "einval" | "ph_overflow" => 22,
+        "emfile" => 24,
+        "enospc" => 28,
+        "enametoolong" => 36,
+        "enosys" => 38,
+        "removed" => 43,
+        "enotsup" => 95,
+        "timeout" => 110,
+        _ => 22,
+    };
+    (-(errno as isize)) as usize
 }
 
 // AGENT: Store the architecture-level syscall return value in a0.

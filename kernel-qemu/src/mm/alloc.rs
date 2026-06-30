@@ -337,24 +337,37 @@ impl SharedPage {
     }
 }
 
+const KSTK_ALIGN: usize = 16;
+
+// AGENT: own one aligned kernel stack allocation for a schedulable task.
 pub struct KStk(usize);
 impl KStk {
+    // AGENT: allocate an explicitly aligned zeroed stack so RISC-V trap return
+    // code can use KStk::top() as an ABI-aligned stack pointer.
     pub fn new() -> Self {
-        let v = vec![0u8; KSTK_SZ].into_boxed_slice();
-        let ptr = Box::into_raw(v) as *mut u8 as usize;
-        KStk(ptr)
+        let layout = kstk_layout();
+        let ptr = unsafe { ::alloc::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            ::alloc::alloc::handle_alloc_error(layout);
+        }
+        KStk(ptr as usize)
     }
     pub fn top(&self) -> usize {
         self.0 + KSTK_SZ
     }
 }
+
+// AGENT: centralize the stack layout so allocation and deallocation stay paired.
+fn kstk_layout() -> ::core::alloc::Layout {
+    ::core::alloc::Layout::from_size_align(KSTK_SZ, KSTK_ALIGN)
+        .expect("kernel stack layout should be valid")
+}
+
 impl Drop for KStk {
+    // AGENT: release the stack through the same layout used for allocation.
     fn drop(&mut self) {
         unsafe {
-            let _ = Box::from_raw(::core::slice::from_raw_parts_mut(
-                self.0 as *mut u8,
-                KSTK_SZ,
-            ));
+            ::alloc::alloc::dealloc(self.0 as *mut u8, kstk_layout());
         }
     }
 }

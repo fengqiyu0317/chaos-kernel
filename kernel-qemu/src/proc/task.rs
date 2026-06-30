@@ -195,6 +195,8 @@ impl Task {
         Self::make_with_process(id, tag, ProcessState::new_with_addr_space(addr_space))
     }
 
+    // AGENT: every schedulable QEMU task owns a kernel stack from construction,
+    // so fork, clone, and initial user tasks all have a trap-frame landing area.
     fn make_with_process(id: usize, tag: &str, process: Arc<ProcessState>) -> Arc<Self> {
         let _kobj_stamp = CLK.load(Ordering::Relaxed);
         Arc::new(Self {
@@ -204,7 +206,7 @@ impl Task {
             }),
             process,
             sig_mask: Mutex::new(0),
-            kstk: Mutex::new(None),
+            kstk: Mutex::new(Some(KStk::new())),
             thd_ctx: Mutex::new(Some(ThdCtx::default())),
             sched: Mutex::new(SchedEntity::new()),
         })
@@ -220,6 +222,11 @@ impl Task {
     }
     pub fn process_pid(&self) -> usize {
         self.process.pid.lock().unwrap().get()
+    }
+    // AGENT: expose only the kernel stack top needed by trap setup, keeping KStk
+    // ownership inside Task.
+    pub fn kernel_stack_top(&self) -> Option<usize> {
+        self.kstk.lock().unwrap().as_ref().map(KStk::top)
     }
     pub fn link_parent(&self, p: &Arc<Task>) {
         *self.process.parent.lock().unwrap() = Some(p.clone());
@@ -694,7 +701,6 @@ impl TaskTable {
             child_sched.policy = parent_policy;
             child_sched.slice_left = child_sched.policy.time_slice;
         }
-        *tgt.kstk.lock().unwrap() = Some(KStk::new());
         *tgt.process.parent.lock().unwrap() = Some(proc_src.clone());
         proc_src.process.subtasks.lock().unwrap().push(tgt.clone());
         let p = Pid(nid);
