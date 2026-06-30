@@ -35,7 +35,11 @@ global_asm!(include_str!("entry.S"));
 unsafe extern "C" {
     static mut sbss: u8;
     static mut ebss: u8;
+    static ekernel: u8;
 }
+
+const QEMU_VIRT_RAM_START: usize = 0x8000_0000;
+const QEMU_VIRT_RAM_END: usize = 0x8800_0000;
 
 // AGENT: First Rust entry point for the M9 QEMU carrier layer.
 #[no_mangle]
@@ -78,7 +82,8 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
 // AGENT: Install a leaked Kernel as the QEMU scheduler/timer backend so real
 // timer interrupts can drive migrated Kernel::schedule_tick() state.
 fn init_qemu_kernel_backend() -> &'static kernel::Kernel {
-    let kernel = Box::leak(Box::new(kernel::Kernel::new(kernel::N_FRAMES)));
+    let frame_pool = init_qemu_frame_pool();
+    let kernel = Box::leak(Box::new(kernel::Kernel::new(frame_pool)));
     kernel.proc_init();
     kernel::install_qemu_wait_kernel(kernel);
     let current = kernel.cur_task(0).map(|task| task.id()).unwrap_or(0);
@@ -87,6 +92,23 @@ fn init_qemu_kernel_backend() -> &'static kernel::Kernel {
         current
     );
     kernel
+}
+
+// AGENT: seed the migrated FramePool from the QEMU virt RAM range while
+// reserving the linked kernel image, boot stack, and early heap up to ekernel.
+fn init_qemu_frame_pool() -> kernel::FramePool {
+    let total_pages = (QEMU_VIRT_RAM_END - QEMU_VIRT_RAM_START) / kernel::PAGE_SZ;
+    let pool = kernel::FramePool::new(total_pages, QEMU_VIRT_RAM_START);
+    let kernel_end = align_up_page(core::ptr::addr_of!(ekernel) as usize);
+    pool.mark_free_range(kernel_end, QEMU_VIRT_RAM_END);
+    println!(
+        "[kernel-qemu] frame pool ready base={:#x} free_start={:#x} end={:#x} free_pages={}",
+        QEMU_VIRT_RAM_START,
+        kernel_end,
+        QEMU_VIRT_RAM_END,
+        pool.free_count()
+    );
+    pool
 }
 
 // AGENT: Arm a one-tick logical timer target before hardware timer interrupts
@@ -161,6 +183,11 @@ fn wait_for_timer_wheel_probe(token: &kernel::WaitToken) {
             clk, active
         );
     }
+}
+
+// AGENT: page-align linker symbols before seeding physical frame ranges.
+fn align_up_page(addr: usize) -> usize {
+    (addr + kernel::PAGE_SZ - 1) & !(kernel::PAGE_SZ - 1)
 }
 
 // AGENT: Keep panic output observable in QEMU before powering off.

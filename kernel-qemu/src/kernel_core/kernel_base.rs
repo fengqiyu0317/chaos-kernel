@@ -18,13 +18,14 @@ pub struct Kernel {
     pub tty_buf: Mutex<VecDeque<u8>>,
 }
 impl Kernel {
-    // AGENT: construct shared kernel state; behavior methods live under kernel_ops/.
-    pub fn new(nf: usize) -> Self {
+    // AGENT: construct shared kernel state around a caller-initialized frame
+    // pool so QEMU boot can seed only linker/RAM-derived free pages.
+    pub fn new(pool: FramePool) -> Self {
         Self {
             tasks: TaskTable::new(),
             run_queue: RunQueue::new(),
             cache: BlockCache::new(N_CHAINS),
-            pool: FramePool::new(nf),
+            pool,
             cpus: Mutex::new([None, None, None, None, None, None, None, None]),
             mnt: MountTable::new(),
             timers: global_timer_wheel(),

@@ -17,6 +17,7 @@ trap 'rm -f "$LOG"' EXIT
 
 timeout 15s qemu-system-riscv64 \
     -machine virt \
+    -m 128M \
     -nographic \
     -bios default \
     -kernel "$KERNEL" 2>&1 | tee "$LOG"
