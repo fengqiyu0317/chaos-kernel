@@ -9,10 +9,7 @@ pub static TIMER_WHEEL: IrqOnceCell<Mutex<TimerWheel>> = IrqOnceCell::new();
 
 // AGENT: initialize the QEMU logical timer wheel once heap allocation is ready.
 pub fn init_timer_wheel() {
-    if TIMER_WHEEL
-        .init(Mutex::new(TimerWheel::new()))
-        .is_err()
-    {
+    if TIMER_WHEEL.init(Mutex::new(TimerWheel::new())).is_err() {
         panic!("QEMU timer wheel initialized more than once");
     }
 }

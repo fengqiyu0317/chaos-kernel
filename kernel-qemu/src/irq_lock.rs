@@ -200,12 +200,7 @@ impl<T> IrqSafeRwLock<T> {
 
             if self
                 .state
-                .compare_exchange_weak(
-                    state,
-                    state + 1,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(state, state + 1, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
                 return IrqSafeRwLockReadGuard {
