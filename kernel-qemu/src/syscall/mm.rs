@@ -1,21 +1,21 @@
 // AGENT
 use super::*;
 
-// AGENT: validate mmap flags/protections and route anonymous versus file-backed mappings.
+// AGENT: validate mmap flags/protections and route only anonymous mappings; file-backed
+// mmap is intentionally not carried in kernel-qemu yet.
 pub(super) fn sys_mmap(
     kernel: &Kernel,
     a0: usize,
     a1: usize,
     a2: usize,
     a3: usize,
-    a4: usize,
+    _a4: usize,
     a5: usize,
 ) -> Result<usize, &'static str> {
     let addr = a0;
     let len = a1;
     let prot = a2;
     let flags = a3;
-    let fd = a4;
     let offset = a5;
     if len == 0 {
         return Err("einval");
@@ -34,6 +34,12 @@ pub(super) fn sys_mmap(
     let map_shared = (flags & MAP_SHARED) != 0;
     let map_private = (flags & MAP_PRIVATE) != 0;
     if map_shared && map_private {
+        return Err("einval");
+    }
+    if !map_anon {
+        return Err("enosys");
+    }
+    if offset != 0 {
         return Err("einval");
     }
     let effective_shared = map_shared;
@@ -75,39 +81,13 @@ pub(super) fn sys_mmap(
     if _avail < pages_needed {
         return Err("enomem");
     }
-    let file_backing = if map_anon {
-        if offset != 0 {
-            return Err("einval");
-        }
-        None
-    } else {
-        if offset % PAGE_SZ != 0 {
-            return Err("einval");
-        }
-        let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
-        let fh = entry.regular_handle().ok_or("enodev")?;
-        fh.mmap(result_addr, result_end, offset)?;
-        let opt = fh.get_opt();
-        if !opt.rd {
-            return Err("eacces");
-        }
-        if effective_shared && (prot & PROT_WRITE != 0) && !opt.wr {
-            return Err("eacces");
-        }
-        Some(fh)
-    };
     {
         let mut addr_space = task.process.addr_space.lock().unwrap();
         if map_fixed {
             addr_space.unmap_range(result_addr, aligned_len, &kernel.pool)?;
         }
-        let region_offset = if map_anon { 0 } else { offset };
-        let region = VmRegion::with_offset(result_addr, aligned_len, vm_flags, region_offset);
-        if let Some(fh) = file_backing {
-            addr_space.map_file_region(region, fh.inode_ref(), effective_shared, &kernel.pool)?;
-        } else {
-            addr_space.map_region(region, &kernel.pool)?;
-        }
+        let region = VmRegion::with_offset(result_addr, aligned_len, vm_flags, 0);
+        addr_space.map_region(region, &kernel.pool)?;
     }
     Ok(result_addr)
 }

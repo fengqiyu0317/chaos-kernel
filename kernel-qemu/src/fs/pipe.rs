@@ -305,20 +305,6 @@ impl FLike {
             FLike::Ep(_) => Err("enosys"),
         }
     }
-    pub fn mmap_fl(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> {
-        if start >= end {
-            return Err("einval");
-        }
-        let _pages = (end - start + PAGE_SZ - 1) / PAGE_SZ;
-        match self {
-            FLike::File(f) => {
-                // AGENT: file mmap observes shared FileNode metadata.
-                let _file_pages = (f.metadata_sz() + PAGE_SZ - 1) / PAGE_SZ;
-                f.mmap(start, end, off)
-            }
-            _ => Err("enosys"),
-        }
-    }
     pub fn poll(&self) -> (bool, bool, bool) {
         match self {
             // HUMAN: move the code to the implementation of the corresponding struct

@@ -446,23 +446,6 @@ impl FHandle {
     pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> {
         Ok(0)
     }
-    // AGENT: validate that a descriptor can back a regular file mmap.
-    pub fn mmap(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> {
-        if start >= end || start % PAGE_SZ != 0 || end % PAGE_SZ != 0 || off % PAGE_SZ != 0 {
-            return Err("einval");
-        }
-        if self.pipe || self.node.kind != FileKind::Regular {
-            return Err("enodev");
-        }
-        if !self.get_opt().rd {
-            return Err("eacces");
-        }
-        Ok(())
-    }
-    pub fn inode_ref(&self) -> Arc<Mutex<Vec<u8>>> {
-        self.node.data.clone()
-    }
-
     pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> {
         let d = self.node.data.lock().unwrap();
         let actual_end = min(offset + len, d.len());

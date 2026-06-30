@@ -1,63 +1,10 @@
 // AGENT
 use super::*;
 
-// AGENT: record whether a resident user page is anonymous or backed by a file.
-#[derive(Clone)]
-pub enum PageBacking {
-    Anonymous,
-    File {
-        data: Arc<Mutex<Vec<u8>>>,
-        offset: usize,
-        valid_len: usize,
-        shared: bool,
-    },
-}
-
-impl PageBacking {
-    // AGENT: once a private file-backed COW page is dirtied, keep future flush
-    // decisions from treating the resident page as a clean file mapping.
-    fn detach_private_file_copy(&mut self) {
-        if matches!(self, PageBacking::File { shared: false, .. }) {
-            *self = PageBacking::Anonymous;
-        }
-    }
-
-    // AGENT: flush MAP_SHARED page bytes back into the valid file-backed range.
-    fn flush_range(&self, page: &[u8], page_off: usize, len: usize) -> Result<(), &'static str> {
-        let PageBacking::File {
-            data,
-            offset,
-            valid_len,
-            shared,
-        } = self
-        else {
-            return Ok(());
-        };
-        if !*shared || page_off >= *valid_len || page_off >= PAGE_SZ {
-            return Ok(());
-        }
-        let page_end = min(PAGE_SZ, page_off.checked_add(len).ok_or("efault")?);
-        let valid_end = min(*valid_len, page_end);
-        if valid_end <= page_off {
-            return Ok(());
-        }
-        let copy_len = valid_end - page_off;
-        let file_start = offset.checked_add(page_off).ok_or("efault")?;
-        let file_end = file_start.checked_add(copy_len).ok_or("efault")?;
-        let mut file = data.lock().unwrap();
-        if file_end > file.len() {
-            file.resize(file_end, 0);
-        }
-        file[file_start..file_end].copy_from_slice(&page[page_off..valid_end]);
-        Ok(())
-    }
-}
-
 // AGENT: QEMU PTE metadata keeps current hardware leaf state while VmRegion
 // remains the single source of VM flags.
 pub struct PageTableEntry {
     pub frame: SharedPage,
-    pub backing: PageBacking,
     pub pte_flags: usize,
     pub cow: bool,
 }
@@ -65,14 +12,8 @@ pub struct PageTableEntry {
 impl PageTableEntry {
     // AGENT: default page-table entries are anonymous zero-filled pages.
     pub fn new(frame: PgFrame, flags: u32) -> Self {
-        Self::with_backing(frame, flags, PageBacking::Anonymous)
-    }
-
-    // AGENT: allow mmap to seed resident pages with file backing metadata.
-    pub fn with_backing(frame: PgFrame, flags: u32, backing: PageBacking) -> Self {
         Self {
             frame: SharedPage::new(frame),
-            backing,
             pte_flags: vm_flags_to_pte_flags(flags),
             cow: false,
         }
@@ -89,7 +30,6 @@ impl PageTableEntry {
         let paddr = self.frame.fault(pool)?;
         self.pte_flags = vm_flags_to_pte_flags(flags);
         self.cow = false;
-        self.backing.detach_private_file_copy();
         Ok(paddr)
     }
 
@@ -115,16 +55,9 @@ impl PageTableEntry {
     fn clone_mapping(&self) -> Self {
         Self {
             frame: self.frame.clone(),
-            backing: self.backing.clone(),
             pte_flags: self.pte_flags,
             cow: self.cow,
         }
-    }
-
-    // AGENT: flush a full resident page before unmap or address-space teardown.
-    fn flush_shared_file_page(&self) -> Result<(), &'static str> {
-        let page = phys_page_slice(self.frame.paddr());
-        self.backing.flush_range(&page, 0, PAGE_SZ)
     }
 }
 
@@ -261,6 +194,13 @@ pub struct AddrSpace {
     pub vm_map: VmMap,
     resident_pages: ResidentPageTable,
     sv39: Sv39PageTable,
+}
+
+// AGENT: carry the resolved state for one bounded user-memory write so the
+// public copy path does not mix validation, COW, translation, and byte copying.
+struct UserWriteChunk {
+    paddr: usize,
+    len: usize,
 }
 
 impl AddrSpace {
@@ -409,8 +349,49 @@ impl AddrSpace {
         Ok(usize::from_ne_bytes(bytes))
     }
 
-    // AGENT: user writes resolve COW through resident metadata, translate through
-    // Sv39, and then reflect MAP_SHARED file pages in FileNode data.
+    // AGENT: prepare one write chunk by checking VMA permissions, resolving COW
+    // outside resident-page locks, and verifying metadata matches the Sv39 leaf.
+    fn prepare_user_write_chunk(
+        &mut self,
+        cur: usize,
+        end: usize,
+        pool: &FramePool,
+    ) -> Result<UserWriteChunk, &'static str> {
+        let region = self.vm_map.find(cur).ok_or("efault")?;
+        if region.flags & VM_WRITE == 0 {
+            return Err("efault");
+        }
+
+        let region_end = region.end();
+        let page_addr = cur & !(PAGE_SZ - 1);
+        let page_off = cur & (PAGE_SZ - 1);
+        let len = min(end - cur, min(PAGE_SZ - page_off, region_end - cur));
+        let need_cow = {
+            let entries = self.resident_pages.entries.lock().unwrap();
+            let pte = entries.get(&page_addr).ok_or("efault")?;
+            !pte.is_writable() && pte.cow
+        };
+        if need_cow {
+            self.handle_cow_fault(cur, pool).map_err(|_| "efault")?;
+        }
+
+        let frame_paddr = {
+            let entries = self.resident_pages.entries.lock().unwrap();
+            let pte = entries.get(&page_addr).ok_or("efault")?;
+            if !pte.is_writable() {
+                return Err("efault");
+            }
+            pte.frame.paddr()
+        };
+        let paddr = self.sv39.translate(cur, PageAccess::Write)?;
+        if (paddr & !(PAGE_SZ - 1)) != frame_paddr {
+            return Err("efault");
+        }
+        Ok(UserWriteChunk { paddr, len })
+    }
+
+    // AGENT: user writes resolve COW through resident metadata, then translate
+    // through Sv39 and copy directly into the target physical page.
     pub fn write_user_bytes(
         &mut self,
         addr: usize,
@@ -424,40 +405,15 @@ impl AddrSpace {
         let mut written = 0usize;
         while written < src.len() {
             let cur = addr + written;
-            let region = self.vm_map.find(cur).ok_or("efault")?;
-            if region.flags & VM_WRITE == 0 {
-                return Err("efault");
-            }
-            let page_addr = cur & !(PAGE_SZ - 1);
-            let page_off = cur & (PAGE_SZ - 1);
-            let chunk = min(end - cur, min(PAGE_SZ - page_off, region.end() - cur));
-            let need_cow = {
-                let entries = self.resident_pages.entries.lock().unwrap();
-                let pte = entries.get(&page_addr).ok_or("efault")?;
-                !pte.is_writable() && pte.cow
-            };
-            if need_cow {
-                self.handle_cow_fault(cur, pool).map_err(|_| "efault")?;
-            }
-            let (frame_paddr, backing) = {
-                let entries = self.resident_pages.entries.lock().unwrap();
-                let pte = entries.get(&page_addr).ok_or("efault")?;
-                if !pte.is_writable() {
-                    return Err("efault");
-                }
-                (pte.frame.paddr(), pte.backing.clone())
-            };
-            let paddr = self.sv39.translate(cur, PageAccess::Write)?;
-            copy_to_phys(paddr, &src[written..written + chunk]);
-            let page = phys_page_slice(frame_paddr);
-            backing.flush_range(page, page_off, chunk)?;
-            written += chunk;
+            let chunk = self.prepare_user_write_chunk(cur, end, pool)?;
+            copy_to_phys(chunk.paddr, &src[written..written + chunk.len]);
+            written += chunk.len;
         }
         Ok(())
     }
 
-    // AGENT: unmapping flushes resident shared file-backed pages before
-    // removing mappings, and returns last-reference frames to FramePool.
+    // AGENT: unmapping removes resident metadata and Sv39 leaves; file-backed
+    // writeback is intentionally not implemented in kernel-qemu yet.
     pub fn unmap_range(
         &mut self,
         start: usize,
@@ -471,11 +427,6 @@ impl AddrSpace {
             .filter(|&&addr| addr >= start && addr < end)
             .copied()
             .collect();
-        for addr in &pages_to_unmap {
-            if let Some(pte) = entries.get(addr) {
-                pte.flush_shared_file_page()?;
-            }
-        }
         self.vm_map.remove_range(start, len);
         for addr in &pages_to_unmap {
             self.sv39.unmap_leaf_if_present(*addr);
@@ -485,14 +436,13 @@ impl AddrSpace {
         Ok(pages_to_unmap.len())
     }
 
-    // AGENT: process teardown flushes resident metadata before clearing the
+    // AGENT: process teardown drops resident metadata before clearing the
     // separately owned Sv39 page-table frames.
     pub fn release_all_pages(&mut self, _pool: &FramePool) -> usize {
         self.vm_map.regions.clear();
         let entries = self.resident_pages.take_all();
         let mut released = 0;
         for pte in entries.into_values() {
-            let _ = pte.flush_shared_file_page();
             if pte.frame.is_unique() {
                 released += 1;
             }
@@ -613,98 +563,6 @@ impl AddrSpace {
         let mut entries = self.resident_pages.entries.lock().unwrap();
         for (page_addr, frame) in mapped.into_iter() {
             entries.insert(page_addr, PageTableEntry::new(frame, flags));
-        }
-        crate::csr::sfence_vma();
-        Ok(())
-    }
-
-    // AGENT: create resident file-backed mmap pages, preserving VmMap metadata,
-    // software backing records, and the corresponding Sv39 leaves separately.
-    pub fn map_file_region(
-        &mut self,
-        region: VmRegion,
-        file_data: Arc<Mutex<Vec<u8>>>,
-        shared: bool,
-        pool: &FramePool,
-    ) -> Result<(), &'static str> {
-        if region.base % PAGE_SZ != 0 || region.len % PAGE_SZ != 0 || region.offset % PAGE_SZ != 0 {
-            return Err("einval");
-        }
-        let region_end = region.checked_end().ok_or("einval")?;
-        if region_end > KERN_BASE {
-            return Err("einval");
-        }
-        let flags = region.flags;
-        let region_base = region.base;
-        let region_len = region.len;
-        let file_base = region.offset;
-        let pages: Vec<usize> = page_range(region.base, region.len).collect();
-        let mut file_offsets = Vec::with_capacity(pages.len());
-        for idx in 0..pages.len() {
-            let delta = idx.checked_mul(PAGE_SZ).ok_or("einval")?;
-            file_offsets.push(file_base.checked_add(delta).ok_or("einval")?);
-        }
-
-        let mut allocated = Vec::with_capacity(pages.len());
-        for _ in pages.iter() {
-            match pool.alloc_pg_frame() {
-                Some(frame) => {
-                    zero_page(frame.paddr());
-                    allocated.push(frame);
-                }
-                None => {
-                    return Err("enomem");
-                }
-            }
-        }
-
-        let file_snapshot = file_data.lock().unwrap().clone();
-        if let Err(err) = self.vm_map.insert(region) {
-            return Err(err);
-        }
-
-        let mut mapped: Vec<(usize, PgFrame, PageBacking)> = Vec::with_capacity(pages.len());
-        for ((page_addr, frame), file_offset) in pages
-            .into_iter()
-            .zip(allocated.into_iter())
-            .zip(file_offsets.into_iter())
-        {
-            let valid_len = if file_offset < file_snapshot.len() {
-                min(PAGE_SZ, file_snapshot.len() - file_offset)
-            } else {
-                0
-            };
-            let backing = PageBacking::File {
-                data: file_data.clone(),
-                offset: file_offset,
-                valid_len,
-                shared,
-            };
-            if valid_len > 0 {
-                copy_to_phys(
-                    frame.paddr(),
-                    &file_snapshot[file_offset..file_offset + valid_len],
-                );
-            }
-            let pte_flags = vm_flags_to_pte_flags(flags);
-            if let Err(err) = self
-                .sv39
-                .map_leaf(page_addr, frame.paddr(), pte_flags, pool)
-            {
-                for (mapped_addr, _, _) in mapped.iter() {
-                    self.sv39.unmap_leaf_if_present(*mapped_addr);
-                }
-                self.vm_map.remove_range(region_base, region_len);
-                return Err(err);
-            }
-            mapped.push((page_addr, frame, backing));
-        }
-        let mut entries = self.resident_pages.entries.lock().unwrap();
-        for (page_addr, frame, backing) in mapped.into_iter() {
-            entries.insert(
-                page_addr,
-                PageTableEntry::with_backing(frame, flags, backing),
-            );
         }
         crate::csr::sfence_vma();
         Ok(())
