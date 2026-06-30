@@ -9,6 +9,7 @@ pub const SIE_STIE: usize = 1 << 5;
 pub const SSTATUS_SIE: usize = 1 << 1;
 pub const SSTATUS_SPIE: usize = 1 << 5;
 pub const SSTATUS_SPP: usize = 1 << 8;
+pub const SATP_MODE_SV39: usize = 8usize << 60;
 
 // AGENT: Read the current trap vector base and mode from stvec.
 #[inline]
@@ -143,6 +144,39 @@ pub unsafe fn write_sscratch(value: usize) {
     unsafe {
         asm!("csrw sscratch, {}", in(reg) value, options(nomem, nostack));
     }
+}
+
+// AGENT: Read the active address-translation mode and root PPN.
+#[inline]
+pub fn read_satp() -> usize {
+    let value: usize;
+    unsafe {
+        asm!("csrr {}, satp", out(reg) value, options(nomem, nostack));
+    }
+    value
+}
+
+// AGENT: Install a prepared satp value; callers must issue sfence.vma after
+// changing page-table roots or permissions.
+#[inline]
+pub unsafe fn write_satp(value: usize) {
+    unsafe {
+        asm!("csrw satp, {}", in(reg) value, options(nomem, nostack));
+    }
+}
+
+// AGENT: Flush all local address translations after modifying Sv39 tables.
+#[inline]
+pub fn sfence_vma() {
+    unsafe {
+        asm!("sfence.vma", options(nomem, nostack));
+    }
+}
+
+// AGENT: Build an Sv39 satp value from an ASID and a page-table root physical address.
+#[inline]
+pub fn make_satp_sv39(asid: u16, root_paddr: usize) -> usize {
+    SATP_MODE_SV39 | ((asid as usize) << 44) | (root_paddr >> 12)
 }
 
 // AGENT: Read the platform time CSR used to schedule the next SBI timer event.

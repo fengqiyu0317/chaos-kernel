@@ -10,16 +10,19 @@ This directory currently contains a direct source-first copy of:
 - `kernel-sim/src/kernel/mm/bits.rs`
 - `kernel-sim/src/kernel/mm/memory.rs`
 
-The files are intentionally not registered from `kernel-qemu/src/main.rs` yet.
-They still depend on the host-side `kernel-sim` prelude and cannot compile in
-the `#![no_std]` QEMU crate without the next migration step.
+The files are now registered through the migrated `kernel-qemu/src/mod.rs` tree
+and compile in the `#![no_std]` QEMU crate. The current MM work is no longer a
+plain source copy: anonymous/file-backed resident pages are backed by QEMU
+`PgFrame`s and Sv39 leaf PTEs, while higher-level VMA and syscall-facing
+semantics still follow the `kernel-sim` source-first shape.
 
-Before enabling `mod mm;`, replace or isolate these dependencies:
+Remaining replacement and hardening work:
 
 - `std::collections` imports with `alloc::collections` where applicable.
 - `Vec`, `Box`, and related heap allocations behind a QEMU global allocator.
-- `Arc<Mutex<Vec<u8>>>` simulated resident page storage with real frame/PPN
-  metadata and Sv39 page-table entries.
+- Keep `Arc<Mutex<Vec<u8>>>` out of resident page storage; file-backed mmap
+  still uses it only as file-node backing metadata until the file layer is fully
+  migrated.
 - `std::sync::Mutex` with a QEMU-side lock or irq-safe critical section.
 - `std::mem` and `std::slice` paths with `core::mem` and `core::slice`.
 - `CLK` timer references with the QEMU timer tick source.
@@ -34,7 +37,8 @@ Semantic entries to preserve while replacing internals:
 - Current `mmap`, `munmap`, `brk`, COW, and frame-release observable behavior
   as the `kernel-sim` compatibility baseline.
 
-Next files expected in this module:
+Added and expected support files in this module:
 
-- `sv39.rs` for QEMU/RISC-V page-table walk, map, unmap, and permission bits.
+- `sv39.rs` for QEMU/RISC-V page-table walk, map, unmap, translate, and
+  permission bits.
 - `usercopy.rs` for copy-in/copy-out over translated user pages.

@@ -205,25 +205,16 @@ pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<u
     }
 }
 
-// AGENT: SharedPage is the resident page object shared by forked PTEs; cloning
-// it shares both the physical frame handle and the simulated page bytes.
+// AGENT: SharedPage is the resident physical page object shared by forked PTEs;
+// it owns COW frame splitting so PageTableEntry only tracks mapping metadata.
 #[derive(Clone)]
 pub struct SharedPage {
     frame: PgFrame,
-    data: Arc<Mutex<Vec<u8>>>,
 }
 
 impl SharedPage {
     pub fn new(frame: PgFrame) -> Self {
-        Self::with_data(frame, vec![0; PAGE_SZ])
-    }
-
-    pub fn with_data(frame: PgFrame, mut data: Vec<u8>) -> Self {
-        data.resize(PAGE_SZ, 0);
-        Self {
-            frame,
-            data: Arc::new(Mutex::new(data)),
-        }
+        Self { frame }
     }
 
     pub fn frame_id(&self) -> usize {
@@ -232,10 +223,6 @@ impl SharedPage {
 
     pub fn paddr(&self) -> usize {
         self.frame.paddr()
-    }
-
-    pub fn data(&self) -> Arc<Mutex<Vec<u8>>> {
-        self.data.clone()
     }
 
     pub fn is_unique(&self) -> bool {
@@ -251,10 +238,11 @@ impl SharedPage {
             return Ok(self.paddr());
         }
 
-        let old_data = self.data.lock().unwrap().clone();
+        let old_paddr = self.paddr();
         let new_frame = pool.alloc_pg_frame().ok_or("oom")?;
         let new_paddr = new_frame.paddr();
-        *self = SharedPage::with_data(new_frame, old_data);
+        copy_page(new_paddr, old_paddr);
+        self.frame = new_frame;
         Ok(new_paddr)
     }
 }

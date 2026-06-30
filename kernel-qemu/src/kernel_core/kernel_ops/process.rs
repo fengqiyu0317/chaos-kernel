@@ -74,7 +74,7 @@ impl Kernel {
     // AGENT: fork keeps descriptor state while estimating shared file-node pressure.
     pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> {
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
-        let child = self.tasks.fork_task(&parent)?;
+        let child = self.tasks.fork_task(&parent, &self.pool)?;
         let child_id = child.id();
         child.set_sched_state(TaskRunState::Runnable);
         child.reset_slice();

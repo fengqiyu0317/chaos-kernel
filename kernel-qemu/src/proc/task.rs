@@ -637,14 +637,14 @@ impl TaskTable {
             }
         }
     }
-    pub fn fork_task(&self, src: &Arc<Task>) -> Result<Arc<Task>, &'static str> {
+    pub fn fork_task(&self, src: &Arc<Task>, pool: &FramePool) -> Result<Arc<Task>, &'static str> {
         let fork_slot = self.reserve_fork_slot()?;
         let proc_src = self.process_of_tid(src.id()).unwrap_or_else(|| src.clone());
         let nid = self.seq.fetch_add(1, Ordering::SeqCst);
         let ns = proc_src.tag();
         let child_addr_space = {
             let src_addr_space = proc_src.process.addr_space.lock().unwrap();
-            Arc::new(Mutex::new(AddrSpace::fork_from(&src_addr_space)))
+            Arc::new(Mutex::new(AddrSpace::fork_from(&src_addr_space, pool)?))
         };
         let tgt = Task::make_with_addr_space(nid, &ns, child_addr_space);
         {

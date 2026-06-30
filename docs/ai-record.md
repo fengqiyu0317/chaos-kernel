@@ -1302,6 +1302,103 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
 
+## 2026-06-30：M9 kernel-qemu MM/Sv39 地址空间第一批替换
+
+目标：修正 `kernel-qemu/src/mm/address_space.rs` 中 `PageTableEntry` 仍像 `kernel-sim` 一样保存模拟 resident page 内容的问题，把第一批匿名/文件 resident 页改为真实 `PgFrame` + Sv39 leaf PTE 承载，同时保留 `kernel-sim` 的 VMA、权限、映射生命周期和 usercopy 入口形状。
+
+已完成修改：
+
+- 新增 `kernel-qemu/src/mm/sv39.rs`，提供最小 Sv39 PTE flags、page-table walk、map、unmap、update leaf、translate，以及物理页 zero/copy helper。
+- `kernel-qemu/src/csr.rs` 增加 `satp` 读写、`sfence.vma` 和 `make_satp_sv39()` helper，为后续开启分页留出承载接口。
+- `PageTableEntry` 不再保存 `SharedPage` / `Arc<Mutex<Vec<u8>>>` resident page 内容，改为保存 `PgFrame`、`PageBacking`、迁入 VM flags、Sv39 `pte_flags`、`present` 和 COW metadata。
+- `AddrSpace` 懒分配真实 Sv39 root frame；`map_region()` / `map_file_region()` 分配真实 frame、清零/写入文件快照、建立 leaf PTE，再保存 metadata。
+- `read_user_bytes()` / `write_user_bytes()` 改为通过 Sv39 `translate()` 检查 `U/R/W` 后对物理页 copy；共享文件页写回仍通过 `PageBacking` metadata 完成。
+- `fork_from()` 现在接收 `FramePool`，为子地址空间建立 Sv39 root 和共享 leaf mapping；私有可写页转为 COW 时同步更新父 PTE 为只读。
+- 更新 `kernel-qemu/src/mm/TODO.md`，移除“mm 尚未注册/不能编译”的过时描述。
+
+关键文件：
+
+- `kernel-qemu/src/mm/sv39.rs`
+- `kernel-qemu/src/mm/address_space.rs`
+- `kernel-qemu/src/mm/mod.rs`
+- `kernel-qemu/src/csr.rs`
+- `kernel-qemu/src/proc/task.rs`
+- `kernel-qemu/src/kernel_core/kernel_ops/process.rs`
+- `kernel-qemu/src/mm/TODO.md`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo check --target riscv64gc-unknown-none-elf
+cargo build --release
+cargo fmt --check
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check -- kernel-qemu/src/csr.rs kernel-qemu/src/mm/address_space.rs kernel-qemu/src/mm/mod.rs kernel-qemu/src/mm/sv39.rs kernel-qemu/src/proc/task.rs kernel-qemu/src/kernel_core/kernel_ops/process.rs kernel-qemu/src/mm/TODO.md
+```
+
+结果：`cargo check --target riscv64gc-unknown-none-elf` 通过；`cargo build --release` 通过；`tools/qemu-smoke.sh` 通过，QEMU 输出 `[kernel-qemu] frame pool ready ... free_pages=31930`、`[kernel-qemu] timer tick observed ticks=1`、`[kernel-qemu] timer wheel target observed clk=1 active=0` 和 `[kernel-qemu] shutdown`；`git diff --check` 通过。`cargo fmt --check` 当前未通过，差异位于既有未改文件 `kernel-qemu/src/irq_lock.rs` 和 `kernel-qemu/src/kernel_core/time.rs`，本轮未自动格式化以避免混入无关改动。
+
+未解决问题：
+
+- 当前仍未在 boot 路径写入 Sv39 `satp` 开启全局分页；新增的是地址空间内部的 Sv39 table 承载和 usercopy 翻译路径。
+- trap 层 page fault 仍是早期 fatal 诊断路径，尚未接入 task exit、lazy allocation 或 trap 级 COW recovery。
+- `PageBacking::File` 仍依赖迁入文件层的 `Arc<Mutex<Vec<u8>>>` 文件内容 metadata；resident page 内容已经不再保存在 `PageTableEntry` 的 `Vec<u8>` 中。
+- 后续仍需把 `semantics.rs` 中直接解引用用户指针的早期 `write` 临时实现切到迁入后的 usercopy/AddrSpace 路径。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
+
+## 2026-06-29：M9 kernel-qemu 真实 timer 驱动 timer wheel
+
+目标：补齐 QEMU 启动路径中缺失的 `Kernel` wait/timer 后端安装，让真实 S-mode timer interrupt 不只更新 carrier tick 计数，还能进入迁入的 `Kernel::schedule_tick(0)` 并推进全局 `TimerWheel`。
+
+已完成修改：
+
+- `kernel-qemu/src/main.rs` 在 heap、timer wheel 和可选 selftest 之后创建并泄漏一个 QEMU 侧 `Kernel`，调用 `proc_init()` 建立 CPU0 当前 init task，再通过 `install_qemu_wait_kernel()` 安装为 wait/timer backend。
+- `kernel-qemu/src/main.rs` 在打开硬件 timer interrupt 前注册一个一 tick 的 `TimerTarget::WakeToken` probe；真实 timer interrupt 到来后经 `timer::on_timer_interrupt()`、`qemu_wait_timer_tick()` 和 `Kernel::schedule_tick(0)` 使该 token 进入 timeout。
+- `tools/qemu-smoke.sh` 增加 `[kernel-qemu] timer wheel target observed` 检查，防止后续只保留 carrier tick 而断开 migrated timer wheel。
+
+关键文件：
+
+- `kernel-qemu/src/main.rs`
+- `kernel-qemu/src/timer.rs`
+- `kernel-qemu/src/kernel_core/sync.rs`
+- `kernel-qemu/src/kernel_core/kernel_ops/sched_signal.rs`
+- `tools/qemu-smoke.sh`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo check --target riscv64gc-unknown-none-elf
+cargo fmt --check
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check -- kernel-qemu/src/main.rs tools/qemu-smoke.sh
+
+cd kernel-sim
+cargo test
+```
+
+结果：`cargo check --target riscv64gc-unknown-none-elf` 通过；`tools/qemu-smoke.sh` 通过，QEMU 输出 `[kernel-qemu] kernel timer backend installed current_task=1`、`[kernel-qemu] timer wheel target armed id=1 deadline=1`、`[kernel-qemu] timer tick observed ticks=1` 和 `[kernel-qemu] timer wheel target observed clk=1 active=0`；`git diff --check -- kernel-qemu/src/main.rs tools/qemu-smoke.sh` 通过；`kernel-sim cargo test` 在当前工作树状态下通过，其中 `tests/smoke.rs` 为 `78 passed`。`cargo fmt --check` 当前未通过，差异位于既有 `kernel-qemu/src/irq_lock.rs` 和 `kernel-qemu/src/kernel_core/time.rs` 格式，未在本轮自动格式化以避免混入无关改动。
+
+未解决问题：
+
+- QEMU 启动路径仍是 `minimal carrier only; kernel-sim semantics not loaded`，尚未启动真实用户 init。
+- 本轮只证明真实中断能推进全局 timer wheel 和 `WakeToken` timeout；还没有实现 per-process alarm / interval timer / POSIX timer syscall。
+- 后续应补 `WaitQueue::sleep_timeout()`、`SyncQueue::wait_timeout()`、futex timeout 和 epoll timeout 在 QEMU backend 下的更完整 selftest/smoke 覆盖。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
+
 ## 2026-06-28：M9 kernel-qemu early heap
 
 目标：先让 `kernel-qemu` 的 `#![no_std]` crate 拥有最小全局堆承载，使 `extern crate alloc`、`Vec`、`Box`、`BTreeMap`、`Arc` 能在 QEMU 启动路径中实际工作；该阶段不迁移最终用户页、页表页或 `FramePool` / Sv39 语义。

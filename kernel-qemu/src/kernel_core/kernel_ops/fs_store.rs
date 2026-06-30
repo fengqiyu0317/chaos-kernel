@@ -18,7 +18,14 @@ impl Kernel {
                     }
                 }
             }
-            format!("/{}", parts.join("/"))
+            let mut canonical = String::from("/");
+            for (idx, part) in parts.iter().enumerate() {
+                if idx > 0 {
+                    canonical.push('/');
+                }
+                canonical.push_str(part);
+            }
+            canonical
         };
         let resolved = self.mnt.resolve(path)?;
         let _cache = rehash_mount_cache(&self.mnt.entries.read().unwrap());

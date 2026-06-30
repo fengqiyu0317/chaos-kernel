@@ -7,6 +7,9 @@ pub struct ProcInit {
     pub auxv: BTreeMap<u8, usize>,
 }
 impl ProcInit {
+    // AGENT: keep the stack-construction helper available to release builds
+    // that call it from migrated exec/task code across codegen units.
+    #[inline]
     pub fn push_at(
         &self,
         addr_space: &mut AddrSpace,
