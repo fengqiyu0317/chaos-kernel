@@ -2,14 +2,14 @@
 use kernel_sim::{
     check_access, compute_inet_checksum, parse_ipv4_header, set_current_task_id, wait_ev,
     AddrSpace, BlockCache, Channel, EpData, EpEvent, EvBus, EvFlag, ExitReason, FHandle, FLike,
-    FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking, PageTableEntry, PgFrame,
-    SchedulePolicy, Sema, Spin, SpinLock, SyncQueue, Task, TaskRunState, TaskTable, TimerEntry,
-    VmMap, VmRegion, WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS,
-    MAP_PRIVATE, MAP_SHARED, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ,
-    PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT,
-    SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN,
-    SYS_READ, SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF,
-    USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking, PageTableEntry, SchedulePolicy,
+    Sema, Spin, SpinLock, SyncQueue, Task, TaskRunState, TaskTable, TimerEntry, VmMap, VmRegion,
+    WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED,
+    N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK,
+    SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT, SYS_FORK,
+    SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION,
+    SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC,
+    VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
@@ -781,16 +781,21 @@ fn fork_copies_context_address_space_cwd_and_kernel_stack() {
     }
     {
         *parent.process.cwd.lock().unwrap() = String::from("caf\u{e9}/fork");
+        let frame = kernel
+            .pool
+            .get_pg_frame(17)
+            .expect("test frame 17 should be free");
         let mut addr_space = parent.process.addr_space.lock().unwrap();
         addr_space.vm_map.brk = 0x0060_0000;
         addr_space
             .vm_map
             .insert(VmRegion::new(0x5000_0000, PAGE_SZ, VM_READ | VM_WRITE))
             .expect("test mapping should not overlap");
-        addr_space.page_table.lock().unwrap().insert(
-            0x5000_0000,
-            PageTableEntry::new(17, PgFrame::with_rc(1), VM_READ | VM_WRITE),
-        );
+        addr_space
+            .page_table
+            .lock()
+            .unwrap()
+            .insert(0x5000_0000, PageTableEntry::new(frame, VM_READ | VM_WRITE));
     }
 
     let child = kernel.do_fork(1).expect("fork should create child");
@@ -816,26 +821,20 @@ fn fork_copies_context_address_space_cwd_and_kernel_stack() {
         let child_addr_space = child_task.process.addr_space.lock().unwrap();
         assert_eq!(child_addr_space.vm_map.brk, 0x0060_0000);
         assert!(child_addr_space.vm_map.find(0x5000_0000).is_some());
-        let child_pte = child_addr_space
-            .page_table
-            .lock()
-            .unwrap()
+        let child_pt = child_addr_space.page_table.lock().unwrap();
+        let child_pte = child_pt
             .get(&0x5000_0000)
-            .expect("child should have a COW PTE")
-            .clone();
+            .expect("child should have a COW PTE");
         assert!(child_pte.cow);
         assert!(!child_pte.writable);
         assert_eq!(child_pte.frame.count(), 2);
     }
     {
         let parent_addr_space = parent.process.addr_space.lock().unwrap();
-        let parent_pte = parent_addr_space
-            .page_table
-            .lock()
-            .unwrap()
+        let parent_pt = parent_addr_space.page_table.lock().unwrap();
+        let parent_pte = parent_pt
             .get(&0x5000_0000)
-            .expect("parent should have a COW PTE")
-            .clone();
+            .expect("parent should have a COW PTE");
         assert!(parent_pte.cow);
         assert!(!parent_pte.writable);
         assert_eq!(parent_pte.frame.count(), 2);
@@ -869,15 +868,20 @@ fn cow_write_fault_copies_child_page_and_keeps_parent_shared() {
     let parent = kernel.cur_task(0).expect("init should be current");
     let page = 0x5100_0000;
     {
+        let frame = kernel
+            .pool
+            .get_pg_frame(33)
+            .expect("test frame 33 should be free");
         let mut addr_space = parent.process.addr_space.lock().unwrap();
         addr_space
             .vm_map
             .insert(VmRegion::new(page, PAGE_SZ, VM_READ | VM_WRITE))
             .expect("test mapping should not overlap");
-        addr_space.page_table.lock().unwrap().insert(
-            page,
-            PageTableEntry::new(33, PgFrame::with_rc(1), VM_READ | VM_WRITE),
-        );
+        addr_space
+            .page_table
+            .lock()
+            .unwrap()
+            .insert(page, PageTableEntry::new(frame, VM_READ | VM_WRITE));
     }
 
     let child = kernel.do_fork(1).expect("fork should create child");
@@ -890,29 +894,24 @@ fn cow_write_fault_copies_child_page_and_keeps_parent_shared() {
     assert!(kernel.handle_pgfault_ext(page, 0x2));
 
     let child_addr_space = child_task.process.addr_space.lock().unwrap();
-    let child_pte = child_addr_space
-        .page_table
-        .lock()
-        .unwrap()
+    let child_pt = child_addr_space.page_table.lock().unwrap();
+    let child_pte = child_pt
         .get(&page)
-        .expect("child should retain a mapped PTE")
-        .clone();
+        .expect("child should retain a mapped PTE");
     assert!(child_pte.writable);
     assert!(!child_pte.cow);
-    assert_ne!(child_pte.frame_id, 33);
+    assert_ne!(child_pte.frame_id(), 33);
     assert_eq!(child_pte.frame.count(), 1);
+    drop(child_pt);
     assert_eq!(child_addr_space.cow_sharers(), 0);
     drop(child_addr_space);
 
     let parent_addr_space = parent.process.addr_space.lock().unwrap();
-    let parent_pte = parent_addr_space
-        .page_table
-        .lock()
-        .unwrap()
+    let parent_pt = parent_addr_space.page_table.lock().unwrap();
+    let parent_pte = parent_pt
         .get(&page)
-        .expect("parent should keep the original PTE")
-        .clone();
-    assert_eq!(parent_pte.frame_id, 33);
+        .expect("parent should keep the original PTE");
+    assert_eq!(parent_pte.frame_id(), 33);
     assert!(parent_pte.cow);
     assert!(!parent_pte.writable);
     assert_eq!(parent_pte.frame.count(), 1);
@@ -1372,14 +1371,17 @@ fn munmap_propagates_shared_writeback_error_without_unmapping() {
     let base = 0x5600_0000;
     let file_data = Arc::new(Mutex::new(vec![0; PAGE_SZ]));
     {
+        let frame = kernel
+            .pool
+            .get_pg_frame(70)
+            .expect("test frame 70 should be free");
         let mut addr_space = task.process.addr_space.lock().unwrap();
         addr_space
             .vm_map
             .insert(VmRegion::new(base, PAGE_SZ, VM_READ | VM_WRITE | VM_SHARED))
             .expect("test mapping should not overlap");
         let pte = PageTableEntry::with_backing(
-            70,
-            PgFrame::with_rc(1),
+            frame,
             VM_READ | VM_WRITE | VM_SHARED,
             PageBacking::File {
                 data: file_data,
@@ -1399,13 +1401,8 @@ fn munmap_propagates_shared_writeback_error_without_unmapping() {
     assert_eq!(err, "efault");
     let addr_space = task.process.addr_space.lock().unwrap();
     assert!(addr_space.vm_map.find(base).is_some());
-    let pte = addr_space
-        .page_table
-        .lock()
-        .unwrap()
-        .get(&base)
-        .expect("failed munmap should keep the PTE")
-        .clone();
+    let pt = addr_space.page_table.lock().unwrap();
+    let pte = pt.get(&base).expect("failed munmap should keep the PTE");
     assert_eq!(pte.frame.count(), 1);
 }
 
@@ -1457,9 +1454,13 @@ fn unmap_range_returns_unmapped_page_count_and_splits_region() {
             .expect("test mapping should not overlap");
         let mut pt = addr_space.page_table.lock().unwrap();
         for (idx, frame_id) in frames.into_iter().enumerate() {
+            let frame = kernel
+                .pool
+                .get_pg_frame(frame_id)
+                .expect("test frame should be free");
             pt.insert(
                 base + idx * PAGE_SZ,
-                PageTableEntry::new(frame_id, PgFrame::with_rc(1), VM_READ | VM_WRITE),
+                PageTableEntry::new(frame, VM_READ | VM_WRITE),
             );
         }
     }
@@ -1492,6 +1493,10 @@ fn fork_keeps_shared_writable_mapping_without_cow() {
     let parent = kernel.cur_task(0).expect("init should be current");
     let page = 0x5200_0000;
     {
+        let frame = kernel
+            .pool
+            .get_pg_frame(44)
+            .expect("test frame 44 should be free");
         let mut addr_space = parent.process.addr_space.lock().unwrap();
         addr_space
             .vm_map
@@ -1499,7 +1504,7 @@ fn fork_keeps_shared_writable_mapping_without_cow() {
             .expect("test mapping should not overlap");
         addr_space.page_table.lock().unwrap().insert(
             page,
-            PageTableEntry::new(44, PgFrame::with_rc(1), VM_READ | VM_WRITE | VM_SHARED),
+            PageTableEntry::new(frame, VM_READ | VM_WRITE | VM_SHARED),
         );
     }
 
@@ -1510,25 +1515,18 @@ fn fork_keeps_shared_writable_mapping_without_cow() {
         .expect("child should be registered");
 
     let child_addr_space = child_task.process.addr_space.lock().unwrap();
-    let child_pte = child_addr_space
-        .page_table
-        .lock()
-        .unwrap()
+    let child_pt = child_addr_space.page_table.lock().unwrap();
+    let child_pte = child_pt
         .get(&page)
-        .expect("child should inherit shared PTE")
-        .clone();
+        .expect("child should inherit shared PTE");
     assert!(child_pte.writable);
     assert!(!child_pte.cow);
     assert_eq!(child_pte.frame.count(), 2);
+    drop(child_pt);
 
     let parent_addr_space = parent.process.addr_space.lock().unwrap();
-    let parent_pte = parent_addr_space
-        .page_table
-        .lock()
-        .unwrap()
-        .get(&page)
-        .expect("parent should keep shared PTE")
-        .clone();
+    let parent_pt = parent_addr_space.page_table.lock().unwrap();
+    let parent_pte = parent_pt.get(&page).expect("parent should keep shared PTE");
     assert!(parent_pte.writable);
     assert!(!parent_pte.cow);
     assert_eq!(parent_pte.frame.count(), 2);

@@ -1,21 +1,31 @@
 // AGENT
 use super::*;
 
+// AGENT: share the frame bitmap with PgFrame so RAII drops can return pages.
 pub struct FramePool {
-    pub(crate) slots: Mutex<Vec<bool>>,
+    pub(crate) slots: Arc<Mutex<Vec<bool>>>,
     pub(crate) cap: usize,
+    pub(crate) base_paddr: usize,
 }
 impl FramePool {
+    // AGENT: initialize the simulator frame bitmap inside Arc for PgFrame RAII drops.
     pub fn new(n: usize) -> Self {
         Self {
-            slots: Mutex::new(vec![true; n]),
+            slots: Arc::new(Mutex::new(vec![true; n])),
             cap: n,
+            base_paddr: MEM_OFF,
         }
     }
+    // AGENT: allocate the requested frame id so tests and seeded mappings can
+    // build stable RAII PgFrame handles.
     pub fn get(&self, id: usize) -> Option<usize> {
-        // HUMAN: delete the GKL lock
-        let r = self.get_inner();
-        r
+        let mut s = self.slots.lock().unwrap();
+        if id < s.len() && s[id] {
+            s[id] = false;
+            Some(id)
+        } else {
+            None
+        }
     }
     pub fn get_inner(&self) -> Option<usize> {
         let mut s = self.slots.lock().unwrap();
@@ -55,6 +65,45 @@ impl FramePool {
     }
     pub fn free_count(&self) -> usize {
         self.slots.lock().unwrap().iter().filter(|&&f| f).count()
+    }
+
+    // AGENT: map a frame id back to the simulator physical address.
+    pub fn frame_id_to_paddr(&self, id: usize) -> Option<usize> {
+        if id >= self.cap {
+            return None;
+        }
+        id.checked_mul(PAGE_SZ)
+            .and_then(|offset| self.base_paddr.checked_add(offset))
+    }
+
+    // AGENT: validate that a physical address names a page in this pool.
+    pub fn paddr_to_frame_id(&self, paddr: usize) -> Option<usize> {
+        if paddr < self.base_paddr || paddr % PAGE_SZ != 0 {
+            return None;
+        }
+        let id = (paddr - self.base_paddr) / PAGE_SZ;
+        if id < self.cap {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    // AGENT: allocate a physical frame as a RAII page-frame handle.
+    pub fn alloc_pg_frame(&self) -> Option<PgFrame> {
+        let id = self.get_inner()?;
+        Some(self.pg_frame_from_allocated(id))
+    }
+
+    // AGENT: allocate a specific physical frame as a RAII page-frame handle.
+    pub fn get_pg_frame(&self, id: usize) -> Option<PgFrame> {
+        self.get(id)?;
+        Some(self.pg_frame_from_allocated(id))
+    }
+
+    // AGENT: attach RAII ownership to a frame that is already marked allocated.
+    fn pg_frame_from_allocated(&self, id: usize) -> PgFrame {
+        PgFrame::from_allocated(id, self.slots.clone(), self.base_paddr)
     }
 
     pub fn get_zone_aware(&self, zone: &ZoneInfo) -> Option<usize> {
@@ -235,7 +284,9 @@ impl SharedPage {
             pending: AtomicBool::new(true),
         }
     }
-    pub fn fault(&self, pool: &FramePool, src: &PgFrame) -> Result<usize, &'static str> {
+    // AGENT: accept PgFrame as the COW source handle; PgFrame drop owns
+    // lifetime cleanup instead of manual refcount mutation here.
+    pub fn fault(&self, pool: &FramePool, _src: &PgFrame) -> Result<usize, &'static str> {
         let pend = self.pending.load(Ordering::Relaxed);
         let cur = self.frame.load(Ordering::Relaxed);
         if !pend {
@@ -248,7 +299,6 @@ impl SharedPage {
             (pa - MEM_OFF) / PAGE_SZ
         };
         self.frame.store(nf, Ordering::Relaxed);
-        let _rc_before = src.rc.fetch_sub(1, Ordering::Relaxed);
         self.w.store(true, Ordering::Relaxed);
         self.pending.store(false, Ordering::Relaxed);
         Ok(nf)

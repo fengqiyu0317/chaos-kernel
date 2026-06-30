@@ -1,8 +1,9 @@
 // AGENT
 use super::*;
 
+// AGENT: share the frame bitmap with PgFrame so RAII drops can return pages.
 pub struct FramePool {
-    pub(crate) slots: Mutex<Vec<bool>>,
+    pub(crate) slots: Arc<Mutex<Vec<bool>>>,
     pub(crate) cap: usize,
     pub(crate) base_paddr: usize,
 }
@@ -11,7 +12,7 @@ impl FramePool {
     // marks linker/RAM-derived ranges usable.
     pub fn new(n: usize, base_paddr: usize) -> Self {
         Self {
-            slots: Mutex::new(vec![false; n]),
+            slots: Arc::new(Mutex::new(vec![false; n])),
             cap: n,
             base_paddr,
         }
@@ -121,6 +122,23 @@ impl FramePool {
     }
     pub fn free_count(&self) -> usize {
         self.slots.lock().unwrap().iter().filter(|&&f| f).count()
+    }
+
+    // AGENT: allocate a physical frame as a RAII page-frame handle.
+    pub fn alloc_pg_frame(&self) -> Option<PgFrame> {
+        let id = self.get_inner()?;
+        Some(self.pg_frame_from_allocated(id))
+    }
+
+    // AGENT: allocate a specific physical frame as a RAII page-frame handle.
+    pub fn get_pg_frame(&self, id: usize) -> Option<PgFrame> {
+        self.get(id)?;
+        Some(self.pg_frame_from_allocated(id))
+    }
+
+    // AGENT: attach RAII ownership to a frame that is already marked allocated.
+    fn pg_frame_from_allocated(&self, id: usize) -> PgFrame {
+        PgFrame::from_allocated(id, self.slots.clone(), self.base_paddr)
     }
 
     // AGENT: find the first frame id whose physical address satisfies an
@@ -278,7 +296,9 @@ impl SharedPage {
             pending: AtomicBool::new(true),
         }
     }
-    pub fn fault(&self, pool: &FramePool, src: &PgFrame) -> Result<usize, &'static str> {
+    // AGENT: accept PgFrame as the COW source handle; PgFrame drop owns
+    // lifetime cleanup instead of manual refcount mutation here.
+    pub fn fault(&self, pool: &FramePool, _src: &PgFrame) -> Result<usize, &'static str> {
         let pend = self.pending.load(Ordering::Relaxed);
         let cur = self.frame.load(Ordering::Relaxed);
         if !pend {
@@ -291,7 +311,6 @@ impl SharedPage {
             pool.paddr_to_frame_id(pa).ok_or("oom")?
         };
         self.frame.store(nf, Ordering::Relaxed);
-        let _rc_before = src.rc.fetch_sub(1, Ordering::Relaxed);
         self.w.store(true, Ordering::Relaxed);
         self.pending.store(false, Ordering::Relaxed);
         Ok(nf)

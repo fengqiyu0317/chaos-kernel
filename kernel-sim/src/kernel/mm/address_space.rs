@@ -45,10 +45,9 @@ impl PageBacking {
     }
 }
 
-// AGENT: page-table entries now carry backing metadata for mmap writeback.
-#[derive(Clone)]
+// AGENT: page-table entries own a RAII frame handle plus backing metadata for
+// mmap writeback.
 pub struct PageTableEntry {
-    pub frame_id: usize,
     pub frame: PgFrame,
     pub data: Arc<Mutex<Vec<u8>>>,
     pub backing: PageBacking,
@@ -60,14 +59,13 @@ pub struct PageTableEntry {
 
 impl PageTableEntry {
     // AGENT: default page-table entries are anonymous zero-filled pages.
-    pub fn new(frame_id: usize, frame: PgFrame, flags: u32) -> Self {
-        Self::with_backing(frame_id, frame, flags, PageBacking::Anonymous)
+    pub fn new(frame: PgFrame, flags: u32) -> Self {
+        Self::with_backing(frame, flags, PageBacking::Anonymous)
     }
 
     // AGENT: allow mmap to seed resident pages with file backing metadata.
-    pub fn with_backing(frame_id: usize, frame: PgFrame, flags: u32, backing: PageBacking) -> Self {
+    pub fn with_backing(frame: PgFrame, flags: u32, backing: PageBacking) -> Self {
         Self {
-            frame_id,
             frame,
             data: Arc::new(Mutex::new(vec![0; PAGE_SZ])),
             backing,
@@ -83,8 +81,7 @@ impl PageTableEntry {
         self.cow = true;
     }
 
-    fn resolve_write(&mut self, frame_id: usize, frame: PgFrame, data: Vec<u8>) {
-        self.frame_id = frame_id;
+    fn resolve_write(&mut self, frame: PgFrame, data: Vec<u8>) {
         self.frame = frame;
         self.data = Arc::new(Mutex::new(data));
         self.writable = self.flags & VM_WRITE != 0;
@@ -97,24 +94,27 @@ impl PageTableEntry {
         self.writable = flags & VM_WRITE != 0 && !self.cow;
     }
 
+    pub fn frame_id(&self) -> usize {
+        self.frame.id()
+    }
+
+    // AGENT: clone only when a new PTE mapping should share the same frame.
+    fn clone_mapping(&self) -> Self {
+        Self {
+            frame: self.frame.clone(),
+            data: self.data.clone(),
+            backing: self.backing.clone(),
+            flags: self.flags,
+            writable: self.writable,
+            cow: self.cow,
+            present: self.present,
+        }
+    }
+
     // AGENT: flush a full resident page before unmap or address-space teardown.
     fn flush_shared_file_page(&self) -> Result<(), &'static str> {
         let page = self.data.lock().unwrap();
         self.backing.flush_range(&page, 0, PAGE_SZ)
-    }
-
-    // AGENT: drop one resident mapping reference and return the frame when it
-    // is no longer shared by another PTE.
-    fn release_frame_ref(&self, pool: &FramePool) -> bool {
-        if self.frame.count() == 0 {
-            return false;
-        }
-        let prev = self.frame.down();
-        if prev == 1 {
-            pool.put(self.frame_id);
-            return true;
-        }
-        false
     }
 }
 
@@ -179,11 +179,10 @@ impl AddrSpace {
             if !parent_entry.present {
                 continue;
             }
-            parent_entry.frame.up();
             if flags & VM_WRITE != 0 && flags & VM_SHARED == 0 {
                 parent_entry.as_cow();
             }
-            child_pt.insert(page_addr, parent_entry.clone());
+            child_pt.insert(page_addr, parent_entry.clone_mapping());
         }
         drop(child_pt);
         child
@@ -201,23 +200,23 @@ impl AddrSpace {
             return Err("segfault");
         }
         if pte.writable && !pte.cow {
-            return Ok(pte.frame_id * PAGE_SZ + MEM_OFF);
+            return Ok(pte.frame.paddr());
         }
         if !pte.cow {
             return Err("segfault");
         }
 
         let old_data = pte.data.lock().unwrap().clone();
-        if pte.frame.count() <= 1 {
+        if pte.frame.is_unique() {
             pte.writable = pte.flags & VM_WRITE != 0;
             pte.cow = false;
-            return Ok(pte.frame_id * PAGE_SZ + MEM_OFF);
+            return Ok(pte.frame.paddr());
         }
 
-        let new_frame_id = pool.get_inner().ok_or("oom")?;
-        pte.frame.down();
-        pte.resolve_write(new_frame_id, PgFrame::with_rc(1), old_data);
-        Ok(new_frame_id * PAGE_SZ + MEM_OFF)
+        let new_frame = pool.alloc_pg_frame().ok_or("oom")?;
+        let new_paddr = new_frame.paddr();
+        pte.resolve_write(new_frame, old_data);
+        Ok(new_paddr)
     }
 
     fn checked_user_end(addr: usize, len: usize) -> Result<usize, &'static str> {
@@ -380,7 +379,7 @@ impl AddrSpace {
         &mut self,
         start: usize,
         len: usize,
-        pool: &FramePool,
+        _pool: &FramePool,
     ) -> Result<usize, &'static str> {
         let end = start.checked_add(len).ok_or("efault")?;
         let mut pt = self.page_table.lock().unwrap();
@@ -396,29 +395,25 @@ impl AddrSpace {
         }
         self.vm_map.remove_range(start, len);
         for addr in &pages_to_unmap {
-            if let Some(pte) = pt.remove(addr) {
-                pte.release_frame_ref(pool);
-            }
+            let _dropped = pt.remove(addr);
         }
         Ok(pages_to_unmap.len())
     }
 
     // AGENT: process teardown flushes shared file-backed pages before dropping frames.
-    pub fn release_all_pages(&mut self, pool: &FramePool) -> usize {
+    pub fn release_all_pages(&mut self, _pool: &FramePool) -> usize {
         self.vm_map.regions.clear();
-        let entries: Vec<PageTableEntry> = {
+        let entries = {
             let mut pt = self.page_table.lock().unwrap();
-            let entries = pt.values().cloned().collect();
-            pt.clear();
-            entries
+            std::mem::take(&mut *pt)
         };
         let mut released = 0;
-        for pte in entries {
+        for pte in entries.into_values() {
             if !pte.present {
                 continue;
             }
             let _ = pte.flush_shared_file_page();
-            if pte.release_frame_ref(pool) {
+            if pte.frame.is_unique() {
                 released += 1;
             }
         }
@@ -493,28 +488,19 @@ impl AddrSpace {
         let pages: Vec<usize> = page_range(region.base, region.len).collect();
         let mut allocated = Vec::with_capacity(pages.len());
         for _ in pages.iter() {
-            match pool.get_inner() {
-                Some(frame_id) => allocated.push(frame_id),
+            match pool.alloc_pg_frame() {
+                Some(frame) => allocated.push(frame),
                 None => {
-                    for frame_id in allocated {
-                        pool.put(frame_id);
-                    }
                     return Err("enomem");
                 }
             }
         }
         if let Err(err) = self.vm_map.insert(region) {
-            for frame_id in allocated {
-                pool.put(frame_id);
-            }
             return Err(err);
         }
         let mut pt = self.page_table.lock().unwrap();
-        for (page_addr, frame_id) in pages.into_iter().zip(allocated.into_iter()) {
-            pt.insert(
-                page_addr,
-                PageTableEntry::new(frame_id, PgFrame::with_rc(1), flags),
-            );
+        for (page_addr, frame) in pages.into_iter().zip(allocated.into_iter()) {
+            pt.insert(page_addr, PageTableEntry::new(frame, flags));
         }
         Ok(())
     }
@@ -546,12 +532,9 @@ impl AddrSpace {
 
         let mut allocated = Vec::with_capacity(pages.len());
         for _ in pages.iter() {
-            match pool.get_inner() {
-                Some(frame_id) => allocated.push(frame_id),
+            match pool.alloc_pg_frame() {
+                Some(frame) => allocated.push(frame),
                 None => {
-                    for frame_id in allocated {
-                        pool.put(frame_id);
-                    }
                     return Err("enomem");
                 }
             }
@@ -559,14 +542,11 @@ impl AddrSpace {
 
         let file_snapshot = file_data.lock().unwrap().clone();
         if let Err(err) = self.vm_map.insert(region) {
-            for frame_id in allocated {
-                pool.put(frame_id);
-            }
             return Err(err);
         }
 
         let mut pt = self.page_table.lock().unwrap();
-        for ((page_addr, frame_id), file_offset) in pages
+        for ((page_addr, frame), file_offset) in pages
             .into_iter()
             .zip(allocated.into_iter())
             .zip(file_offsets.into_iter())
@@ -582,7 +562,7 @@ impl AddrSpace {
                 valid_len,
                 shared,
             };
-            let pte = PageTableEntry::with_backing(frame_id, PgFrame::with_rc(1), flags, backing);
+            let pte = PageTableEntry::with_backing(frame, flags, backing);
             if valid_len > 0 {
                 pte.data.lock().unwrap()[..valid_len]
                     .copy_from_slice(&file_snapshot[file_offset..file_offset + valid_len]);

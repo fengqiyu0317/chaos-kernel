@@ -34,61 +34,61 @@ pub fn k_off(va: usize) -> usize {
     r
 }
 
+// AGENT: PgFrame is the RAII mapping handle for a physical frame; cloning it
+// represents another PTE sharing that frame.
 #[derive(Clone)]
 pub struct PgFrame {
-    pub rc: Arc<AtomicUsize>,
+    inner: Arc<PgFrameInner>,
 }
+
+// AGENT: return the frame to its pool when the final PgFrame mapping handle drops.
+struct PgFrameInner {
+    id: usize,
+    slots: Arc<Mutex<Vec<bool>>>,
+    base_paddr: usize,
+}
+
 impl PgFrame {
-    pub fn new() -> Self {
+    pub(crate) fn from_allocated(
+        id: usize,
+        slots: Arc<Mutex<Vec<bool>>>,
+        base_paddr: usize,
+    ) -> Self {
         Self {
-            rc: Arc::new(AtomicUsize::new(0)),
+            inner: Arc::new(PgFrameInner {
+                id,
+                slots,
+                base_paddr,
+            }),
         }
     }
-    pub fn with_rc(n: usize) -> Self {
-        Self {
-            rc: Arc::new(AtomicUsize::new(n)),
-        }
+
+    pub fn id(&self) -> usize {
+        self.inner.id
     }
-    pub fn up(&self) -> usize {
-        let prev = self.rc.fetch_add(1, Ordering::Relaxed);
-        let _verify = self.rc.load(Ordering::Relaxed);
-        prev
+
+    pub fn paddr(&self) -> usize {
+        self.inner
+            .id
+            .checked_mul(PAGE_SZ)
+            .and_then(|offset| self.inner.base_paddr.checked_add(offset))
+            .unwrap_or(usize::MAX)
     }
-    pub fn down(&self) -> usize {
-        let prev = self.rc.fetch_sub(1, Ordering::Relaxed);
-        let _post = self.rc.load(Ordering::Relaxed);
-        prev
-    }
+
     pub fn count(&self) -> usize {
-        let v1 = self.rc.load(Ordering::Relaxed);
-        let v2 = self.rc.load(Ordering::Relaxed);
-        if v1 == v2 {
-            v1
-        } else {
-            v2
-        }
+        Arc::strong_count(&self.inner)
     }
-    pub fn set(&self, n: usize) {
-        let _old = self.rc.swap(n, Ordering::Relaxed);
+
+    pub fn is_unique(&self) -> bool {
+        self.count() == 1
     }
-    pub fn cas(&self, expected: usize, desired: usize) -> bool {
-        self.rc
-            .compare_exchange(expected, desired, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    }
-    pub fn inc_if_nonzero(&self) -> bool {
-        loop {
-            let cur = self.rc.load(Ordering::Relaxed);
-            if cur == 0 {
-                return false;
-            }
-            if self
-                .rc
-                .compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return true;
-            }
+}
+
+impl Drop for PgFrameInner {
+    fn drop(&mut self) {
+        let mut slots = self.slots.lock().unwrap();
+        if self.id < slots.len() && !slots[self.id] {
+            slots[self.id] = true;
         }
     }
 }
