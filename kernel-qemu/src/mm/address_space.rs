@@ -383,8 +383,8 @@ impl AddrSpace {
         Ok(end)
     }
 
-    // AGENT: read through VmMap permissions, resident-page metadata, and the
-    // actual Sv39 translation layer in that order.
+    // AGENT: copy user bytes by trusting the live Sv39 page table as the read
+    // authority instead of duplicating resident-page or VmMap validity checks.
     pub fn read_user_bytes(&self, addr: usize, dst: &mut [u8]) -> Result<(), &'static str> {
         if dst.is_empty() {
             return Ok(());
@@ -393,17 +393,8 @@ impl AddrSpace {
         let mut copied = 0usize;
         while copied < dst.len() {
             let cur = addr + copied;
-            let region = self.vm_map.find(cur).ok_or("efault")?;
-            if region.flags & VM_READ == 0 {
-                return Err("efault");
-            }
-            let page_addr = cur & !(PAGE_SZ - 1);
             let page_off = cur & (PAGE_SZ - 1);
-            let chunk = min(end - cur, min(PAGE_SZ - page_off, region.end() - cur));
-            {
-                let entries = self.resident_pages.entries.lock().unwrap();
-                entries.get(&page_addr).ok_or("efault")?;
-            }
+            let chunk = min(end - cur, PAGE_SZ - page_off);
             let paddr = self.sv39.translate(cur, PageAccess::Read)?;
             copy_from_phys(paddr, &mut dst[copied..copied + chunk]);
             copied += chunk;
