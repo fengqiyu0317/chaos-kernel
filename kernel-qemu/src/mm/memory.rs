@@ -162,47 +162,73 @@ impl VmRegion {
     }
 }
 
+// AGENT: keep VmMap to mutable per-address-space state; the fixed mmap search
+// base is not stored per address space.
 pub struct VmMap {
     pub regions: Vec<VmRegion>,
     pub brk: usize,
-    pub mmap_base: usize,
 }
 
+const MMAP_BASE: usize = 0x7000_0000;
+
 impl VmMap {
+    // AGENT: initialize only the VM metadata that can differ by address space.
     pub fn new() -> Self {
         Self {
             regions: Vec::new(),
             brk: 0x0040_0000,
-            mmap_base: 0x7000_0000,
         }
     }
 
-    // AGENT: reject overflowed or kernel-crossing regions before overlap checks.
+    // AGENT: validate, place, and coalesce one page-granular VMA while keeping
+    // the region list sorted by base address.
     pub fn insert(&mut self, region: VmRegion) -> Result<(), &'static str> {
+        if region.len == 0 || region.base % PAGE_SZ != 0 || region.len % PAGE_SZ != 0 {
+            return Err("einval");
+        }
+
         let rb = region.base;
         let re = region.checked_end().ok_or("overflow")?;
         if re > KERN_BASE {
             return Err("efault");
         }
+
         let mut idx = 0;
         while idx < self.regions.len() {
             let eb = self.regions[idx].base;
             let ee = self.regions[idx].checked_end().ok_or("overflow")?;
+
             if rb < ee && eb < re {
                 return Err("overlap");
             }
             if eb > rb {
                 break;
             }
+
             idx += 1;
         }
-        let _coalesce_prev = if idx > 0 {
-            let pi = idx - 1;
-            let pe = self.regions[pi].end();
-            pe == rb && self.regions[pi].flags == region.flags
-        } else {
-            false
-        };
+
+        if idx > 0 {
+            let prev_idx = idx - 1;
+            if let Some(merged) = self.regions[prev_idx].merge_with(&region) {
+                self.regions[prev_idx] = merged;
+                if idx < self.regions.len() {
+                    if let Some(merged) = self.regions[prev_idx].merge_with(&self.regions[idx]) {
+                        self.regions[prev_idx] = merged;
+                        self.regions.remove(idx);
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        if idx < self.regions.len() {
+            if let Some(merged) = region.merge_with(&self.regions[idx]) {
+                self.regions[idx] = merged;
+                return Ok(());
+            }
+        }
+
         self.regions.insert(idx, region);
         Ok(())
     }
@@ -274,11 +300,11 @@ impl VmMap {
     // AGENT: search free VM gaps with checked candidate/end arithmetic.
     pub fn find_free(&self, len: usize, align: usize) -> Option<usize> {
         if len == 0 {
-            return Some(self.mmap_base);
+            return Some(MMAP_BASE);
         }
         let al = if align > 1 { align } else { PAGE_SZ };
         let al_mask = al - 1;
-        let mut cand = self.mmap_base.checked_add(al_mask)? & !al_mask;
+        let mut cand = MMAP_BASE.checked_add(al_mask)? & !al_mask;
         let mut iters = 0;
         let max_iters = self.regions.len() + 2;
         while iters < max_iters {

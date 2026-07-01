@@ -354,23 +354,19 @@ impl Task {
     pub fn get_futex(&self) -> Arc<FutexBucket> {
         self.process.futex.clone()
     }
-    // AGENT: record process death once; resource teardown is driven by Kernel::exit_task.
-    pub fn exit_proc(&self, reason: ExitReason) -> bool {
-        {
-            let mut exit_reason = self.process.exit_reason.lock().unwrap();
-            if exit_reason.is_some() {
-                return false;
-            }
-            *exit_reason = Some(reason);
+    // AGENT: record process death once; Kernel::exit_task owns teardown,
+    // reparenting, scheduler cleanup, and SIGCHLD delivery.
+    pub(crate) fn exit_proc(&self, reason: ExitReason) -> bool {
+        let mut exit_reason = self.process.exit_reason.lock().unwrap();
+        if exit_reason.is_some() {
+            return false;
         }
-        {
-            self.process.ev.lock().unwrap().set(EvFlag::PROC_QUIT);
-        } // AGENT: use EvBus::set instead of manual inline
-        {
-            let pg = self.process.parent.lock().unwrap();
-            if let Some(ref p) = *pg {
-                p.process.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
-            } // AGENT: use EvBus::set instead of manual inline
+        *exit_reason = Some(reason);
+        drop(exit_reason);
+
+        self.process.ev.lock().unwrap().set(EvFlag::PROC_QUIT);
+        if let Some(parent) = self.process.parent.lock().unwrap().clone() {
+            parent.process.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
         }
         self.set_sched_state(TaskRunState::Zombie);
         true
@@ -867,17 +863,6 @@ impl TaskTable {
         self.register(&t, Pid(t.id()));
         t.process.threads.lock().unwrap().push(t.id());
         t
-    }
-
-    pub fn terminate_and_collect(&self, id: usize, code: usize) -> bool {
-        let t = { self.map.read().unwrap().get(&id).cloned() };
-        if let Some(t) = t {
-            t.exit_proc(ExitReason::Code((code & 0xFF) as u8));
-            self.reap(id);
-            true
-        } else {
-            false
-        }
     }
 
     pub fn active_tasks(&self) -> Vec<usize> {

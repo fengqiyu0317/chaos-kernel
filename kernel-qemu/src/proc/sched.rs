@@ -157,4 +157,3 @@ impl RunQueue {
 }
 
 pub type Tid = usize;
-pub type Pgid = i32;

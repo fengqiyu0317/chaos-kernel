@@ -119,7 +119,6 @@ impl AddrSpace {
     pub fn fork_from(parent: &AddrSpace, pool: &FramePool) -> Result<Self, &'static str> {
         let mut child = Self::new();
         child.vm_map.brk = parent.vm_map.brk;
-        child.vm_map.mmap_base = parent.vm_map.mmap_base;
         for region in parent.vm_map.clone_regions() {
             if region.flags & VM_DONTCOPY != 0 {
                 continue;

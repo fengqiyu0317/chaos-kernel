@@ -18,6 +18,8 @@ impl Kernel {
         Ok(())
     }
 
+    // AGENT: keep process-exit teardown centralized and release each thread
+    // context once, even when the exiting task is listed in process.threads.
     pub(crate) fn exit_task(&self, cpu: usize, task: &Arc<Task>, reason: ExitReason) {
         let thread_ids = task.process.threads.lock().unwrap().clone();
         if !task.exit_proc(reason) {
@@ -25,15 +27,22 @@ impl Kernel {
         }
         let parent = task.process.parent.lock().unwrap().clone();
         let process_owner = task.process.clone();
+        let mut released_exiting_task = false;
         for tid in thread_ids {
             if let Some(thread) = self.tasks.find(tid) {
-                if Arc::ptr_eq(&thread.process, &process_owner) {
-                    thread.release_thread_exit_resources();
-                    self.run_queue.remove(thread.id());
+                if !Arc::ptr_eq(&thread.process, &process_owner) {
+                    continue;
                 }
+                if thread.id() == task.id() {
+                    released_exiting_task = true;
+                }
+                thread.release_thread_exit_resources();
+                self.run_queue.remove(thread.id());
             }
         }
-        task.release_thread_exit_resources();
+        if !released_exiting_task {
+            task.release_thread_exit_resources();
+        }
         let _released_pages = task.release_process_exit_resources(&self.pool);
         self.tasks.reparent_children_to_init(task);
         self.run_queue.remove(task.id());
