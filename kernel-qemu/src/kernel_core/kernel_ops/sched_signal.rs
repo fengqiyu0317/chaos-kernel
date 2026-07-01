@@ -157,7 +157,7 @@ impl Kernel {
         if cpu == 0 {
             self.advance_timers();
         }
-        if cpu != 0 || !self.run_queue.preemptible() {
+        if cpu != 0 {
             return;
         }
         match self.cur_task(cpu) {
@@ -169,17 +169,19 @@ impl Kernel {
             Some(t) => {
                 t.set_sched_state(TaskRunState::Running);
                 if t.tick_slice() {
-                    if self.run_queue.len() > 0 {
+                    if self.run_queue.len() == 0 {
+                        t.reset_slice();
+                    } else if self.run_queue.preemptible() {
                         t.set_sched_state(TaskRunState::Runnable);
                         self.run_queue.enqueue(t.id(), t.sched_policy());
                         self.schedule_next_runnable(cpu);
-                    } else {
-                        t.reset_slice();
                     }
                 }
             }
             None => {
-                self.schedule_next_runnable(cpu);
+                if self.run_queue.preemptible() {
+                    self.schedule_next_runnable(cpu);
+                }
             }
         }
     }

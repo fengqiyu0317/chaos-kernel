@@ -76,33 +76,17 @@ impl Drop for PgFrameInner {
     }
 }
 
+// AGENT: keep VmRegion to the VMA metadata that is currently used by the
+// QEMU address-space code; unused region tag/offset fields were removed.
 pub struct VmRegion {
     pub base: usize,
     pub len: usize,
     pub flags: u32,
-    pub offset: usize,
-    pub tag: u16,
 }
 
 impl VmRegion {
     pub fn new(base: usize, len: usize, flags: u32) -> Self {
-        Self {
-            base,
-            len,
-            flags,
-            offset: 0,
-            tag: 0,
-        }
-    }
-
-    pub fn with_offset(base: usize, len: usize, flags: u32, offset: usize) -> Self {
-        Self {
-            base,
-            len,
-            flags,
-            offset,
-            tag: 0,
-        }
+        Self { base, len, flags }
     }
 
     // AGENT: expose a checked end for callers that must reject overflowed VM ranges.
@@ -136,7 +120,7 @@ impl VmRegion {
         !no_overlap
     }
 
-    // AGENT: reject splits that would overflow either the region end or file offset.
+    // AGENT: reject splits that would overflow the region end.
     pub fn split_at(&self, addr: usize) -> Option<(VmRegion, VmRegion)> {
         let e = self.checked_end()?;
         if addr <= self.base || addr >= e {
@@ -144,8 +128,6 @@ impl VmRegion {
         }
         let ll = addr - self.base;
         let rl = self.len - ll;
-        let lo = self.offset;
-        let ro = self.offset.checked_add(ll)?;
         let mut lf = self.flags;
         let mut rf = self.flags;
         if self.flags & VM_GROWSDOWN != 0 {
@@ -155,15 +137,11 @@ impl VmRegion {
             base: self.base,
             len: ll,
             flags: lf,
-            offset: lo,
-            tag: self.tag,
         };
         let r = VmRegion {
             base: addr,
             len: rl,
             flags: rf,
-            offset: ro,
-            tag: self.tag,
         };
         Some((l, r))
     }
@@ -177,16 +155,11 @@ impl VmRegion {
         if self.flags != other.flags {
             return None;
         }
-        if self.tag != other.tag {
-            return None;
-        }
         let combined_len = self.len.checked_add(other.len)?;
         let combined = VmRegion {
             base: self.base,
             len: combined_len,
             flags: self.flags,
-            offset: self.offset,
-            tag: self.tag,
         };
         Some(combined)
     }
@@ -278,14 +251,8 @@ impl VmMap {
             }
             // AGENT: Region starts inside removal, extends past end: keep [end, re)
             else if rb >= base {
-                let delta = end - rb;
-                let Some(next_offset) = self.regions[i].offset.checked_add(delta) else {
-                    self.regions.remove(i);
-                    continue;
-                };
                 self.regions[i].base = end;
                 self.regions[i].len = re - end;
-                self.regions[i].offset = next_offset;
                 i += 1;
             }
             // AGENT: Region starts before removal, ends inside: keep [rb, base)
@@ -358,8 +325,6 @@ impl VmMap {
                 base: r.base,
                 len: r.len,
                 flags: r.flags,
-                offset: r.offset,
-                tag: r.tag,
             };
             out.push(nr);
         }
