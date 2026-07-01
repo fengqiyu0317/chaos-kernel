@@ -78,7 +78,19 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         kernel::proc::sched::tests::run_all();
         println!("[kernel-qemu] sched selftest passed");
     }
-    let _kernel = init_qemu_kernel_backend();
+    let kernel = init_qemu_kernel_backend();
+    // AGENT: run ProcInit stack-writing checks only after the real QEMU frame
+    // pool and direct map are installed.
+    #[cfg(feature = "qemu-proc-selftest")]
+    {
+        println!("[kernel-qemu] proc selftest start");
+        kernel::proc::process_tests::run_all(&kernel.pool);
+        println!("[kernel-qemu] proc selftest passed");
+    }
+    // AGENT: keep the ordinary boot path warning-free while proc selftests are
+    // feature-gated out.
+    #[cfg(not(feature = "qemu-proc-selftest"))]
+    let _ = kernel;
     let timer_probe = arm_timer_wheel_probe();
     trap::init_kernel_trap_vector();
     println!(

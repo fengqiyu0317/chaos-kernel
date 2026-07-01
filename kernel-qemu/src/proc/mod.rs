@@ -3,6 +3,9 @@ use super::*;
 
 pub mod ipc;
 pub mod process;
+// AGENT: expose process-stack regressions to optional QEMU boot selftests.
+#[cfg(any(test, feature = "qemu-proc-selftest"))]
+pub mod process_tests;
 pub mod sched;
 pub mod signal;
 pub mod task;
