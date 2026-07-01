@@ -43,6 +43,23 @@ impl Kernel {
         true
     }
 
+    // AGENT: update the task-owned priority and refresh the run queue only for
+    // tasks that are already runnable.
+    pub fn boost_task_priority(&self, task_id: usize, amount: i32) -> bool {
+        let Some(task) = self.tasks.find(task_id) else {
+            return false;
+        };
+        if task.done() {
+            return false;
+        }
+
+        let policy = task.boost_priority(amount);
+        if task.sched_state() == TaskRunState::Runnable {
+            self.run_queue.enqueue(task_id, policy);
+        }
+        true
+    }
+
     // AGENT: central signal send path so pending-signal enqueue and scheduler
     // wakeup stay together.
     pub fn send_signal_to_task(&self, task: &Arc<Task>, signo: i32, sender_tid: isize) {

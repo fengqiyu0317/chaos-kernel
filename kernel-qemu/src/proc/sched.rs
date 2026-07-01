@@ -116,16 +116,6 @@ impl RunQueue {
         q.len() < before
     }
 
-    pub fn boost_priority(&self, task_id: usize, amount: i32) {
-        let mut q = self.queue.lock().unwrap();
-        for (id, policy) in q.iter_mut() {
-            if *id == task_id {
-                policy.prio = (policy.prio - amount).clamp(PRIO_MIN, PRIO_MAX);
-                break;
-            }
-        }
-    }
-
     pub fn yield_current(&self, policy: SchedulePolicy) -> bool {
         let cur = self.current.lock().unwrap().take();
         match cur {
