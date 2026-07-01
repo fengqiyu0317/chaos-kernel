@@ -741,47 +741,27 @@ impl TaskTable {
         Ok(())
     }
 
-    // AGENT: expose the session that owns a process group for setpgid checks.
-    pub fn process_group_session(&self, pgid: Pgid) -> Option<usize> {
-        self.groups
-            .lock()
-            .unwrap()
-            .get(&pgid)
-            .map(|group| group.session_id)
-    }
-
     // AGENT: move a process between process groups as one state transition.
     pub fn move_process_to_group(
         &self,
         task: &Arc<Task>,
         new_pgid: Pgid,
     ) -> Result<(), &'static str> {
+        if new_pgid <= 0 {
+            return Err("einval");
+        }
         let pid = task.process_pid();
         let sid = task.process_sid();
         let old_pgid = *task.process.pgid.lock().unwrap();
-        if old_pgid == new_pgid {
-            let mut groups = self.groups.lock().unwrap();
-            Self::add_pid_to_group_locked(&mut groups, new_pgid, sid, pid)?;
-            return Ok(());
-        }
 
         let mut groups = self.groups.lock().unwrap();
-        if new_pgid != pid as Pgid {
-            match groups.get(&new_pgid) {
-                Some(group) if group.session_id == sid => {}
-                Some(_) => return Err("eperm"),
-                None => return Err("eperm"),
-            }
-        } else if groups
-            .get(&new_pgid)
-            .is_some_and(|group| group.session_id != sid)
-        {
-            return Err("eperm");
+        Self::add_pid_to_group_locked(&mut groups, new_pgid, sid, pid)?;
+        if old_pgid == new_pgid {
+            return Ok(());
         }
 
         Self::remove_pid_from_group_locked(&mut groups, old_pgid, pid);
         *task.process.pgid.lock().unwrap() = new_pgid;
-        Self::add_pid_to_group_locked(&mut groups, new_pgid, sid, pid)?;
         Ok(())
     }
 

@@ -1,31 +1,20 @@
 // AGENT
 use super::*;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IpcPerm {
-    pub key: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub cuid: u32,
-    pub cgid: u32,
-    pub mode: u32,
-    pub seq: u32,
-    pub pad1: usize,
-    pub pad2: usize,
-}
+const IPC_PRIVATE_KEY: u32 = 0;
+const IPC_CREAT: usize = 0o1000;
+const IPC_EXCL: usize = 0o2000;
+const IPC_MODE_MASK: u32 = 0o777;
 
-#[repr(C)]
+// AGENT: keep only semaphore-set metadata that current kernel-qemu logic uses.
 #[derive(Clone, Copy)]
 pub struct SemDs {
-    pub perm: IpcPerm,
-    pub otime: usize,
-    _p1: usize,
-    pub ctime: usize,
-    _p2: usize,
+    pub key: u32,
+    pub mode: u32,
     pub nsems: usize,
 }
 
+// AGENT: model one semaphore set as metadata plus its contained semaphores.
 pub struct SemArr {
     pub ds: Mutex<SemDs>,
     pub sems: Vec<Sema>,
@@ -42,62 +31,75 @@ impl SemArr {
             s.remove();
         }
     }
-    pub fn otime_now(&self) {
-        self.ds.lock().unwrap().otime = 0;
+
+    fn prune_dead_sets(store: &mut BTreeMap<u32, Weak<SemArr>>) {
+        store.retain(|_, sems| sems.strong_count() > 0);
     }
-    pub fn ctime_now(&self) {
-        self.ds.lock().unwrap().ctime = 0;
+
+    fn next_private_key(store: &BTreeMap<u32, Weak<SemArr>>) -> u32 {
+        (1u32..)
+            .find(|candidate| !store.contains_key(candidate))
+            .unwrap()
     }
-    pub fn set_ds(&self, new: &SemDs) {
-        let mut l = self.ds.lock().unwrap();
-        l.perm.uid = new.perm.uid;
-        l.perm.gid = new.perm.gid;
-        l.perm.mode = new.perm.mode & 0x1ff;
+
+    fn new_set(key: u32, nsems: usize, flags: usize) -> Arc<Self> {
+        let mut sems = Vec::with_capacity(nsems);
+        for _ in 0..nsems {
+            sems.push(Sema::new(0));
+        }
+
+        Arc::new(SemArr {
+            ds: Mutex::new(SemDs {
+                key,
+                mode: (flags as u32) & IPC_MODE_MASK,
+                nsems,
+            }),
+            sems,
+        })
     }
+
+    // AGENT: create or reuse a semaphore set using only key, mode, and set size metadata.
     pub fn get_or_create(
         key: u32,
         nsems: usize,
         flags: usize,
         store: &RwLock<BTreeMap<u32, Weak<SemArr>>>,
     ) -> Result<Arc<Self>, &'static str> {
-        let mut m = store.write().unwrap();
-        let mut k = key;
-        if k == 0 {
-            k = (1u32..).find(|i| m.get(i).is_none()).unwrap();
-        } else if let Some(w) = m.get(&k) {
-            if let Some(a) = w.upgrade() {
-                if (flags & (1 << 9)) != 0 && (flags & (1 << 10)) != 0 {
+        let mut sets = store.write().unwrap();
+        Self::prune_dead_sets(&mut sets);
+
+        let creating_private = key == IPC_PRIVATE_KEY;
+        let wants_create = (flags & IPC_CREAT) != 0;
+        let wants_exclusive = (flags & IPC_EXCL) != 0;
+
+        if !creating_private {
+            if let Some(existing) = sets.get(&key).and_then(Weak::upgrade) {
+                let existing_nsems = existing.ds.lock().unwrap().nsems;
+                if wants_create && wants_exclusive {
                     return Err("eexist");
                 }
-                return Ok(a);
+                if nsems > existing_nsems {
+                    return Err("einval");
+                }
+                return Ok(existing);
+            }
+
+            if !wants_create {
+                return Err("enoent");
             }
         }
-        let mut sv = Vec::new();
-        for _ in 0..nsems {
-            sv.push(Sema::new(0));
+
+        if nsems == 0 {
+            return Err("einval");
         }
-        let arr = Arc::new(SemArr {
-            ds: Mutex::new(SemDs {
-                perm: IpcPerm {
-                    key: k,
-                    uid: 0,
-                    gid: 0,
-                    cuid: 0,
-                    cgid: 0,
-                    mode: (flags as u32) & 0x1ff,
-                    seq: 0,
-                    pad1: 0,
-                    pad2: 0,
-                },
-                otime: 0,
-                _p1: 0,
-                ctime: 0,
-                _p2: 0,
-                nsems,
-            }),
-            sems: sv,
-        });
-        m.insert(k, Arc::downgrade(&arr));
+
+        let stored_key = if creating_private {
+            Self::next_private_key(&sets)
+        } else {
+            key
+        };
+        let arr = Self::new_set(stored_key, nsems, flags);
+        sets.insert(stored_key, Arc::downgrade(&arr));
         Ok(arr)
     }
 }
@@ -119,9 +121,6 @@ impl SemCtx {
     }
     pub fn remove(&mut self, id: SemId) {
         self.arrays.remove(&id);
-    }
-    fn free_id(&self) -> SemId {
-        (0..).find(|i| self.arrays.get(i).is_none()).unwrap()
     }
     pub fn get(&self, id: SemId) -> Option<Arc<SemArr>> {
         self.arrays.get(&id).cloned()

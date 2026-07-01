@@ -173,14 +173,9 @@ pub(super) fn sys_setpgid(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize
     if target.is_session_leader() {
         return Err("eperm");
     }
-    let new_pgid = new_pgid as Pgid;
-    if new_pgid != target_pid as Pgid {
-        match kernel.tasks.process_group_session(new_pgid) {
-            Some(group_sid) if group_sid == target_sid => {}
-            _ => return Err("eperm"),
-        }
-    }
-    kernel.tasks.move_process_to_group(&target, new_pgid)?;
+    kernel
+        .tasks
+        .move_process_to_group(&target, new_pgid as Pgid)?;
     Ok(0)
 }
 
