@@ -170,7 +170,8 @@ impl Kernel {
                 if t.tick_slice() {
                     if self.run_queue.len() == 0 {
                         t.reset_slice();
-                    } else if self.run_queue.preemptible() {
+                    } else {
+                        // AGENT: A ready peer gets the CPU at slice expiry.
                         t.set_sched_state(TaskRunState::Runnable);
                         self.run_queue.enqueue(t.id(), t.sched_policy());
                         self.schedule_next_runnable(cpu);
@@ -178,9 +179,8 @@ impl Kernel {
                 }
             }
             None => {
-                if self.run_queue.preemptible() {
-                    self.schedule_next_runnable(cpu);
-                }
+                // AGENT: An idle CPU immediately pulls runnable work.
+                self.schedule_next_runnable(cpu);
             }
         }
     }

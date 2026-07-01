@@ -25,10 +25,10 @@ impl SchedulePolicy {
     }
 }
 
+// AGENT: RunQueue keeps only runnable/current task state.
 pub struct RunQueue {
     pub queue: Mutex<Vec<(usize, SchedulePolicy)>>,
     pub current: Mutex<Option<usize>>,
-    pub preempt_count: AtomicUsize,
 }
 
 impl RunQueue {
@@ -36,7 +36,6 @@ impl RunQueue {
         Self {
             queue: Mutex::new(Vec::new()),
             current: Mutex::new(None),
-            preempt_count: AtomicUsize::new(0),
         }
     }
 
@@ -115,22 +114,6 @@ impl RunQueue {
             }
         }
         q.len() < before
-    }
-
-    pub fn preempt_disable(&self) {
-        let _prev = self.preempt_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn preempt_enable(&self) {
-        let prev = self.preempt_count.load(Ordering::Relaxed);
-        if prev == 0 {
-            return;
-        }
-        self.preempt_count.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    pub fn preemptible(&self) -> bool {
-        self.preempt_count.load(Ordering::Relaxed) == 0
     }
 
     pub fn boost_priority(&self, task_id: usize, amount: i32) {
