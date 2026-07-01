@@ -11,6 +11,7 @@ pub fn run_all(pool: &FramePool) {
     spawn_root_creates_single_pid_one_init();
     spawn_root_rejects_nonempty_task_table();
     proc_init_push_at_writes_user_stack(pool);
+    shm_segment_maps_shared_physical_page(pool);
 }
 
 // AGENT: capability inheritance keeps only the mask-approved bits and clamps
@@ -152,6 +153,40 @@ fn proc_init_push_at_writes_user_stack(pool: &FramePool) {
     assert_eq!(addr_space.read_user_usize(auxv + word * 3).unwrap(), entry);
     assert_eq!(addr_space.read_user_usize(auxv + word * 4).unwrap(), 0);
     assert_eq!(addr_space.read_user_usize(auxv + word * 5).unwrap(), 0);
+}
+
+// AGENT: shared-memory segments should map the same physical page into
+// independent address spaces instead of allocating anonymous COW pages.
+fn shm_segment_maps_shared_physical_page(pool: &FramePool) {
+    let segment = ShmSegment::new(1, pool).expect("shm segment should allocate");
+    let mut left = AddrSpace::new();
+    let mut right = AddrSpace::new();
+    let left_addr = 0x2000_0000;
+    let right_addr = 0x3000_0000;
+    let flags = VM_READ | VM_WRITE;
+
+    left.map_shared_pages(
+        VmRegion::new(left_addr, PAGE_SZ, flags),
+        segment.pages(),
+        pool,
+    )
+    .expect("left shared mapping should succeed");
+    right
+        .map_shared_pages(
+            VmRegion::new(right_addr, PAGE_SZ, flags),
+            segment.pages(),
+            pool,
+        )
+        .expect("right shared mapping should succeed");
+
+    left.write_user_bytes(left_addr + 17, b"shared", pool)
+        .expect("shared mapping should be writable");
+
+    let mut bytes = [0u8; 6];
+    right
+        .read_user_bytes(right_addr + 17, &mut bytes)
+        .expect("shared mapping should be readable");
+    assert_eq!(&bytes, b"shared");
 }
 
 // AGENT: read a known-length C string from user memory and verify its trailing

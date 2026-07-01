@@ -199,10 +199,39 @@ impl Drop for SemCtx {
 
 type ShmId = usize;
 
+// AGENT: keep System V shared-memory backing as real shared physical pages.
+pub struct ShmSegment {
+    pages: Vec<SharedPage>,
+}
+
+impl ShmSegment {
+    pub fn new(npages: usize, pool: &FramePool) -> Result<Arc<Self>, &'static str> {
+        if npages == 0 {
+            return Err("einval");
+        }
+
+        let mut pages = Vec::with_capacity(npages);
+        for _ in 0..npages {
+            let frame = pool.alloc_pg_frame().ok_or("enomem")?;
+            zero_page(frame.paddr());
+            pages.push(SharedPage::new(frame));
+        }
+        Ok(Arc::new(Self { pages }))
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub fn pages(&self) -> &[SharedPage] {
+        &self.pages
+    }
+}
+
 #[derive(Clone)]
 pub struct ShmTag {
     pub addr: usize,
-    pub pages: Arc<Mutex<Vec<usize>>>,
+    pub segment: Arc<ShmSegment>,
 }
 impl ShmTag {
     pub fn set_addr(&mut self, a: usize) {
@@ -213,17 +242,21 @@ impl ShmTag {
 pub fn shm_get_or_create(
     key: usize,
     npages: usize,
-    store: &RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
-) -> Arc<Mutex<Vec<usize>>> {
+    pool: &FramePool,
+    store: &RwLock<BTreeMap<usize, Weak<ShmSegment>>>,
+) -> Result<Arc<ShmSegment>, &'static str> {
     let mut m = store.write().unwrap();
     if let Some(w) = m.get(&key) {
-        if let Some(g) = w.upgrade() {
-            return g;
+        if let Some(segment) = w.upgrade() {
+            if npages > segment.page_count() {
+                return Err("einval");
+            }
+            return Ok(segment);
         }
     }
-    let g = Arc::new(Mutex::new(vec![0usize; npages]));
-    m.insert(key, Arc::downgrade(&g));
-    g
+    let segment = ShmSegment::new(npages, pool)?;
+    m.insert(key, Arc::downgrade(&segment));
+    Ok(segment)
 }
 
 #[derive(Default)]
@@ -231,9 +264,9 @@ pub struct ShmCtx {
     pub ids: BTreeMap<ShmId, ShmTag>,
 }
 impl ShmCtx {
-    pub fn add(&mut self, g: Arc<Mutex<Vec<usize>>>) -> ShmId {
+    pub fn add(&mut self, segment: Arc<ShmSegment>) -> ShmId {
         let id = (0..).find(|i| !self.ids.contains_key(i)).unwrap();
-        self.ids.insert(id, ShmTag { addr: 0, pages: g });
+        self.ids.insert(id, ShmTag { addr: 0, segment });
         id
     }
     pub fn get(&self, id: ShmId) -> Option<ShmTag> {

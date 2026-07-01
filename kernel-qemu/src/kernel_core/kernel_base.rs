@@ -14,7 +14,7 @@ pub struct Kernel {
     // AGENT: unified path-backed file table shared by open-like handles and exec.
     pub file_nodes: RwLock<BTreeMap<String, Arc<FileNode>>>,
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
-    pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
+    pub shm_store: RwLock<BTreeMap<usize, Weak<ShmSegment>>>,
     pub tty_buf: Mutex<VecDeque<u8>>,
 }
 impl Kernel {

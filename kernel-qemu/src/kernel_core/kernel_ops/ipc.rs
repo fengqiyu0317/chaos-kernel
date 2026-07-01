@@ -12,7 +12,7 @@ impl Kernel {
     }
 
     // AGENT: route shared-memory lookup through the kernel-owned IPC store.
-    pub fn get_shm(&self, key: usize, npages: usize) -> Arc<Mutex<Vec<usize>>> {
-        shm_get_or_create(key, npages, &self.shm_store)
+    pub fn get_shm(&self, key: usize, npages: usize) -> Result<Arc<ShmSegment>, &'static str> {
+        shm_get_or_create(key, npages, &self.pool, &self.shm_store)
     }
 }
