@@ -241,46 +241,33 @@ impl VmMap {
         region.contains(addr).then_some(region)
     }
 
-    // AGENT: ignore invalid removal ranges instead of allowing wrapped end addresses.
+    // AGENT: remove the requested half-open range from VMA metadata by keeping
+    // any non-overlapping left/right fragments.
     pub fn remove_range(&mut self, base: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
         let Some(end) = base.checked_add(len) else {
             return;
         };
-        let mut i = 0;
-        while i < self.regions.len() {
-            let rb = self.regions[i].base;
-            let re = self.regions[i].end();
-            // No overlap
+
+        let mut kept = Vec::with_capacity(self.regions.len());
+        for region in self.regions.drain(..) {
+            let rb = region.base;
+            let re = region.end();
             if re <= base || rb >= end {
-                i += 1;
+                kept.push(region);
+                continue;
             }
-            // AGENT: Region fully inside removal range
-            else if rb >= base && re <= end {
-                self.regions.remove(i);
+
+            if rb < base {
+                kept.push(VmRegion::new(rb, base - rb, region.flags));
             }
-            // AGENT: Region starts inside removal, extends past end: keep [end, re)
-            else if rb >= base {
-                self.regions[i].base = end;
-                self.regions[i].len = re - end;
-                i += 1;
-            }
-            // AGENT: Region starts before removal, ends inside: keep [rb, base)
-            else if re <= end {
-                self.regions[i].len = base - rb;
-                i += 1;
-            }
-            // AGENT: Region contains entire removal range: split into [rb, base) + [end, re)
-            else {
-                let region = self.regions.remove(i);
-                if let Some((left_temp, right)) = region.split_at(end) {
-                    if let Some((left, _mid)) = left_temp.split_at(base) {
-                        self.regions.insert(i, left);
-                        self.regions.insert(i + 1, right);
-                        i += 2;
-                    }
-                }
+            if end < re {
+                kept.push(VmRegion::new(end, re - end, region.flags));
             }
         }
+        self.regions = kept;
     }
 
     // AGENT: search free VM gaps with checked candidate/end arithmetic.
