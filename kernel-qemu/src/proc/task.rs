@@ -690,28 +690,55 @@ impl TaskTable {
         }
     }
 
-    // AGENT: register a process identity and mirror it into the authoritative
-    // process-group table.
-    fn register_process_identity(&self, task: &Arc<Task>, pid: Pid) {
+    // AGENT: register a freshly-created process exactly once, keeping pid,
+    // process-group membership, and main-thread tracking in one place.
+    fn register_process_identity(&self, task: &Arc<Task>, pid: Pid) -> Result<(), &'static str> {
         let pid_value = pid.get();
-        *task.process.pid.lock().unwrap() = pid;
+        if pid_value == 0 {
+            return Err("einval");
+        }
+
+        let default_pgid = Pgid::try_from(pid_value).map_err(|_| "einval")?;
+        let current_pid = task.process.pid.lock().unwrap().get();
+        if current_pid != 0 {
+            return Err("eexist");
+        }
+
         let pgid = {
-            let mut pgid_guard = task.process.pgid.lock().unwrap();
-            if *pgid_guard == 0 {
-                *pgid_guard = pid_value as Pgid;
+            let stored_pgid = *task.process.pgid.lock().unwrap();
+            if stored_pgid == 0 {
+                default_pgid
+            } else {
+                stored_pgid
             }
-            *pgid_guard
         };
+        if pgid <= 0 {
+            return Err("einval");
+        }
+
         let sid = {
-            let mut sid_guard = task.process.sid.lock().unwrap();
-            if *sid_guard == 0 {
-                *sid_guard = pid_value;
+            let stored_sid = *task.process.sid.lock().unwrap();
+            if stored_sid == 0 {
+                pid_value
+            } else {
+                stored_sid
             }
-            *sid_guard
         };
-        let mut groups = self.groups.lock().unwrap();
-        Self::add_pid_to_group_locked(&mut groups, pgid, sid, pid_value)
-            .expect("process identity should not cross sessions");
+
+        {
+            let mut groups = self.groups.lock().unwrap();
+            Self::add_pid_to_group_locked(&mut groups, pgid, sid, pid_value)?;
+        }
+
+        *task.process.pid.lock().unwrap() = pid;
+        *task.process.pgid.lock().unwrap() = pgid;
+        *task.process.sid.lock().unwrap() = sid;
+
+        let mut threads = task.process.threads.lock().unwrap();
+        if !threads.contains(&pid_value) {
+            threads.push(pid_value);
+        }
+        Ok(())
     }
 
     // AGENT: expose the session that owns a process group for setpgid checks.
@@ -787,7 +814,8 @@ impl TaskTable {
     pub fn spawn(&self, tag: &str) -> Arc<Task> {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = Task::make(id, tag);
-        self.register_process_identity(&t, Pid(id));
+        self.register_process_identity(&t, Pid(id))
+            .expect("fresh process identity should register");
         self.map.write().unwrap().insert(id, t.clone());
         t
     }
@@ -837,9 +865,21 @@ impl TaskTable {
     }
     // AGENT: register updates pid plus process-group membership, keeping fork
     // and standalone process creation on the same identity path.
-    pub fn register(&self, task: &Arc<Task>, pid: Pid) {
-        self.register_process_identity(task, pid.clone());
-        self.map.write().unwrap().insert(pid.get(), task.clone());
+    pub fn register(&self, task: &Arc<Task>, pid: Pid) -> Result<(), &'static str> {
+        let pid_value = pid.get();
+        if self
+            .map
+            .read()
+            .unwrap()
+            .get(&pid_value)
+            .is_some_and(|existing| !Arc::ptr_eq(existing, task))
+        {
+            return Err("eexist");
+        }
+
+        self.register_process_identity(task, pid)?;
+        self.map.write().unwrap().insert(pid_value, task.clone());
+        Ok(())
     }
     // AGENT: reap removes the process from its group before deleting the task
     // and any same-process thread entries from the task table.
@@ -1000,11 +1040,10 @@ impl TaskTable {
             child_sched.policy = parent_policy;
             child_sched.slice_left = child_sched.policy.time_slice();
         }
+        let p = Pid(nid);
+        self.register(&tgt, p)?;
         *tgt.process.parent.lock().unwrap() = Some(proc_src.clone());
         proc_src.process.subtasks.lock().unwrap().push(tgt.clone());
-        let p = Pid(nid);
-        tgt.process.threads.lock().unwrap().push(nid);
-        self.register(&tgt, p);
         fork_slot.release();
         Ok(tgt)
     }
@@ -1098,9 +1137,8 @@ impl TaskTable {
             .expect("initial stdout fd should allocate");
         t.add_file(FLike::File(fd2))
             .expect("initial stderr fd should allocate");
-        // AGENT: spawn() already registered pid/pgid/sid membership for this
-        // standalone user process.
-        t.process.threads.lock().unwrap().push(t.id());
+        // AGENT: spawn() already registered pid/pgid/sid membership and the
+        // main thread for this standalone user process.
         t
     }
 

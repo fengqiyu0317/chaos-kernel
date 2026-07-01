@@ -5,7 +5,6 @@ impl Kernel {
     pub fn proc_init(&self) {
         let root = self.tasks.spawn_root();
         let rid = root.id();
-        root.process.threads.lock().unwrap().push(rid);
         root.set_sched_state(TaskRunState::Running);
         root.reset_slice();
         self.set_cur(0, Some(root));
