@@ -133,6 +133,16 @@ pub struct CapSet {
 }
 
 impl CapSet {
+    // AGENT: keep capability-index validation in one place so callers do not
+    // repeat manual shift bounds checks.
+    fn cap_bit(cap: u32) -> Option<u64> {
+        if cap < 64 {
+            Some(1u64 << cap)
+        } else {
+            None
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             bits: 0,
@@ -150,23 +160,27 @@ impl CapSet {
     }
 
     pub fn check(&self, cap: u32) -> bool {
-        if cap >= 64 {
-            return false;
+        if let Some(bit) = Self::cap_bit(cap) {
+            (self.effective & bit) != 0
+        } else {
+            false
         }
-        (self.effective & (1u64 << cap)) != 0
     }
 
     pub fn grant(&mut self, cap: u32) {
-        if cap < 64 {
-            self.bits |= 1u64 << cap;
-            self.effective |= 1u64 << cap;
+        if let Some(bit) = Self::cap_bit(cap) {
+            self.bits |= bit;
+            self.effective |= bit;
         }
     }
 
+    // AGENT: dropping a capability must also remove it from ambient so a later
+    // inheritance path cannot keep a capability the process no longer owns.
     pub fn drop_cap(&mut self, cap: u32) {
-        if cap < 64 {
-            self.bits &= !(1u64 << cap);
-            self.effective &= !(1u64 << cap);
+        if let Some(bit) = Self::cap_bit(cap) {
+            self.bits &= !bit;
+            self.effective &= !bit;
+            self.ambient &= !bit;
         }
     }
 
@@ -191,12 +205,15 @@ impl CapSet {
         self.ambient = 0;
     }
 
+    // AGENT: only owned capabilities that are allowed to cross an inheritance
+    // boundary may be raised into the ambient set.
     pub fn raise_ambient(&mut self, cap: u32) -> bool {
-        if cap >= 64 {
+        let Some(bit) = Self::cap_bit(cap) else {
             return false;
-        }
-        let bit = 1u64 << cap;
-        if (self.bits & bit) != 0 {
+        };
+        let owns_capability = (self.bits & bit) != 0;
+        let may_inherit = (INHERITABLE_MASK & bit) != 0;
+        if owns_capability && may_inherit {
             self.ambient |= bit;
             true
         } else {

@@ -6,6 +6,8 @@ use super::*;
 // selftest path.
 pub fn run_all(pool: &FramePool) {
     capset_inherit_keeps_only_allowed_bits();
+    capset_raise_ambient_requires_owned_inheritable_cap();
+    capset_drop_cap_clears_ambient();
     proc_init_push_at_writes_user_stack(pool);
 }
 
@@ -27,6 +29,49 @@ fn capset_inherit_keeps_only_allowed_bits() {
     assert_eq!(child.bits, kept);
     assert_eq!(child.effective, kept);
     assert_eq!(child.ambient, kept);
+}
+
+// AGENT: raising ambient capabilities is limited to capabilities the process
+// owns and the inheritance mask allows to cross a boundary.
+fn capset_raise_ambient_requires_owned_inheritable_cap() {
+    let owned_inheritable = 1u64 << CAP_KILL;
+    let owned_not_inheritable = 1u64 << 63;
+    let mut caps = CapSet {
+        bits: owned_inheritable | owned_not_inheritable,
+        effective: owned_inheritable | owned_not_inheritable,
+        ambient: 0,
+    };
+
+    assert!(!caps.raise_ambient(CAP_SETUID));
+    assert!(!caps.raise_ambient(63));
+    assert!(!caps.raise_ambient(64));
+    assert_eq!(caps.ambient, 0);
+
+    assert!(caps.raise_ambient(CAP_KILL));
+    assert_eq!(caps.ambient, owned_inheritable);
+}
+
+// AGENT: dropping a capability clears every dependent set, including ambient.
+fn capset_drop_cap_clears_ambient() {
+    let dropped = 1u64 << CAP_KILL;
+    let kept = 1u64 << CAP_SETUID;
+    let mut caps = CapSet {
+        bits: dropped | kept,
+        effective: dropped | kept,
+        ambient: dropped | kept,
+    };
+
+    caps.drop_cap(CAP_KILL);
+
+    assert_eq!(caps.bits, kept);
+    assert_eq!(caps.effective, kept);
+    assert_eq!(caps.ambient, kept);
+
+    caps.drop_cap(64);
+
+    assert_eq!(caps.bits, kept);
+    assert_eq!(caps.effective, kept);
+    assert_eq!(caps.ambient, kept);
 }
 
 // AGENT: construct a minimal init stack through real AddrSpace mappings and
