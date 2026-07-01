@@ -634,9 +634,9 @@ pub struct TaskTable {
     pub groups: Mutex<BTreeMap<Pgid, Arc<ProcessGroup>>>,
     pub seq: AtomicUsize,
     pub root: Mutex<Option<Arc<Task>>>,
-    // AGENT: reserve capacity for forks in progress so concurrent fork callers
-    // cannot all pass the process-table limit check before registration.
-    fork_reservations: AtomicUsize,
+    // AGENT: reserve capacity for task-table insertions before registration so
+    // concurrent creators cannot all pass the N_PROC check at once.
+    process_reservations: AtomicUsize,
 }
 impl TaskTable {
     pub fn new() -> Self {
@@ -645,7 +645,7 @@ impl TaskTable {
             groups: Mutex::new(BTreeMap::new()),
             seq: AtomicUsize::new(1),
             root: Mutex::new(None),
-            fork_reservations: AtomicUsize::new(0),
+            process_reservations: AtomicUsize::new(0),
         }
     }
     // AGENT: add a process pid to a group while the groups map is already held.
@@ -790,19 +790,38 @@ impl TaskTable {
     }
 
     // AGENT: standalone spawned processes start as leaders of their own
-    // session/process group; fork overrides this by pre-setting pgid and sid.
-    pub fn spawn(&self, tag: &str) -> Arc<Task> {
+    // session/process group; callers enqueue them separately when runnable.
+    pub fn spawn(&self, tag: &str) -> Result<Arc<Task>, &'static str> {
+        let slot = self.reserve_process_slot()?;
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
-        let t = Task::make(id, tag);
-        self.register_process_identity(&t, Pid(id))
-            .expect("fresh process identity should register");
-        self.map.write().unwrap().insert(id, t.clone());
-        t
+        let t = self.insert_new_process(id, tag)?;
+        slot.release();
+        Ok(t)
     }
-    pub fn spawn_root(&self) -> Arc<Task> {
-        let t = self.spawn("init");
-        *self.root.lock().unwrap() = Some(t.clone());
-        t
+    // AGENT: init is a singleton and must consume pid 1 before any other task
+    // is inserted, because signal and reparenting paths treat pid 1 specially.
+    pub fn spawn_root(&self) -> Result<Arc<Task>, &'static str> {
+        let mut root = self.root.lock().unwrap();
+        if root.is_some() {
+            return Err("eexist");
+        }
+        if self.count() != 0 {
+            return Err("ebusy");
+        }
+
+        let slot = self.reserve_process_slot()?;
+        if self
+            .seq
+            .compare_exchange(Pid::INIT, Pid::INIT + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("ebusy");
+        }
+
+        let t = self.insert_new_process(Pid::INIT, "init")?;
+        *root = Some(t.clone());
+        slot.release();
+        Ok(t)
     }
     pub fn find(&self, id: usize) -> Option<Arc<Task>> {
         self.map.read().unwrap().get(&id).cloned()
@@ -928,19 +947,29 @@ impl TaskTable {
     pub fn count(&self) -> usize {
         self.map.read().unwrap().len()
     }
-    fn reserve_fork_slot(&self) -> Result<ForkSlotReservation<'_>, &'static str> {
+    // AGENT: share fresh-process identity registration between standalone
+    // spawn and the pid-1 init path.
+    fn insert_new_process(&self, id: usize, tag: &str) -> Result<Arc<Task>, &'static str> {
+        let t = Task::make(id, tag);
+        self.register_process_identity(&t, Pid(id))?;
+        self.map.write().unwrap().insert(id, t.clone());
+        Ok(t)
+    }
+    // AGENT: reserve one task-table slot while a creator builds and registers a
+    // task, closing the old check-then-insert race for every process creator.
+    fn reserve_process_slot(&self) -> Result<TaskSlotReservation<'_>, &'static str> {
         loop {
             let live = self.count();
-            let reserved = self.fork_reservations.load(Ordering::SeqCst);
+            let reserved = self.process_reservations.load(Ordering::SeqCst);
             if live.saturating_add(reserved) >= N_PROC {
                 return Err("eagain");
             }
             if self
-                .fork_reservations
+                .process_reservations
                 .compare_exchange(reserved, reserved + 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                return Ok(ForkSlotReservation {
+                return Ok(TaskSlotReservation {
                     table: self,
                     active: true,
                 });
@@ -948,7 +977,7 @@ impl TaskTable {
         }
     }
     pub fn fork_task(&self, src: &Arc<Task>, pool: &FramePool) -> Result<Arc<Task>, &'static str> {
-        let fork_slot = self.reserve_fork_slot()?;
+        let process_slot = self.reserve_process_slot()?;
         let proc_src = self.process_of_tid(src.id()).unwrap_or_else(|| src.clone());
         let nid = self.seq.fetch_add(1, Ordering::SeqCst);
         let ns = proc_src.tag();
@@ -1024,7 +1053,7 @@ impl TaskTable {
         self.register(&tgt, p)?;
         *tgt.process.parent.lock().unwrap() = Some(proc_src.clone());
         proc_src.process.subtasks.lock().unwrap().push(tgt.clone());
-        fork_slot.release();
+        process_slot.release();
         Ok(tgt)
     }
     pub fn clone_thread(
@@ -1057,7 +1086,9 @@ impl TaskTable {
         envs: Vec<String>,
         pool: &FramePool,
     ) -> Arc<Task> {
-        let t = self.spawn(path);
+        let t = self
+            .spawn(path)
+            .expect("new user task should reserve a task-table slot");
         *t.process.exec_path.lock().unwrap() = path.to_string();
         let _elf_entry = validate_elf_header(&[
             0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0x3e, 0, 1, 0, 0, 0,
@@ -1143,12 +1174,14 @@ impl TaskTable {
     }
 }
 
-struct ForkSlotReservation<'a> {
+// AGENT: release a provisional task-table reservation automatically if process
+// creation exits early.
+struct TaskSlotReservation<'a> {
     table: &'a TaskTable,
     active: bool,
 }
 
-impl ForkSlotReservation<'_> {
+impl TaskSlotReservation<'_> {
     fn release(mut self) {
         self.release_inner();
     }
@@ -1156,12 +1189,14 @@ impl ForkSlotReservation<'_> {
     fn release_inner(&mut self) {
         if self.active {
             self.active = false;
-            self.table.fork_reservations.fetch_sub(1, Ordering::SeqCst);
+            self.table
+                .process_reservations
+                .fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
 
-impl Drop for ForkSlotReservation<'_> {
+impl Drop for TaskSlotReservation<'_> {
     fn drop(&mut self) {
         self.release_inner();
     }

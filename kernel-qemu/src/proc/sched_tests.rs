@@ -66,8 +66,8 @@ fn kernel_boost_updates_task_policy_and_queue_cache() {
     ensure_timer_wheel();
 
     let kernel = Kernel::new(test_frame_pool(8));
-    let first = kernel.tasks.spawn("first");
-    let second = kernel.tasks.spawn("second");
+    let first = kernel.tasks.spawn("first").expect("spawn first task");
+    let second = kernel.tasks.spawn("second").expect("spawn second task");
 
     second.boost_priority(5);
     first.set_sched_state(TaskRunState::Runnable);

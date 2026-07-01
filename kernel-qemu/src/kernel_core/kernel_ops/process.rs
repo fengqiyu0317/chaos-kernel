@@ -3,7 +3,10 @@ use super::*;
 impl Kernel {
     // AGENT: create the simulator init task and install it as CPU0's current task.
     pub fn proc_init(&self) {
-        let root = self.tasks.spawn_root();
+        let root = self
+            .tasks
+            .spawn_root()
+            .expect("proc_init should create the single init task");
         let rid = root.id();
         root.set_sched_state(TaskRunState::Running);
         root.reset_slice();

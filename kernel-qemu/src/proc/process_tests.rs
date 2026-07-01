@@ -8,6 +8,8 @@ pub fn run_all(pool: &FramePool) {
     capset_inherit_keeps_only_allowed_bits();
     capset_raise_ambient_requires_owned_inheritable_cap();
     capset_drop_cap_clears_ambient();
+    spawn_root_creates_single_pid_one_init();
+    spawn_root_rejects_nonempty_task_table();
     proc_init_push_at_writes_user_stack(pool);
 }
 
@@ -72,6 +74,31 @@ fn capset_drop_cap_clears_ambient() {
     assert_eq!(caps.bits, kept);
     assert_eq!(caps.effective, kept);
     assert_eq!(caps.ambient, kept);
+}
+
+// AGENT: init must be the first singleton task because pid 1 is special for
+// signal protection and orphan reparenting.
+fn spawn_root_creates_single_pid_one_init() {
+    let table = TaskTable::new();
+    let init = table.spawn_root().expect("first root spawn should succeed");
+
+    assert_eq!(init.id(), Pid::INIT);
+    assert_eq!(init.process_pid(), Pid::INIT);
+    assert_eq!(table.root.lock().unwrap().as_ref().map(|t| t.id()), Some(1));
+    assert_eq!(table.spawn_root().err(), Some("eexist"));
+    assert_eq!(table.count(), 1);
+}
+
+// AGENT: spawn_root must not silently overwrite root after another standalone
+// task has already consumed pid 1.
+fn spawn_root_rejects_nonempty_task_table() {
+    let table = TaskTable::new();
+    let first = table.spawn("worker").expect("standalone spawn should work");
+
+    assert_eq!(first.id(), Pid::INIT);
+    assert_eq!(table.spawn_root().err(), Some("ebusy"));
+    assert!(table.root.lock().unwrap().is_none());
+    assert_eq!(table.count(), 1);
 }
 
 // AGENT: construct a minimal init stack through real AddrSpace mappings and

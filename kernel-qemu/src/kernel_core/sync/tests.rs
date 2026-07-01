@@ -184,7 +184,7 @@ fn wait_token_event_wake_uses_installed_scheduler_backend() {
     reset_wait_token_state(17);
 
     let kernel = Box::leak(Box::new(Kernel::new(test_frame_pool(8))));
-    let task = kernel.tasks.spawn_root();
+    let task = kernel.tasks.spawn_root().expect("spawn test init task");
     task.set_sched_state(TaskRunState::Sleeping);
     set_current_task_id(Some(task.id()));
     install_qemu_wait_kernel(kernel);
@@ -325,7 +325,7 @@ fn fd_close_detaches_epoll_subscription_before_reuse() {
     reset_wait_token_state(23);
 
     let kernel = Kernel::new(test_frame_pool(8));
-    let task = kernel.tasks.spawn_root();
+    let task = kernel.tasks.spawn_root().expect("spawn test init task");
     let (old_read, old_write) = PipeNode::pair();
     let (read_fd, write_fd) = task
         .add_file_pair_with_cloexec(FLike::Pipe(old_read), FLike::Pipe(old_write), false)
