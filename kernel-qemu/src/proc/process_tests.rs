@@ -10,6 +10,8 @@ pub fn run_all(pool: &FramePool) {
     capset_drop_cap_clears_ambient();
     spawn_root_creates_single_pid_one_init();
     spawn_root_rejects_nonempty_task_table();
+    reap_rejects_live_process();
+    reap_zombie_process_removes_thread_group_once();
     proc_init_push_at_writes_user_stack(pool);
     shm_segment_maps_shared_physical_page(pool);
 }
@@ -100,6 +102,36 @@ fn spawn_root_rejects_nonempty_task_table() {
     assert_eq!(table.spawn_root().err(), Some("ebusy"));
     assert!(table.root.lock().unwrap().is_none());
     assert_eq!(table.count(), 1);
+}
+
+// AGENT: reap is a zombie-only operation; a mistaken live-process id must not
+// delete the task table entry.
+fn reap_rejects_live_process() {
+    let table = TaskTable::new();
+    let task = table.spawn("worker").expect("standalone spawn should work");
+
+    assert_eq!(table.reap(task.id()), Err("ebusy"));
+    assert!(table.find(task.id()).is_some());
+    assert_eq!(table.count(), 1);
+}
+
+// AGENT: multi-threaded zombies are collected at process granularity, while all
+// same-process task-table entries disappear in the single reap step.
+fn reap_zombie_process_removes_thread_group_once() {
+    let table = TaskTable::new();
+    let parent = table.spawn_root().expect("root spawn should work");
+    let child = table.spawn("child").expect("child spawn should work");
+    child.link_parent(&parent);
+    parent.link_child(&child);
+    let thread = table.clone_thread(&child, 0x8000_0000, 0, 0);
+
+    assert!(child.exit_proc(ExitReason::Code(7)));
+    assert_eq!(table.zombie_tasks(), vec![child.id()]);
+    assert_eq!(table.reap(thread.id()), Ok(()));
+
+    assert!(table.find(child.id()).is_none());
+    assert!(table.find(thread.id()).is_none());
+    assert!(parent.process.subtasks.lock().unwrap().is_empty());
 }
 
 // AGENT: construct a minimal init stack through real AddrSpace mappings and

@@ -570,6 +570,14 @@ impl WaitToken {
         }
     }
 
+    // AGENT: repair the current task state after the temporary spin wait bridge
+    // sees completion but before callers continue on the same kernel stack.
+    fn finish_waiter_task(&self) {
+        if let Some(kernel) = qemu_wait_kernel() {
+            kernel.finish_task_wait(self.state.task_id);
+        }
+    }
+
     // AGENT: QEMU has no host Instant/park_timeout. Optional timeouts are routed
     // through the kernel timer wheel, while indefinite waits block the current
     // task and spin until the eventual scheduler/context-switch layer resumes it.
@@ -583,8 +591,14 @@ impl WaitToken {
             if !blocked {
                 self.block_waiter_task();
                 blocked = true;
+                if self.is_woken() {
+                    break;
+                }
             }
             ::core::hint::spin_loop();
+        }
+        if blocked {
+            self.finish_waiter_task();
         }
         self.outcome()
     }

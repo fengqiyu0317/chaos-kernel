@@ -1,6 +1,14 @@
 use super::*;
 
 impl Kernel {
+    // AGENT: wait-token scheduling is still single-hart, so "current" means the
+    // CPU0 task whose kernel stack is actively executing.
+    fn is_current_task_on_cpu0(&self, task_id: usize) -> bool {
+        self.cur_task(0)
+            .map(|current| current.id() == task_id)
+            .unwrap_or(false)
+    }
+
     // AGENT: common QEMU wait-token wake path. Event, futex, epoll, and timer
     // wakeups should make a sleeping task runnable through the run queue instead
     // of unparking a host thread.
@@ -13,7 +21,9 @@ impl Kernel {
         }
         if task.sched_state() == TaskRunState::Sleeping {
             task.set_sched_state(TaskRunState::Runnable);
-            self.run_queue.enqueue(task.id(), task.sched_policy());
+            if !self.is_current_task_on_cpu0(task_id) {
+                self.run_queue.enqueue(task.id(), task.sched_policy());
+            }
         }
         true
     }
@@ -29,16 +39,39 @@ impl Kernel {
         if task.done() {
             return false;
         }
+        if task.sched_state() == TaskRunState::Sleeping {
+            return true;
+        }
         task.set_sched_state(TaskRunState::Sleeping);
         self.run_queue.remove(task_id);
-        let is_current = self
-            .cur_task(0)
-            .map(|current| current.id() == task_id)
-            .unwrap_or(false);
-        if is_current {
+        if self.is_current_task_on_cpu0(task_id) {
             self.run_queue.clear_current();
-            self.set_cur(0, None);
-            self.schedule_next_runnable(0);
+        }
+        true
+    }
+
+    // AGENT: restore the current task after the temporary spin-based wait bridge
+    // observes a token completion. A later real context-switch path can remove
+    // this current-stack repair step.
+    pub(crate) fn finish_task_wait(&self, task_id: usize) -> bool {
+        let Some(task) = self.tasks.find(task_id) else {
+            return false;
+        };
+        if task.done() {
+            return false;
+        }
+
+        if self.is_current_task_on_cpu0(task_id) {
+            self.run_queue.remove(task_id);
+            task.set_sched_state(TaskRunState::Running);
+            task.reset_slice();
+            self.run_queue.set_current(task_id);
+            return true;
+        }
+
+        if task.sched_state() == TaskRunState::Sleeping {
+            task.set_sched_state(TaskRunState::Runnable);
+            self.run_queue.enqueue(task_id, task.sched_policy());
         }
         true
     }
@@ -182,8 +215,8 @@ impl Kernel {
                 self.run_queue.remove(t.id());
                 self.schedule_next_runnable(cpu);
             }
+            Some(t) if t.sched_state() != TaskRunState::Running => {}
             Some(t) => {
-                t.set_sched_state(TaskRunState::Running);
                 if t.tick_slice() {
                     if self.run_queue.len() == 0 {
                         t.reset_slice();
