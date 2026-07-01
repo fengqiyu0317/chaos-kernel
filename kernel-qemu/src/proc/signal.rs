@@ -31,9 +31,11 @@ pub struct SigSet {
 }
 
 impl SigSet {
+    // AGENT: initialize exactly the signal action slots accepted by the current
+    // QEMU signal paths; valid delivered signals are below NSIG.
     pub fn new() -> Self {
-        let mut actions = Vec::with_capacity(NSIG as usize + 1);
-        for _ in 0..=NSIG {
+        let mut actions = Vec::with_capacity(NSIG as usize);
+        for _ in 0..NSIG {
             actions.push(SigAction {
                 handler: SIG_DFL,
                 flags: 0,
@@ -44,7 +46,7 @@ impl SigSet {
     }
 
     pub fn set_action(&mut self, signo: u32, action: SigAction) {
-        if signo < NSIG as u32 && signo != SIGKILL && signo != SIGSTOP {
+        if signo > 0 && signo < NSIG && signo != SIGKILL && signo != SIGSTOP {
             self.actions[signo as usize] = action;
         }
     }
