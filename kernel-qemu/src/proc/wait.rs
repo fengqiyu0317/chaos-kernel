@@ -1,22 +1,26 @@
 // AGENT
 use super::*;
 
+// AGENT: ProcessGroup keeps only group identity, membership, and session
+// ownership. The group leader is derived from pgid, and foreground state
+// belongs to the future session/TTY layer.
+
+pub type Pgid = i32;
+
 pub struct ProcessGroup {
     pub pgid: Pgid,
-    pub leader: usize,
     pub members: Mutex<Vec<usize>>,
     pub session_id: usize,
-    pub foreground: AtomicBool,
 }
 
 impl ProcessGroup {
+    // AGENT: leader is only the initial member pid; do not store it separately
+    // from pgid.
     pub fn new(pgid: Pgid, leader: usize, session: usize) -> Self {
         Self {
             pgid,
-            leader,
             members: Mutex::new(vec![leader]),
             session_id: session,
-            foreground: AtomicBool::new(false),
         }
     }
 
@@ -42,18 +46,13 @@ impl ProcessGroup {
         self.members.lock().unwrap().len()
     }
 
+    // AGENT: process-group leader identity is represented by pgid.
     pub fn is_leader(&self, pid: usize) -> bool {
-        self.leader == pid
+        self.pgid as usize == pid
     }
 
-    pub fn set_foreground(&self, fg: bool) {
-        self.foreground.store(fg, Ordering::Relaxed);
-    }
-
-    pub fn is_foreground(&self) -> bool {
-        self.foreground.load(Ordering::Relaxed)
-    }
-
+    // AGENT: use pgid as the group-leader source id now that leader is not a
+    // separate field.
     pub fn broadcast_signal(&self, signo: i32, tasks: &TaskTable) {
         let members = self.members.lock().unwrap();
         let member_ids = members.clone();
@@ -62,7 +61,7 @@ impl ProcessGroup {
             let task = tasks.find(pid);
             match task {
                 Some(t) => {
-                    t.send_sig(signo, self.leader as isize);
+                    t.send_sig(signo, self.pgid as isize);
                 }
                 None => { /* do nothing */ }
             }
