@@ -665,23 +665,26 @@ fn page_range(base: usize, len: usize) -> impl Iterator<Item = usize> {
     (start..end).step_by(PAGE_SZ)
 }
 
-// AGENT: translate migrated VM flags into legal Sv39 leaf permissions.
+// AGENT: translate migrated VM flags into legal Sv39 leaf permissions while
+// keeping PROT_NONE pages non-user and VM_WRITE leaves hardware-legal.
 fn vm_flags_to_pte_flags(flags: u32) -> usize {
-    let mut pte_flags = PTE_A;
-    if flags & (VM_READ | VM_WRITE | VM_EXEC) != 0 {
-        pte_flags |= PTE_U;
+    let can_read = flags & VM_READ != 0;
+    let can_write = flags & VM_WRITE != 0;
+    let can_exec = flags & VM_EXEC != 0;
+
+    if !can_read && !can_write && !can_exec {
+        return PTE_A | PTE_R;
     }
-    if flags & (VM_READ | VM_WRITE) != 0 {
+
+    let mut pte_flags = PTE_A | PTE_U;
+    if can_read {
         pte_flags |= PTE_R;
     }
-    if flags & VM_WRITE != 0 {
-        pte_flags |= PTE_W | PTE_D;
+    if can_write {
+        pte_flags |= PTE_R | PTE_W | PTE_D;
     }
-    if flags & VM_EXEC != 0 {
+    if can_exec {
         pte_flags |= PTE_X;
-    }
-    if pte_flags & (PTE_R | PTE_W | PTE_X) == 0 {
-        pte_flags |= PTE_R;
     }
     pte_flags
 }
