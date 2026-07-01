@@ -17,6 +17,9 @@ impl ProcInit {
         top: usize,
     ) -> Result<usize, &'static str> {
         let word = mem::size_of::<usize>();
+        if top & 0xF != 0 {
+            return Err("einval");
+        }
         let mut sp = top;
         let mut arg_locs = Vec::with_capacity(self.args.len());
         let mut env_locs = Vec::with_capacity(self.envs.len());
@@ -37,8 +40,7 @@ impl ProcInit {
         }
         env_locs.reverse();
 
-        let ptr_bytes =
-            (1 + self.args.len() + 1 + self.envs.len() + 1 + self.auxv.len() * 2 + 2) * word;
+        let ptr_bytes = self.checked_ptr_bytes(word)?;
         sp = sp.checked_sub(ptr_bytes).ok_or("e2big")?;
         let align = sp & 0xF;
         if align != 0 {
@@ -64,20 +66,54 @@ impl ProcInit {
         Ok(stack_base)
     }
 
-    pub fn total_size(&self) -> usize {
-        // AGENT
+    // AGENT: expose a checked size calculation so exec rejects impossible
+    // argument layouts before mapping and writing the user stack.
+    pub fn checked_total_size(&self) -> Result<usize, &'static str> {
+        let word = mem::size_of::<usize>();
         let mut sz = 0usize;
         for a in &self.args {
-            sz += a.len() + 1;
+            sz = sz
+                .checked_add(a.len().checked_add(1).ok_or("e2big")?)
+                .ok_or("e2big")?;
         }
         for e in &self.envs {
-            sz += e.len() + 1;
+            sz = sz
+                .checked_add(e.len().checked_add(1).ok_or("e2big")?)
+                .ok_or("e2big")?;
         }
-        sz += (self.auxv.len() * 2 + 2 + self.args.len() + 1 + self.envs.len() + 1 + 1)
-            * mem::size_of::<usize>();
-        (sz + 15) & !15
+        sz = sz
+            .checked_add(self.checked_ptr_bytes(word)?)
+            .ok_or("e2big")?;
+        sz.checked_add(15).map(|size| size & !15).ok_or("e2big")
     }
 
+    // AGENT: keep the old infallible helper as a saturating compatibility view;
+    // new exec paths should use checked_total_size() for error reporting.
+    pub fn total_size(&self) -> usize {
+        self.checked_total_size().unwrap_or(usize::MAX)
+    }
+
+    // AGENT: account for argc, argv/envp null sentinels, auxv key/value pairs,
+    // and the final AT_NULL pair without relying on unchecked usize arithmetic.
+    fn checked_ptr_bytes(&self, word: usize) -> Result<usize, &'static str> {
+        let aux_words = self.auxv.len().checked_mul(2).ok_or("e2big")?;
+        let ptr_words = 1usize
+            .checked_add(self.args.len())
+            .ok_or("e2big")?
+            .checked_add(1)
+            .ok_or("e2big")?
+            .checked_add(self.envs.len())
+            .ok_or("e2big")?
+            .checked_add(1)
+            .ok_or("e2big")?
+            .checked_add(aux_words)
+            .ok_or("e2big")?
+            .checked_add(2)
+            .ok_or("e2big")?;
+        ptr_words.checked_mul(word).ok_or("e2big")
+    }
+
+    // AGENT: write one native-width stack slot through the unified user-copy path.
     fn write_usize(
         addr_space: &mut AddrSpace,
         pool: &FramePool,

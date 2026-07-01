@@ -84,7 +84,14 @@ impl Kernel {
             envs,
             auxv: BTreeMap::from([(AT_PAGESZ, PAGE_SZ), (AT_ENTRY, entry)]),
         };
-        if init.total_size() > USR_STK_SZ {
+        let init_size = match init.checked_total_size() {
+            Ok(size) => size,
+            Err(err) => {
+                addr_space.release_all_pages(&self.pool);
+                return Err(err);
+            }
+        };
+        if init_size > USR_STK_SZ {
             addr_space.release_all_pages(&self.pool);
             return Err("e2big");
         }
