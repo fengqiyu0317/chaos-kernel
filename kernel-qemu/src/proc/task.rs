@@ -42,9 +42,10 @@ pub struct SchedEntity {
 }
 
 impl SchedEntity {
+    // AGENT: Initialize the runtime countdown from the priority-derived time slice.
     pub fn new() -> Self {
         let policy = SchedulePolicy::new();
-        let slice_left = policy.time_slice;
+        let slice_left = policy.time_slice();
         Self {
             state: TaskRunState::Runnable,
             policy,
@@ -277,9 +278,11 @@ impl Task {
     pub fn sched_policy(&self) -> SchedulePolicy {
         self.sched.lock().unwrap().policy.clone()
     }
+    // AGENT: Recompute the reset slice from priority so SchedulePolicy stores
+    // only the source priority.
     pub fn reset_slice(&self) {
         let mut sched = self.sched.lock().unwrap();
-        sched.slice_left = sched.policy.time_slice;
+        sched.slice_left = sched.policy.time_slice();
     }
     pub fn tick_slice(&self) -> bool {
         let mut sched = self.sched.lock().unwrap();
@@ -424,41 +427,19 @@ impl Task {
             None => 0,
         }
     }
-    pub fn has_sig(&self) -> bool {
-        let sq = self.process.sig_queue.lock().unwrap();
-        if sq.is_empty() {
-            return false;
-        }
-        let sm = *self.sig_mask.lock().unwrap();
-        let mut found = false;
-        for (sig, _) in sq.iter() {
-            let s = *sig;
-            let bit = if s >= 0 && (s as u32) < NSIG {
-                1u64 << (s as u64)
-            } else {
-                0
-            };
-            if bit != 0 && (sm & bit) == 0 {
-                found = true;
-                break;
-            }
-        }
-        found
-    }
-
-    pub fn send_sig(&self, signo: i32, sender_tid: isize) {
+    // AGENT: enqueue a standard pending signal for this process. Scheduler
+    // wakeups belong to Kernel::send_signal_to_task, so direct callers cannot
+    // accidentally bypass the run-queue transition.
+    pub(crate) fn enqueue_signal(&self, signo: i32, sender_tid: isize) {
         if signo <= 0 || signo as u32 >= NSIG {
             return;
         }
         let mut sq = self.process.sig_queue.lock().unwrap();
-        let dup = sq.iter().any(|(s, _)| *s == signo);
-        // AGENT
-        if dup {
+        if sq.iter().any(|(s, _)| *s == signo) {
             return;
         }
         sq.push_back((signo, sender_tid));
         drop(sq);
-        // AGENT
         self.process.ev.lock().unwrap().set(EvFlag::RECV_SIG);
     }
 
@@ -939,7 +920,7 @@ impl TaskTable {
             let parent_policy = src.sched.lock().unwrap().policy.clone();
             let mut child_sched = tgt.sched.lock().unwrap();
             child_sched.policy = parent_policy;
-            child_sched.slice_left = child_sched.policy.time_slice;
+            child_sched.slice_left = child_sched.policy.time_slice();
         }
         *tgt.process.parent.lock().unwrap() = Some(proc_src.clone());
         proc_src.process.subtasks.lock().unwrap().push(tgt.clone());
@@ -1063,15 +1044,6 @@ impl TaskTable {
             .filter(|(_, t)| t.done())
             .map(|(id, _)| *id)
             .collect()
-    }
-
-    pub fn send_signal_group(&self, pgid: Pgid, signo: i32) -> usize {
-        let group = self.pgid_group(pgid);
-        let count = group.len();
-        for t in group {
-            t.send_sig(signo, -1);
-        }
-        count
     }
 }
 

@@ -1,33 +1,27 @@
 // AGENT
 use super::*;
 
+// AGENT: Keep only the stored scheduling priority; policy class, nice, and
+// time-slice length are not separate state in the current scheduler.
 #[derive(Clone)]
 pub struct SchedulePolicy {
-    pub policy: u8,
     pub prio: i32,
-    pub nice: i32,
-    pub time_slice: usize,
 }
 
+// AGENT: Derive the time-slice length from priority instead of storing a
+// duplicate field in SchedulePolicy.
 impl SchedulePolicy {
     pub fn new() -> Self {
-        Self {
-            policy: SCHED_NORMAL,
-            prio: PRIO_DEFAULT,
-            nice: 0,
-            time_slice: 10,
-        }
+        Self { prio: PRIO_DEFAULT }
     }
 
     pub fn with_prio(prio: i32) -> Self {
         let prio = prio.clamp(PRIO_MIN, PRIO_MAX);
-        let time_slice = (20 - prio).max(1) as usize;
-        Self {
-            policy: SCHED_NORMAL,
-            prio,
-            nice: prio,
-            time_slice,
-        }
+        Self { prio }
+    }
+
+    pub fn time_slice(&self) -> usize {
+        ((PRIO_MAX - self.prio + 1) / 2).max(1) as usize
     }
 }
 

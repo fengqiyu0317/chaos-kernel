@@ -43,9 +43,10 @@ impl Kernel {
         true
     }
 
-    // AGENT: central signal enqueue path so sleeping tasks can be made runnable.
+    // AGENT: central signal send path so pending-signal enqueue and scheduler
+    // wakeup stay together.
     pub fn send_signal_to_task(&self, task: &Arc<Task>, signo: i32, sender_tid: isize) {
-        task.send_sig(signo, sender_tid);
+        task.enqueue_signal(signo, sender_tid);
         if task.done() {
             return;
         }
