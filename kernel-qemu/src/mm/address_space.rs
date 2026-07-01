@@ -19,6 +19,15 @@ impl PageTableEntry {
         }
     }
 
+    // AGENT: attach an existing shared physical page without enabling COW.
+    fn from_shared(frame: SharedPage, flags: u32) -> Self {
+        Self {
+            frame,
+            pte_flags: vm_flags_to_pte_flags(flags),
+            cow: false,
+        }
+    }
+
     fn as_cow(&mut self) {
         self.cow = true;
         self.pte_flags = pte_flags_without_write(self.pte_flags);
@@ -518,6 +527,55 @@ impl AddrSpace {
         let mut entries = self.resident_pages.entries.lock().unwrap();
         for (page_addr, frame) in mapped.into_iter() {
             entries.insert(page_addr, PageTableEntry::new(frame, flags));
+        }
+        crate::csr::sfence_vma();
+        Ok(())
+    }
+
+    // AGENT: map an existing shared segment into this address space without
+    // allocating anonymous frames or turning writable pages into COW mappings.
+    pub fn map_shared_pages(
+        &mut self,
+        mut region: VmRegion,
+        shared_pages: &[SharedPage],
+        pool: &FramePool,
+    ) -> Result<(), &'static str> {
+        if region.len == 0 || region.base % PAGE_SZ != 0 || region.len % PAGE_SZ != 0 {
+            return Err("einval");
+        }
+        if region.checked_end().ok_or("einval")? > KERN_BASE {
+            return Err("einval");
+        }
+        if shared_pages.len() != region.len / PAGE_SZ {
+            return Err("einval");
+        }
+
+        region.flags |= VM_SHARED;
+        let flags = region.flags;
+        let region_base = region.base;
+        let region_len = region.len;
+        let pte_flags = vm_flags_to_pte_flags(flags);
+        let pages: Vec<usize> = page_range(region_base, region_len).collect();
+
+        if let Err(err) = self.vm_map.insert(region) {
+            return Err(err);
+        }
+
+        let mut mapped = Vec::with_capacity(shared_pages.len());
+        for (page_addr, page) in pages.into_iter().zip(shared_pages.iter()) {
+            if let Err(err) = self.sv39.map_leaf(page_addr, page.paddr(), pte_flags, pool) {
+                for (mapped_addr, _) in mapped.iter() {
+                    let _ = self.sv39.unmap_leaf_if_present(*mapped_addr);
+                }
+                self.vm_map.remove_range(region_base, region_len);
+                return Err(err);
+            }
+            mapped.push((page_addr, page.clone()));
+        }
+
+        let mut entries = self.resident_pages.entries.lock().unwrap();
+        for (page_addr, page) in mapped.into_iter() {
+            entries.insert(page_addr, PageTableEntry::from_shared(page, flags));
         }
         crate::csr::sfence_vma();
         Ok(())
