@@ -229,26 +229,16 @@ impl VmMap {
         Ok(())
     }
 
-    // AGENT: binary-search using checked region ends through VmRegion::end().
+    // AGENT: find the last region whose base can contain addr, then verify
+    // the upper bound through VmRegion::contains().
     pub fn find(&self, addr: usize) -> Option<&VmRegion> {
-        let n = self.regions.len();
-        if n == 0 {
+        let idx = self.regions.partition_point(|region| region.base <= addr);
+        if idx == 0 {
             return None;
         }
-        let mut lo = 0;
-        let mut hi = n;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let r = &self.regions[mid];
-            if addr < r.base {
-                hi = mid;
-            } else if addr >= r.end() {
-                lo = mid + 1;
-            } else {
-                return Some(r);
-            }
-        }
-        None
+
+        let region = &self.regions[idx - 1];
+        region.contains(addr).then_some(region)
     }
 
     // AGENT: ignore invalid removal ranges instead of allowing wrapped end addresses.
