@@ -36,12 +36,12 @@ impl Kernel {
                 if thread.id() == task.id() {
                     released_exiting_task = true;
                 }
-                thread.release_thread_exit_resources();
+                thread.release_thread_exit_resources(&self.pool);
                 self.run_queue.remove(thread.id());
             }
         }
         if !released_exiting_task {
-            task.release_thread_exit_resources();
+            task.release_thread_exit_resources(&self.pool);
         }
         let _released_pages = task.release_process_exit_resources(&self.pool);
         self.tasks.reparent_children_to_init(task);

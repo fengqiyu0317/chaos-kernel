@@ -389,11 +389,36 @@ impl Task {
     pub fn release_process_exit_resources(&self, pool: &FramePool) -> usize {
         self.process.release_exit_resources(pool)
     }
-    // AGENT: drop thread-private execution resources once the process is dead.
-    pub fn release_thread_exit_resources(&self) {
+
+    // AGENT: clear CLONE_CHILD_CLEARTID's user word before dropping thread
+    // context, then wake one futex waiter on that address.
+    fn clear_child_tid_and_wake(&self, clear_tid: usize, pool: &FramePool) {
+        if clear_tid == 0 {
+            return;
+        }
+
+        let zero = 0u32.to_ne_bytes();
+        let cleared = self
+            .process
+            .addr_space
+            .lock()
+            .unwrap()
+            .write_user_bytes(clear_tid, &zero, pool)
+            .is_ok();
+        if cleared {
+            self.process.futex.wake(clear_tid, 1);
+        }
+    }
+
+    // AGENT: drop thread-private execution resources once the process is dead,
+    // preserving clear-child-tid teardown before discarding ThdCtx.
+    pub fn release_thread_exit_resources(&self, pool: &FramePool) {
         *self.sig_mask.lock().unwrap() = 0;
         self.kstk.lock().unwrap().take();
-        self.thd_ctx.lock().unwrap().take();
+        let old_ctx = self.thd_ctx.lock().unwrap().take();
+        if let Some(ctx) = old_ctx {
+            self.clear_child_tid_and_wake(ctx.clear_tid, pool);
+        }
         self.set_sched_state(TaskRunState::Zombie);
     }
     pub fn wait_status(&self) -> usize {
@@ -601,6 +626,9 @@ impl TaskTable {
                 group.add_member(pid);
             }
             None => {
+                if pgid != pid as Pgid {
+                    return Err("eperm");
+                }
                 groups.insert(pgid, Arc::new(ProcessGroup::new(pgid, pid, sid)));
             }
         }
