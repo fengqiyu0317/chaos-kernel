@@ -443,32 +443,31 @@ impl Task {
         self.process.ev.lock().unwrap().set(EvFlag::RECV_SIG);
     }
 
-    // AGENT: ProcessState.sig_queue is the pending source of truth; SigSet stores dispositions.
+    // AGENT: ProcessState.sig_queue is the pending source of truth; SigSet
+    // stores dispositions, including which pending signals can be discarded as
+    // ignored before delivery.
     pub fn take_deliverable_signal(&self) -> Option<PendingSignal> {
         let mask = *self.sig_mask.lock().unwrap();
-        let picked = {
-            let mut sq = self.process.sig_queue.lock().unwrap();
-            let pos = sq.iter().position(|(sig, _)| {
-                *sig > 0 && (*sig as u32) < NSIG && (mask & (1u64 << (*sig as u64))) == 0
-            })?;
-            sq.remove(pos)
-        };
-        match picked {
-            Some((signo, sender_tid)) => {
-                let action = self
-                    .process
-                    .sig_state
-                    .lock()
-                    .unwrap()
-                    .get_action(signo as u32)
-                    .clone();
-                Some(PendingSignal {
-                    signo: signo as u32,
-                    sender_tid,
-                    action,
-                })
-            }
-            None => None,
+        loop {
+            let (signo, sender_tid) = {
+                let mut sq = self.process.sig_queue.lock().unwrap();
+                let pos = sq.iter().position(|(sig, _)| {
+                    *sig > 0 && (*sig as u32) < NSIG && (mask & (1u64 << (*sig as u64))) == 0
+                })?;
+                sq.remove(pos)?
+            };
+            let action = {
+                let sig_state = self.process.sig_state.lock().unwrap();
+                if sig_state.is_ignored(signo as u32) {
+                    continue;
+                }
+                sig_state.get_action(signo as u32).clone()
+            };
+            return Some(PendingSignal {
+                signo: signo as u32,
+                sender_tid,
+                action,
+            });
         }
     }
 

@@ -8,6 +8,18 @@ pub struct SigAction {
     pub mask: u64,
 }
 
+impl SigAction {
+    // AGENT: keep the canonical default disposition in one place so exec reset
+    // paths do not leave stale sigaction flags or masks behind.
+    pub fn default_action() -> Self {
+        Self {
+            handler: SIG_DFL,
+            flags: 0,
+            mask: 0,
+        }
+    }
+}
+
 // AGENT: signal frame now stores only the state required by sigreturn.
 #[derive(Clone)]
 pub struct SigFrame {
@@ -36,11 +48,7 @@ impl SigSet {
     pub fn new() -> Self {
         let mut actions = Vec::with_capacity(NSIG as usize);
         for _ in 0..NSIG {
-            actions.push(SigAction {
-                handler: SIG_DFL,
-                flags: 0,
-                mask: 0,
-            });
+            actions.push(SigAction::default_action());
         }
         Self { actions }
     }
@@ -73,10 +81,12 @@ impl SigSet {
         }
     }
 
+    // AGENT: exec keeps ignored dispositions but resets caught handlers to a
+    // clean default action, including stale masks and flags.
     pub fn clear_non_caught(&mut self) {
         for i in 1..self.actions.len() {
             if self.actions[i].handler != SIG_DFL && self.actions[i].handler != SIG_IGN {
-                self.actions[i].handler = SIG_DFL;
+                self.actions[i] = SigAction::default_action();
             }
         }
     }

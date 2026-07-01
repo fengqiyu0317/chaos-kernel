@@ -125,12 +125,14 @@ impl Kernel {
         })
     }
 
-    // AGENT: close FD_CLOEXEC descriptors and mark successful exec so parent
-    // setpgid calls can reject children after the exec boundary.
+    // AGENT: close FD_CLOEXEC descriptors, reset caught signal dispositions,
+    // and mark successful exec so parent setpgid calls can reject children
+    // after the exec boundary.
     fn commit_exec(&self, task: &Arc<Task>, prepared: PreparedExec) {
         for fd in prepared.close_fds {
             let _ = task.close_fd(fd);
         }
+        task.process.sig_state.lock().unwrap().clear_non_caught();
         {
             let mut current_addr_space = task.process.addr_space.lock().unwrap();
             current_addr_space.release_all_pages(&self.pool);
