@@ -271,14 +271,8 @@ pub(super) fn sys_dup2(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
     let old_fd = a0;
     let new_fd = a1;
     // AGENT: validate both fd numbers against the fd limit, not N_PROC.
-    if old_fd >= MAX_FD {
+    if old_fd >= MAX_FD || new_fd >= MAX_FD {
         return Err("ebadf");
-    }
-    if new_fd >= MAX_FD {
-        return Err("ebadf");
-    }
-    if old_fd == new_fd {
-        return Ok(new_fd);
     }
     let task = kernel.cur_task(0).ok_or("esrch")?;
     task.dup2_fd(old_fd, new_fd)

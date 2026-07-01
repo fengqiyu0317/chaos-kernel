@@ -300,6 +300,16 @@ impl Task {
     pub fn sched_policy(&self) -> SchedulePolicy {
         self.sched.lock().unwrap().policy.clone()
     }
+    // AGENT: update the task-owned scheduling policy so boosts survive running,
+    // sleeping, and later requeue transitions.
+    pub fn boost_priority(&self, amount: i32) -> SchedulePolicy {
+        let mut sched = self.sched.lock().unwrap();
+        let amount = amount.max(0);
+        let prio = sched.policy.prio.saturating_sub(amount);
+        sched.policy = SchedulePolicy::with_prio(prio);
+        sched.slice_left = sched.slice_left.min(sched.policy.time_slice());
+        sched.policy.clone()
+    }
     // AGENT: Recompute the reset slice from priority so SchedulePolicy stores
     // only the source priority.
     pub fn reset_slice(&self) {
@@ -577,19 +587,18 @@ impl Task {
         if old_fd >= MAX_FD || new_fd >= MAX_FD {
             return Err("ebadf");
         }
-        if old_fd == new_fd {
-            return Ok(new_fd);
-        }
         let cleanup = {
             let mut files = self.process.files.lock().unwrap();
             let entry = files.get(&old_fd).cloned().ok_or("ebadf")?;
-            let new_entry = entry.dup(false);
+            if old_fd == new_fd {
+                return Ok(new_fd);
+            }
             let cleanup = if files.contains_key(&new_fd) {
                 Some(Self::remove_fd_locked(&mut files, new_fd)?)
             } else {
                 None
             };
-            files.insert(new_fd, new_entry);
+            files.insert(new_fd, entry.dup(false));
             self.process.free_fds.lock().unwrap().remove(&new_fd);
             cleanup
         };
