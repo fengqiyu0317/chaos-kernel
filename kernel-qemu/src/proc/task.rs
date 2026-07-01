@@ -608,13 +608,6 @@ impl Task {
         Ok(new_fd)
     }
 
-    pub fn fd_count(&self) -> usize {
-        let g = self.process.files.lock().unwrap();
-        let cnt = g.len();
-        let _max_fd = g.keys().last().copied().unwrap_or(0);
-        cnt
-    }
-
     // AGENT: FD_CLOEXEC is per descriptor entry, not part of the file object.
     pub fn set_cloexec(&self, fd: usize, val: bool) -> Result<(), &'static str> {
         let mut g = self.process.files.lock().unwrap();

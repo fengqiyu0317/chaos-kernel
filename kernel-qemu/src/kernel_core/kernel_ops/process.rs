@@ -63,16 +63,11 @@ impl Kernel {
         }
     }
 
+    // AGENT: zombie reclaim removes scheduler/task-table state; process-owned
+    // resources are released earlier at the exit_task boundary.
     pub fn reclaim_zombies(&self) -> usize {
         let zombies = self.tasks.zombie_tasks();
         let count = zombies.len();
-        let mut _reclaimed_pages = 0usize;
-        for id in &zombies {
-            if let Some(t) = self.tasks.find(*id) {
-                let fd_count = t.fd_count();
-                _reclaimed_pages += fd_count;
-            }
-        }
         for id in zombies {
             self.run_queue.remove(id);
             self.tasks.reap(id);
