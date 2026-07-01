@@ -10,13 +10,11 @@ pub(super) fn sys_epoll_create(kernel: &Kernel, a0: usize) -> Result<usize, &'st
     if _backing.is_none() {
         return Err("enomem");
     }
-    // AGENT: create a real epoll instance and allocate its fd from the current task table.
+    // AGENT: create a real epoll instance and allocate its fd from the current
+    // task fd allocator.
     let task = kernel.cur_task(0).ok_or("esrch")?;
-    if task.fd_count() + 1 > MAX_FD {
-        return Err("emfile");
-    }
     let inst = EpInst::new();
-    let epfd = task.add_file(FLike::Ep(inst.clone()));
+    let epfd = task.add_file(FLike::Ep(inst.clone()))?;
     task.set_ep(epfd, inst);
     Ok(epfd)
 }

@@ -125,12 +125,11 @@ impl Kernel {
         })
     }
 
+    // AGENT: close FD_CLOEXEC descriptors through Task::close_fd so the fd
+    // allocator and fd table stay synchronized.
     fn commit_exec(&self, task: &Arc<Task>, prepared: PreparedExec) {
-        {
-            let mut files = task.process.files.lock().unwrap();
-            for fd in prepared.close_fds {
-                files.remove(&fd);
-            }
+        for fd in prepared.close_fds {
+            let _ = task.close_fd(fd);
         }
         {
             let mut current_addr_space = task.process.addr_space.lock().unwrap();

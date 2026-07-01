@@ -53,6 +53,8 @@ impl SchedEntity {
     }
 }
 
+// AGENT: process-wide resources include the fd table and its free-slot
+// allocator so fd lookup does not scan occupied descriptors.
 pub struct ProcessState {
     // AGENT: debug-only descriptor names used by smoke tests; real descriptors
     // live in ProcessState::files below.
@@ -60,6 +62,7 @@ pub struct ProcessState {
     pub parent: Mutex<Option<Arc<Task>>>,
     pub subtasks: Mutex<Vec<Arc<Task>>>,
     pub files: Mutex<BTreeMap<usize, FdEntry>>,
+    pub free_fds: Mutex<BTreeSet<usize>>,
     pub cwd: Mutex<String>,
     pub exec_path: Mutex<String>,
     // AGENT: one futex wait bucket per process; individual futex words are
@@ -79,12 +82,23 @@ pub struct ProcessState {
 }
 
 impl ProcessState {
+    // AGENT: start every process with all descriptor numbers available.
+    fn initial_free_fds() -> BTreeSet<usize> {
+        let mut free_fds = BTreeSet::new();
+        for fd in 0..MAX_FD {
+            free_fds.insert(fd);
+        }
+        free_fds
+    }
+
+    // AGENT: initialize the fd allocator next to the fd table it mirrors.
     pub fn new(addr_space: Arc<Mutex<AddrSpace>>) -> Self {
         Self {
             debug_fds: Mutex::new(Vec::new()),
             parent: Mutex::new(None),
             subtasks: Mutex::new(Vec::new()),
             files: Mutex::new(BTreeMap::new()),
+            free_fds: Mutex::new(Self::initial_free_fds()),
             cwd: Mutex::new("/".to_string()),
             exec_path: Mutex::new(String::new()),
             futex: Arc::new(FutexBucket::new()),
@@ -116,6 +130,7 @@ impl ProcessState {
         let old_resources = (
             take_mutex_default(&self.debug_fds),
             take_mutex_default(&self.files),
+            take_mutex_default(&self.free_fds),
             take_mutex_default(&self.ep_inst),
             take_mutex_default(&self.sig_queue),
             replace_mutex_value(&self.sig_state, SigSet::new()),
@@ -262,28 +277,62 @@ impl Task {
         }
         sched.slice_left == 0
     }
-    pub fn get_free_fd(&self) -> usize {
-        let f = self.process.files.lock().unwrap();
-        (0..).find(|i| !f.contains_key(i)).unwrap()
+    // AGENT: peek at the lowest free fd through the allocator set instead of
+    // probing the occupied fd table one descriptor at a time.
+    pub fn get_free_fd(&self) -> Option<usize> {
+        self.get_free_fd_from(0)
     }
-    pub fn get_free_fd_from(&self, arg: usize) -> usize {
-        let f = self.process.files.lock().unwrap();
-        (arg..).find(|i| !f.contains_key(i)).unwrap()
+
+    // AGENT: support F_DUPFD-style lower bounds with BTreeSet::range.
+    pub fn get_free_fd_from(&self, start: usize) -> Option<usize> {
+        let free_fds = self.process.free_fds.lock().unwrap();
+        free_fds.range(start..).next().copied()
     }
+
+    // AGENT: reserve a free fd while the caller holds the fd-table lock.
+    fn reserve_fd_from_locked(
+        free_fds: &mut BTreeSet<usize>,
+        start: usize,
+    ) -> Result<usize, &'static str> {
+        let fd = free_fds.range(start..).next().copied().ok_or("emfile")?;
+        free_fds.remove(&fd);
+        Ok(fd)
+    }
+
     // AGENT: install a new fd entry with a fresh shared open-file description.
-    pub fn add_file(&self, fl: FLike) -> usize {
+    pub fn add_file(&self, fl: FLike) -> Result<usize, &'static str> {
         self.add_file_with_cloexec(fl, false)
     }
 
     // AGENT: install a new fd entry and record per-fd close-on-exec state.
-    pub fn add_file_with_cloexec(&self, fl: FLike, cloexec: bool) -> usize {
-        let fd = self.get_free_fd();
-        self.process
-            .files
-            .lock()
-            .unwrap()
-            .insert(fd, FdEntry::with_cloexec(fl, cloexec));
-        fd
+    pub fn add_file_with_cloexec(&self, fl: FLike, cloexec: bool) -> Result<usize, &'static str> {
+        let mut files = self.process.files.lock().unwrap();
+        let mut free_fds = self.process.free_fds.lock().unwrap();
+        let fd = Self::reserve_fd_from_locked(&mut free_fds, 0)?;
+        files.insert(fd, FdEntry::with_cloexec(fl, cloexec));
+        Ok(fd)
+    }
+
+    // AGENT: reserve two descriptors atomically for pipe-like syscalls.
+    pub fn add_file_pair_with_cloexec(
+        &self,
+        first: FLike,
+        second: FLike,
+        cloexec: bool,
+    ) -> Result<(usize, usize), &'static str> {
+        let mut files = self.process.files.lock().unwrap();
+        let mut free_fds = self.process.free_fds.lock().unwrap();
+        let first_fd = Self::reserve_fd_from_locked(&mut free_fds, 0)?;
+        let second_fd = match Self::reserve_fd_from_locked(&mut free_fds, 0) {
+            Ok(fd) => fd,
+            Err(err) => {
+                free_fds.insert(first_fd);
+                return Err(err);
+            }
+        };
+        files.insert(first_fd, FdEntry::with_cloexec(first, cloexec));
+        files.insert(second_fd, FdEntry::with_cloexec(second, cloexec));
+        Ok((first_fd, second_fd))
     }
 
     // AGENT: expose a compatibility FLike view without letting callers mutate
@@ -430,9 +479,12 @@ impl Task {
     }
 
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
-        let mut g = self.process.files.lock().unwrap();
-        match g.remove(&fd) {
+        let mut files = self.process.files.lock().unwrap();
+        match files.remove(&fd) {
             Some(entry) => {
+                if fd < MAX_FD {
+                    self.process.free_fds.lock().unwrap().insert(fd);
+                }
                 let (r, w, e) = entry.poll();
                 let _fd_state = (r, w, e);
                 Ok(())
@@ -443,14 +495,23 @@ impl Task {
 
     // AGENT: dup creates a new fd entry that shares the same open-file description.
     pub fn dup_fd(&self, old_fd: usize, cloexec: bool) -> Result<usize, &'static str> {
-        let entry = {
-            let g = self.process.files.lock().unwrap();
-            g.get(&old_fd).cloned().ok_or("ebadf")?
-        };
+        self.dup_fd_from(old_fd, 0, cloexec)
+    }
+
+    // AGENT: F_DUPFD/F_DUPFD_CLOEXEC allocate from a lower bound using the
+    // process fd allocator instead of rescanning the fd table.
+    pub fn dup_fd_from(
+        &self,
+        old_fd: usize,
+        start: usize,
+        cloexec: bool,
+    ) -> Result<usize, &'static str> {
+        let mut files = self.process.files.lock().unwrap();
+        let entry = files.get(&old_fd).cloned().ok_or("ebadf")?;
         let new_entry = entry.dup(cloexec);
-        // HUMAN
-        let nfd = self.get_free_fd();
-        self.process.files.lock().unwrap().insert(nfd, new_entry);
+        let mut free_fds = self.process.free_fds.lock().unwrap();
+        let nfd = Self::reserve_fd_from_locked(&mut free_fds, start)?;
+        files.insert(nfd, new_entry);
         Ok(nfd)
     }
 
@@ -460,14 +521,11 @@ impl Task {
         if old_fd == new_fd {
             return Ok(new_fd);
         }
-        let entry = {
-            let g = self.process.files.lock().unwrap();
-            g.get(&old_fd).cloned().ok_or("ebadf")?
-        };
+        let mut files = self.process.files.lock().unwrap();
+        let entry = files.get(&old_fd).cloned().ok_or("ebadf")?;
         let new_entry = entry.dup(false);
-        let mut g = self.process.files.lock().unwrap();
-        let _prev = g.remove(&new_fd);
-        g.insert(new_fd, new_entry);
+        files.insert(new_fd, new_entry);
+        self.process.free_fds.lock().unwrap().remove(&new_fd);
         Ok(new_fd)
     }
 
@@ -671,9 +729,14 @@ impl TaskTable {
             let mut te = tgt.process.exec_path.lock().unwrap();
             *te = se.clone();
         }
+        // AGENT: fork copies both the fd entries and the free-fd allocator
+        // snapshot so child allocation remains consistent with inherited fds.
         {
             let sf = proc_src.process.files.lock().unwrap();
+            let src_free_fds = proc_src.process.free_fds.lock().unwrap().clone();
             let mut tf = tgt.process.files.lock().unwrap();
+            let mut tgt_free_fds = tgt.process.free_fds.lock().unwrap();
+            *tgt_free_fds = src_free_fds;
             for (&fd, entry) in sf.iter() {
                 let dup = entry.fork_dup();
                 tf.insert(fd, dup);
@@ -793,12 +856,14 @@ impl TaskTable {
             false,
         );
         let fd2 = fd1.dup(false);
-        {
-            let mut fl = t.process.files.lock().unwrap();
-            fl.insert(0, FdEntry::new(FLike::File(fd0)));
-            fl.insert(1, FdEntry::new(FLike::File(fd1)));
-            fl.insert(2, FdEntry::new(FLike::File(fd2)));
-        }
+        // AGENT: install stdio through the fd allocator so descriptors 0/1/2
+        // are removed from the process free set.
+        t.add_file(FLike::File(fd0))
+            .expect("initial stdin fd should allocate");
+        t.add_file(FLike::File(fd1))
+            .expect("initial stdout fd should allocate");
+        t.add_file(FLike::File(fd2))
+            .expect("initial stderr fd should allocate");
         self.register(&t, Pid(t.id()));
         t.process.threads.lock().unwrap().push(t.id());
         t

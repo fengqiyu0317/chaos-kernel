@@ -55,6 +55,8 @@ pub(super) fn sys_write(
     Err("enosys")
 }
 
+// AGENT: propagate fd allocator exhaustion instead of manufacturing an
+// out-of-range descriptor.
 pub(super) fn sys_open(
     kernel: &Kernel,
     a0: usize,
@@ -114,7 +116,7 @@ pub(super) fn sys_open(
     if _truncate && wr {
         fh.set_len(0)?;
     }
-    let fd = task.add_file_with_cloexec(FLike::File(fh), _cloexec);
+    let fd = task.add_file_with_cloexec(FLike::File(fh), _cloexec)?;
     let _perm_check = {
         let owner_r = (mode >> 8) & 0x4;
         let owner_w = (mode >> 8) & 0x2;
@@ -231,6 +233,7 @@ pub(super) fn sys_ioctl(
     }
 }
 
+// AGENT: allocate pipe endpoints through one fd allocator transaction.
 pub(super) fn sys_pipe(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let fds_addr = a0;
     let pipe_flags = a1;
@@ -242,16 +245,11 @@ pub(super) fn sys_pipe(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
     }
     let cur = kernel.cur_task(0);
     if let Some(t) = cur {
-        let fd_count = t.fd_count();
-        // AGENT: pipe consumes two file descriptors, bounded by MAX_FD.
-        if fd_count + 2 > MAX_FD {
-            return Err("emfile");
-        }
         let (rd, wr) = PipeNode::pair();
         let _nonblock = (pipe_flags & O_NONBLOCK) != 0;
         let _cloexec = (pipe_flags & O_CLOEXEC) != 0;
-        let rd_fd = t.add_file_with_cloexec(FLike::Pipe(rd), _cloexec);
-        let wr_fd = t.add_file_with_cloexec(FLike::Pipe(wr), _cloexec);
+        let (rd_fd, wr_fd) =
+            t.add_file_pair_with_cloexec(FLike::Pipe(rd), FLike::Pipe(wr), _cloexec)?;
         Ok(rd_fd | (wr_fd << 32))
     } else {
         Err("esrch")
@@ -305,25 +303,13 @@ pub(super) fn sys_fcntl(
             if arg >= MAX_FD {
                 return Err("einval");
             }
-            let mut fds = task.process.files.lock().unwrap();
-            let entry = fds.get(&fd).cloned().ok_or("ebadf")?;
-            let new_fd = (arg..MAX_FD)
-                .find(|candidate| !fds.contains_key(candidate))
-                .ok_or("emfile")?;
-            fds.insert(new_fd, entry.dup(false));
-            Ok(new_fd)
+            task.dup_fd_from(fd, arg, false)
         }
         F_DUPFD_CLOEXEC => {
             if arg >= MAX_FD {
                 return Err("einval");
             }
-            let mut fds = task.process.files.lock().unwrap();
-            let entry = fds.get(&fd).cloned().ok_or("ebadf")?;
-            let new_fd = (arg..MAX_FD)
-                .find(|candidate| !fds.contains_key(candidate))
-                .ok_or("emfile")?;
-            fds.insert(new_fd, entry.dup(true));
-            Ok(new_fd)
+            task.dup_fd_from(fd, arg, true)
         }
         F_GETFD => {
             let cloexec = task.get_fd_entry(fd).ok_or("ebadf")?.is_cloexec();

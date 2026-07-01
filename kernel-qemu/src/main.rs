@@ -10,6 +10,8 @@ use core::hint::spin_loop;
 use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
 
+use crate::irq_lock::IrqOnceCell;
+
 mod console;
 mod csr;
 mod heap;
@@ -40,6 +42,11 @@ unsafe extern "C" {
 
 const QEMU_VIRT_RAM_START: usize = 0x8000_0000;
 const QEMU_VIRT_RAM_END: usize = 0x8800_0000;
+
+// AGENT: keep the active kernel Sv39 page table owned by a boot-global cell so
+// its PgFrame-backed root and intermediate table pages are never returned while
+// satp still points at them.
+static KERNEL_PAGE_TABLE: IrqOnceCell<kernel::PageTable> = IrqOnceCell::new();
 
 // AGENT: First Rust entry point for the M9 QEMU carrier layer.
 #[no_mangle]
@@ -106,7 +113,9 @@ fn install_kernel_page_table(frame_pool: &kernel::FramePool) {
         .expect("kernel Sv39 page table should activate");
     let satp = csr::read_satp();
     let direct_map = kernel::direct_map_active();
-    let _kernel_page_table = Box::leak(Box::new(page_table));
+    if KERNEL_PAGE_TABLE.init(page_table).is_err() {
+        panic!("kernel Sv39 page table installed more than once");
+    }
     println!(
         "[kernel-qemu] kernel page table installed satp={:#x} direct_map={}",
         satp, direct_map
