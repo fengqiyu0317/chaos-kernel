@@ -112,7 +112,9 @@ impl EpInst {
     pub fn take_source_sub(&self, fd: usize) -> Option<usize> {
         self.source_subs.lock().unwrap().remove(&fd)
     }
-    pub fn control(&mut self, op: i32, fd: usize, ev: &EpEvent) -> Result<(), &'static str> {
+    // AGENT: EpInst clones share their tables through Arc<Mutex<_>>, so control
+    // only needs &self and works for duplicated epoll fds.
+    pub fn control(&self, op: i32, fd: usize, ev: &EpEvent) -> Result<(), &'static str> {
         let mut events = self.events.lock().unwrap();
         match op {
             EpCtlOp::ADD => {

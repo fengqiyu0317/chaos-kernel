@@ -81,7 +81,6 @@ pub struct ProcessState {
     pub exit_reason: Mutex<Option<ExitReason>>,
     pub sig_queue: Mutex<VecDeque<(i32, isize)>>,
     pub sig_state: Mutex<SigSet>,
-    pub ep_inst: Mutex<BTreeMap<usize, EpInst>>,
     pub addr_space: Arc<Mutex<AddrSpace>>,
 }
 
@@ -117,7 +116,6 @@ impl ProcessState {
             exit_reason: Mutex::new(None),
             sig_queue: Mutex::new(VecDeque::new()),
             sig_state: Mutex::new(SigSet::new()),
-            ep_inst: Mutex::new(BTreeMap::new()),
             addr_space,
         }
     }
@@ -137,7 +135,6 @@ impl ProcessState {
             take_mutex_default(&self.debug_fds),
             take_mutex_default(&self.files),
             take_mutex_default(&self.free_fds),
-            take_mutex_default(&self.ep_inst),
             take_mutex_default(&self.sig_queue),
             replace_mutex_value(&self.sig_state, SigSet::new()),
             take_mutex_default(&self.sem_ctx),
@@ -426,21 +423,6 @@ impl Task {
             Some(reason) => reason.wait_status(),
             None => 0,
         }
-    }
-    // AGENT: expose mutation through a closure so callers update the real EpInst,
-    // not a cloned copy that would need to be written back.
-    pub fn with_ep_mut<R>(
-        &self,
-        fd: usize,
-        f: impl FnOnce(&mut EpInst) -> Result<R, &'static str>,
-    ) -> Result<R, &'static str> {
-        let mut ep = self.process.ep_inst.lock().unwrap();
-        let inst = ep.get_mut(&fd).ok_or("eperm")?;
-        f(inst)
-    }
-    pub fn set_ep(&self, fd: usize, inst: EpInst) {
-        let mut ep = self.process.ep_inst.lock().unwrap();
-        ep.insert(fd, inst);
     }
     pub fn has_sig(&self) -> bool {
         let sq = self.process.sig_queue.lock().unwrap();
@@ -953,7 +935,6 @@ impl TaskTable {
         // AGENT: child inherits signal dispositions, but not pending signals.
         let sig_state = { proc_src.process.sig_state.lock().unwrap().fork_copy() };
         *tgt.process.sig_state.lock().unwrap() = sig_state;
-        *tgt.process.ep_inst.lock().unwrap() = proc_src.process.ep_inst.lock().unwrap().clone();
         {
             let parent_policy = src.sched.lock().unwrap().policy.clone();
             let mut child_sched = tgt.sched.lock().unwrap();

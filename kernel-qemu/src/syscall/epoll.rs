@@ -1,6 +1,15 @@
 // AGENT
 use super::*;
 
+// AGENT: the fd table is the single source of truth for epoll instances, so
+// close/dup/dup2/exec lifecycle rules do not need a second parallel map.
+fn epoll_instance(task: &Task, epfd: usize) -> Result<EpInst, &'static str> {
+    match task.get_file(epfd) {
+        Some(FLike::Ep(inst)) => Ok(inst),
+        Some(_) | None => Err("eperm"),
+    }
+}
+
 pub(super) fn sys_epoll_create(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
     let size = a0;
     if size == 0 {
@@ -13,10 +22,7 @@ pub(super) fn sys_epoll_create(kernel: &Kernel, a0: usize) -> Result<usize, &'st
     // AGENT: create a real epoll instance and allocate its fd from the current
     // task fd allocator.
     let task = kernel.cur_task(0).ok_or("esrch")?;
-    let inst = EpInst::new();
-    let epfd = task.add_file(FLike::Ep(inst.clone()))?;
-    task.set_ep(epfd, inst);
-    Ok(epfd)
+    task.add_file(FLike::Ep(EpInst::new()))
 }
 
 // AGENT: epoll_ctl mirrors source-backed registrations into cancellable EvBus
@@ -65,11 +71,8 @@ pub(super) fn sys_epoll_ctl(
 
     // AGENT: mutate the registered epoll instance first, then mirror ADD/MOD/DEL
     // into the source object's cancellable readiness subscription when present.
-    task.with_ep_mut(epfd, |inst| inst.control(op, fd, &ev))?;
-    let inst = {
-        let ep = task.process.ep_inst.lock().unwrap();
-        ep.get(&epfd).cloned().ok_or("eperm")?
-    };
+    let inst = epoll_instance(&task, epfd)?;
+    inst.control(op, fd, &ev)?;
     match op {
         EpCtlOp::ADD => {
             if let Some(sub_id) = file.register_epoll(fd, inst.clone(), &ev) {
@@ -127,10 +130,7 @@ pub(super) fn sys_epoll_wait(
     };
 
     loop {
-        let inst = {
-            let ep = task.process.ep_inst.lock().unwrap();
-            ep.get(&epfd).cloned().ok_or("eperm")?
-        };
+        let inst = epoll_instance(&task, epfd)?;
         inst.clear_ready();
         let registrations: Vec<(usize, EpEvent)> = {
             inst.events

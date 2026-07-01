@@ -13,7 +13,7 @@ use super::*;
 // - EvBus/EvFlag is used as event-bit storage by pipe, process exit/signal,
 //   semaphore state transitions, and pipe-backed epoll readiness notification.
 // - WaitToken is the common task wait token used by Channel,
-//   proc::WaitQueue, ConditionWait/CountingEvent helpers, and FutexBucket.
+//   ConditionWait/CountingEvent helpers, epoll waiters, and FutexBucket.
 // - ConditionWait is used by Channel through wait_until(), signal(), and
 //   broadcast().
 // - FutexBucket is wired to SYS_FUTEX and process-exit cleanup.
