@@ -61,6 +61,16 @@ impl PageFaultAccess {
             _ => None,
         }
     }
+
+    // AGENT: convert the architecture-local fault class into the Kernel
+    // boundary type before invoking migrated memory semantics.
+    fn into_kernel_access(self) -> crate::kernel::KernelPageFaultAccess {
+        match self {
+            Self::Instruction => crate::kernel::KernelPageFaultAccess::Instruction,
+            Self::Load => crate::kernel::KernelPageFaultAccess::Load,
+            Self::Store => crate::kernel::KernelPageFaultAccess::Store,
+        }
+    }
 }
 
 // AGENT: Structured fatal trap categories for the early no-task-exit QEMU path.
@@ -150,8 +160,8 @@ fn handle_user_ecall(frame: &mut TrapFrame) {
     crate::syscall_abi::dispatch_from_trap_frame(frame);
 }
 
-// AGENT: route recoverable user store faults through migrated AddrSpace COW
-// handling, while keeping other early faults on the structured fatal path.
+// AGENT: route recoverable user page faults through Kernel memory semantics,
+// while keeping unrecoverable early faults on the structured fatal path.
 fn handle_page_fault(frame: &TrapFrame, origin: TrapOrigin, scause: usize, stval: usize) {
     let cause = decode_scause(scause);
     let access = match cause {
@@ -161,23 +171,17 @@ fn handle_page_fault(frame: &TrapFrame, origin: TrapOrigin, scause: usize, stval
     let Some(access) = access else {
         fail_trap(frame, origin, FatalTrap::Unhandled { cause }, stval);
     };
-    if origin == TrapOrigin::User
-        && access == PageFaultAccess::Store
-        && recover_user_store_page_fault(stval).is_ok()
-    {
+    if origin == TrapOrigin::User && recover_user_page_fault(stval, access).is_ok() {
         return;
     }
     fail_trap(frame, origin, FatalTrap::PageFault { access, cause }, stval);
 }
 
-// AGENT: keep trap recovery as an architecture dispatch step; the COW semantics
-// remain in AddrSpace::handle_cow_fault via the installed migrated Kernel.
-fn recover_user_store_page_fault(addr: usize) -> Result<(), &'static str> {
+// AGENT: keep trap recovery as an architecture dispatch step; migrated memory
+// semantics stay behind Kernel::handle_pgfault.
+fn recover_user_page_fault(addr: usize, access: PageFaultAccess) -> Result<(), &'static str> {
     let kernel = crate::kernel::qemu_wait_kernel().ok_or("esrch")?;
-    let task = kernel.cur_task(0).ok_or("esrch")?;
-    let addr_space = task.process.addr_space.lock().unwrap();
-    addr_space.handle_cow_fault(addr, &kernel.pool)?;
-    Ok(())
+    kernel.handle_pgfault(addr, access.into_kernel_access())
 }
 
 // AGENT: Illegal instructions are reported explicitly before the later per-task kill path exists.

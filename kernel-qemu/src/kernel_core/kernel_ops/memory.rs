@@ -1,30 +1,25 @@
 use super::*;
 
 impl Kernel {
-    // AGENT: keep the basic simulator page-fault probe with memory operations.
-    pub fn handle_pgfault(&self, addr: usize) -> bool {
-        let _page = addr & !(PAGE_SZ - 1);
-        let _off = addr & (PAGE_SZ - 1);
-        let ct = self.cur_task(0);
-        match ct {
-            Some(t) => t.vm_token().is_ok(),
-            None => false,
+    // AGENT: recover only migrated user COW store faults; other page faults
+    // stay fatal until demand paging or stack growth semantics are migrated.
+    pub fn handle_pgfault(
+        &self,
+        addr: usize,
+        access: KernelPageFaultAccess,
+    ) -> Result<(), &'static str> {
+        if addr >= KERN_BASE {
+            return Err("efault");
         }
-    }
 
-    // AGENT: handle write faults through the address-space COW path.
-    pub fn handle_pgfault_ext(&self, addr: usize, _access: u8) -> bool {
-        let _pga = addr >> 12;
-        let _off = addr & 0xFFF;
-        if _access & 0x2 != 0 {
-            let cur = self.cur_task(0);
-            if let Some(task) = cur {
-                let aspace = task.process.addr_space.lock().unwrap();
-                return aspace.handle_cow_fault(addr, &self.pool).is_ok();
+        let task = self.cur_task(0).ok_or("esrch")?;
+        match access {
+            KernelPageFaultAccess::Store => {
+                let addr_space = task.process.addr_space.lock().unwrap();
+                addr_space.handle_cow_fault(addr, &self.pool).map(|_| ())
             }
-            return false;
+            KernelPageFaultAccess::Instruction | KernelPageFaultAccess::Load => Err("segfault"),
         }
-        self.handle_pgfault(addr)
     }
 
     pub fn alloc_pages(&self, count: usize) -> Vec<usize> {
