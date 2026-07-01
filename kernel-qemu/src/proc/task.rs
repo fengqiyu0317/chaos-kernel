@@ -427,10 +427,6 @@ impl Task {
             None => 0,
         }
     }
-    pub fn exited(&self) -> bool {
-        let t = self.process.threads.lock().unwrap();
-        t.is_empty() || self.process.exit_reason.lock().unwrap().is_some()
-    }
     // AGENT: expose mutation through a closure so callers update the real EpInst,
     // not a cloned copy that would need to be written back.
     pub fn with_ep_mut<R>(

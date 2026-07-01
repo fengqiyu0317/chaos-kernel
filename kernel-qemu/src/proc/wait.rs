@@ -56,22 +56,6 @@ impl ProcessGroup {
     pub fn is_leader(&self, pid: usize) -> bool {
         self.pgid as usize == pid
     }
-
-    // AGENT: use the authoritative member snapshot and skip already-dead tasks
-    // when broadcasting through a live process group.
-    pub fn broadcast_signal(&self, signo: i32, tasks: &TaskTable) {
-        for pid in self.members_snapshot() {
-            let task = tasks.find(pid);
-            match task {
-                Some(t) => {
-                    if !t.done() {
-                        t.send_sig(signo, self.pgid as isize);
-                    }
-                }
-                None => { /* do nothing */ }
-            }
-        }
-    }
 }
 
 // AGENT: generic wait queues store WaitToken instead of std::thread::Thread.
