@@ -108,28 +108,76 @@ type SemId = usize;
 type SemNum = u16;
 type SemOp = i16;
 
+// AGENT: keep process-local semaphore handles and SEM_UNDO adjustments together.
 #[derive(Default)]
 pub struct SemCtx {
     pub arrays: BTreeMap<SemId, Arc<SemArr>>,
     pub undos: BTreeMap<(SemId, SemNum), SemOp>,
 }
 impl SemCtx {
+    // AGENT: reuse the lowest free process-local semaphore id.
+    fn next_id(&self) -> SemId {
+        (0..).find(|i| !self.arrays.contains_key(i)).unwrap()
+    }
+
+    // AGENT: look up a semaphore without using Index so stale undo records cannot panic.
+    fn sem(&self, id: SemId, num: SemNum) -> Option<&Sema> {
+        self.arrays
+            .get(&id)
+            .and_then(|arr| arr.sems.get(num as usize))
+    }
+
+    // AGENT: apply one accumulated simplified SEM_UNDO adjustment.
+    fn apply_undo(sem: &Sema, op: SemOp) {
+        let steps = if op < 0 {
+            (0isize - op as isize) as usize
+        } else {
+            op as usize
+        };
+        for _ in 0..steps {
+            if op > 0 {
+                sem.release();
+            } else if sem.try_acquire() != Ok(true) {
+                break;
+            }
+        }
+    }
+
+    // AGENT: allocate a process-local handle for a semaphore set.
     pub fn add(&mut self, arr: Arc<SemArr>) -> SemId {
-        let id = (0..).find(|i| !self.arrays.contains_key(i)).unwrap();
+        let id = self.next_id();
         self.arrays.insert(id, arr);
         id
     }
+
+    // AGENT: dropping a local handle also drops any undo state tied to that reused id.
     pub fn remove(&mut self, id: SemId) {
         self.arrays.remove(&id);
+        self.undos.retain(|&(undo_id, _), _| undo_id != id);
     }
+
+    // AGENT: clone the Arc so callers can operate without holding the SemCtx lock.
     pub fn get(&self, id: SemId) -> Option<Arc<SemArr>> {
         self.arrays.get(&id).cloned()
     }
-    pub fn add_undo(&mut self, id: SemId, num: SemNum, op: SemOp) {
+
+    // AGENT: record the inverse operation only for live semaphores.
+    pub fn add_undo(&mut self, id: SemId, num: SemNum, op: SemOp) -> bool {
+        if self.sem(id, num).is_none() {
+            return false;
+        }
+        let key = (id, num);
         let old = *self.undos.get(&(id, num)).unwrap_or(&0);
-        self.undos.insert((id, num), old - op);
+        let next = old.saturating_sub(op);
+        if next == 0 {
+            self.undos.remove(&key);
+        } else {
+            self.undos.insert(key, next);
+        }
+        true
     }
 }
+// AGENT: fork-style copies inherit handles but not SEM_UNDO adjustments.
 impl Clone for SemCtx {
     fn clone(&self) -> Self {
         SemCtx {
@@ -138,14 +186,12 @@ impl Clone for SemCtx {
         }
     }
 }
+// AGENT: process teardown applies any accumulated simplified SEM_UNDO adjustments.
 impl Drop for SemCtx {
     fn drop(&mut self) {
         for (&(id, num), &op) in &self.undos {
-            if let Some(arr) = self.arrays.get(&id) {
-                match op {
-                    1 => arr[num as usize].release(),
-                    _ => {}
-                }
+            if let Some(sem) = self.sem(id, num) {
+                Self::apply_undo(sem, op);
             }
         }
     }

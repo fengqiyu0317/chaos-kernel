@@ -3,13 +3,13 @@ use kernel_sim::{
     check_access, compute_inet_checksum, parse_ipv4_header, set_current_task_id, wait_ev,
     AddrSpace, BlockCache, Channel, EpData, EpEvent, EvBus, EvFlag, ExitReason, FHandle, FLike,
     FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking, PageTableEntry, SchedulePolicy,
-    Sema, Spin, SpinLock, SyncQueue, Task, TaskRunState, TaskTable, TimerEntry, VmMap, VmRegion,
-    WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED,
-    N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK,
-    SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT, SYS_FORK,
-    SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION,
-    SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC,
-    VM_READ, VM_SHARED, VM_WRITE,
+    SemCtx, Sema, Spin, SpinLock, SyncQueue, Task, TaskRunState, TaskTable, TimerEntry, VmMap,
+    VmRegion, WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE,
+    MAP_SHARED, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE,
+    SIGUSR1, SYS_BRK, SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT,
+    SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ,
+    SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ,
+    VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
@@ -370,6 +370,48 @@ fn semaphore_remove_and_set_val_keep_acquire_state_consistent() {
     sem.release();
     assert_eq!(sem.get_val(), 1);
     assert_eq!(sem.try_acquire(), Err("removed"));
+}
+
+// AGENT: accumulated SEM_UNDO releases should all be applied at process-context drop.
+#[test]
+fn sem_ctx_drop_applies_accumulated_undo() {
+    let kernel = Kernel::new(N_FRAMES);
+    let sems = kernel
+        .get_sem(0, 1, 0)
+        .expect("private semaphore set should be created");
+    let mut ctx = SemCtx::default();
+    let id = ctx.add(sems.clone());
+
+    assert!(ctx.add_undo(id, 0, -1));
+    assert!(ctx.add_undo(id, 0, -1));
+    assert!(!ctx.add_undo(id, 1, -1));
+    drop(ctx);
+
+    assert_eq!(sems[0].get_val(), 2);
+}
+
+// AGENT: removing a process-local semaphore id must not leak undo into a reused id.
+#[test]
+fn sem_ctx_remove_clears_undo_for_reused_id() {
+    let kernel = Kernel::new(N_FRAMES);
+    let first = kernel
+        .get_sem(0, 1, 0)
+        .expect("first private semaphore set should be created");
+    let second = kernel
+        .get_sem(0, 1, 0)
+        .expect("second private semaphore set should be created");
+    let mut ctx = SemCtx::default();
+
+    let first_id = ctx.add(first.clone());
+    assert!(ctx.add_undo(first_id, 0, -1));
+    ctx.remove(first_id);
+
+    let second_id = ctx.add(second.clone());
+    assert_eq!(second_id, first_id);
+    drop(ctx);
+
+    assert_eq!(first[0].get_val(), 0);
+    assert_eq!(second[0].get_val(), 0);
 }
 
 // AGENT: write a valid IPv4 header checksum for synthetic parser smoke tests.
