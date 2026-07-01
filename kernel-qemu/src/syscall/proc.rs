@@ -138,33 +138,49 @@ pub(super) fn sys_getppid(kernel: &Kernel) -> Result<usize, &'static str> {
     }
 }
 
+// AGENT: validate POSIX-style process-group changes before asking TaskTable to
+// perform the single authoritative membership update.
 pub(super) fn sys_setpgid(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let pid = a0;
     let pgid = a1;
-    let cur = kernel.cur_task(0);
-    let caller_pid = cur.as_ref().map(|t| t.process_pid()).unwrap_or(1);
+    let cur = kernel.cur_task(0).ok_or("esrch")?;
+    let caller_pid = cur.process_pid();
     let target_pid = if pid == 0 { caller_pid } else { pid };
     let new_pgid = if pgid == 0 { target_pid } else { pgid };
+    if new_pgid > i32::MAX as usize {
+        return Err("einval");
+    }
+    let target = kernel.tasks.find(target_pid).ok_or("esrch")?;
     if target_pid != caller_pid {
-        let target = kernel.tasks.find(target_pid);
-        match target {
-            Some(t) => {
-                let parent = t.process.parent.lock().unwrap();
-                let is_child = parent
-                    .as_ref()
-                    .map(|p| p.process_pid() == caller_pid)
-                    .unwrap_or(false);
-                drop(parent);
-                if !is_child {
-                    return Err("esrch");
-                }
-            }
-            None => return Err("esrch"),
+        let parent = target.process.parent.lock().unwrap();
+        let is_child = parent
+            .as_ref()
+            .map(|p| p.process_pid() == caller_pid)
+            .unwrap_or(false);
+        drop(parent);
+        if !is_child {
+            return Err("esrch");
+        }
+        if target.process.did_exec.load(Ordering::SeqCst) {
+            return Err("eacces");
         }
     }
-    if let Some(t) = kernel.tasks.find(target_pid) {
-        *t.process.pgid.lock().unwrap() = new_pgid as Pgid;
+    let caller_sid = cur.process_sid();
+    let target_sid = target.process_sid();
+    if caller_sid != target_sid {
+        return Err("eperm");
     }
+    if target.is_session_leader() {
+        return Err("eperm");
+    }
+    let new_pgid = new_pgid as Pgid;
+    if new_pgid != target_pid as Pgid {
+        match kernel.tasks.process_group_session(new_pgid) {
+            Some(group_sid) if group_sid == target_sid => {}
+            _ => return Err("eperm"),
+        }
+    }
+    kernel.tasks.move_process_to_group(&target, new_pgid)?;
     Ok(0)
 }
 
@@ -185,16 +201,12 @@ pub(super) fn sys_getpgid(kernel: &Kernel, a0: usize) -> Result<usize, &'static 
     }
 }
 
+// AGENT: create a new session through TaskTable so sid, pgid, and group
+// membership are updated atomically from the syscall boundary.
 pub(super) fn sys_setsid(kernel: &Kernel) -> Result<usize, &'static str> {
     let cur = kernel.cur_task(0);
     if let Some(t) = cur {
-        let pid = t.process_pid();
-        let pgid = *t.process.pgid.lock().unwrap();
-        if pgid as usize == pid {
-            return Err("eperm");
-        }
-        *t.process.pgid.lock().unwrap() = pid as Pgid;
-        Ok(pid)
+        kernel.tasks.start_new_session(&t)
     } else {
         Err("esrch")
     }

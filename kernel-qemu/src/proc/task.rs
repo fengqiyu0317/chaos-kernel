@@ -72,6 +72,10 @@ pub struct ProcessState {
     pub shm_ctx: Mutex<ShmCtx>,
     pub pid: Mutex<Pid>,
     pub pgid: Mutex<Pgid>,
+    // AGENT: sid is the process session id used by setpgid/setsid validation.
+    pub sid: Mutex<usize>,
+    // AGENT: parents may no longer change a child's process group after exec.
+    pub did_exec: AtomicBool,
     pub threads: Mutex<Vec<Tid>>,
     pub ev: Arc<Mutex<EvBus>>,
     pub exit_reason: Mutex<Option<ExitReason>>,
@@ -106,6 +110,8 @@ impl ProcessState {
             shm_ctx: Mutex::new(ShmCtx::default()),
             pid: Mutex::new(Pid::new()),
             pgid: Mutex::new(0),
+            sid: Mutex::new(0),
+            did_exec: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
             ev: EvBus::make(),
             exit_reason: Mutex::new(None),
@@ -239,6 +245,14 @@ impl Task {
     }
     pub fn process_pid(&self) -> usize {
         self.process.pid.lock().unwrap().get()
+    }
+    // AGENT: expose session identity beside pid/pgid for process-group checks.
+    pub fn process_sid(&self) -> usize {
+        *self.process.sid.lock().unwrap()
+    }
+    // AGENT: session leaders cannot move to another process group.
+    pub fn is_session_leader(&self) -> bool {
+        self.process_sid() == self.process_pid()
     }
     // AGENT: expose only the kernel stack top needed by trap setup, keeping KStk
     // ownership inside Task.
@@ -553,6 +567,9 @@ impl fmt::Debug for Task {
 
 pub struct TaskTable {
     pub map: RwLock<BTreeMap<usize, Arc<Task>>>,
+    // AGENT: process groups are indexed by pgid and store process pids, not
+    // thread ids; Task.process.pgid mirrors this authoritative membership map.
+    pub groups: Mutex<BTreeMap<Pgid, Arc<ProcessGroup>>>,
     pub seq: AtomicUsize,
     pub root: Mutex<Option<Arc<Task>>>,
     // AGENT: reserve capacity for forks in progress so concurrent fork callers
@@ -563,15 +580,149 @@ impl TaskTable {
     pub fn new() -> Self {
         Self {
             map: RwLock::new(BTreeMap::new()),
+            groups: Mutex::new(BTreeMap::new()),
             seq: AtomicUsize::new(1),
             root: Mutex::new(None),
             fork_reservations: AtomicUsize::new(0),
         }
     }
+    // AGENT: add a process pid to a group while the groups map is already held.
+    fn add_pid_to_group_locked(
+        groups: &mut BTreeMap<Pgid, Arc<ProcessGroup>>,
+        pgid: Pgid,
+        sid: usize,
+        pid: usize,
+    ) -> Result<(), &'static str> {
+        match groups.get(&pgid) {
+            Some(group) => {
+                if group.session_id != sid {
+                    return Err("eperm");
+                }
+                group.add_member(pid);
+            }
+            None => {
+                groups.insert(pgid, Arc::new(ProcessGroup::new(pgid, pid, sid)));
+            }
+        }
+        Ok(())
+    }
+
+    // AGENT: remove stale group membership and delete empty process groups.
+    fn remove_pid_from_group_locked(
+        groups: &mut BTreeMap<Pgid, Arc<ProcessGroup>>,
+        pgid: Pgid,
+        pid: usize,
+    ) {
+        let remove_group = groups
+            .get(&pgid)
+            .map(|group| {
+                group.remove_member(pid);
+                group.is_empty()
+            })
+            .unwrap_or(false);
+        if remove_group {
+            groups.remove(&pgid);
+        }
+    }
+
+    // AGENT: register a process identity and mirror it into the authoritative
+    // process-group table.
+    fn register_process_identity(&self, task: &Arc<Task>, pid: Pid) {
+        let pid_value = pid.get();
+        *task.process.pid.lock().unwrap() = pid;
+        let pgid = {
+            let mut pgid_guard = task.process.pgid.lock().unwrap();
+            if *pgid_guard == 0 {
+                *pgid_guard = pid_value as Pgid;
+            }
+            *pgid_guard
+        };
+        let sid = {
+            let mut sid_guard = task.process.sid.lock().unwrap();
+            if *sid_guard == 0 {
+                *sid_guard = pid_value;
+            }
+            *sid_guard
+        };
+        let mut groups = self.groups.lock().unwrap();
+        Self::add_pid_to_group_locked(&mut groups, pgid, sid, pid_value)
+            .expect("process identity should not cross sessions");
+    }
+
+    // AGENT: expose the session that owns a process group for setpgid checks.
+    pub fn process_group_session(&self, pgid: Pgid) -> Option<usize> {
+        self.groups
+            .lock()
+            .unwrap()
+            .get(&pgid)
+            .map(|group| group.session_id)
+    }
+
+    // AGENT: move a process between process groups as one state transition.
+    pub fn move_process_to_group(
+        &self,
+        task: &Arc<Task>,
+        new_pgid: Pgid,
+    ) -> Result<(), &'static str> {
+        let pid = task.process_pid();
+        let sid = task.process_sid();
+        let old_pgid = *task.process.pgid.lock().unwrap();
+        if old_pgid == new_pgid {
+            let mut groups = self.groups.lock().unwrap();
+            Self::add_pid_to_group_locked(&mut groups, new_pgid, sid, pid)?;
+            return Ok(());
+        }
+
+        let mut groups = self.groups.lock().unwrap();
+        if new_pgid != pid as Pgid {
+            match groups.get(&new_pgid) {
+                Some(group) if group.session_id == sid => {}
+                Some(_) => return Err("eperm"),
+                None => return Err("eperm"),
+            }
+        } else if groups
+            .get(&new_pgid)
+            .is_some_and(|group| group.session_id != sid)
+        {
+            return Err("eperm");
+        }
+
+        Self::remove_pid_from_group_locked(&mut groups, old_pgid, pid);
+        *task.process.pgid.lock().unwrap() = new_pgid;
+        Self::add_pid_to_group_locked(&mut groups, new_pgid, sid, pid)?;
+        Ok(())
+    }
+
+    // AGENT: make a process a session leader and the sole initial member of its
+    // new process group; TTY foreground state remains a later job-control layer.
+    pub fn start_new_session(&self, task: &Arc<Task>) -> Result<usize, &'static str> {
+        let pid = task.process_pid();
+        let old_pgid = *task.process.pgid.lock().unwrap();
+        if old_pgid as usize == pid {
+            return Err("eperm");
+        }
+        let new_pgid = pid as Pgid;
+        let mut groups = self.groups.lock().unwrap();
+        if groups
+            .get(&new_pgid)
+            .is_some_and(|group| !group.is_empty() || group.session_id != pid)
+        {
+            return Err("eperm");
+        }
+
+        Self::remove_pid_from_group_locked(&mut groups, old_pgid, pid);
+        *task.process.sid.lock().unwrap() = pid;
+        *task.process.pgid.lock().unwrap() = new_pgid;
+        Self::add_pid_to_group_locked(&mut groups, new_pgid, pid, pid)?;
+        Ok(pid)
+    }
+
+    // AGENT: standalone spawned processes start as leaders of their own
+    // session/process group; fork overrides this by pre-setting pgid and sid.
     pub fn spawn(&self, tag: &str) -> Arc<Task> {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = Task::make(id, tag);
-        *t.process.pid.lock().unwrap() = Pid(id);
+        self.register_process_identity(&t, Pid(id));
         self.map.write().unwrap().insert(id, t.clone());
         t
     }
@@ -600,21 +751,33 @@ impl TaskTable {
             .find(|t| t.process.threads.lock().unwrap().contains(&tid))
             .cloned()
     }
+    // AGENT: resolve process-group membership through ProcessGroup instead of
+    // scanning stale per-process pgid fields.
     pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> {
         let mut seen = BTreeSet::new();
-        self.map
-            .read()
+        let members = self
+            .groups
+            .lock()
             .unwrap()
-            .values()
-            .filter(|t| *t.process.pgid.lock().unwrap() == pgid)
-            .filter(|t| seen.insert(t.process_pid()))
-            .cloned()
+            .get(&pgid)
+            .map(|group| group.members_snapshot())
+            .unwrap_or_default();
+        let map = self.map.read().unwrap();
+        members
+            .into_iter()
+            .filter(|pid| seen.insert(*pid))
+            .filter_map(|pid| map.get(&pid).cloned())
+            .filter(|task| !task.done())
             .collect()
     }
+    // AGENT: register updates pid plus process-group membership, keeping fork
+    // and standalone process creation on the same identity path.
     pub fn register(&self, task: &Arc<Task>, pid: Pid) {
-        *task.process.pid.lock().unwrap() = pid.clone();
+        self.register_process_identity(task, pid.clone());
         self.map.write().unwrap().insert(pid.get(), task.clone());
     }
+    // AGENT: reap removes the process from its group before deleting the task
+    // and any same-process thread entries from the task table.
     pub fn reap(&self, id: usize) {
         let t = { self.map.read().unwrap().get(&id).cloned() };
         if let Some(t) = t {
@@ -637,6 +800,12 @@ impl TaskTable {
                         r.link_child(&c);
                     }
                 }
+            }
+            let process_pid = t.process_pid();
+            let process_pgid = *t.process.pgid.lock().unwrap();
+            {
+                let mut groups = self.groups.lock().unwrap();
+                Self::remove_pid_from_group_locked(&mut groups, process_pgid, process_pid);
             }
             let thread_ids: Vec<usize> = t.process.threads.lock().unwrap().drain(..).collect();
             let mut map = self.map.write().unwrap();
@@ -746,8 +915,13 @@ impl TaskTable {
                 ctx
             });
         }
+        // AGENT: fork inherits the parent's process group and session, while
+        // the child starts with a fresh pre-exec setpgid window.
         let pg = { *proc_src.process.pgid.lock().unwrap() };
+        let sid = { *proc_src.process.sid.lock().unwrap() };
         *tgt.process.pgid.lock().unwrap() = pg;
+        *tgt.process.sid.lock().unwrap() = sid;
+        tgt.process.did_exec.store(false, Ordering::SeqCst);
         *tgt.process.sem_ctx.lock().unwrap() = proc_src.process.sem_ctx.lock().unwrap().clone();
         *tgt.process.shm_ctx.lock().unwrap() = proc_src.process.shm_ctx.lock().unwrap().clone();
         let smask = { *src.sig_mask.lock().unwrap() };
@@ -860,7 +1034,8 @@ impl TaskTable {
             .expect("initial stdout fd should allocate");
         t.add_file(FLike::File(fd2))
             .expect("initial stderr fd should allocate");
-        self.register(&t, Pid(t.id()));
+        // AGENT: spawn() already registered pid/pgid/sid membership for this
+        // standalone user process.
         t.process.threads.lock().unwrap().push(t.id());
         t
     }

@@ -38,6 +38,12 @@ impl ProcessGroup {
         members.len() < before
     }
 
+    // AGENT: snapshot membership before looking up tasks so callers do not
+    // hold the group member lock while entering TaskTable.
+    pub fn members_snapshot(&self) -> Vec<usize> {
+        self.members.lock().unwrap().clone()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.members.lock().unwrap().is_empty()
     }
@@ -51,17 +57,16 @@ impl ProcessGroup {
         self.pgid as usize == pid
     }
 
-    // AGENT: use pgid as the group-leader source id now that leader is not a
-    // separate field.
+    // AGENT: use the authoritative member snapshot and skip already-dead tasks
+    // when broadcasting through a live process group.
     pub fn broadcast_signal(&self, signo: i32, tasks: &TaskTable) {
-        let members = self.members.lock().unwrap();
-        let member_ids = members.clone();
-        drop(members);
-        for pid in member_ids {
+        for pid in self.members_snapshot() {
             let task = tasks.find(pid);
             match task {
                 Some(t) => {
-                    t.send_sig(signo, self.pgid as isize);
+                    if !t.done() {
+                        t.send_sig(signo, self.pgid as isize);
+                    }
                 }
                 None => { /* do nothing */ }
             }

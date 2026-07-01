@@ -125,8 +125,8 @@ impl Kernel {
         })
     }
 
-    // AGENT: close FD_CLOEXEC descriptors through Task::close_fd so the fd
-    // allocator and fd table stay synchronized.
+    // AGENT: close FD_CLOEXEC descriptors and mark successful exec so parent
+    // setpgid calls can reject children after the exec boundary.
     fn commit_exec(&self, task: &Arc<Task>, prepared: PreparedExec) {
         for fd in prepared.close_fds {
             let _ = task.close_fd(fd);
@@ -137,6 +137,7 @@ impl Kernel {
             *current_addr_space = prepared.addr_space;
         }
         *task.process.exec_path.lock().unwrap() = prepared.exec_path;
+        task.process.did_exec.store(true, Ordering::SeqCst);
         *task.thd_ctx.lock().unwrap() = Some(prepared.thd_ctx);
     }
 
