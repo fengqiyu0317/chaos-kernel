@@ -193,19 +193,15 @@ impl VmMap {
             return Err("efault");
         }
 
-        let mut idx = 0;
-        while idx < self.regions.len() {
-            let eb = self.regions[idx].base;
-            let ee = self.regions[idx].checked_end().ok_or("overflow")?;
-
-            if rb < ee && eb < re {
+        let idx = self.regions.partition_point(|region| region.base < rb);
+        if idx > 0 {
+            let prev_end = self.regions[idx - 1].checked_end().ok_or("overflow")?;
+            if rb < prev_end {
                 return Err("overlap");
             }
-            if eb > rb {
-                break;
-            }
-
-            idx += 1;
+        }
+        if idx < self.regions.len() && self.regions[idx].base < re {
+            return Err("overlap");
         }
 
         if idx > 0 {
