@@ -250,12 +250,7 @@ impl ElfLoadSegment {
         if mapped_len == 0 || page_base.checked_add(mapped_len).is_none() {
             return Err("ph_overflow");
         }
-        Ok(VmRegion::with_offset(
-            page_base,
-            mapped_len,
-            self.vm_flags(),
-            file_page_offset,
-        ))
+        Ok(VmRegion::new(page_base, mapped_len, self.vm_flags()))
     }
 }
 

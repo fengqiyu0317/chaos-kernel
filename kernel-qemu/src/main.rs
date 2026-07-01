@@ -83,6 +83,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
 // timer interrupts can drive migrated Kernel::schedule_tick() state.
 fn init_qemu_kernel_backend() -> &'static kernel::Kernel {
     let frame_pool = init_qemu_frame_pool();
+    install_kernel_page_table(&frame_pool);
     let kernel = Box::leak(Box::new(kernel::Kernel::new(frame_pool)));
     kernel.proc_init();
     kernel::install_qemu_wait_kernel(kernel);
@@ -92,6 +93,24 @@ fn init_qemu_kernel_backend() -> &'static kernel::Kernel {
         current
     );
     kernel
+}
+
+// AGENT: switch from bare addressing to an Sv39 root that keeps the current
+// low-linked kernel alive while adding the high-half physical direct map.
+fn install_kernel_page_table(frame_pool: &kernel::FramePool) {
+    let page_table =
+        kernel::build_kernel_page_table(frame_pool, QEMU_VIRT_RAM_START, QEMU_VIRT_RAM_END)
+            .expect("kernel Sv39 page table should build");
+    page_table
+        .activate_kernel_direct_map()
+        .expect("kernel Sv39 page table should activate");
+    let satp = csr::read_satp();
+    let direct_map = kernel::direct_map_active();
+    let _kernel_page_table = Box::leak(Box::new(page_table));
+    println!(
+        "[kernel-qemu] kernel page table installed satp={:#x} direct_map={}",
+        satp, direct_map
+    );
 }
 
 // AGENT: seed the migrated FramePool from the QEMU virt RAM range while

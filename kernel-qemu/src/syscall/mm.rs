@@ -86,7 +86,7 @@ pub(super) fn sys_mmap(
         if map_fixed {
             addr_space.unmap_range(result_addr, aligned_len, &kernel.pool)?;
         }
-        let region = VmRegion::with_offset(result_addr, aligned_len, vm_flags, 0);
+        let region = VmRegion::new(result_addr, aligned_len, vm_flags);
         addr_space.map_region(region, &kernel.pool)?;
     }
     Ok(result_addr)

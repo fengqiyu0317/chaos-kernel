@@ -61,119 +61,6 @@ impl PageTableEntry {
     }
 }
 
-// AGENT: isolate ownership of the real Sv39 page-table root and intermediate
-// table frames from higher-level address-space metadata.
-struct Sv39PageTable {
-    root_paddr: usize,
-    root_frame: Option<PgFrame>,
-    table_frames: Vec<PgFrame>,
-}
-
-impl Sv39PageTable {
-    // AGENT: start without a hardware root because early ProcessState creation
-    // does not yet have access to the FramePool.
-    fn new() -> Self {
-        Self {
-            root_paddr: 0,
-            root_frame: None,
-            table_frames: Vec::new(),
-        }
-    }
-
-    // AGENT: expose the live root only after the first mapping allocates it.
-    fn root_paddr(&self) -> Result<usize, &'static str> {
-        if self.root_paddr == 0 {
-            Err("efault")
-        } else {
-            Ok(self.root_paddr)
-        }
-    }
-
-    // AGENT: avoid returning page-table frames while satp still points at this root.
-    fn deactivate_if_current(&self) {
-        if self.root_paddr != 0
-            && crate::csr::read_satp() == crate::csr::make_satp_sv39(self.root_paddr)
-        {
-            unsafe {
-                crate::csr::write_satp(0);
-            }
-            crate::csr::sfence_vma();
-        }
-    }
-
-    // AGENT: lazily allocate the real Sv39 root on the first mapping operation.
-    fn ensure_root(&mut self, pool: &FramePool) -> Result<usize, &'static str> {
-        if self.root_paddr != 0 {
-            return Ok(self.root_paddr);
-        }
-        let frame = pool.alloc_pg_frame().ok_or("enomem")?;
-        zero_page(frame.paddr());
-        self.root_paddr = frame.paddr();
-        self.root_frame = Some(frame);
-        Ok(self.root_paddr)
-    }
-
-    // AGENT: create a hardware leaf mapping while keeping intermediate table
-    // frame ownership inside Sv39PageTable.
-    fn map_leaf(
-        &mut self,
-        va: usize,
-        pa: usize,
-        flags: usize,
-        pool: &FramePool,
-    ) -> Result<(), &'static str> {
-        let root = self.ensure_root(pool)?;
-        map(root, va, pa, flags, pool, &mut self.table_frames)
-    }
-
-    // AGENT: update an existing hardware leaf through the owned Sv39 root.
-    fn update_leaf(&self, va: usize, pa: usize, flags: usize) -> Result<(), &'static str> {
-        update_leaf(self.root_paddr()?, va, pa, flags)
-    }
-
-    // AGENT: validate that resident metadata still has a matching hardware leaf
-    // before mutating COW ownership.
-    fn leaf_paddr(&self, va: usize) -> Result<usize, &'static str> {
-        leaf_paddr(self.root_paddr()?, va)
-    }
-
-    // AGENT: keep callers simple when a not-yet-mapped address space has no root.
-    fn update_leaf_if_present(
-        &self,
-        va: usize,
-        pa: usize,
-        flags: usize,
-    ) -> Result<(), &'static str> {
-        if self.root_paddr == 0 {
-            Ok(())
-        } else {
-            update_leaf(self.root_paddr, va, pa, flags)
-        }
-    }
-
-    // AGENT: remove a hardware leaf if this address space has already allocated
-    // a real Sv39 root and report page-table inconsistencies to the caller.
-    fn unmap_leaf_if_present(&self, va: usize) -> Result<(), &'static str> {
-        if self.root_paddr == 0 {
-            Ok(())
-        } else {
-            unmap(self.root_paddr, va).map(|_| ())
-        }
-    }
-
-    // AGENT: route user memory translation through the owned Sv39 tree.
-    fn translate(&self, va: usize, access: PageAccess) -> Result<usize, &'static str> {
-        translate(self.root_paddr()?, va, access)
-    }
-
-    // AGENT: drop all hardware page-table frames during exec or process teardown.
-    fn clear(&mut self) {
-        self.table_frames.clear();
-        self.root_frame = None;
-        self.root_paddr = 0;
-    }
-}
-
 // AGENT: store software resident-page metadata separately from the real Sv39
 // page table so the BTreeMap is not mistaken for hardware page-table storage.
 struct ResidentPageTable {
@@ -201,7 +88,7 @@ impl ResidentPageTable {
 pub struct AddrSpace {
     pub vm_map: VmMap,
     resident_pages: ResidentPageTable,
-    sv39: Sv39PageTable,
+    sv39: PageTable,
 }
 
 // AGENT: carry the resolved state for one bounded user-memory write so the
@@ -217,7 +104,7 @@ impl AddrSpace {
         Self {
             vm_map: VmMap::new(),
             resident_pages: ResidentPageTable::new(),
-            sv39: Sv39PageTable::new(),
+            sv39: PageTable::new(),
         }
     }
 
