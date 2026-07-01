@@ -270,39 +270,41 @@ impl VmMap {
         self.regions = kept;
     }
 
-    // AGENT: search free VM gaps with checked candidate/end arithmetic.
+    // AGENT: search free VM gaps with checked candidate/end arithmetic and reuse
+    // the shared MM alignment helper with stricter failure checks.
     pub fn find_free(&self, len: usize, align: usize) -> Option<usize> {
         if len == 0 {
             return Some(MMAP_BASE);
         }
-        let al = if align > 1 { align } else { PAGE_SZ };
-        let al_mask = al - 1;
-        let mut cand = MMAP_BASE.checked_add(al_mask)? & !al_mask;
-        let mut iters = 0;
-        let max_iters = self.regions.len() + 2;
-        while iters < max_iters {
-            let ce = cand.checked_add(len)?;
-            if ce > KERN_BASE {
+
+        let align = if align <= 1 { PAGE_SZ } else { align };
+        if !align.is_power_of_two() {
+            return None;
+        }
+
+        let align_addr = |addr| {
+            let aligned = align_up(addr, align);
+            (aligned >= addr && aligned % align == 0).then_some(aligned)
+        };
+
+        let mut cand = align_addr(MMAP_BASE)?;
+
+        loop {
+            let end = cand.checked_add(len)?;
+            if end > KERN_BASE {
                 return None;
             }
-            let mut conflict_end = 0usize;
-            let mut hit = false;
-            for r in self.regions.iter() {
-                let rb = r.base;
-                let re = r.end();
-                if rb < ce && cand < re {
-                    conflict_end = re;
-                    hit = true;
-                    break;
-                }
-            }
-            if !hit {
+
+            let conflict = self
+                .regions
+                .iter()
+                .find(|region| region.base < end && cand < region.end());
+            let Some(conflict) = conflict else {
                 return Some(cand);
-            }
-            cand = conflict_end.checked_add(al_mask)? & !al_mask;
-            iters += 1;
+            };
+
+            cand = align_addr(conflict.end())?;
         }
-        None
     }
 
     // AGENT: report a saturated total instead of wrapping mapped byte counts.
