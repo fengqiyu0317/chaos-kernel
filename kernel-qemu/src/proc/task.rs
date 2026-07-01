@@ -823,25 +823,32 @@ impl TaskTable {
         slot.release();
         Ok(t)
     }
+    // AGENT: `id` is a schedulable task/thread id; callers that need the
+    // owning process should resolve through process_of_tid().
     pub fn find(&self, id: usize) -> Option<Arc<Task>> {
         self.map.read().unwrap().get(&id).cloned()
     }
+
+    // AGENT: return one process representative per tag so cloned threads do
+    // not duplicate process-level tag searches.
     pub fn find_by_tag(&self, tag: &str) -> Vec<Arc<Task>> {
+        let mut seen = BTreeSet::new();
         self.map
             .read()
             .unwrap()
             .values()
             .filter(|t| t.tag() == tag)
+            .filter(|t| seen.insert(t.process_pid()))
             .cloned()
             .collect()
     }
+
+    // AGENT: resolve a thread id to its process leader explicitly instead of
+    // depending on task-table iteration order.
     pub fn process_of_tid(&self, tid: usize) -> Option<Arc<Task>> {
-        self.map
-            .read()
-            .unwrap()
-            .values()
-            .find(|t| t.process.threads.lock().unwrap().contains(&tid))
-            .cloned()
+        let map = self.map.read().unwrap();
+        let process_pid = map.get(&tid)?.process_pid();
+        map.get(&process_pid).cloned()
     }
     // AGENT: resolve process-group membership through ProcessGroup instead of
     // scanning stale per-process pgid fields.
