@@ -70,6 +70,14 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         kernel::kernel_core::sync::tests::run_all();
         println!("[kernel-qemu] sync selftest passed");
     }
+    // AGENT: expose focused RunQueue regressions through the same optional
+    // QEMU boot self-test path.
+    #[cfg(feature = "qemu-sched-selftest")]
+    {
+        println!("[kernel-qemu] sched selftest start");
+        kernel::proc::sched::tests::run_all();
+        println!("[kernel-qemu] sched selftest passed");
+    }
     let _kernel = init_qemu_kernel_backend();
     let timer_probe = arm_timer_wheel_probe();
     trap::init_kernel_trap_vector();
