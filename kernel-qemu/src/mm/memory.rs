@@ -120,30 +120,27 @@ impl VmRegion {
         !no_overlap
     }
 
-    // AGENT: reject splits that would overflow the region end.
+    // AGENT: split a valid interior address into two regions that preserve
+    // the original VMA metadata.
     pub fn split_at(&self, addr: usize) -> Option<(VmRegion, VmRegion)> {
-        let e = self.checked_end()?;
-        if addr <= self.base || addr >= e {
+        let end = self.checked_end()?;
+        if addr <= self.base || addr >= end {
             return None;
         }
-        let ll = addr - self.base;
-        let rl = self.len - ll;
-        let mut lf = self.flags;
-        let mut rf = self.flags;
-        if self.flags & VM_GROWSDOWN != 0 {
-            lf &= !VM_GROWSDOWN;
-        }
-        let l = VmRegion {
+
+        let left_len = addr - self.base;
+        let right_len = end - addr;
+        let left = VmRegion {
             base: self.base,
-            len: ll,
-            flags: lf,
+            len: left_len,
+            flags: self.flags,
         };
-        let r = VmRegion {
+        let right = VmRegion {
             base: addr,
-            len: rl,
-            flags: rf,
+            len: right_len,
+            flags: self.flags,
         };
-        Some((l, r))
+        Some((left, right))
     }
 
     // AGENT: merge only when both endpoints and combined length are representable.
