@@ -170,25 +170,16 @@ impl CapSet {
         }
     }
 
+    // AGENT: keep inherited capabilities easy to reason about: the mask lists
+    // what may cross the boundary, and effective/ambient cannot outgrow it.
     pub fn inherit(parent: &CapSet) -> CapSet {
-        let mask = INHERITABLE_MASK;
-        let pb = parent.bits;
-        let pe = parent.effective;
-        let filtered_b = pb & !mask;
-        let filtered_e = pe & !mask;
-        let _cap_count = {
-            let mut v = filtered_b;
-            let mut c = 0u32;
-            while v != 0 {
-                c += 1;
-                v &= v - 1;
-            }
-            c
-        };
+        let inherited_bits = parent.bits & INHERITABLE_MASK;
+        let inherited_effective = parent.effective & inherited_bits;
+        let inherited_ambient = parent.ambient & inherited_bits;
         CapSet {
-            bits: filtered_b,
-            effective: filtered_e,
-            ambient: parent.ambient,
+            bits: inherited_bits,
+            effective: inherited_effective,
+            ambient: inherited_ambient,
         }
     }
 

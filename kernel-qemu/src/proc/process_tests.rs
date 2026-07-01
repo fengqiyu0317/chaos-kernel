@@ -5,7 +5,28 @@ use super::*;
 // AGENT: expose ProcInit stack construction checks to the optional QEMU boot
 // selftest path.
 pub fn run_all(pool: &FramePool) {
+    capset_inherit_keeps_only_allowed_bits();
     proc_init_push_at_writes_user_stack(pool);
+}
+
+// AGENT: capability inheritance keeps only the mask-approved bits and clamps
+// dependent sets so they cannot contain capabilities the child no longer owns.
+fn capset_inherit_keeps_only_allowed_bits() {
+    let kept = 1u64 << CAP_KILL;
+    let dropped = 1u64 << 63;
+    let effective_without_base = 1u64 << CAP_SETUID;
+    let ambient_without_base = 1u64 << CAP_NET_RAW;
+    let parent = CapSet {
+        bits: kept | dropped,
+        effective: kept | dropped | effective_without_base,
+        ambient: kept | dropped | ambient_without_base,
+    };
+
+    let child = CapSet::inherit(&parent);
+
+    assert_eq!(child.bits, kept);
+    assert_eq!(child.effective, kept);
+    assert_eq!(child.ambient, kept);
 }
 
 // AGENT: construct a minimal init stack through real AddrSpace mappings and
@@ -47,7 +68,10 @@ fn proc_init_push_at_writes_user_stack(pool: &FramePool) {
     assert_user_cstr(&addr_space, env0, "A=B");
 
     let auxv = sp + word * 5;
-    assert_eq!(addr_space.read_user_usize(auxv).unwrap(), AT_PAGESZ as usize);
+    assert_eq!(
+        addr_space.read_user_usize(auxv).unwrap(),
+        AT_PAGESZ as usize
+    );
     assert_eq!(addr_space.read_user_usize(auxv + word).unwrap(), PAGE_SZ);
     assert_eq!(
         addr_space.read_user_usize(auxv + word * 2).unwrap(),

@@ -188,9 +188,12 @@ impl Kernel {
                     if self.run_queue.len() == 0 {
                         t.reset_slice();
                     } else {
-                        // AGENT: A ready peer gets the CPU at slice expiry.
+                        // AGENT: A ready peer gets the CPU at slice expiry;
+                        // reuse the run-queue current marker for the requeue.
                         t.set_sched_state(TaskRunState::Runnable);
-                        self.run_queue.enqueue(t.id(), t.sched_policy());
+                        if !self.run_queue.yield_current(t.sched_policy()) {
+                            self.run_queue.enqueue(t.id(), t.sched_policy());
+                        }
                         self.schedule_next_runnable(cpu);
                     }
                 }
