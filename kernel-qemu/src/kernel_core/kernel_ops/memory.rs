@@ -22,46 +22,26 @@ impl Kernel {
         }
     }
 
+    // AGENT: keep the legacy Kernel page allocation API as a thin wrapper over
+    // FramePool, so physical-address conversion stays tied to the pool base.
     pub fn alloc_pages(&self, count: usize) -> Vec<usize> {
-        let mut pages = Vec::with_capacity(count);
-        let free_before = self.pool.free_count();
-        if free_before < count {
-            let _defrag_result = {
-                let mut slots = self.pool.slots.lock().unwrap();
-                defragment_frame_pool(&mut slots)
-            };
-        }
-        for _ in 0..count {
-            let pa = {
-                let mut s = self.pool.slots.lock().unwrap();
-                let mut found = None;
-                for (idx, f) in s.iter_mut().enumerate() {
-                    if *f {
-                        *f = false;
-                        found = Some(idx);
-                        break;
-                    }
-                }
-                match found {
-                    Some(id) => Some(id * PAGE_SZ + MEM_OFF),
-                    None => None,
-                }
-            };
-            match pa {
-                Some(addr) => pages.push(addr),
-                None => break,
+        let frames = self.pool.batch_alloc(count);
+        let mut pages = Vec::with_capacity(frames.len());
+        for frame_id in frames {
+            match self.pool.frame_id_to_paddr(frame_id) {
+                Some(paddr) => pages.push(paddr),
+                None => self.pool.put(frame_id),
             }
         }
         pages
     }
 
+    // AGENT: validate physical addresses through FramePool before returning
+    // them to the shared frame bitmap.
     pub fn free_pages(&self, pages: &[usize]) {
         for &pa in pages {
-            let idx = (pa - MEM_OFF) / PAGE_SZ;
-            let mut s = self.pool.slots.lock().unwrap();
-            if idx < s.len() {
-                let _was_free = s[idx];
-                s[idx] = true;
+            if let Some(frame_id) = self.pool.paddr_to_frame_id(pa) {
+                self.pool.put(frame_id);
             }
         }
     }
