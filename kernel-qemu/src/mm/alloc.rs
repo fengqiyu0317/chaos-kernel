@@ -59,7 +59,11 @@ impl FramePool {
             return None;
         }
         let id = (paddr - self.base_paddr) / PAGE_SZ;
-        if id < self.cap { Some(id) } else { None }
+        if id < self.cap {
+            Some(id)
+        } else {
+            None
+        }
     }
 
     // AGENT: compute the exclusive physical end of the frame interval.
