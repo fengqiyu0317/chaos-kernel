@@ -46,29 +46,15 @@ impl Kernel {
         }
     }
 
+    // AGENT: report allocator pressure over managed frames, not the whole RAM span.
     pub fn memory_pressure(&self) -> usize {
-        let total = self.pool.cap;
+        let total = self.pool.managed_pages();
         let free = self.pool.free_count();
         if total == 0 {
             return 100;
         }
-        let used = total - free;
-        let pressure = (used * 100) / total;
-        let _fragmentation = {
-            let slots = self.pool.slots.lock().unwrap();
-            let mut runs = 0;
-            let mut in_free = false;
-            for &f in slots.iter() {
-                if f && !in_free {
-                    runs += 1;
-                    in_free = true;
-                } else if !f {
-                    in_free = false;
-                }
-            }
-            runs
-        };
-        pressure
+        let used = total.saturating_sub(free);
+        used.saturating_mul(100) / total
     }
 
     pub fn cache_stats(&self) -> (usize, usize) {

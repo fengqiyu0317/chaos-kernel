@@ -4,6 +4,7 @@ use super::*;
 // AGENT: share the frame bitmap with PgFrame so RAII drops can return pages.
 pub struct FramePool {
     pub(crate) slots: Arc<Mutex<Vec<bool>>>,
+    managed: Arc<Mutex<Vec<bool>>>,
     pub(crate) cap: usize,
     pub(crate) base_paddr: usize,
 }
@@ -13,6 +14,7 @@ impl FramePool {
     pub fn new(n: usize, base_paddr: usize) -> Self {
         Self {
             slots: Arc::new(Mutex::new(vec![false; n])),
+            managed: Arc::new(Mutex::new(vec![false; n])),
             cap: n,
             base_paddr,
         }
@@ -32,9 +34,13 @@ impl FramePool {
 
         let first = (start - self.base_paddr) / PAGE_SZ;
         let last = min((end - self.base_paddr) / PAGE_SZ, self.cap);
+        let mut managed = self.managed.lock().unwrap();
         let mut slots = self.slots.lock().unwrap();
         for idx in first..last {
-            slots[idx] = true;
+            if !managed[idx] {
+                managed[idx] = true;
+                slots[idx] = true;
+            }
         }
     }
 
@@ -53,11 +59,7 @@ impl FramePool {
             return None;
         }
         let id = (paddr - self.base_paddr) / PAGE_SZ;
-        if id < self.cap {
-            Some(id)
-        } else {
-            None
-        }
+        if id < self.cap { Some(id) } else { None }
     }
 
     // AGENT: compute the exclusive physical end of the frame interval.
@@ -111,8 +113,9 @@ impl FramePool {
     // AGENT: return an allocated frame id to the bitmap once and ignore
     // duplicate/out-of-range releases.
     pub fn put(&self, idx: usize) {
+        let managed = self.managed.lock().unwrap();
         let mut s = self.slots.lock().unwrap();
-        if idx < s.len() && !s[idx] {
+        if idx < s.len() && managed[idx] && !s[idx] {
             s[idx] = true;
         }
     }
@@ -122,6 +125,16 @@ impl FramePool {
     }
     pub fn free_count(&self) -> usize {
         self.slots.lock().unwrap().iter().filter(|&&f| f).count()
+    }
+
+    // AGENT: count only frames that boot-time discovery actually made allocatable.
+    pub fn managed_pages(&self) -> usize {
+        self.managed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&managed| managed)
+            .count()
     }
 
     // AGENT: allocate a physical frame as a RAII page-frame handle.

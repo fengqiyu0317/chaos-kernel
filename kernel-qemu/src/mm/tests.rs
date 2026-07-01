@@ -1,11 +1,13 @@
 // AGENT: keep bit-helper regressions next to the QEMU MM helper module and
 // expose the same checks to the optional QEMU boot self-test path.
 use super::*;
+use crate::kernel::{FramePool, MEM_OFF, PAGE_SZ};
 
 pub fn run_all() {
     align_up_rejects_overflow();
     rotate_bits_masks_zero_distance_rotation();
     hash_combine_mixes_zero_values();
+    frame_pool_counts_only_managed_pages();
     buddy_allocator_alloc_free_smoke();
     buddy_free_merges_with_nonzero_base();
     buddy_free_rejects_duplicate_and_bad_ranges();
@@ -31,6 +33,26 @@ fn rotate_bits_masks_zero_distance_rotation() {
 fn hash_combine_mixes_zero_values() {
     assert_eq!(hash_combine(0, 0), 0x9e3779b97f4a7c15);
     assert_ne!(hash_combine(hash_combine(0, 0), 1), hash_combine(0, 1));
+}
+
+// AGENT: FramePool pressure accounting must ignore reserved RAM outside the
+// boot-discovered free range.
+#[cfg_attr(test, test)]
+fn frame_pool_counts_only_managed_pages() {
+    let pool = FramePool::new(8, MEM_OFF);
+    pool.mark_free_range(MEM_OFF + 2 * PAGE_SZ, MEM_OFF + 6 * PAGE_SZ);
+
+    assert_eq!(pool.managed_pages(), 4);
+    assert_eq!(pool.free_count(), 4);
+
+    assert_eq!(pool.get(3), Some(3));
+    assert_eq!(pool.free_count(), 3);
+
+    pool.put(1);
+    assert_eq!(pool.free_count(), 3);
+
+    pool.put(3);
+    assert_eq!(pool.free_count(), 4);
 }
 
 // AGENT: keep the buddy smoke check in the MM helper tests and call it from
