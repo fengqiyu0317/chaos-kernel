@@ -141,6 +141,26 @@ impl FdEntry {
         self.cloexec = val;
     }
 
+    // AGENT: expose epoll instances to fd-table lifecycle cleanup without
+    // leaking the open-file-description internals.
+    pub fn epoll_instance(&self) -> Option<EpInst> {
+        match self.desc.file() {
+            FLike::Ep(inst) => Some(inst.clone()),
+            _ => None,
+        }
+    }
+
+    // AGENT: compare open-file-description identity so close can distinguish the
+    // last fd-table reference from temporary cloned FdEntry handles.
+    pub fn same_open_description(&self, other: &FdEntry) -> bool {
+        Arc::ptr_eq(&self.desc, &other.desc)
+    }
+
+    // AGENT: remove a source-backed epoll subscription from this file object.
+    pub fn unregister_epoll_source(&self, sub_id: usize) -> bool {
+        self.desc.file().unregister_epoll(sub_id)
+    }
+
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
         self.desc.read(buf)
     }

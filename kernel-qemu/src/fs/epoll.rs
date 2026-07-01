@@ -112,6 +112,39 @@ impl EpInst {
     pub fn take_source_sub(&self, fd: usize) -> Option<usize> {
         self.source_subs.lock().unwrap().remove(&fd)
     }
+
+    // AGENT: closing a watched fd removes its registration and returns the
+    // source subscription id that must be cancelled on the watched file object.
+    pub fn remove_closed_fd(&self, fd: usize) -> Option<usize> {
+        self.events.lock().unwrap().remove(&fd);
+        self.ready.lock().unwrap().remove(&fd);
+        self.source_subs.lock().unwrap().remove(&fd)
+    }
+
+    // AGENT: closing the last descriptor for an epoll instance detaches every
+    // source callback and wakes waiters so they can observe the closed fd.
+    pub fn drain_source_subs_on_close(&self) -> Vec<(usize, usize)> {
+        let subs = {
+            let mut source_subs = self.source_subs.lock().unwrap();
+            let drained = source_subs
+                .iter()
+                .map(|(&fd, &sub_id)| (fd, sub_id))
+                .collect();
+            source_subs.clear();
+            drained
+        };
+
+        self.events.lock().unwrap().clear();
+        self.ready.lock().unwrap().clear();
+
+        let waiters: Vec<WaitToken> = self.waiters.lock().unwrap().drain(..).collect();
+        for token in waiters {
+            token.wake();
+        }
+
+        subs
+    }
+
     // AGENT: EpInst clones share their tables through Arc<Mutex<_>>, so control
     // only needs &self and works for duplicated epoll fds.
     pub fn control(&self, op: i32, fd: usize, ev: &EpEvent) -> Result<(), &'static str> {

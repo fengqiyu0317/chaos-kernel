@@ -4,7 +4,7 @@ use super::*;
 use crate::kernel::kernel_core::{
     global_timer_wheel, init_timer_wheel, set_current_task_id, TimerTarget, TimerWheel, TIMER_WHEEL,
 };
-use crate::kernel::{Kernel, TaskRunState};
+use crate::kernel::{EpCtlOp, EpData, EpEvent, EpInst, FLike, Kernel, PipeNode, TaskRunState};
 
 pub fn run_all() {
     wait_token_captures_current_task();
@@ -19,6 +19,7 @@ pub fn run_all() {
     futex_wait_timeout_removes_published_waiter();
     futex_cmp_requeue_propagates_word_read_fault();
     futex_requeue_skips_completed_waiters_when_moving();
+    fd_close_detaches_epoll_subscription_before_reuse();
 }
 
 // AGENT: reset simulator-global wait state so QEMU boot selftests are
@@ -314,5 +315,86 @@ fn futex_requeue_skips_completed_waiters_when_moving() {
     assert_eq!(waiters[0].addr, dst);
     assert!(waiters[0].token.same(&live));
 
+    clear_wait_token_state();
+}
+
+// AGENT: closing a watched fd must remove the old epoll interest and cancel its
+// pipe source callback before the same fd number can be reused for another file.
+#[cfg_attr(test, test)]
+fn fd_close_detaches_epoll_subscription_before_reuse() {
+    reset_wait_token_state(23);
+
+    let kernel = Kernel::new(test_frame_pool(8));
+    let task = kernel.tasks.spawn_root();
+    let (old_read, old_write) = PipeNode::pair();
+    let (read_fd, write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(old_read), FLike::Pipe(old_write), false)
+        .expect("pipe fd allocation should succeed");
+    let epoll = EpInst::new();
+    let epfd = task
+        .add_file(FLike::Ep(epoll.clone()))
+        .expect("epoll fd allocation should succeed");
+
+    let event = EpEvent {
+        events: EpEvent::IN,
+        data: EpData { ptr: 1 },
+    };
+    epoll
+        .control(EpCtlOp::ADD, read_fd, &event)
+        .expect("initial epoll add should succeed");
+    let sub_id = {
+        let source = task.get_file(read_fd).expect("watched fd should exist");
+        source
+            .register_epoll(read_fd, epoll.clone(), &event)
+            .expect("pipe registration should install a source subscription")
+    };
+    epoll.set_source_sub(read_fd, sub_id);
+
+    task.close_fd(read_fd)
+        .expect("closing watched fd should succeed");
+    assert!(!epoll.events.lock().unwrap().contains_key(&read_fd));
+    assert!(epoll.ready.lock().unwrap().is_empty());
+
+    let (new_read, new_write) = PipeNode::pair();
+    let (new_read_fd, new_write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(new_read), FLike::Pipe(new_write), false)
+        .expect("fd reuse allocation should succeed");
+    assert_eq!(new_read_fd, read_fd);
+
+    let new_event = EpEvent {
+        events: EpEvent::IN,
+        data: EpData { ptr: 2 },
+    };
+    epoll
+        .control(EpCtlOp::ADD, new_read_fd, &new_event)
+        .expect("reused fd should not collide with a stale epoll interest");
+    let new_sub_id = {
+        let source = task
+            .get_file(new_read_fd)
+            .expect("reused watched fd should exist");
+        source
+            .register_epoll(new_read_fd, epoll.clone(), &new_event)
+            .expect("reused pipe registration should install a source subscription")
+    };
+    epoll.set_source_sub(new_read_fd, new_sub_id);
+
+    let old_writer = task
+        .get_fd_entry(write_fd)
+        .expect("old writer fd should still exist");
+    assert_eq!(
+        old_writer
+            .write(b"x")
+            .expect_err("old pipe should be broken"),
+        "broken"
+    );
+    assert!(
+        epoll.ready.lock().unwrap().is_empty(),
+        "stale source callback marked the reused fd ready"
+    );
+
+    let _ = task.close_fd(new_read_fd);
+    let _ = task.close_fd(new_write_fd);
+    let _ = task.close_fd(write_fd);
+    let _ = task.close_fd(epfd);
     clear_wait_token_state();
 }

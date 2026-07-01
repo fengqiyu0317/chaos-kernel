@@ -205,6 +205,28 @@ pub struct Task {
     pub sched: Mutex<SchedEntity>,
 }
 
+// AGENT: fd close cleanup is collected under the fd-table lock and executed
+// after releasing it so source unsubscribe and final Drop cannot re-enter the
+// fd table while it is locked.
+struct FdCloseCleanup {
+    closed_entry: FdEntry,
+    closed_fd_source_subs: Vec<usize>,
+    epoll_source_subs: Vec<(FdEntry, usize)>,
+}
+
+impl FdCloseCleanup {
+    // AGENT: detach source callbacks before dropping the closed fd entry.
+    fn run(self) {
+        for sub_id in self.closed_fd_source_subs {
+            self.closed_entry.unregister_epoll_source(sub_id);
+        }
+        for (source, sub_id) in self.epoll_source_subs {
+            source.unregister_epoll_source(sub_id);
+        }
+        drop(self.closed_entry);
+    }
+}
+
 impl Task {
     pub fn make(id: usize, tag: &str) -> Arc<Self> {
         Self::make_with_process(id, tag, ProcessState::new_shared())
@@ -471,19 +493,60 @@ impl Task {
         }
     }
 
-    pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
-        let mut files = self.process.files.lock().unwrap();
-        match files.remove(&fd) {
-            Some(entry) => {
-                if fd < MAX_FD {
-                    self.process.free_fds.lock().unwrap().insert(fd);
+    // AGENT: remove one fd from the table and collect epoll subscriptions that
+    // must be cancelled after the fd-table lock is released.
+    fn remove_fd_locked(
+        files: &mut BTreeMap<usize, FdEntry>,
+        fd: usize,
+    ) -> Result<FdCloseCleanup, &'static str> {
+        let closed_entry = files.remove(&fd).ok_or("ebadf")?;
+
+        let mut closed_fd_source_subs = Vec::new();
+        for entry in files.values() {
+            if let Some(epoll) = entry.epoll_instance() {
+                if let Some(sub_id) = epoll.remove_closed_fd(fd) {
+                    closed_fd_source_subs.push(sub_id);
                 }
-                let (r, w, e) = entry.poll();
-                let _fd_state = (r, w, e);
-                Ok(())
             }
-            None => Err("ebadf"),
         }
+
+        let mut epoll_source_subs = Vec::new();
+        let still_open = files
+            .values()
+            .any(|entry| entry.same_open_description(&closed_entry));
+        if !still_open {
+            if let Some(epoll) = closed_entry.epoll_instance() {
+                for (watched_fd, sub_id) in epoll.drain_source_subs_on_close() {
+                    if let Some(source) = files.get(&watched_fd).cloned() {
+                        epoll_source_subs.push((source, sub_id));
+                    }
+                }
+            }
+        }
+
+        Ok(FdCloseCleanup {
+            closed_entry,
+            closed_fd_source_subs,
+            epoll_source_subs,
+        })
+    }
+
+    // AGENT: close removes fd-table state, detaches epoll registrations, then
+    // drops the open-file description outside the fd-table lock.
+    pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
+        if fd >= MAX_FD {
+            return Err("ebadf");
+        }
+
+        let cleanup = {
+            let mut files = self.process.files.lock().unwrap();
+            let cleanup = Self::remove_fd_locked(&mut files, fd)?;
+            self.process.free_fds.lock().unwrap().insert(fd);
+            cleanup
+        };
+
+        cleanup.run();
+        Ok(())
     }
 
     // AGENT: dup creates a new fd entry that shares the same open-file description.
@@ -508,17 +571,31 @@ impl Task {
         Ok(nfd)
     }
 
-    // AGENT: dup2 replaces only the target fd entry and shares old_fd's open
-    // file description.
+    // AGENT: dup2 replaces the target through the same close cleanup path as
+    // close_fd so watched-fd and epoll-instance lifetimes stay consistent.
     pub fn dup2_fd(&self, old_fd: usize, new_fd: usize) -> Result<usize, &'static str> {
+        if old_fd >= MAX_FD || new_fd >= MAX_FD {
+            return Err("ebadf");
+        }
         if old_fd == new_fd {
             return Ok(new_fd);
         }
-        let mut files = self.process.files.lock().unwrap();
-        let entry = files.get(&old_fd).cloned().ok_or("ebadf")?;
-        let new_entry = entry.dup(false);
-        files.insert(new_fd, new_entry);
-        self.process.free_fds.lock().unwrap().remove(&new_fd);
+        let cleanup = {
+            let mut files = self.process.files.lock().unwrap();
+            let entry = files.get(&old_fd).cloned().ok_or("ebadf")?;
+            let new_entry = entry.dup(false);
+            let cleanup = if files.contains_key(&new_fd) {
+                Some(Self::remove_fd_locked(&mut files, new_fd)?)
+            } else {
+                None
+            };
+            files.insert(new_fd, new_entry);
+            self.process.free_fds.lock().unwrap().remove(&new_fd);
+            cleanup
+        };
+        if let Some(cleanup) = cleanup {
+            cleanup.run();
+        }
         Ok(new_fd)
     }
 
