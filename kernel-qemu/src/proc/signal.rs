@@ -8,13 +8,11 @@ pub struct SigAction {
     pub mask: u64,
 }
 
-// AGENT: simulated userspace signal frame used by kernel-sim sigreturn.
+// AGENT: signal frame now stores only the state required by sigreturn.
 #[derive(Clone)]
 pub struct SigFrame {
     pub saved_ctx: Context,
     pub saved_mask: u64,
-    pub signo: u32,
-    pub sender_tid: isize,
 }
 
 // AGENT: signal selected from Task::sig_queue with its disposition snapshot.
@@ -25,10 +23,10 @@ pub struct PendingSignal {
     pub action: SigAction,
 }
 
+// AGENT: current QEMU signal state keeps dispositions only; pending signals
+// live in ProcessState::sig_queue and blocked masks live in Task::sig_mask.
 #[derive(Clone)]
 pub struct SigSet {
-    pub pending: u64,
-    pub blocked: u64,
     pub actions: Vec<SigAction>,
 }
 
@@ -42,62 +40,7 @@ impl SigSet {
                 mask: 0,
             });
         }
-        Self {
-            pending: 0,
-            blocked: 0,
-            actions,
-        }
-    }
-
-    pub fn sig_pending(&self, signo: u32) -> bool {
-        if signo < NSIG {
-            (self.pending & (1u64 << signo)) != 0
-        } else {
-            false
-        }
-    }
-
-    pub fn sig_raise(&mut self, signo: u32) {
-        if signo < NSIG {
-            self.pending |= 1u64 << signo;
-        }
-    }
-
-    pub fn coalesce_pending(&mut self) -> u64 {
-        // AGENT
-        (self.pending & !self.blocked) & !1u64
-    }
-
-    pub fn sig_clear(&mut self, signo: u32) {
-        if signo < NSIG {
-            self.pending &= !(1u64 << signo);
-        }
-    }
-
-    pub fn sig_block(&mut self, mask: u64) {
-        self.blocked |= mask;
-        self.blocked &= !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
-    }
-
-    pub fn sig_unblock(&mut self, mask: u64) {
-        self.blocked &= !mask;
-    }
-
-    pub fn sig_setmask(&mut self, mask: u64) {
-        self.blocked = mask & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
-    }
-
-    pub fn deliverable(&self) -> Option<u32> {
-        let actionable = self.pending & !self.blocked;
-        if actionable == 0 {
-            return None;
-        }
-        for i in 1..NSIG {
-            if (actionable & (1u64 << i)) != 0 {
-                return Some(i);
-            }
-        }
-        None
+        Self { actions }
     }
 
     pub fn set_action(&mut self, signo: u32, action: SigAction) {
@@ -116,8 +59,6 @@ impl SigSet {
 
     pub fn fork_copy(&self) -> Self {
         Self {
-            pending: 0,
-            blocked: self.blocked,
             actions: self.actions.clone(),
         }
     }

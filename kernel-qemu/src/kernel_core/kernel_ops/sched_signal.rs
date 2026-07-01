@@ -98,8 +98,6 @@ impl Kernel {
                     ctx.sig_frames.push(SigFrame {
                         saved_ctx,
                         saved_mask: old_mask,
-                        signo: sig.signo,
-                        sender_tid: sig.sender_tid,
                     });
                     let next_mask = (old_mask | sig.action.mask | (1u64 << sig.signo))
                         & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
