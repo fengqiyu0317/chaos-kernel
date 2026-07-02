@@ -690,57 +690,6 @@ impl TaskTable {
         }
     }
 
-    // AGENT: register a freshly-created process exactly once, keeping pid,
-    // process-group membership, and main-thread tracking in one place.
-    fn register_process_identity(&self, task: &Arc<Task>, pid: Pid) -> Result<(), &'static str> {
-        let pid_value = pid.get();
-        if pid_value == 0 {
-            return Err("einval");
-        }
-
-        let default_pgid = Pgid::try_from(pid_value).map_err(|_| "einval")?;
-        let current_pid = task.process.pid.lock().unwrap().get();
-        if current_pid != 0 {
-            return Err("eexist");
-        }
-
-        let pgid = {
-            let stored_pgid = *task.process.pgid.lock().unwrap();
-            if stored_pgid == 0 {
-                default_pgid
-            } else {
-                stored_pgid
-            }
-        };
-        if pgid <= 0 {
-            return Err("einval");
-        }
-
-        let sid = {
-            let stored_sid = *task.process.sid.lock().unwrap();
-            if stored_sid == 0 {
-                pid_value
-            } else {
-                stored_sid
-            }
-        };
-
-        {
-            let mut groups = self.groups.lock().unwrap();
-            Self::add_pid_to_group_locked(&mut groups, pgid, sid, pid_value)?;
-        }
-
-        *task.process.pid.lock().unwrap() = pid;
-        *task.process.pgid.lock().unwrap() = pgid;
-        *task.process.sid.lock().unwrap() = sid;
-
-        let mut threads = task.process.threads.lock().unwrap();
-        if !threads.contains(&pid_value) {
-            threads.push(pid_value);
-        }
-        Ok(())
-    }
-
     // AGENT: move a process between process groups as one state transition.
     pub fn move_process_to_group(
         &self,
@@ -851,9 +800,8 @@ impl TaskTable {
         map.get(&process_pid).cloned()
     }
     // AGENT: resolve process-group membership through ProcessGroup instead of
-    // scanning stale per-process pgid fields.
+    // scanning stale per-process pgid fields; liveness is a caller decision.
     pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> {
-        let mut seen = BTreeSet::new();
         let members = self
             .groups
             .lock()
@@ -864,72 +812,92 @@ impl TaskTable {
         let map = self.map.read().unwrap();
         members
             .into_iter()
-            .filter(|pid| seen.insert(*pid))
             .filter_map(|pid| map.get(&pid).cloned())
-            .filter(|task| !task.done())
             .collect()
     }
-    // AGENT: register updates pid plus process-group membership, keeping fork
-    // and standalone process creation on the same identity path.
+    // AGENT: register publishes a freshly-created process exactly once, keeping
+    // the task table, pid, process group, session, and main-thread list in sync.
     pub fn register(&self, task: &Arc<Task>, pid: Pid) -> Result<(), &'static str> {
         let pid_value = pid.get();
-        if self
-            .map
-            .read()
-            .unwrap()
-            .get(&pid_value)
-            .is_some_and(|existing| !Arc::ptr_eq(existing, task))
-        {
+        if pid_value == 0 || task.id() != pid_value {
+            return Err("einval");
+        }
+
+        let default_pgid = Pgid::try_from(pid_value).map_err(|_| "einval")?;
+        let pgid = match *task.process.pgid.lock().unwrap() {
+            0 => default_pgid,
+            existing if existing > 0 => existing,
+            _ => return Err("einval"),
+        };
+        let sid = match *task.process.sid.lock().unwrap() {
+            0 => pid_value,
+            existing => existing,
+        };
+
+        let mut map = self.map.write().unwrap();
+        if map.contains_key(&pid_value) || task.process.pid.lock().unwrap().get() != 0 {
             return Err("eexist");
         }
 
-        self.register_process_identity(task, pid)?;
-        self.map.write().unwrap().insert(pid_value, task.clone());
+        {
+            let mut groups = self.groups.lock().unwrap();
+            Self::add_pid_to_group_locked(&mut groups, pgid, sid, pid_value)?;
+        }
+
+        *task.process.pid.lock().unwrap() = pid;
+        *task.process.pgid.lock().unwrap() = pgid;
+        *task.process.sid.lock().unwrap() = sid;
+
+        {
+            let mut threads = task.process.threads.lock().unwrap();
+            if !threads.contains(&pid_value) {
+                threads.push(pid_value);
+            }
+        }
+
+        map.insert(pid_value, task.clone());
         Ok(())
     }
-    // AGENT: reap removes the process from its group before deleting the task
-    // and any same-process thread entries from the task table.
-    pub fn reap(&self, id: usize) {
-        let t = { self.map.read().unwrap().get(&id).cloned() };
-        if let Some(t) = t {
-            if let Some(parent) = t.process.parent.lock().unwrap().clone() {
-                parent
-                    .process
-                    .subtasks
-                    .lock()
-                    .unwrap()
-                    .retain(|child| child.id() != id);
-            }
-            let ch: Vec<Arc<Task>> = t.process.subtasks.lock().unwrap().drain(..).collect();
-            let rt = self.root.lock().unwrap().clone();
-            if let Some(ref r) = rt {
-                for c in ch {
-                    if r.id() == id {
-                        *c.process.parent.lock().unwrap() = None;
-                    } else {
-                        c.link_parent(r);
-                        r.link_child(&c);
-                    }
-                }
-            }
-            let process_pid = t.process_pid();
-            let process_pgid = *t.process.pgid.lock().unwrap();
-            {
-                let mut groups = self.groups.lock().unwrap();
-                Self::remove_pid_from_group_locked(&mut groups, process_pgid, process_pid);
-            }
-            let thread_ids: Vec<usize> = t.process.threads.lock().unwrap().drain(..).collect();
-            let mut map = self.map.write().unwrap();
-            for tid in thread_ids {
-                let same_process = map
-                    .get(&tid)
-                    .is_some_and(|thread| Arc::ptr_eq(&thread.process, &t.process));
-                if same_process {
-                    map.remove(&tid);
-                }
-            }
-            map.remove(&id);
+    // AGENT: reap only deletes processes that have already reached zombie state;
+    // exit_task owns resource teardown, while reap unlinks the remaining table
+    // and parent/group bookkeeping.
+    pub fn reap(&self, id: usize) -> Result<(), &'static str> {
+        let task = self.find(id).ok_or("esrch")?;
+        if !task.done() {
+            return Err("ebusy");
         }
+
+        let process = task.process.clone();
+        let process_pid = task.process_pid();
+        let process_pgid = *task.process.pgid.lock().unwrap();
+        if let Some(parent) = task.process.parent.lock().unwrap().clone() {
+            parent
+                .process
+                .subtasks
+                .lock()
+                .unwrap()
+                .retain(|child| !Arc::ptr_eq(&child.process, &process));
+        }
+        self.reparent_children_to_init(&task);
+
+        {
+            let mut groups = self.groups.lock().unwrap();
+            Self::remove_pid_from_group_locked(&mut groups, process_pgid, process_pid);
+        }
+
+        let thread_ids: Vec<usize> = task.process.threads.lock().unwrap().drain(..).collect();
+        let mut map = self.map.write().unwrap();
+        for tid in thread_ids {
+            if map
+                .get(&tid)
+                .is_some_and(|thread| Arc::ptr_eq(&thread.process, &process))
+            {
+                map.remove(&tid);
+            }
+        }
+        map.remove(&process_pid);
+        map.remove(&id);
+        Ok(())
     }
     pub fn reparent_children_to_init(&self, task: &Arc<Task>) {
         let children: Vec<Arc<Task>> = task.process.subtasks.lock().unwrap().drain(..).collect();
@@ -958,8 +926,7 @@ impl TaskTable {
     // spawn and the pid-1 init path.
     fn insert_new_process(&self, id: usize, tag: &str) -> Result<Arc<Task>, &'static str> {
         let t = Task::make(id, tag);
-        self.register_process_identity(&t, Pid(id))?;
-        self.map.write().unwrap().insert(id, t.clone());
+        self.register(&t, Pid(id))?;
         Ok(t)
     }
     // AGENT: reserve one task-table slot while a creator builds and registers a
@@ -983,85 +950,80 @@ impl TaskTable {
             }
         }
     }
+    // AGENT: keep fork readable by separating process-wide inherited state from
+    // the caller thread context that receives the child-side zero return value.
     pub fn fork_task(&self, src: &Arc<Task>, pool: &FramePool) -> Result<Arc<Task>, &'static str> {
         let process_slot = self.reserve_process_slot()?;
         let proc_src = self.process_of_tid(src.id()).unwrap_or_else(|| src.clone());
-        let nid = self.seq.fetch_add(1, Ordering::SeqCst);
-        let ns = proc_src.tag();
+        let child_id = self.seq.fetch_add(1, Ordering::SeqCst);
+        let tag = proc_src.tag();
         let child_addr_space = {
-            let src_addr_space = proc_src.process.addr_space.lock().unwrap();
-            Arc::new(Mutex::new(AddrSpace::fork_from(&src_addr_space, pool)?))
+            let parent_addr_space = proc_src.process.addr_space.lock().unwrap();
+            let forked_addr_space = AddrSpace::fork_from(&parent_addr_space, pool)?;
+            Arc::new(Mutex::new(forked_addr_space))
         };
-        let tgt = Task::make_with_addr_space(nid, &ns, child_addr_space);
-        {
-            let src_fds = proc_src.process.debug_fds.lock().unwrap();
-            let mut tgt_fds = tgt.process.debug_fds.lock().unwrap();
-            *tgt_fds = src_fds.clone();
-        }
-        let _vmap_cost = {
-            let ca = proc_src.process.cwd.lock().unwrap().len();
-            let cb = proc_src.process.exec_path.lock().unwrap().len();
-            let pg = (ca + cb + PAGE_SZ - 1) / PAGE_SZ;
-            let hash = ca.wrapping_mul(0x9e37) ^ cb.wrapping_mul(0x5f3) ^ nid;
-            hash % (pg + 1)
-        };
-        {
-            let sc = proc_src.process.cwd.lock().unwrap();
-            let mut tc = tgt.process.cwd.lock().unwrap();
-            *tc = sc.clone();
-        }
-        {
-            let se = proc_src.process.exec_path.lock().unwrap();
-            let mut te = tgt.process.exec_path.lock().unwrap();
-            *te = se.clone();
-        }
+        let child = Task::make_with_addr_space(child_id, &tag, child_addr_space);
+
+        let debug_fds = proc_src.process.debug_fds.lock().unwrap().clone();
+        let cwd = proc_src.process.cwd.lock().unwrap().clone();
+        let exec_path = proc_src.process.exec_path.lock().unwrap().clone();
+        *child.process.debug_fds.lock().unwrap() = debug_fds;
+        *child.process.cwd.lock().unwrap() = cwd;
+        *child.process.exec_path.lock().unwrap() = exec_path;
+
         // AGENT: fork copies both the fd entries and the free-fd allocator
         // snapshot so child allocation remains consistent with inherited fds.
         {
-            let sf = proc_src.process.files.lock().unwrap();
-            let src_free_fds = proc_src.process.free_fds.lock().unwrap().clone();
-            let mut tf = tgt.process.files.lock().unwrap();
-            let mut tgt_free_fds = tgt.process.free_fds.lock().unwrap();
-            *tgt_free_fds = src_free_fds;
-            for (&fd, entry) in sf.iter() {
-                let dup = entry.fork_dup();
-                tf.insert(fd, dup);
-            }
+            let parent_files = proc_src.process.files.lock().unwrap();
+            let child_files: BTreeMap<usize, FdEntry> = parent_files
+                .iter()
+                .map(|(&fd, entry)| (fd, entry.fork_dup()))
+                .collect();
+            let child_free_fds = proc_src.process.free_fds.lock().unwrap().clone();
+            *child.process.files.lock().unwrap() = child_files;
+            *child.process.free_fds.lock().unwrap() = child_free_fds;
         }
-        {
-            let src_ctx = src.thd_ctx.lock().unwrap().clone();
-            let mut tgt_ctx = tgt.thd_ctx.lock().unwrap();
-            *tgt_ctx = src_ctx.map(|mut ctx| {
-                ctx.uctx.set_ret(0);
-                ctx
-            });
-        }
+
+        let child_ctx = src.thd_ctx.lock().unwrap().clone().map(|mut ctx| {
+            ctx.uctx.set_ret(0);
+            ctx
+        });
+        *child.thd_ctx.lock().unwrap() = child_ctx;
+
         // AGENT: fork inherits the parent's process group and session, while
         // the child starts with a fresh pre-exec setpgid window.
-        let pg = { *proc_src.process.pgid.lock().unwrap() };
-        let sid = { *proc_src.process.sid.lock().unwrap() };
-        *tgt.process.pgid.lock().unwrap() = pg;
-        *tgt.process.sid.lock().unwrap() = sid;
-        tgt.process.did_exec.store(false, Ordering::SeqCst);
-        *tgt.process.sem_ctx.lock().unwrap() = proc_src.process.sem_ctx.lock().unwrap().clone();
-        *tgt.process.shm_ctx.lock().unwrap() = proc_src.process.shm_ctx.lock().unwrap().clone();
-        let smask = { *src.sig_mask.lock().unwrap() };
-        *tgt.sig_mask.lock().unwrap() = smask;
+        let pgid = *proc_src.process.pgid.lock().unwrap();
+        let sid = *proc_src.process.sid.lock().unwrap();
+        let sem_ctx = proc_src.process.sem_ctx.lock().unwrap().clone();
+        let shm_ctx = proc_src.process.shm_ctx.lock().unwrap().clone();
+        let sig_mask = *src.sig_mask.lock().unwrap();
+
+        *child.process.pgid.lock().unwrap() = pgid;
+        *child.process.sid.lock().unwrap() = sid;
+        child.process.did_exec.store(false, Ordering::SeqCst);
+        *child.process.sem_ctx.lock().unwrap() = sem_ctx;
+        *child.process.shm_ctx.lock().unwrap() = shm_ctx;
+        *child.sig_mask.lock().unwrap() = sig_mask;
+
         // AGENT: child inherits signal dispositions, but not pending signals.
         let sig_state = { proc_src.process.sig_state.lock().unwrap().fork_copy() };
-        *tgt.process.sig_state.lock().unwrap() = sig_state;
+        *child.process.sig_state.lock().unwrap() = sig_state;
         {
             let parent_policy = src.sched.lock().unwrap().policy.clone();
-            let mut child_sched = tgt.sched.lock().unwrap();
+            let mut child_sched = child.sched.lock().unwrap();
             child_sched.policy = parent_policy;
             child_sched.slice_left = child_sched.policy.time_slice();
         }
-        let p = Pid(nid);
-        self.register(&tgt, p)?;
-        *tgt.process.parent.lock().unwrap() = Some(proc_src.clone());
-        proc_src.process.subtasks.lock().unwrap().push(tgt.clone());
+        self.register(&child, Pid(child_id))?;
+        *child.process.parent.lock().unwrap() = Some(proc_src.clone());
+        proc_src
+            .process
+            .subtasks
+            .lock()
+            .unwrap()
+            .push(child.clone());
         process_slot.release();
-        Ok(tgt)
+        Ok(child)
     }
     pub fn clone_thread(
         &self,
@@ -1170,13 +1132,17 @@ impl TaskTable {
             .collect()
     }
 
+    // AGENT: report one live task-table id per zombie process, not one per
+    // thread, so reclaim calls reap exactly once for a dead thread group.
     pub fn zombie_tasks(&self) -> Vec<usize> {
-        self.map
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|(_, t)| t.done())
-            .map(|(id, _)| *id)
+        let map = self.map.read().unwrap();
+        let mut seen = BTreeSet::new();
+        map.iter()
+            .filter(|(_, task)| task.done())
+            .filter_map(|(id, task)| {
+                let pid = task.process_pid();
+                seen.insert(pid).then_some(*id)
+            })
             .collect()
     }
 }

@@ -69,10 +69,12 @@ impl Kernel {
     // resources are released earlier at the exit_task boundary.
     pub fn reclaim_zombies(&self) -> usize {
         let zombies = self.tasks.zombie_tasks();
-        let count = zombies.len();
+        let mut count = 0;
         for id in zombies {
             self.run_queue.remove(id);
-            self.tasks.reap(id);
+            if self.tasks.reap(id).is_ok() {
+                count += 1;
+            }
         }
         count
     }
@@ -126,7 +128,7 @@ impl Kernel {
         match found_zombie {
             Some((id, status)) => {
                 self.run_queue.remove(id);
-                self.tasks.reap(id);
+                self.tasks.reap(id)?;
                 Ok((id, status))
             }
             None => {

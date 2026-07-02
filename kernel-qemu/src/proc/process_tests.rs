@@ -10,6 +10,8 @@ pub fn run_all(pool: &FramePool) {
     capset_drop_cap_clears_ambient();
     spawn_root_creates_single_pid_one_init();
     spawn_root_rejects_nonempty_task_table();
+    register_rejects_duplicate_pid_without_replacing_task();
+    pgid_group_keeps_zombie_members_until_reap();
     reap_rejects_live_process();
     reap_zombie_process_removes_thread_group_once();
     proc_init_push_at_writes_user_stack(pool);
@@ -102,6 +104,35 @@ fn spawn_root_rejects_nonempty_task_table() {
     assert_eq!(table.spawn_root().err(), Some("ebusy"));
     assert!(table.root.lock().unwrap().is_none());
     assert_eq!(table.count(), 1);
+}
+
+// AGENT: duplicate pid registration must fail before replacing the published
+// task-table entry or corrupting process-group membership.
+fn register_rejects_duplicate_pid_without_replacing_task() {
+    let table = TaskTable::new();
+    let first = table.spawn("worker").expect("standalone spawn should work");
+    let duplicate = Task::make(first.id(), "duplicate");
+
+    assert_eq!(table.register(&duplicate, Pid(first.id())), Err("eexist"));
+    assert!(Arc::ptr_eq(&table.find(first.id()).unwrap(), &first));
+
+    let group = table.pgid_group(first.id() as Pgid);
+    assert_eq!(group.len(), 1);
+    assert!(Arc::ptr_eq(&group[0], &first));
+}
+
+// AGENT: process-group lookup reports membership, including zombies that remain
+// present until wait/reap removes them from the table.
+fn pgid_group_keeps_zombie_members_until_reap() {
+    let table = TaskTable::new();
+    let task = table.spawn("worker").expect("standalone spawn should work");
+    let pgid = *task.process.pgid.lock().unwrap();
+
+    assert!(task.exit_proc(ExitReason::Code(0)));
+
+    let group = table.pgid_group(pgid);
+    assert_eq!(group.len(), 1);
+    assert!(Arc::ptr_eq(&group[0], &task));
 }
 
 // AGENT: reap is a zombie-only operation; a mistaken live-process id must not

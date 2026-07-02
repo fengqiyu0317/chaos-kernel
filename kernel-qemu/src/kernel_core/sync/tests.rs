@@ -14,6 +14,9 @@ pub fn run_all() {
     wait_token_expired_deadline_times_out_immediately();
     wait_token_timer_target_times_out_on_schedule_tick();
     wait_token_event_wake_uses_installed_scheduler_backend();
+    wait_token_block_current_keeps_placeholder_stack();
+    wait_token_current_wake_finishes_without_requeue();
+    wait_token_tick_leaves_sleeping_current_parked();
     futex_wait_returns_changed_without_queueing();
     futex_wait_propagates_word_read_fault();
     futex_wait_timeout_removes_published_waiter();
@@ -193,6 +196,76 @@ fn wait_token_event_wake_uses_installed_scheduler_backend() {
     assert!(token.wake_event());
     assert_eq!(task.sched_state(), TaskRunState::Runnable);
     assert_eq!(kernel.run_queue.pick_next(), Some(task.id()));
+
+    clear_wait_token_state();
+}
+
+// AGENT: the current bridge records the current task as sleeping without
+// pretending that its kernel stack has really switched away.
+#[cfg_attr(test, test)]
+fn wait_token_block_current_keeps_placeholder_stack() {
+    reset_wait_token_state(24);
+
+    let kernel = Box::leak(Box::new(Kernel::new(test_frame_pool(8))));
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init task should be current");
+    let peer = kernel.tasks.spawn("peer").expect("spawn peer task");
+    peer.set_sched_state(TaskRunState::Runnable);
+    kernel.run_queue.enqueue(peer.id(), peer.sched_policy());
+
+    assert!(kernel.block_task_for_wait(task.id()));
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(task.id()));
+    assert_eq!(kernel.run_queue.pick_next(), Some(peer.id()));
+    assert!(!kernel.run_queue.yield_current(task.sched_policy()));
+
+    clear_wait_token_state();
+}
+
+// AGENT: waking the task whose stack is still spinning should not enqueue a
+// duplicate runnable entry; wait completion restores it to Running in place.
+#[cfg_attr(test, test)]
+fn wait_token_current_wake_finishes_without_requeue() {
+    reset_wait_token_state(25);
+
+    let kernel = Box::leak(Box::new(Kernel::new(test_frame_pool(8))));
+    kernel.proc_init();
+    install_qemu_wait_kernel(kernel);
+    let task = kernel.cur_task(0).expect("init task should be current");
+    let token = WaitToken::current();
+
+    assert!(kernel.block_task_for_wait(task.id()));
+    assert!(token.wake_event());
+    assert_eq!(task.sched_state(), TaskRunState::Runnable);
+    assert_eq!(kernel.run_queue.pick_next(), None);
+
+    assert!(kernel.finish_task_wait(task.id()));
+    assert_eq!(task.sched_state(), TaskRunState::Running);
+    assert_eq!(kernel.run_queue.pick_next(), None);
+
+    clear_wait_token_state();
+}
+
+// AGENT: timer ticks must not time-slice the temporary sleeping-current state
+// used by the spin wait bridge.
+#[cfg_attr(test, test)]
+fn wait_token_tick_leaves_sleeping_current_parked() {
+    reset_wait_token_state(26);
+
+    let kernel = Box::leak(Box::new(Kernel::new(test_frame_pool(8))));
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init task should be current");
+    let peer = kernel.tasks.spawn("peer").expect("spawn peer task");
+    task.set_sched_state(TaskRunState::Sleeping);
+    kernel.run_queue.clear_current();
+    peer.set_sched_state(TaskRunState::Runnable);
+    kernel.run_queue.enqueue(peer.id(), peer.sched_policy());
+
+    kernel.schedule_tick(0);
+
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(task.id()));
+    assert_eq!(kernel.run_queue.pick_next(), Some(peer.id()));
 
     clear_wait_token_state();
 }
