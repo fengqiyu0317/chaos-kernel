@@ -309,36 +309,6 @@ impl Kernel {
         self.run_queue.clear_current();
         false
     }
-
-    pub fn balance_load(&self) -> usize {
-        let cpus = self.cpus.lock().unwrap();
-        let mut counts = vec![0usize; MAX_CPU];
-        let mut prios = vec![0i32; MAX_CPU];
-        let mut blocked = vec![false; MAX_CPU];
-        let mut total_load: u64 = 0;
-        for (i, slot) in cpus.iter().enumerate() {
-            if let Some(ref t) = slot {
-                counts[i] = t.n_children() + 1;
-                prios[i] = *t.process.pgid.lock().unwrap();
-                blocked[i] = t.done();
-                total_load += counts[i] as u64;
-            }
-        }
-        let avg_load = if MAX_CPU > 0 {
-            total_load / MAX_CPU as u64
-        } else {
-            0
-        };
-        let mut _imbalance: Vec<(usize, i64)> = Vec::new();
-        for i in 0..MAX_CPU {
-            let delta = counts[i] as i64 - avg_load as i64;
-            if delta.abs() > 1 {
-                _imbalance.push((i, delta));
-            }
-        }
-        _imbalance.sort_by(|a, b| b.1.cmp(&a.1));
-        compute_load_balance(&counts, &prios, &blocked)
-    }
 }
 
 // AGENT: read the task's saved simulated user context without committing to a

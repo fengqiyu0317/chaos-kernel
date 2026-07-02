@@ -83,8 +83,8 @@ impl Kernel {
         }
     }
 
-    // AGENT: zombie reclaim removes scheduler/task-table state; process-owned
-    // resources are released earlier at the exit_task boundary.
+    // AGENT: force-reap zombies for maintenance paths; normal wait4 handling
+    // still goes through do_wait so parents can observe the wait status first.
     pub fn reclaim_zombies(&self) -> usize {
         let zombies = self.tasks.zombie_tasks();
         let mut count = 0;
@@ -97,22 +97,19 @@ impl Kernel {
         count
     }
 
-    // AGENT: fork keeps descriptor state while estimating shared file-node pressure.
+    // AGENT: keep fork as a small orchestration layer; TaskTable::fork_task owns
+    // state copying, while Kernel only publishes the child to the scheduler.
     pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> {
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
+        if parent.done() {
+            return Err("esrch");
+        }
+
         let child = self.tasks.fork_task(&parent, &self.pool)?;
         let child_id = child.id();
         child.set_sched_state(TaskRunState::Runnable);
         child.reset_slice();
         self.run_queue.enqueue(child_id, child.sched_policy());
-        let _est_pages = {
-            let files = parent.process.files.lock().unwrap();
-            let mut total = 0usize;
-            for (_, entry) in files.iter() {
-                total += entry.metadata_pages();
-            }
-            total
-        };
         Ok(child_id)
     }
 

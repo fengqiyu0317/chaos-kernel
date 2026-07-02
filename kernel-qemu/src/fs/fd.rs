@@ -97,13 +97,6 @@ impl OpenFileDescription {
             _ => None,
         }
     }
-
-    pub fn metadata_pages(&self) -> usize {
-        match &self.file {
-            FLike::File(f) => f.metadata_sz() / PAGE_SZ + 1,
-            _ => 1,
-        }
-    }
 }
 
 impl FdEntry {
@@ -187,10 +180,6 @@ impl FdEntry {
 
     pub fn regular_handle(&self) -> Option<FHandle> {
         self.desc.regular_handle()
-    }
-
-    pub fn metadata_pages(&self) -> usize {
-        self.desc.metadata_pages()
     }
 
     // AGENT: compatibility view for older tests and helpers that inspect FLike.
@@ -438,9 +427,6 @@ impl FHandle {
     }
     pub fn sync_data(&self) -> Result<(), &'static str> {
         Ok(())
-    }
-    pub fn metadata_sz(&self) -> usize {
-        self.node.data.lock().unwrap().len()
     }
     pub fn lookup(&self, _path: &str, _depth: usize) -> Result<(), &'static str> {
         Ok(())

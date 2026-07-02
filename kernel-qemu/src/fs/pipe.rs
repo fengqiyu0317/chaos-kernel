@@ -366,9 +366,6 @@ impl PseudoNode {
     pub fn write_at(&self, _off: usize, _buf: &[u8]) -> Result<usize, &'static str> {
         Err("nosup")
     }
-    pub fn metadata_sz(&self) -> usize {
-        self.content.len()
-    }
 }
 
 pub fn read_as_vec(data: &[u8]) -> Vec<u8> {
