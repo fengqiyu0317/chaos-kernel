@@ -71,7 +71,7 @@ impl OpenFileDescription {
         self.file.write(buf)
     }
 
-    pub fn poll(&self) -> (bool, bool, bool) {
+    pub fn poll(&self) -> PollStatus {
         self.file.poll()
     }
 
@@ -168,7 +168,7 @@ impl FdEntry {
         self.desc.write(buf)
     }
 
-    pub fn poll(&self) -> (bool, bool, bool) {
+    pub fn poll(&self) -> PollStatus {
         self.desc.poll()
     }
 
@@ -474,14 +474,19 @@ impl FHandle {
         d.off += 1;
         Ok(format!("entry_{}", off))
     }
-    pub fn poll_status(&self) -> (bool, bool, bool) {
+    pub fn poll_status(&self) -> PollStatus {
         let desc = self.desc.read().unwrap();
         let readable = desc.opt.rd;
         let writable = desc.opt.wr;
         let _off = desc.off;
         drop(desc);
         let error = self.path.is_empty() && self.node.data.lock().unwrap().is_empty();
-        (readable, writable, error)
+        PollStatus {
+            readable,
+            writable,
+            error,
+            closed: false,
+        }
     }
     pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> {
         Ok(0)

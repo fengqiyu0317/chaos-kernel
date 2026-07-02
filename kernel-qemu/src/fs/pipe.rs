@@ -23,6 +23,16 @@ pub struct PipeNode {
     dir: PipeDir,
 }
 
+// AGENT: make poll readiness explicit so closed peer state is not hidden inside
+// a three-boolean tuple.
+#[derive(Clone, Copy, Default)]
+pub struct PollStatus {
+    pub readable: bool,
+    pub writable: bool,
+    pub error: bool,
+    pub closed: bool,
+}
+
 impl Clone for PipeNode {
     // AGENT: cloning a pipe endpoint represents another fd/reference to that
     // endpoint, so the explicit reader/writer counters must follow the clone.
@@ -101,28 +111,22 @@ impl PipeNode {
             }
         }
     }
-    // AGENT: translate epoll interest into the EvBus bits that should wake this
-    // endpoint. CLOSED wakes read/write interests so EOF/EPIPE is rechecked by
-    // the level-triggered poll pass.
+    // AGENT: translate supported epoll interest into the EvBus bits that should
+    // wake this endpoint. ERROR/HUP-style states are reported regardless of the
+    // caller interest mask, so every pipe subscription watches them.
     fn epoll_bus_mask(&self, events: u32) -> u32 {
-        let mut mask = 0;
+        let mut mask = EvFlag::CLOSED | EvFlag::ERROR;
         match self.dir {
             PipeDir::Rd => {
-                if events & (EpEvent::IN | EpEvent::RDNORM | EpEvent::RDBAND | EpEvent::PRI) != 0 {
-                    mask |= EvFlag::READABLE | EvFlag::CLOSED;
+                if events & (EpEvent::IN | EpEvent::RDNORM) != 0 {
+                    mask |= EvFlag::READABLE;
                 }
             }
             PipeDir::Wr => {
-                if events & (EpEvent::OUT | EpEvent::WRNORM | EpEvent::WRBAND) != 0 {
-                    mask |= EvFlag::WRITABLE | EvFlag::CLOSED | EvFlag::ERROR;
+                if events & (EpEvent::OUT | EpEvent::WRNORM) != 0 {
+                    mask |= EvFlag::WRITABLE;
                 }
             }
-        }
-        if events & (EpEvent::ERR) != 0 {
-            mask |= EvFlag::ERROR;
-        }
-        if events & (EpEvent::HUP | EpEvent::RDHUP) != 0 {
-            mask |= EvFlag::CLOSED;
         }
         mask
     }
@@ -195,14 +199,15 @@ impl PipeNode {
     }
     // AGENT: poll reuses the same readiness bit calculation as epoll
     // registration, so pipe readiness has one local source of truth.
-    pub fn poll(&self) -> (bool, bool, bool) {
+    pub fn poll(&self) -> PollStatus {
         let d = self.data.lock().unwrap();
         let ready = self.readiness_locked(&d);
-        (
-            (ready & EvFlag::READABLE) != 0,
-            (ready & EvFlag::WRITABLE) != 0,
-            (ready & EvFlag::ERROR) != 0,
-        )
+        PollStatus {
+            readable: (ready & EvFlag::READABLE) != 0,
+            writable: (ready & EvFlag::WRITABLE) != 0,
+            error: (ready & EvFlag::ERROR) != 0,
+            closed: (ready & EvFlag::CLOSED) != 0,
+        }
     }
 }
 
@@ -295,7 +300,7 @@ impl FLike {
             FLike::Ep(_) => Err("enosys"),
         }
     }
-    pub fn poll(&self) -> (bool, bool, bool) {
+    pub fn poll(&self) -> PollStatus {
         match self {
             // HUMAN: move the code to the implementation of the corresponding struct
             FLike::File(f) => f.poll_status(),
@@ -303,7 +308,10 @@ impl FLike {
             FLike::Ep(e) => {
                 let ready = e.ready.lock().unwrap();
                 let has_ready = !ready.is_empty();
-                (has_ready, false, false)
+                PollStatus {
+                    readable: has_ready,
+                    ..PollStatus::default()
+                }
             }
         }
     }

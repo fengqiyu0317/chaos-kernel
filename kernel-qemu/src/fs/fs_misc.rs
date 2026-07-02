@@ -416,8 +416,8 @@ pub fn audit_fd_table(files: &BTreeMap<usize, FdEntry>) -> Vec<usize> {
         let fl = entry.as_flike();
         match &fl {
             FLike::Pipe(_) => {
-                let (r, w, e) = fl.poll();
-                if e {
+                let status = fl.poll();
+                if status.error {
                     leaks.push(fd);
                 }
             }

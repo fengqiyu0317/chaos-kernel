@@ -97,6 +97,26 @@ pub(super) fn sys_epoll_ctl(
     Ok(0)
 }
 
+// AGENT: keep epoll's public event translation aligned with pipe source
+// wakeups. ERR and HUP are reported even if callers did not request them.
+pub(crate) fn epoll_ready_events(status: PollStatus, interest: u32) -> u32 {
+    let mut ready = 0u32;
+    if status.readable {
+        ready |= (EpEvent::IN | EpEvent::RDNORM) & interest;
+    }
+    if status.writable {
+        ready |= (EpEvent::OUT | EpEvent::WRNORM) & interest;
+    }
+    if status.error {
+        ready |= EpEvent::ERR;
+    }
+    if status.closed {
+        ready |= EpEvent::HUP;
+        ready |= EpEvent::RDHUP & interest;
+    }
+    ready
+}
+
 // AGENT: epoll_wait now sleeps on EpInst.waiters and is woken by registered
 // source readiness callbacks. QEMU timeouts use the logical timer wheel instead
 // of host Instant/park_timeout.
@@ -150,17 +170,7 @@ pub(super) fn sys_epoll_wait(
             let Some(fl) = task.get_file(fd) else {
                 continue;
             };
-            let (readable, writable, error) = fl.poll();
-            let mut ready = 0u32;
-            if readable {
-                ready |= (EpEvent::IN | EpEvent::RDNORM) & ev.events;
-            }
-            if writable {
-                ready |= (EpEvent::OUT | EpEvent::WRNORM) & ev.events;
-            }
-            if error {
-                ready |= EpEvent::ERR;
-            }
+            let ready = epoll_ready_events(fl.poll(), ev.events);
             if ready == 0 {
                 continue;
             }
