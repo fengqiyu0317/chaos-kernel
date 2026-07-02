@@ -1,6 +1,7 @@
 // AGENT
 use super::*;
 
+mod checkpoint;
 mod exec;
 mod fs_store;
 mod ipc;

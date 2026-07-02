@@ -85,6 +85,8 @@ pub(super) fn sys_exit(kernel: &Kernel, a0: usize) -> Result<SyscallOutcome, &'s
     Ok(SyscallOutcome::NoReturn)
 }
 
+// AGENT: copy wait status before committing the zombie reap so a failed user
+// write does not lose the child's observable exit state.
 pub(super) fn sys_wait4(
     kernel: &Kernel,
     a0: usize,
@@ -112,6 +114,9 @@ pub(super) fn sys_wait4(
             .lock()
             .unwrap()
             .write_user_bytes(status_addr, &status, &kernel.pool)?;
+    }
+    if pid != 0 {
+        kernel.reap_waited_child(pid)?;
     }
     Ok(pid)
 }

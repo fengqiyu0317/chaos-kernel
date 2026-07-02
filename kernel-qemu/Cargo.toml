@@ -8,7 +8,8 @@ qemu-mm-selftest = []
 qemu-proc-selftest = []
 qemu-sched-selftest = []
 qemu-sync-selftest = []
-qemu-selftest = ["qemu-mm-selftest", "qemu-sched-selftest", "qemu-sync-selftest", "qemu-proc-selftest"]
+qemu-checkpoint-selftest = []
+qemu-selftest = ["qemu-mm-selftest", "qemu-sched-selftest", "qemu-sync-selftest", "qemu-proc-selftest", "qemu-checkpoint-selftest"]
 
 [profile.dev]
 panic = "abort"

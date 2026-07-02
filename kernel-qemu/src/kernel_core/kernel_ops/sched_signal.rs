@@ -9,13 +9,21 @@ impl Kernel {
             .unwrap_or(false)
     }
 
-    // AGENT: put a task back on CPU0's run queue unless its current stack is
-    // still the one executing the temporary spin-based wait bridge.
-    fn make_task_runnable(&self, task: &Arc<Task>) {
-        task.set_sched_state(TaskRunState::Runnable);
-        if !self.is_current_task_on_cpu0(task.id()) {
+    // AGENT: enqueue only runnable tasks that are not held by job-control stop.
+    fn enqueue_task_if_ready(&self, task: &Arc<Task>) {
+        if task.sched_state() == TaskRunState::Runnable
+            && !task.is_job_stopped()
+            && !self.is_current_task_on_cpu0(task.id())
+        {
             self.run_queue.enqueue(task.id(), task.sched_policy());
         }
+    }
+
+    // AGENT: record that a wait/event completed; job-stopped tasks become
+    // runnable in scheduler state but stay off the run queue until SIGCONT.
+    fn make_task_runnable(&self, task: &Arc<Task>) {
+        task.set_sched_state(TaskRunState::Runnable);
+        self.enqueue_task_if_ready(task);
     }
 
     // AGENT: common QEMU wait-token wake path. Event, futex, epoll, and timer
@@ -45,7 +53,7 @@ impl Kernel {
         if task.done() {
             return false;
         }
-        if task.sched_state() == TaskRunState::Stopped {
+        if task.is_job_stopped() {
             return false;
         }
         if task.sched_state() == TaskRunState::Sleeping {
@@ -69,10 +77,9 @@ impl Kernel {
         if task.done() {
             return false;
         }
-        if task.sched_state() == TaskRunState::Stopped {
+        if task.is_job_stopped() {
             return false;
         }
-
         if self.is_current_task_on_cpu0(task_id) {
             self.run_queue.remove(task_id);
             task.set_sched_state(TaskRunState::Running);
@@ -83,7 +90,7 @@ impl Kernel {
 
         if task.sched_state() == TaskRunState::Sleeping {
             task.set_sched_state(TaskRunState::Runnable);
-            self.run_queue.enqueue(task_id, task.sched_policy());
+            self.enqueue_task_if_ready(&task);
         }
         true
     }
@@ -99,7 +106,7 @@ impl Kernel {
         }
 
         let policy = task.boost_priority(amount);
-        if task.sched_state() == TaskRunState::Runnable {
+        if task.sched_state() == TaskRunState::Runnable && !task.is_job_stopped() {
             self.run_queue.enqueue(task_id, policy);
         }
         true
@@ -108,15 +115,30 @@ impl Kernel {
     // AGENT: central signal send path so pending-signal enqueue and scheduler
     // wakeup stay together.
     pub fn send_signal_to_task(&self, task: &Arc<Task>, signo: i32, sender_tid: isize) {
-        if !task.enqueue_signal(signo, sender_tid) || task.done() {
+        if signo <= 0 || signo as u32 >= NSIG {
             return;
         }
-        match task.sched_state() {
-            TaskRunState::Sleeping => {
-                self.wake_task_for_wait(task.id());
+        let signo = signo as u32;
+        let queued = task.enqueue_signal(signo as i32, sender_tid);
+        if task.done() || (!queued && signo != SIGCONT && signo != SIGKILL) {
+            return;
+        }
+        match signo {
+            SIGCONT => {
+                task.set_job_stopped(false);
+                self.enqueue_task_if_ready(task);
             }
-            TaskRunState::Stopped if signo as u32 == SIGCONT || signo as u32 == SIGKILL => {
-                self.make_task_runnable(task);
+            SIGKILL => {
+                task.set_job_stopped(false);
+                if task.sched_state() == TaskRunState::Sleeping {
+                    self.make_task_runnable(task);
+                } else {
+                    self.enqueue_task_if_ready(task);
+                }
+            }
+            _ if task.is_job_stopped() => {}
+            _ if task.sched_state() == TaskRunState::Sleeping => {
+                self.wake_task_for_wait(task.id());
             }
             _ => {}
         }
@@ -175,7 +197,8 @@ impl Kernel {
                     SIGCHLD => continue,
                     SIGCONT => continue,
                     SIGSTOP => {
-                        task.set_sched_state(TaskRunState::Stopped);
+                        task.set_job_stopped(true);
+                        task.set_sched_state(TaskRunState::Runnable);
                         self.run_queue.remove(task.id());
                         self.run_queue.clear_current();
                         self.set_cur(cpu, None);
@@ -291,7 +314,11 @@ impl Kernel {
         }
         while let Some((id, _policy)) = self.run_queue.dequeue() {
             match self.tasks.find(id) {
-                Some(task) if !task.done() && task.sched_state() == TaskRunState::Runnable => {
+                Some(task)
+                    if !task.done()
+                        && !task.is_job_stopped()
+                        && task.sched_state() == TaskRunState::Runnable =>
+                {
                     task.set_sched_state(TaskRunState::Running);
                     task.reset_slice();
                     self.set_cur(cpu, Some(task));

@@ -9,6 +9,7 @@
     unused_mut
 )]
 
+pub mod checkpoint_image;
 pub mod fs;
 pub mod kernel_core;
 pub mod mm;
@@ -17,6 +18,7 @@ pub mod syscall;
 pub mod util;
 
 // AGENT: keep the former flat public API while giving rust-analyzer real modules.
+pub use self::checkpoint_image::*;
 pub use self::fs::*;
 pub use self::kernel_core::*;
 pub use self::mm::*;

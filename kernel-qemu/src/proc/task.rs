@@ -27,14 +27,13 @@ pub struct TaskInfo {
     pub tag: String,
 }
 
-// AGENT: distinguish job-control stops from ordinary wait sleeps so signal
-// wakeups do not accidentally continue a stopped task.
+// AGENT: keep this enum limited to scheduler placement; job-control stop state
+// lives separately on ProcessState so signal semantics do not pollute run state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskRunState {
     Runnable,
     Running,
     Sleeping,
-    Stopped,
     Zombie,
 }
 
@@ -80,6 +79,9 @@ pub struct ProcessState {
     pub sid: Mutex<usize>,
     // AGENT: parents may no longer change a child's process group after exec.
     pub did_exec: AtomicBool,
+    // AGENT: job-control stop is process-wide state, separate from scheduler
+    // placement so stopped runnable tasks do not enter the run queue.
+    pub job_stopped: AtomicBool,
     pub threads: Mutex<Vec<Tid>>,
     pub ev: Arc<Mutex<EvBus>>,
     pub exit_reason: Mutex<Option<ExitReason>>,
@@ -115,6 +117,7 @@ impl ProcessState {
             pgid: Mutex::new(0),
             sid: Mutex::new(0),
             did_exec: AtomicBool::new(false),
+            job_stopped: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
             ev: EvBus::make(),
             exit_reason: Mutex::new(None),
@@ -205,6 +208,7 @@ pub struct Task {
     pub sig_mask: Mutex<u64>,
     pub kstk: Mutex<Option<KStk>>,
     pub thd_ctx: Mutex<Option<ThdCtx>>,
+    pub restored_trap_frame: Mutex<Option<SavedTrapFrame>>,
     pub sched: Mutex<SchedEntity>,
 }
 
@@ -228,6 +232,66 @@ impl FdCloseCleanup {
         }
         drop(self.closed_entry);
     }
+}
+
+// AGENT: keep the first checkpoint fd surface intentionally narrow until the
+// image format grows file-object sections for arbitrary open files.
+fn checkpoint_fd_kind(fd: usize) -> Result<SavedFdKind, &'static str> {
+    match fd {
+        0 => Ok(SavedFdKind::Stdin),
+        1 => Ok(SavedFdKind::Stdout),
+        2 => Ok(SavedFdKind::Stderr),
+        _ => Err("enotsup"),
+    }
+}
+
+// AGENT: assign stable per-image ids to shared open-file descriptions by
+// comparing the fd-table Arc identity through FdEntry.
+fn checkpoint_description_id(
+    entry: &FdEntry,
+    descriptions: &mut Vec<(FdEntry, u32)>,
+) -> Result<u32, &'static str> {
+    for (known, id) in descriptions.iter() {
+        if entry.same_open_description(known) {
+            return Ok(*id);
+        }
+    }
+    let id = u32::try_from(descriptions.len() + 1).map_err(|_| "einval")?;
+    descriptions.push((entry.clone(), id));
+    Ok(id)
+}
+
+// AGENT: rebuild the stdio-like handles supported by the first checkpoint
+// restore pass; regular path files need a later file-object section.
+fn checkpoint_stdio_handle(kind: SavedFdKind, status_flags: u32) -> Result<FHandle, &'static str> {
+    let mut opt = match kind {
+        SavedFdKind::Stdin => FdOpt {
+            rd: true,
+            wr: false,
+            ap: false,
+            nb: false,
+        },
+        SavedFdKind::Stdout | SavedFdKind::Stderr => FdOpt {
+            rd: false,
+            wr: true,
+            ap: false,
+            nb: false,
+        },
+        SavedFdKind::RegularMemoryFile
+        | SavedFdKind::Pipe
+        | SavedFdKind::Epoll
+        | SavedFdKind::Socket
+        | SavedFdKind::Tty => return Err("enotsup"),
+    };
+    opt.nb = (status_flags as usize & O_NONBLOCK) != 0;
+    opt.ap = (status_flags as usize & O_APPEND) != 0;
+    let path = match kind {
+        SavedFdKind::Stdin => "/dev/stdin",
+        SavedFdKind::Stdout => "/dev/stdout",
+        SavedFdKind::Stderr => "/dev/stderr",
+        _ => return Err("enotsup"),
+    };
+    Ok(FHandle::new(path, opt, false, false))
 }
 
 struct InitialUserImage {
@@ -381,6 +445,7 @@ impl Task {
             sig_mask: Mutex::new(0),
             kstk: Mutex::new(Some(KStk::new())),
             thd_ctx: Mutex::new(Some(ThdCtx::default())),
+            restored_trap_frame: Mutex::new(None),
             sched: Mutex::new(SchedEntity::new()),
         })
     }
@@ -411,6 +476,16 @@ impl Task {
     pub fn kernel_stack_top(&self) -> Option<usize> {
         self.kstk.lock().unwrap().as_ref().map(KStk::top)
     }
+    // AGENT: store a complete checkpoint trap frame for the first restored
+    // user-mode entry, separate from the lossy simulator ThdCtx.
+    pub fn set_restored_trap_frame(&self, frame: SavedTrapFrame) {
+        *self.restored_trap_frame.lock().unwrap() = Some(frame);
+    }
+    // AGENT: consume the restored frame once it has been materialized on the
+    // task's kernel stack for trap return.
+    pub fn take_restored_trap_frame(&self) -> Option<SavedTrapFrame> {
+        self.restored_trap_frame.lock().unwrap().take()
+    }
     pub fn link_parent(&self, p: &Arc<Task>) {
         *self.process.parent.lock().unwrap() = Some(p.clone());
     }
@@ -428,6 +503,16 @@ impl Task {
     }
     pub fn set_sched_state(&self, state: TaskRunState) {
         self.sched.lock().unwrap().state = state;
+    }
+    // AGENT: expose process-level job-control stop without overloading
+    // TaskRunState; the scheduler checks this before enqueueing runnable work.
+    pub fn is_job_stopped(&self) -> bool {
+        self.process.job_stopped.load(Ordering::Relaxed)
+    }
+    // AGENT: SIGSTOP/SIGCONT own this flag; scheduler state remains the task's
+    // runnable/sleeping/running placement.
+    pub fn set_job_stopped(&self, stopped: bool) {
+        self.process.job_stopped.store(stopped, Ordering::Relaxed);
     }
     pub fn sched_policy(&self) -> SchedulePolicy {
         self.sched.lock().unwrap().policy.clone()
@@ -528,6 +613,60 @@ impl Task {
     // description through Arc.
     pub fn get_fd_entry(&self, fd: usize) -> Option<FdEntry> {
         self.process.files.lock().unwrap().get(&fd).cloned()
+    }
+
+    // AGENT: serialize the first checkpoint fd subset: stdio descriptors only,
+    // preserving per-fd cloexec and shared open-file-description identity.
+    pub fn snapshot_checkpoint_fds(&self) -> Result<Vec<SavedFdEntry>, &'static str> {
+        let files = self.process.files.lock().unwrap();
+        let mut descriptions: Vec<(FdEntry, u32)> = Vec::new();
+        let mut saved = Vec::with_capacity(files.len());
+        for (&fd, entry) in files.iter() {
+            let kind = checkpoint_fd_kind(fd)?;
+            let handle = entry.regular_handle().ok_or("enotsup")?;
+            let description_id = checkpoint_description_id(entry, &mut descriptions)?;
+            saved.push(SavedFdEntry {
+                fd: u32::try_from(fd).map_err(|_| "einval")?,
+                description_id,
+                cloexec: entry.is_cloexec(),
+                status_flags: u32::try_from(entry.status_flags_bits()).map_err(|_| "einval")?,
+                kind,
+                object_id: description_id as u64,
+                offset: handle.offset(),
+            });
+        }
+        Ok(saved)
+    }
+
+    // AGENT: restore the first checkpoint fd subset by rebuilding stdio-like
+    // memory handles and sharing duplicated open-file-descriptions by id.
+    pub fn restore_checkpoint_fds(&self, fds: &[SavedFdEntry]) -> Result<(), &'static str> {
+        let mut restored = BTreeMap::new();
+        let mut descriptions: BTreeMap<u32, FdEntry> = BTreeMap::new();
+        for saved in fds {
+            let fd = usize::try_from(saved.fd).map_err(|_| "einval")?;
+            if fd >= MAX_FD || restored.contains_key(&fd) {
+                return Err("ebadf");
+            }
+            let entry = if let Some(template) = descriptions.get(&saved.description_id) {
+                template.dup(saved.cloexec)
+            } else {
+                let mut handle = checkpoint_stdio_handle(saved.kind, saved.status_flags)?;
+                handle.seek(FSeek::Start(saved.offset))?;
+                let entry = FdEntry::with_cloexec(FLike::File(handle), saved.cloexec);
+                descriptions.insert(saved.description_id, entry.clone());
+                entry
+            };
+            restored.insert(fd, entry);
+        }
+
+        let mut free_fds = ProcessState::initial_free_fds();
+        for fd in restored.keys() {
+            free_fds.remove(fd);
+        }
+        *self.process.files.lock().unwrap() = restored;
+        *self.process.free_fds.lock().unwrap() = free_fds;
+        Ok(())
     }
     pub fn get_futex(&self) -> Arc<FutexBucket> {
         self.process.futex.clone()

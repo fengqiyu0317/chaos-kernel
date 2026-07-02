@@ -3,7 +3,7 @@
 use core::arch::global_asm;
 use core::mem;
 
-use crate::kernel::{Context, Task};
+use crate::kernel::{Context, SavedTrapFrame, Task};
 use crate::{csr, println, sbi, timer};
 
 global_asm!(include_str!("trap.S"));
@@ -248,6 +248,14 @@ pub unsafe fn prepare_task_user_trap_frame(task: &Task) -> Result<*mut TrapFrame
         return Err("ekstk");
     }
 
+    if let Some(saved) = task.take_restored_trap_frame() {
+        let frame = frame_addr as *mut TrapFrame;
+        unsafe {
+            frame.write(TrapFrame::from_saved_checkpoint_frame(&saved));
+        }
+        return Ok(frame);
+    }
+
     let (entry, user_sp) = {
         let thd = task.thd_ctx.lock().unwrap();
         let ctx = thd.as_ref().ok_or("enoctx")?;
@@ -331,6 +339,34 @@ impl TrapFrame {
     // AGENT: Write the syscall return value into a0.
     pub fn set_return_value(&mut self, value: usize) {
         self.regs[10] = value;
+    }
+
+    // AGENT: capture the complete RISC-V user trap frame for checkpoint images;
+    // Context keeps only simulator ABI fields and is not enough for restore.
+    pub fn to_saved_checkpoint_frame(&self) -> SavedTrapFrame {
+        let mut regs = [0u64; 32];
+        for (dst, src) in regs.iter_mut().zip(self.regs.iter()) {
+            *dst = *src as u64;
+        }
+        SavedTrapFrame {
+            regs,
+            sstatus: self.sstatus as u64,
+            sepc: self.sepc as u64,
+        }
+    }
+
+    // AGENT: materialize a restored checkpoint frame for the normal trap-return
+    // path instead of rebuilding it from the lossy simulator Context.
+    pub fn from_saved_checkpoint_frame(saved: &SavedTrapFrame) -> Self {
+        let mut regs = [0usize; 32];
+        for (dst, src) in regs.iter_mut().zip(saved.regs.iter()) {
+            *dst = *src as usize;
+        }
+        Self {
+            regs,
+            sstatus: saved.sstatus as usize,
+            sepc: saved.sepc as usize,
+        }
     }
 
     // AGENT: capture only the simulator-visible user context fields; Context.r

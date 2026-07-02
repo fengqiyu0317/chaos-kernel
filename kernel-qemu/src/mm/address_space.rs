@@ -123,6 +123,80 @@ impl AddrSpace {
         self.sv39.root_paddr().map(crate::csr::make_satp_sv39)
     }
 
+    // AGENT: export VMA metadata and resident page bytes for process-level
+    // checkpoint images without exposing the internal resident page table.
+    pub fn snapshot_checkpoint_memory(
+        &self,
+    ) -> Result<(Vec<SavedVma>, Vec<SavedPage>), &'static str> {
+        let regions = self.vm_map.clone_regions();
+        let mut saved_vmas = Vec::with_capacity(regions.len());
+        for region in &regions {
+            saved_vmas.push(SavedVma {
+                start: region.base as u64,
+                len: region.len as u64,
+                flags: region.flags,
+                file_offset: 0,
+                kind: checkpoint_mapping_kind(region),
+                object_id: 0,
+            });
+        }
+
+        let entries = self.resident_pages.entries.lock().unwrap();
+        let mut saved_pages = Vec::with_capacity(entries.len());
+        for (&vaddr, pte) in entries.iter() {
+            let paddr = self.sv39.leaf_paddr(vaddr)?;
+            if paddr != pte.frame.paddr() {
+                return Err("efault");
+            }
+            let mut bytes = vec![0u8; PAGE_SZ];
+            copy_from_phys(paddr, &mut bytes);
+            saved_pages.push(SavedPage {
+                vaddr: vaddr as u64,
+                bytes,
+            });
+        }
+        Ok((saved_vmas, saved_pages))
+    }
+
+    // AGENT: rebuild anonymous checkpoint memory by recreating VMAs, replaying
+    // page bytes, then restoring final protections.
+    pub fn restore_checkpoint_memory(
+        brk: usize,
+        vmas: &[SavedVma],
+        pages: &[SavedPage],
+        pool: &FramePool,
+    ) -> Result<Self, &'static str> {
+        let mut addr_space = Self::new();
+        let mut final_regions = Vec::with_capacity(vmas.len());
+
+        for vma in vmas {
+            match vma.kind {
+                MappingKind::Anonymous | MappingKind::Heap | MappingKind::Stack => {}
+                MappingKind::FilePrivate | MappingKind::FileShared => return Err("enotsup"),
+            }
+            let start = checked_u64_to_usize(vma.start)?;
+            let len = checked_u64_to_usize(vma.len)?;
+            let flags = vma.flags;
+            let temp_flags = flags | VM_WRITE;
+            addr_space.map_region(VmRegion::new(start, len, temp_flags), pool)?;
+            final_regions.push((start, len, flags));
+        }
+
+        for page in pages {
+            if page.bytes.len() != PAGE_SZ {
+                return Err("einval");
+            }
+            let vaddr = checked_u64_to_usize(page.vaddr)?;
+            addr_space.write_user_bytes(vaddr, &page.bytes, pool)?;
+        }
+
+        for (start, len, flags) in final_regions {
+            addr_space.protect(start, len, flags)?;
+        }
+        addr_space.vm_map.brk = brk;
+        Ok(addr_space)
+    }
+
     // AGENT: fork copies VmMap separately from resident-page metadata and then
     // mirrors each resident leaf into the child's owned Sv39 page table.
     pub fn fork_from(parent: &AddrSpace, pool: &FramePool) -> Result<Self, &'static str> {
@@ -607,6 +681,22 @@ fn page_range(base: usize, len: usize) -> impl Iterator<Item = usize> {
         None => start,
     };
     (start..end).step_by(PAGE_SZ)
+}
+
+// AGENT: keep the first checkpoint format anonymous-only while still preserving
+// stack/heap hints where the current VMA metadata can identify them.
+fn checkpoint_mapping_kind(region: &VmRegion) -> MappingKind {
+    if region.flags & VM_GROWSDOWN != 0 {
+        MappingKind::Stack
+    } else {
+        MappingKind::Anonymous
+    }
+}
+
+// AGENT: convert serialized addresses into the current machine word size before
+// they are used to allocate or write restored memory.
+fn checked_u64_to_usize(value: u64) -> Result<usize, &'static str> {
+    usize::try_from(value).map_err(|_| "einval")
 }
 
 // AGENT: translate migrated VM flags into legal Sv39 leaf permissions while

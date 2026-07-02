@@ -83,6 +83,12 @@ impl OpenFileDescription {
         *self.status.read().unwrap()
     }
 
+    // AGENT: expose status flags in the same bit shape returned by F_GETFL so
+    // checkpoint code does not duplicate fd option encoding.
+    pub fn status_flags_bits(&self) -> usize {
+        fdopt_to_open_flags(self.status_flags())
+    }
+
     pub fn set_status_flags(&self, flags: usize) -> Result<(), &'static str> {
         self.file.set_status_flags(flags)?;
         let mut status = self.status.write().unwrap();
@@ -174,6 +180,11 @@ impl FdEntry {
         self.desc.status_flags()
     }
 
+    // AGENT: expose serialized status flags for checkpoint fd table snapshots.
+    pub fn status_flags_bits(&self) -> usize {
+        self.desc.status_flags_bits()
+    }
+
     pub fn set_status_flags(&self, flags: usize) -> Result<(), &'static str> {
         self.desc.set_status_flags(flags)
     }
@@ -190,6 +201,23 @@ impl FdEntry {
         }
         file
     }
+}
+
+// AGENT: keep fd status flag encoding shared by fcntl-style reporting and the
+// checkpoint image snapshot path.
+pub fn fdopt_to_open_flags(opt: FdOpt) -> usize {
+    let mut flags = match (opt.rd, opt.wr) {
+        (true, true) => 2,
+        (false, true) => 1,
+        _ => 0,
+    };
+    if opt.nb {
+        flags |= O_NONBLOCK;
+    }
+    if opt.ap {
+        flags |= O_APPEND;
+    }
+    flags
 }
 
 // AGENT: distinguish regular path files from directory nodes for exec checks.
@@ -296,6 +324,12 @@ impl FHandle {
     }
     pub fn get_opt(&self) -> FdOpt {
         self.desc.read().unwrap().opt
+    }
+
+    // AGENT: expose the shared open-file-description offset for checkpoint fd
+    // snapshots without leaking the descriptor lock itself.
+    pub fn offset(&self) -> u64 {
+        self.desc.read().unwrap().off
     }
 
     // AGENT: fcntl(F_SETFL) changes status flags while preserving access mode.

@@ -4,7 +4,7 @@ use super::*;
 use crate::kernel::kernel_core::{init_timer_wheel, TIMER_WHEEL};
 use crate::kernel::{
     Context, FramePool, Kernel, SigAction, TaskRunState, MEM_OFF, PAGE_SZ, PRIO_MIN, SIGCONT,
-    SIGUSR1, SIGUSR2,
+    SIGSTOP, SIGUSR1, SIGUSR2,
 };
 
 // AGENT: expose focused scheduler queue checks to the optional QEMU boot
@@ -13,8 +13,9 @@ pub fn run_all() {
     dequeue_preserves_fifo_for_equal_priority();
     duplicate_enqueue_updates_policy_without_duplicate_entry();
     kernel_boost_updates_task_policy_and_queue_cache();
-    signal_stop_uses_distinct_stopped_state();
+    signal_stop_uses_job_stopped_flag();
     sigcont_resumes_stopped_task_without_resuming_for_plain_signal();
+    sigcont_keeps_sleeping_task_asleep_until_wait_wakeup();
     signal_handler_uses_supplied_interrupted_context();
 }
 
@@ -98,21 +99,23 @@ fn kernel_boost_updates_task_policy_and_queue_cache() {
     assert_eq!(kernel.run_queue.pick_next(), Some(first.id()));
 }
 
-// AGENT: SIGSTOP must not reuse ordinary wait sleep state, or any later wake
-// source could accidentally continue the task.
+// AGENT: SIGSTOP is process-level job-control state, not a scheduler run-state
+// variant; the stopped task stays runnable but cannot be queued.
 #[cfg_attr(test, test)]
-fn signal_stop_uses_distinct_stopped_state() {
+fn signal_stop_uses_job_stopped_flag() {
     ensure_timer_wheel();
 
     let kernel = Kernel::new(test_frame_pool(8));
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init task should be current");
 
-    kernel.send_signal_to_task(&task, crate::kernel::SIGSTOP as i32, -1);
+    kernel.send_signal_to_task(&task, SIGSTOP as i32, -1);
 
     assert_eq!(kernel.deliver_pending_signals(0), 1);
-    assert_eq!(task.sched_state(), TaskRunState::Stopped);
+    assert!(task.is_job_stopped());
+    assert_eq!(task.sched_state(), TaskRunState::Runnable);
     assert!(kernel.cur_task(0).is_none());
+    assert_eq!(kernel.run_queue.pick_next(), None);
 }
 
 // AGENT: ordinary pending signals stay queued for a stopped task; SIGCONT is
@@ -123,13 +126,37 @@ fn sigcont_resumes_stopped_task_without_resuming_for_plain_signal() {
 
     let kernel = Kernel::new(test_frame_pool(8));
     let task = kernel.tasks.spawn("worker").expect("spawn worker");
-    task.set_sched_state(TaskRunState::Stopped);
+    task.set_sched_state(TaskRunState::Runnable);
+    task.set_job_stopped(true);
 
     kernel.send_signal_to_task(&task, SIGUSR1 as i32, -1);
-    assert_eq!(task.sched_state(), TaskRunState::Stopped);
+    assert!(task.is_job_stopped());
+    assert_eq!(task.sched_state(), TaskRunState::Runnable);
     assert_eq!(kernel.run_queue.pick_next(), None);
 
     kernel.send_signal_to_task(&task, SIGCONT as i32, -1);
+    assert!(!task.is_job_stopped());
+    assert_eq!(task.sched_state(), TaskRunState::Runnable);
+    assert_eq!(kernel.run_queue.pick_next(), Some(task.id()));
+}
+
+// AGENT: SIGCONT clears job-control stop but does not collapse a still-blocked
+// wait into runnable state; the real wait wakeup owns that transition.
+#[cfg_attr(test, test)]
+fn sigcont_keeps_sleeping_task_asleep_until_wait_wakeup() {
+    ensure_timer_wheel();
+
+    let kernel = Kernel::new(test_frame_pool(8));
+    let task = kernel.tasks.spawn("worker").expect("spawn worker");
+    task.set_sched_state(TaskRunState::Sleeping);
+    task.set_job_stopped(true);
+
+    kernel.send_signal_to_task(&task, SIGCONT as i32, -1);
+    assert!(!task.is_job_stopped());
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    assert_eq!(kernel.run_queue.pick_next(), None);
+
+    assert!(kernel.wake_task_for_wait(task.id()));
     assert_eq!(task.sched_state(), TaskRunState::Runnable);
     assert_eq!(kernel.run_queue.pick_next(), Some(task.id()));
 }

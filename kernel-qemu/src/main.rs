@@ -87,6 +87,14 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         kernel::proc::process_tests::run_all(&kernel.pool);
         println!("[kernel-qemu] proc selftest passed");
     }
+    // AGENT: checkpoint selftests run after Kernel/FramePool setup because the
+    // snapshot path copies real resident pages and restores them into a task.
+    #[cfg(feature = "qemu-checkpoint-selftest")]
+    {
+        println!("[kernel-qemu] checkpoint selftest start");
+        kernel::kernel_core::checkpoint_tests::run_all(kernel);
+        println!("[kernel-qemu] checkpoint selftest passed");
+    }
     // AGENT: keep the ordinary boot path warning-free while proc selftests are
     // feature-gated out.
     #[cfg(not(feature = "qemu-proc-selftest"))]
