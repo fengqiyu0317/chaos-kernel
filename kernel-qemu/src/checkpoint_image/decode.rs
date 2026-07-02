@@ -4,9 +4,9 @@ use core::convert::TryFrom;
 use super::codec::{checked_u32_to_usize, checked_u64_to_usize, Cursor};
 use super::validate::{validate_first_version, validate_header_static};
 use super::{
-    CheckpointError, CheckpointHeader, CheckpointImage, MappingKind, RestorePolicy, SavedFdEntry,
-    SavedFdKind, SavedPage, SavedProcess, SavedRunState, SavedTimer, SavedTrapFrame, SavedVma,
-    SectionTag, IMAGE_HEADER_LEN,
+    CheckpointError, CheckpointHeader, CheckpointImage, RestorePolicy, SavedFdEntry, SavedFdKind,
+    SavedPage, SavedProcess, SavedRunState, SavedTimer, SavedTrapFrame, SavedVma, SectionTag,
+    IMAGE_HEADER_LEN,
 };
 
 // AGENT: decode bytes and immediately apply the first-version validation
@@ -134,12 +134,6 @@ fn decode_vmas(bytes: &[u8]) -> Result<Vec<SavedVma>, CheckpointError> {
             start: cursor.read_u64()?,
             len: cursor.read_u64()?,
             flags: cursor.read_u32()?,
-            file_offset: cursor.read_u64()?,
-            kind: MappingKind::try_from(cursor.read_u16()?)?,
-            object_id: {
-                let _reserved = cursor.read_u16()?;
-                cursor.read_u64()?
-            },
         });
     }
     cursor.expect_end()?;

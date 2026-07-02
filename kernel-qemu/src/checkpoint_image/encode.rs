@@ -113,10 +113,6 @@ fn encode_vmas(vmas: &[SavedVma]) -> Result<Vec<u8>, CheckpointError> {
         put_u64(&mut out, vma.start);
         put_u64(&mut out, vma.len);
         put_u32(&mut out, vma.flags);
-        put_u64(&mut out, vma.file_offset);
-        put_u16(&mut out, vma.kind as u16);
-        put_u16(&mut out, 0);
-        put_u64(&mut out, vma.object_id);
     }
     Ok(out)
 }

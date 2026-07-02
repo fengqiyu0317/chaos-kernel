@@ -28,9 +28,6 @@ fn sample_image() -> CheckpointImage {
         start: 0x1000_0000,
         len: CHECKPOINT_PAGE_SIZE as u64,
         flags: 0b111,
-        file_offset: 0,
-        kind: MappingKind::Anonymous,
-        object_id: 0,
     });
     image.pages.push(SavedPage {
         vaddr: 0x1000_0000,

@@ -54,15 +54,6 @@ pub enum SavedRunState {
     BlockedWait = 3,
 }
 
-// AGENT: keep the first checkpoint VMA format to anonymous mappings plus stack
-// hints; heap/file-backed distinctions are intentionally not encoded yet.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u16)]
-pub enum MappingKind {
-    Anonymous = 1,
-    Stack = 3,
-}
-
 // AGENT: file descriptor kinds are deliberately narrow for the first restore
 // implementation; unsupported state should be rejected before image emission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,15 +102,12 @@ pub struct SavedTrapFrame {
     pub sepc: u64,
 }
 
-// AGENT: VMA metadata is restored before resident page contents are replayed.
+// AGENT: VMA metadata stores only the region state restore currently consumes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SavedVma {
     pub start: u64,
     pub len: u64,
     pub flags: u32,
-    pub file_offset: u64,
-    pub kind: MappingKind,
-    pub object_id: u64,
 }
 
 // AGENT: resident anonymous page payload copied out of the user address space.
@@ -205,21 +193,6 @@ impl TryFrom<u16> for SavedRunState {
             1 => Ok(Self::SyscallSafePoint),
             2 => Ok(Self::ExplicitQuiescentPoint),
             3 => Ok(Self::BlockedWait),
-            _ => Err(CheckpointError::InvalidEnum),
-        }
-    }
-}
-
-// AGENT: convert serialized mapping kind fields into checked enums.
-impl TryFrom<u16> for MappingKind {
-    type Error = CheckpointError;
-
-    // AGENT: accept only the first checkpoint mapping kinds that restore can
-    // faithfully rebuild today.
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::Anonymous),
-            3 => Ok(Self::Stack),
             _ => Err(CheckpointError::InvalidEnum),
         }
     }

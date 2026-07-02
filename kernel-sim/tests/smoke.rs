@@ -1,15 +1,16 @@
 // AGENT
 use kernel_sim::{
     check_access, compute_inet_checksum, parse_ipv4_header, set_current_task_id, wait_ev,
-    AddrSpace, BlockCache, Channel, EpData, EpEvent, EvBus, EvFlag, ExitReason, FHandle, FLike,
-    FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking, PageTableEntry, SchedulePolicy,
-    SemCtx, Sema, Spin, SpinLock, SyncQueue, Task, TaskRunState, TaskTable, TimerEntry, VmMap,
-    VmRegion, WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE,
-    MAP_SHARED, N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE,
-    SIGUSR1, SYS_BRK, SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT,
-    SYS_FORK, SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ,
-    SYS_SIGACTION, SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ,
-    VM_EXEC, VM_READ, VM_SHARED, VM_WRITE,
+    AddrSpace, BlockCache, BlockDevice, Channel, EpData, EpEvent, EvBus, EvFlag, ExitReason,
+    FHandle, FLike, FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking, PageTableEntry,
+    SchedulePolicy, SemCtx, Sema, Spin, SpinLock, SyncQueue, Task, TaskRunState, TaskTable,
+    TimerEntry, VmMap, VmRegion, WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ,
+    BLOCK_CACHE_BLOCK_SIZE, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, N_FRAMES, N_PROC,
+    N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP,
+    SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX,
+    SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION, SYS_SIGRETURN,
+    SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED,
+    VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
@@ -272,6 +273,67 @@ fn block_cache_fetch_sleeps_outside_spin_guard() {
     assert_eq!(data.len(), 512);
     set_test_current_task(2);
     assert_eq!(cache.total_entries(), 1);
+}
+
+struct SmokeBlockDevice {
+    reads: AtomicU32,
+    writes: Mutex<Vec<(usize, usize, Vec<u8>)>>,
+}
+
+impl SmokeBlockDevice {
+    fn new() -> Self {
+        Self {
+            reads: AtomicU32::new(0),
+            writes: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl BlockDevice for SmokeBlockDevice {
+    fn read_block(&self, dev: usize, block: usize) -> Result<Vec<u8>, &'static str> {
+        let read_idx = self.reads.fetch_add(1, Ordering::SeqCst);
+        let mut data = vec![0; BLOCK_CACHE_BLOCK_SIZE];
+        data[0] = dev as u8;
+        data[1] = block as u8;
+        data[2] = read_idx as u8;
+        Ok(data)
+    }
+
+    fn write_block(&self, dev: usize, block: usize, data: &[u8]) -> Result<(), &'static str> {
+        self.writes
+            .lock()
+            .unwrap()
+            .push((dev, block, data.to_vec()));
+        Ok(())
+    }
+}
+
+// AGENT: block cache keys and dirty writeback are now device/block based, not fd based.
+#[test]
+fn block_cache_reads_writes_and_flushes_by_device_block_key() {
+    let _current_task_guard = lock_current_task_tests();
+    set_test_current_task(1);
+    let cache = BlockCache::new(4);
+    let device = SmokeBlockDevice::new();
+
+    let first = cache.read_block_cached(&device, 7, 9).unwrap();
+    let second = cache.read_block_cached(&device, 7, 9).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(device.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(cache.total_entries(), 1);
+
+    let payload = vec![0xA5; BLOCK_CACHE_BLOCK_SIZE];
+    cache.write_block_cached(7, 9, &payload).unwrap();
+    assert_eq!(cache.dirty_count(), 1);
+    assert_eq!(cache.read_block_cached(&device, 7, 9).unwrap(), payload);
+
+    assert_eq!(cache.flush_dirty(&device).unwrap(), 1);
+    assert_eq!(cache.dirty_count(), 0);
+    let writes = device.writes.lock().unwrap();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].0, 7);
+    assert_eq!(writes[0].1, 9);
+    assert_eq!(writes[0].2, payload);
 }
 
 // AGENT: Channel close wakes a blocked receiver without any Spin-held wait.

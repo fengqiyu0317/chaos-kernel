@@ -20,7 +20,7 @@ impl Kernel {
             let (vmas, pages) = addr_space.snapshot_checkpoint_memory()?;
             let stack = vmas
                 .iter()
-                .find(|vma| vma.kind == MappingKind::Stack)
+                .find(|vma| vma.flags & VM_GROWSDOWN != 0)
                 .ok_or("enotsup")?;
             let stack_base = stack.start;
             let stack_len = stack.len;

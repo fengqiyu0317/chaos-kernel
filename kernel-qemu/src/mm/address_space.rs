@@ -135,9 +135,6 @@ impl AddrSpace {
                 start: region.base as u64,
                 len: region.len as u64,
                 flags: region.flags,
-                file_offset: 0,
-                kind: checkpoint_mapping_kind(region),
-                object_id: 0,
             });
         }
 
@@ -170,9 +167,6 @@ impl AddrSpace {
         let mut final_regions = Vec::with_capacity(vmas.len());
 
         for vma in vmas {
-            match vma.kind {
-                MappingKind::Anonymous | MappingKind::Stack => {}
-            }
             let start = checked_u64_to_usize(vma.start)?;
             let len = checked_u64_to_usize(vma.len)?;
             let flags = vma.flags;
@@ -680,16 +674,6 @@ fn page_range(base: usize, len: usize) -> impl Iterator<Item = usize> {
         None => start,
     };
     (start..end).step_by(PAGE_SZ)
-}
-
-// AGENT: keep the first checkpoint format anonymous-only while still preserving
-// stack/heap hints where the current VMA metadata can identify them.
-fn checkpoint_mapping_kind(region: &VmRegion) -> MappingKind {
-    if region.flags & VM_GROWSDOWN != 0 {
-        MappingKind::Stack
-    } else {
-        MappingKind::Anonymous
-    }
 }
 
 // AGENT: convert serialized addresses into the current machine word size before
