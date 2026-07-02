@@ -5,8 +5,8 @@ use super::codec::{checked_u32_to_usize, checked_u64_to_usize, Cursor};
 use super::validate::{validate_first_version, validate_header_static};
 use super::{
     CheckpointError, CheckpointHeader, CheckpointImage, RestorePolicy, SavedFdEntry, SavedFdKind,
-    SavedPage, SavedProcess, SavedRunState, SavedTimer, SavedTrapFrame, SavedVma, SectionTag,
-    IMAGE_HEADER_LEN,
+    SavedPage, SavedProcess, SavedRunState, SavedTimer, SavedTimerTargetKind, SavedTrapFrame,
+    SavedVma, SectionTag, IMAGE_HEADER_LEN,
 };
 
 // AGENT: decode bytes and immediately apply the first-version validation
@@ -196,10 +196,19 @@ fn decode_timers(bytes: &[u8]) -> Result<Vec<SavedTimer>, CheckpointError> {
     for _ in 0..count {
         let timer_id = cursor.read_u64()?;
         let clock_id = cursor.read_u32()?;
+        let target_kind = SavedTimerTargetKind::try_from(cursor.read_u16()?)?;
+        let _reserved = cursor.read_u16()?;
+        let target_task_id = cursor.read_u64()?;
+        let signo = cursor.read_u32()? as i32;
         let _reserved = cursor.read_u32()?;
+        let sender_tid = cursor.read_u64()? as i64;
         timers.push(SavedTimer {
             timer_id,
             clock_id,
+            target_kind,
+            target_task_id,
+            signo,
+            sender_tid,
             deadline_ticks: cursor.read_u64()?,
             interval_ticks: cursor.read_u64()?,
         });

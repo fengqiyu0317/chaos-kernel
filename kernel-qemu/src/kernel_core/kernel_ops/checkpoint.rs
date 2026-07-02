@@ -41,7 +41,7 @@ impl Kernel {
         image.vmas = vmas;
         image.pages = pages;
         image.fds = task.snapshot_checkpoint_fds()?;
-        image.timers = Vec::new();
+        image.timers = self.timers.lock().snapshot_checkpoint_timers(task.id())?;
         image
             .validate_first_version()
             .map_err(checkpoint_error_to_errno)?;
@@ -87,6 +87,9 @@ impl Kernel {
             *current_addr_space = addr_space;
         }
         task.restore_checkpoint_fds(&image.fds)?;
+        self.timers
+            .lock()
+            .restore_checkpoint_timers(&image.timers, task.id())?;
         task.set_restored_trap_frame(trap_frame);
         task.set_sched_state(TaskRunState::Runnable);
         task.reset_slice();

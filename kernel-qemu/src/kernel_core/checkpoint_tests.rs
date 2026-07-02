@@ -2,6 +2,33 @@ use super::*;
 
 pub fn run_all(kernel: &Kernel) {
     checkpoint_round_trip_restores_memory_and_trap_frame(kernel);
+    checkpoint_round_trip_restores_task_timer(kernel);
+}
+
+// AGENT: prepare the minimal user mappings required by checkpoint validation
+// without failing when another checkpoint selftest already installed them.
+fn ensure_checkpoint_regions(kernel: &Kernel, current: &Task, data_addr: usize, pattern: &[u8]) {
+    let stack_base = USR_STK_OFF;
+    let mut addr_space = current.process.addr_space.lock().unwrap();
+    if addr_space.vm_map.find(data_addr).is_none() {
+        addr_space
+            .map_region(
+                VmRegion::new(data_addr, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("checkpoint data page should map");
+    }
+    if addr_space.vm_map.find(stack_base).is_none() {
+        addr_space
+            .map_region(
+                VmRegion::new(stack_base, PAGE_SZ, VM_READ | VM_WRITE | VM_GROWSDOWN),
+                &kernel.pool,
+            )
+            .expect("checkpoint stack page should map");
+    }
+    addr_space
+        .write_user_bytes(data_addr, pattern, &kernel.pool)
+        .expect("checkpoint data page should be writable");
 }
 
 // AGENT: prove the first checkpoint vertical slice can copy current-task VMA
@@ -16,24 +43,7 @@ fn checkpoint_round_trip_restores_memory_and_trap_frame(kernel: &Kernel) {
     let stack_top = stack_base + PAGE_SZ;
     let pattern = [0x31u8, 0x41, 0x59, 0x26, 0x53, 0x58, 0x97, 0x93];
 
-    {
-        let mut addr_space = current.process.addr_space.lock().unwrap();
-        addr_space
-            .map_region(
-                VmRegion::new(data_addr, PAGE_SZ, VM_READ | VM_WRITE),
-                &kernel.pool,
-            )
-            .expect("checkpoint data page should map");
-        addr_space
-            .map_region(
-                VmRegion::new(stack_base, PAGE_SZ, VM_READ | VM_WRITE | VM_GROWSDOWN),
-                &kernel.pool,
-            )
-            .expect("checkpoint stack page should map");
-        addr_space
-            .write_user_bytes(data_addr, &pattern, &kernel.pool)
-            .expect("checkpoint data page should be writable");
-    }
+    ensure_checkpoint_regions(kernel, &current, data_addr, &pattern);
 
     let mut regs = [0u64; 32];
     regs[2] = stack_top as u64;
@@ -71,4 +81,72 @@ fn checkpoint_round_trip_restores_memory_and_trap_frame(kernel: &Kernel) {
         .expect("restored page should be readable");
     assert_eq!(restored_pattern, pattern);
     assert_eq!(restored.take_restored_trap_frame(), Some(frame));
+}
+
+// AGENT: prove checkpoint/restore carries task-bound timer state and rebinds the
+// restored timer target to the new task id instead of the original process.
+#[cfg_attr(test, test)]
+fn checkpoint_round_trip_restores_task_timer(kernel: &Kernel) {
+    let current = kernel
+        .cur_task(0)
+        .expect("proc_init should install current");
+    let data_addr = 0x5000_1000usize;
+    let pattern = [0x5au8, 0xa5, 0x33, 0xcc];
+    ensure_checkpoint_regions(kernel, &current, data_addr, &pattern);
+
+    let deadline = CLK.load(Ordering::Relaxed).saturating_add(2);
+    let original_timer_id = {
+        let mut timers = kernel.timers.lock();
+        timers.register_timer(
+            deadline,
+            0,
+            TimerTarget::SignalTask {
+                task_id: current.id(),
+                signo: SIGUSR1 as i32,
+                sender_tid: -1,
+            },
+        )
+    };
+
+    let mut regs = [0u64; 32];
+    regs[2] = (USR_STK_OFF + PAGE_SZ) as u64;
+    let frame = SavedTrapFrame {
+        regs,
+        sstatus: 0x20,
+        sepc: 0x1000_0104,
+    };
+
+    let image = kernel
+        .checkpoint_current_image(0, frame)
+        .expect("current task should checkpoint timer");
+    assert_eq!(image.timers.len(), 1);
+    assert_eq!(
+        image.timers[0].target_kind,
+        SavedTimerTargetKind::SignalTask
+    );
+    assert_eq!(image.timers[0].target_task_id, current.id() as u64);
+    assert_eq!(image.timers[0].deadline_ticks, deadline as u64);
+
+    assert!(kernel.timers.lock().cancel(original_timer_id));
+    let restored_id = kernel
+        .restore_process_from_image(image)
+        .expect("checkpoint timer should restore");
+    let restored = kernel
+        .tasks
+        .find(restored_id)
+        .expect("restored timer target should exist");
+
+    let restored_timers = kernel
+        .timers
+        .lock()
+        .snapshot_checkpoint_timers(restored_id)
+        .expect("restored timer should be serializable");
+    assert_eq!(restored_timers.len(), 1);
+    assert_eq!(restored_timers[0].target_task_id, restored_id as u64);
+
+    while CLK.load(Ordering::Relaxed) < deadline {
+        kernel.schedule_tick(0);
+    }
+
+    assert!(restored.has_interrupting_signal());
 }

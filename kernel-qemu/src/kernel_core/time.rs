@@ -2,6 +2,8 @@
 use super::*;
 use crate::irq_lock::{IrqOnceCell, Mutex};
 
+const CHECKPOINT_TIMER_CLOCK_LOGICAL: u32 = 0;
+
 // AGENT: QEMU timer wheel storage; TimerWheel owns Vec slots, so it is
 // explicitly initialized after heap setup and before timer interrupts are
 // enabled.
@@ -92,6 +94,51 @@ impl TimerEntry {
     pub fn cancel(&mut self) {
         self.active = false;
     }
+
+    // AGENT: convert task-bound active timers into checkpoint records while
+    // rejecting wait-token timers that belong to an in-flight blocking wait.
+    fn snapshot_for_checkpoint_task(
+        &self,
+        task_id: usize,
+    ) -> Result<Option<SavedTimer>, &'static str> {
+        if !self.active {
+            return Ok(None);
+        }
+
+        let (target_kind, target_task_id, signo, sender_tid) = match &self.target {
+            TimerTarget::Noop => return Ok(None),
+            TimerTarget::WakeToken { token } if token.task_id() == task_id => {
+                return Err("enotsup")
+            }
+            TimerTarget::WakeToken { .. } => return Ok(None),
+            TimerTarget::WakeTask { task_id: target } if *target == task_id => {
+                (SavedTimerTargetKind::WakeTask, *target, 0, 0)
+            }
+            TimerTarget::WakeTask { .. } => return Ok(None),
+            TimerTarget::SignalTask {
+                task_id: target,
+                signo,
+                sender_tid,
+            } if *target == task_id => (
+                SavedTimerTargetKind::SignalTask,
+                *target,
+                *signo,
+                i64::try_from(*sender_tid).map_err(|_| "einval")?,
+            ),
+            TimerTarget::SignalTask { .. } => return Ok(None),
+        };
+
+        Ok(Some(SavedTimer {
+            timer_id: u64::try_from(self.id).map_err(|_| "einval")?,
+            clock_id: CHECKPOINT_TIMER_CLOCK_LOGICAL,
+            target_kind,
+            target_task_id: u64::try_from(target_task_id).map_err(|_| "einval")?,
+            signo,
+            sender_tid,
+            deadline_ticks: u64::try_from(self.deadline).map_err(|_| "einval")?,
+            interval_ticks: u64::try_from(self.interval).map_err(|_| "einval")?,
+        }))
+    }
 }
 
 // AGENT: timer wheel advanced from the CPU0 schedule_tick path.
@@ -172,12 +219,64 @@ impl TimerWheel {
         false
     }
 
+    // AGENT: snapshot only timers whose observable target belongs to the saved
+    // single task; unrelated global timers remain owned by their live tasks.
+    pub fn snapshot_checkpoint_timers(
+        &self,
+        task_id: usize,
+    ) -> Result<Vec<SavedTimer>, &'static str> {
+        let mut saved = Vec::new();
+        for entry in self.slots.iter().flat_map(|slot| slot.iter()) {
+            if let Some(timer) = entry.snapshot_for_checkpoint_task(task_id)? {
+                saved.push(timer);
+            }
+        }
+        Ok(saved)
+    }
+
+    // AGENT: restore saved task-bound timers by allocating fresh wheel ids and
+    // rebinding every target to the newly restored task id.
+    pub fn restore_checkpoint_timers(
+        &mut self,
+        timers: &[SavedTimer],
+        restored_task_id: usize,
+    ) -> Result<(), &'static str> {
+        for timer in timers {
+            if timer.clock_id != CHECKPOINT_TIMER_CLOCK_LOGICAL {
+                return Err("enotsup");
+            }
+            let deadline = usize::try_from(timer.deadline_ticks).map_err(|_| "einval")?;
+            let interval = usize::try_from(timer.interval_ticks).map_err(|_| "einval")?;
+            let target = restored_timer_target(timer, restored_task_id)?;
+            self.register_timer(deadline, interval, target);
+        }
+        Ok(())
+    }
+
     pub fn active_count(&self) -> usize {
         self.slots
             .iter()
             .flat_map(|s| s.iter())
             .filter(|e| e.active)
             .count()
+    }
+}
+
+// AGENT: rebuild a timer target from image metadata while intentionally replacing
+// the saved task id with the fresh restored pid.
+fn restored_timer_target(
+    timer: &SavedTimer,
+    restored_task_id: usize,
+) -> Result<TimerTarget, &'static str> {
+    match timer.target_kind {
+        SavedTimerTargetKind::WakeTask => Ok(TimerTarget::WakeTask {
+            task_id: restored_task_id,
+        }),
+        SavedTimerTargetKind::SignalTask => Ok(TimerTarget::SignalTask {
+            task_id: restored_task_id,
+            signo: timer.signo,
+            sender_tid: isize::try_from(timer.sender_tid).map_err(|_| "einval")?,
+        }),
     }
 }
 

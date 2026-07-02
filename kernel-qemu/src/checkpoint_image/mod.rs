@@ -15,7 +15,8 @@ mod validate;
 
 pub use self::types::{
     CheckpointError, CheckpointHeader, CheckpointImage, RestorePolicy, SavedFdEntry, SavedFdKind,
-    SavedPage, SavedProcess, SavedRunState, SavedTimer, SavedTrapFrame, SavedVma, SectionTag,
+    SavedPage, SavedProcess, SavedRunState, SavedTimer, SavedTimerTargetKind, SavedTrapFrame,
+    SavedVma, SectionTag,
 };
 
 // AGENT: fixed checkpoint image identity for guest-kernel process snapshots.

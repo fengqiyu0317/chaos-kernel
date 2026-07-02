@@ -42,11 +42,21 @@ fn sample_image() -> CheckpointImage {
         object_id: 1,
         offset: 7,
     });
+    image.timers.push(SavedTimer {
+        timer_id: 9,
+        clock_id: 0,
+        target_kind: SavedTimerTargetKind::SignalTask,
+        target_task_id: 42,
+        signo: 14,
+        sender_tid: -1,
+        deadline_ticks: 21,
+        interval_ticks: 3,
+    });
     image
 }
 
 // AGENT: ensure the explicit binary format can carry the first supported
-// register, VMA, page, fd, and process metadata sections.
+// register, VMA, page, fd, timer, and process metadata sections.
 #[test]
 fn checkpoint_image_round_trips_supported_state() {
     let image = sample_image();

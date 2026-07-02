@@ -69,6 +69,15 @@ pub enum SavedFdKind {
     Tty = 8,
 }
 
+// AGENT: serialized timer target kinds are limited to task-bound targets that can
+// be rebound when a checkpoint is restored as a fresh process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum SavedTimerTargetKind {
+    WakeTask = 1,
+    SignalTask = 2,
+}
+
 // AGENT: fixed image header shared by all M10 sections.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckpointHeader {
@@ -130,11 +139,16 @@ pub struct SavedFdEntry {
     pub offset: u64,
 }
 
-// AGENT: minimal timer state for deadlines that can be restarted after restore.
+// AGENT: minimal timer state for deadlines that can be restarted after restore,
+// including the task-bound target needed to reattach the timer to the new pid.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SavedTimer {
     pub timer_id: u64,
     pub clock_id: u32,
+    pub target_kind: SavedTimerTargetKind,
+    pub target_task_id: u64,
+    pub signo: i32,
+    pub sender_tid: i64,
     pub deadline_ticks: u64,
     pub interval_ticks: u64,
 }
@@ -213,6 +227,20 @@ impl TryFrom<u16> for SavedFdKind {
             6 => Ok(Self::Epoll),
             7 => Ok(Self::Socket),
             8 => Ok(Self::Tty),
+            _ => Err(CheckpointError::InvalidEnum),
+        }
+    }
+}
+
+// AGENT: convert serialized timer target kind fields into checked enums.
+impl TryFrom<u16> for SavedTimerTargetKind {
+    type Error = CheckpointError;
+
+    // AGENT: accept only timer targets that the first restore path can recreate.
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::WakeTask),
+            2 => Ok(Self::SignalTask),
             _ => Err(CheckpointError::InvalidEnum),
         }
     }

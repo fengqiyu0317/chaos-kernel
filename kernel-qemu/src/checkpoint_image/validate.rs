@@ -1,7 +1,7 @@
 use super::{
     CheckpointError, CheckpointHeader, CheckpointImage, RestorePolicy, SavedFdEntry, SavedFdKind,
-    SavedRunState, CHECKPOINT_ARCH_RISCV64, CHECKPOINT_MAGIC, CHECKPOINT_PAGE_SIZE,
-    CHECKPOINT_VERSION,
+    SavedRunState, SavedTimer, SavedTimerTargetKind, CHECKPOINT_ARCH_RISCV64, CHECKPOINT_MAGIC,
+    CHECKPOINT_PAGE_SIZE, CHECKPOINT_VERSION,
 };
 
 // AGENT: enforce the M10 first-version scope before checkpoint bytes are
@@ -36,6 +36,7 @@ pub(super) fn validate_first_version(image: &CheckpointImage) -> Result<(), Chec
     }
     validate_fd_scope(&image.fds)?;
     validate_open_descriptions(&image.fds)?;
+    validate_timer_scope(&image.timers)?;
     Ok(())
 }
 
@@ -84,6 +85,32 @@ fn validate_open_descriptions(fds: &[SavedFdEntry]) -> Result<(), CheckpointErro
                     || fds[i].offset != fds[j].offset)
             {
                 return Err(CheckpointError::InconsistentOpenDescription);
+            }
+        }
+    }
+    Ok(())
+}
+
+// AGENT: first-version timer restore supports only logical-clock timers bound to
+// the saved single task; unbound wait-token timers are rejected before restore.
+fn validate_timer_scope(timers: &[SavedTimer]) -> Result<(), CheckpointError> {
+    for timer in timers {
+        if timer.clock_id != 0 {
+            return Err(CheckpointError::UnsupportedState);
+        }
+        if timer.target_task_id == 0 {
+            return Err(CheckpointError::InvalidEnum);
+        }
+        match timer.target_kind {
+            SavedTimerTargetKind::WakeTask => {
+                if timer.signo != 0 || timer.sender_tid != 0 {
+                    return Err(CheckpointError::InvalidEnum);
+                }
+            }
+            SavedTimerTargetKind::SignalTask => {
+                if timer.signo <= 0 {
+                    return Err(CheckpointError::InvalidEnum);
+                }
             }
         }
     }
