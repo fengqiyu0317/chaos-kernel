@@ -19,6 +19,15 @@ impl Default for FdOpt {
     }
 }
 
+// AGENT: F_SETFL-style updates preserve access mode and only replace mutable
+// status flags carried by the shared open-file description.
+impl FdOpt {
+    pub fn apply_status_flags(&mut self, flags: usize) {
+        self.nb = (flags & O_NONBLOCK) != 0;
+        self.ap = (flags & O_APPEND) != 0;
+    }
+}
+
 pub(crate) struct FdState {
     pub(crate) off: u64,
     pub(crate) opt: FdOpt,
@@ -58,17 +67,40 @@ impl OpenFileDescription {
         &self.file
     }
 
+    // AGENT: enforce open-file-description access flags before dispatching to
+    // the concrete file-like object.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        self.file.read(buf)
+        let status = self.status_flags();
+        if !status.rd {
+            return Err("ebadf");
+        }
+        match &self.file {
+            FLike::File(f) => f.read_with_status(status, buf),
+            FLike::Pipe(p) => p.read_at(buf),
+            FLike::Ep(_) => Err("enosys"),
+        }
     }
 
+    // AGENT: keep append/write permission checks in the shared open-file
+    // description instead of duplicating mutable status in FHandle.
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        self.file.write(buf)
+        let status = self.status_flags();
+        if !status.wr {
+            return Err("ebadf");
+        }
+        match &self.file {
+            FLike::File(f) => f.write_with_status(status, buf),
+            FLike::Pipe(p) => p.write_at(buf),
+            FLike::Ep(_) => Err("enosys"),
+        }
     }
 
     // AGENT: return explicit poll status so epoll can preserve closed peer state.
     pub fn poll(&self) -> PollStatus {
-        self.file.poll()
+        match &self.file {
+            FLike::File(f) => f.poll_status_with_status(self.status_flags()),
+            _ => self.file.poll(),
+        }
     }
 
     pub fn io_ctl(&self, req: usize, arg: usize) -> Result<usize, &'static str> {
@@ -85,11 +117,11 @@ impl OpenFileDescription {
         fdopt_to_open_flags(self.status_flags())
     }
 
+    // AGENT: update only the mutable open-file status bits; access mode remains
+    // fixed from open/pipe creation.
     pub fn set_status_flags(&self, flags: usize) -> Result<(), &'static str> {
-        self.file.set_status_flags(flags)?;
         let mut status = self.status.write().unwrap();
-        status.nb = (flags & O_NONBLOCK) != 0;
-        status.ap = (flags & O_APPEND) != 0;
+        status.apply_status_flags(flags);
         Ok(())
     }
 
@@ -315,18 +347,17 @@ impl FHandle {
         self.desc.read().unwrap().off
     }
 
-    // AGENT: fcntl(F_SETFL) changes status flags while preserving access mode.
-    pub fn set_status_flags(&self, flags: usize) {
-        let mut d = self.desc.write().unwrap();
-        d.opt.nb = (flags & O_NONBLOCK) != 0;
-        d.opt.ap = (flags & O_APPEND) != 0;
-    }
-
     // AGENT: advance the shared open-file-description offset while holding the
     // descriptor state write lock.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+        self.read_with_status(self.get_opt(), buf)
+    }
+
+    // AGENT: read using status supplied by the owning OpenFileDescription while
+    // keeping the regular-file offset in FHandle's descriptor state.
+    fn read_with_status(&self, status: FdOpt, buf: &mut [u8]) -> Result<usize, &'static str> {
         let mut desc = self.desc.write().unwrap();
-        if !desc.opt.rd {
+        if !status.rd {
             return Err("ebadf");
         }
         let off = desc.off as usize;
@@ -363,12 +394,18 @@ impl FHandle {
     // AGENT: append/offset selection and offset advancement happen under one
     // shared descriptor state write lock.
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
+        self.write_with_status(self.get_opt(), buf)
+    }
+
+    // AGENT: write using open-file-description status so F_SETFL changes are
+    // visible without copying mutable flags back into FHandle.
+    fn write_with_status(&self, status: FdOpt, buf: &[u8]) -> Result<usize, &'static str> {
         let mut desc = self.desc.write().unwrap();
-        if !desc.opt.wr {
+        if !status.wr {
             return Err("ebadf");
         }
         let mut d = self.node.data.lock().unwrap();
-        let off = if desc.opt.ap {
+        let off = if status.ap {
             d.len()
         } else {
             desc.off as usize
@@ -459,15 +496,16 @@ impl FHandle {
     }
     // AGENT: regular files do not carry pipe-style closed-peer state.
     pub fn poll_status(&self) -> PollStatus {
-        let desc = self.desc.read().unwrap();
-        let readable = desc.opt.rd;
-        let writable = desc.opt.wr;
-        let _off = desc.off;
-        drop(desc);
+        self.poll_status_with_status(self.get_opt())
+    }
+
+    // AGENT: let OpenFileDescription provide the visible access mode when fd
+    // polling goes through the fd table.
+    fn poll_status_with_status(&self, status: FdOpt) -> PollStatus {
         let error = self.path.is_empty() && self.node.data.lock().unwrap().is_empty();
         PollStatus {
-            readable,
-            writable,
+            readable: status.rd,
+            writable: status.wr,
             error,
             closed: false,
         }

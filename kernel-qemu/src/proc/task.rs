@@ -283,8 +283,7 @@ fn checkpoint_stdio_handle(kind: SavedFdKind, status_flags: u32) -> Result<FHand
         | SavedFdKind::Socket
         | SavedFdKind::Tty => return Err("enotsup"),
     };
-    opt.nb = (status_flags as usize & O_NONBLOCK) != 0;
-    opt.ap = (status_flags as usize & O_APPEND) != 0;
+    opt.apply_status_flags(status_flags as usize);
     let path = match kind {
         SavedFdKind::Stdin => "/dev/stdin",
         SavedFdKind::Stdout => "/dev/stdout",

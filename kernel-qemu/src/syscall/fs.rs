@@ -20,21 +20,6 @@ fn read_user_path(task: &Task, addr: usize) -> Result<String, &'static str> {
     Err("enametoolong")
 }
 
-fn fdopt_to_open_flags(opt: FdOpt) -> usize {
-    let mut flags = match (opt.rd, opt.wr) {
-        (true, true) => 2,
-        (false, true) => 1,
-        _ => 0,
-    };
-    if opt.nb {
-        flags |= O_NONBLOCK;
-    }
-    if opt.ap {
-        flags |= O_APPEND;
-    }
-    flags
-}
-
 // AGENT: ioctl integer arguments live in user memory; copy them through the
 // active address space instead of trusting the raw pointer.
 fn read_user_i32(task: &Task, addr: usize) -> Result<i32, &'static str> {
@@ -294,6 +279,13 @@ pub(super) fn sys_pipe(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
         let _cloexec = (pipe_flags & O_CLOEXEC) != 0;
         let (rd_fd, wr_fd) =
             t.add_file_pair_with_cloexec(FLike::Pipe(rd), FLike::Pipe(wr), _cloexec)?;
+        if _nonblock {
+            for pipe_fd in [rd_fd, wr_fd] {
+                t.get_fd_entry(pipe_fd)
+                    .ok_or("ebadf")?
+                    .set_status_flags(O_NONBLOCK)?;
+            }
+        }
         Ok(rd_fd | (wr_fd << 32))
     } else {
         Err("esrch")
@@ -322,6 +314,8 @@ pub(super) fn sys_dup2(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
     task.dup2_fd(old_fd, new_fd)
 }
 
+// AGENT: fcntl mutates fd entries while keeping access mode fixed in the
+// shared open-file description.
 pub(super) fn sys_fcntl(
     kernel: &Kernel,
     a0: usize,
@@ -363,13 +357,12 @@ pub(super) fn sys_fcntl(
             Ok(fdopt_to_open_flags(entry.status_flags()))
         }
         F_SETFL => {
-            let valid_mask = O_NONBLOCK | O_APPEND;
-            let _new_flags = arg & valid_mask;
+            let valid_mask = O_NONBLOCK | O_APPEND | 0x3;
             if arg & !valid_mask != 0 {
                 return Err("einval");
             }
             let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
-            entry.set_status_flags(_new_flags)?;
+            entry.set_status_flags(arg)?;
             Ok(0)
         }
         F_GETLK => {

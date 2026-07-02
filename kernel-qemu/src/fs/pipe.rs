@@ -265,15 +265,6 @@ impl FLike {
             },
         }
     }
-    pub fn set_status_flags(&self, flags: usize) -> Result<(), &'static str> {
-        match self {
-            FLike::File(f) => {
-                f.set_status_flags(flags);
-                Ok(())
-            }
-            FLike::Pipe(_) | FLike::Ep(_) => Ok(()),
-        }
-    }
     // AGENT: handle object-specific ioctl requests; fd-wide requests such as
     // FIONBIO are applied by sys_ioctl because they mutate descriptor status.
     pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
