@@ -1,18 +1,21 @@
 // AGENT
 use super::*;
 
-#[derive(Clone, PartialEq)]
-pub enum PipeDir {
+// AGENT: pipe endpoint direction is internal to this module; Copy keeps
+// endpoint checks simple without exposing the enum outside pipe handling.
+#[derive(Clone, Copy, PartialEq)]
+enum PipeDir {
     Rd,
     Wr,
 }
 
-// AGENT: split ends into readers/writers to fix clone-drop falsely signaling peer close
-pub struct PipeBuf {
-    pub buf: VecDeque<u8>,
-    pub bus: EvBus,
-    pub readers: i32,
-    pub writers: i32,
+// AGENT: keep shared pipe state private while preserving explicit reader/writer
+// counts for clone/drop peer-close semantics.
+struct PipeBuf {
+    buf: VecDeque<u8>,
+    bus: EvBus,
+    readers: i32,
+    writers: i32,
 }
 
 pub struct PipeNode {
@@ -26,7 +29,7 @@ impl Clone for PipeNode {
     fn clone(&self) -> Self {
         let cloned = PipeNode {
             data: self.data.clone(),
-            dir: self.dir.clone(),
+            dir: self.dir,
         };
         {
             let mut d = cloned.data.lock().unwrap();
@@ -72,19 +75,6 @@ impl PipeNode {
                 dir: PipeDir::Wr,
             },
         )
-    }
-    pub fn can_read(&self) -> bool {
-        if self.dir != PipeDir::Rd {
-            return false;
-        }
-        let d = self.data.lock().unwrap();
-        d.buf.len() > 0 || d.writers == 0
-    }
-    pub fn can_write(&self) -> bool {
-        if self.dir != PipeDir::Wr {
-            return false;
-        }
-        self.data.lock().unwrap().readers > 0
     }
     // AGENT: compute endpoint-local readiness from the pipe state already
     // protected by PipeBuf's mutex.
@@ -203,14 +193,16 @@ impl PipeNode {
         d.bus.set(EvFlag::READABLE);
         Ok(buf.len())
     }
-    // AGENT: poll computes readiness under one PipeBuf lock instead of calling
-    // helpers that would relock the same mutex.
+    // AGENT: poll reuses the same readiness bit calculation as epoll
+    // registration, so pipe readiness has one local source of truth.
     pub fn poll(&self) -> (bool, bool, bool) {
         let d = self.data.lock().unwrap();
-        match self.dir {
-            PipeDir::Rd => (!d.buf.is_empty() || d.writers == 0, false, false),
-            PipeDir::Wr => (false, d.readers > 0, d.readers == 0),
-        }
+        let ready = self.readiness_locked(&d);
+        (
+            (ready & EvFlag::READABLE) != 0,
+            (ready & EvFlag::WRITABLE) != 0,
+            (ready & EvFlag::ERROR) != 0,
+        )
     }
 }
 
@@ -233,7 +225,6 @@ impl FLike {
     // AGENT: epoll fd duplicates must carry all shared EpInst queues and source
     // subscriptions, so clone the EpInst directly.
     pub fn dup(&self, cloexec: bool) -> FLike {
-        let _ts = CLK.load(Ordering::Relaxed);
         match self {
             FLike::File(f) => FLike::File(f.dup(cloexec)),
             FLike::Pipe(p) => FLike::Pipe(p.clone()),
@@ -244,7 +235,6 @@ impl FLike {
         if buf.is_empty() {
             return Ok(0);
         }
-        let _pre_tick = CLK.load(Ordering::Relaxed);
         match self {
             // HUMAN: delete the duplicate code
             FLike::File(f) => f.read(buf),
