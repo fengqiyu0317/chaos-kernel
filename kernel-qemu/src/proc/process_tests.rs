@@ -13,6 +13,7 @@ pub fn run_all(pool: &FramePool) {
     register_rejects_duplicate_pid_without_replacing_task();
     pgid_group_keeps_zombie_members_until_reap();
     reap_rejects_live_process();
+    clone_thread_copies_caller_context_and_shares_process();
     reap_zombie_process_removes_thread_group_once();
     proc_init_push_at_writes_user_stack(pool);
     shm_segment_maps_shared_physical_page(pool);
@@ -154,7 +155,9 @@ fn reap_zombie_process_removes_thread_group_once() {
     let child = table.spawn("child").expect("child spawn should work");
     child.link_parent(&parent);
     parent.link_child(&child);
-    let thread = table.clone_thread(&child, 0x8000_0000, 0, 0);
+    let thread = table
+        .clone_thread(&child, 0x8000_0000, 0, 0)
+        .expect("thread clone should succeed");
 
     assert!(child.exit_proc(ExitReason::Code(7)));
     assert_eq!(table.zombie_tasks(), vec![child.id()]);
@@ -163,6 +166,46 @@ fn reap_zombie_process_removes_thread_group_once() {
     assert!(table.find(child.id()).is_none());
     assert!(table.find(thread.id()).is_none());
     assert!(parent.process.subtasks.lock().unwrap().is_empty());
+}
+
+// AGENT: clone_thread starts from the caller thread context, then applies the
+// clone-specific return value, user stack, TLS, clear-child-tid, and signal mask.
+fn clone_thread_copies_caller_context_and_shares_process() {
+    let table = TaskTable::new();
+    let task = table.spawn("worker").expect("standalone spawn should work");
+    let stack_top = 0x8000_0000;
+    let tls = 0xabc;
+    let clear_tid = 0xdead;
+    let sig_mask = 0x24;
+
+    {
+        let mut thd = task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_mut().expect("source context should exist");
+        ctx.uctx.set_ip(0x401000);
+        ctx.uctx.r[0] = 99;
+        ctx.uctx.r[3] = 0x7777;
+        ctx.uctx.set_sp(0x9000_0000);
+        ctx.clear_tid = 0x1111;
+        ctx.smask = 0x11;
+    }
+    *task.sig_mask.lock().unwrap() = sig_mask;
+
+    let thread = table
+        .clone_thread(&task, stack_top, tls, clear_tid)
+        .expect("thread clone should succeed");
+
+    assert!(Arc::ptr_eq(&task.process, &thread.process));
+    assert!(task.process.threads.lock().unwrap().contains(&thread.id()));
+    assert_eq!(*thread.sig_mask.lock().unwrap(), sig_mask);
+    let thd = thread.thd_ctx.lock().unwrap();
+    let ctx = thd.as_ref().expect("cloned context should exist");
+    assert_eq!(ctx.uctx.ip, 0x401000);
+    assert_eq!(ctx.uctx.r[0], 0);
+    assert_eq!(ctx.uctx.r[3], 0x7777);
+    assert_eq!(ctx.uctx.r[N_REGS - 1], stack_top);
+    assert_eq!(ctx.uctx.r[N_REGS - 2], tls);
+    assert_eq!(ctx.clear_tid, clear_tid);
+    assert_eq!(ctx.smask, sig_mask);
 }
 
 // AGENT: construct a minimal init stack through real AddrSpace mappings and

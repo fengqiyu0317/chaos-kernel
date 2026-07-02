@@ -282,9 +282,13 @@ pub fn parse_elf_load_segments(data: &[u8]) -> Result<(usize, Vec<ElfLoadSegment
         return Err("not_exec");
     }
     let e_machine = read_u16_le(data, 18)?;
-    if e_machine != 0x3E {
+    const EM_X86_64: u16 = 0x3E;
+    const EM_RISCV: u16 = 0xF3;
+    // AGENT: QEMU executes RISC-V user images, while existing migration
+    // fixtures still use x86_64-shaped synthetic ELF bytes.
+    if e_machine != EM_RISCV && e_machine != EM_X86_64 {
         return Err("bad_machine");
-    } // AGENT: EM_X86_64
+    }
     let e_entry = read_u64_le(data, 24)? as usize;
     let e_phoff = read_u64_le(data, 32)? as usize;
     let e_phentsize = read_u16_le(data, 54)?;

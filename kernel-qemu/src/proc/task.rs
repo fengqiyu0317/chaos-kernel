@@ -227,6 +227,138 @@ impl FdCloseCleanup {
     }
 }
 
+struct InitialUserImage {
+    addr_space: AddrSpace,
+    thd_ctx: ThdCtx,
+}
+
+// AGENT: build the first user image from explicit ELF bytes so task creation
+// does not depend on a fake hard-coded header or hidden filesystem state.
+fn prepare_initial_user_image(
+    elf_data: &[u8],
+    args: Vec<String>,
+    envs: Vec<String>,
+    pool: &FramePool,
+) -> Result<InitialUserImage, &'static str> {
+    let (entry, load_segments) = parse_elf_load_segments(elf_data)?;
+    let mut addr_space = AddrSpace::new();
+    match populate_initial_user_image(
+        &mut addr_space,
+        elf_data,
+        load_segments,
+        entry,
+        args,
+        envs,
+        pool,
+    ) {
+        Ok(thd_ctx) => Ok(InitialUserImage {
+            addr_space,
+            thd_ctx,
+        }),
+        Err(err) => {
+            addr_space.release_all_pages(pool);
+            Err(err)
+        }
+    }
+}
+
+fn populate_initial_user_image(
+    addr_space: &mut AddrSpace,
+    elf_data: &[u8],
+    load_segments: Vec<ElfLoadSegment>,
+    entry: usize,
+    args: Vec<String>,
+    envs: Vec<String>,
+    pool: &FramePool,
+) -> Result<ThdCtx, &'static str> {
+    let mut image_end = 0usize;
+    for segment in load_segments {
+        let region = segment.vm_region()?;
+        let region_base = region.base;
+        let region_len = region.len;
+        let region_flags = region.flags;
+        let region_end = region.end();
+        addr_space.map_region(
+            VmRegion {
+                flags: region_flags | VM_WRITE,
+                ..region
+            },
+            pool,
+        )?;
+
+        let file_end = segment
+            .offset
+            .checked_add(segment.file_size)
+            .ok_or("ph_overflow")?;
+        if file_end > elf_data.len() {
+            return Err("ph_overflow");
+        }
+        addr_space.write_user_bytes(segment.vaddr, &elf_data[segment.offset..file_end], pool)?;
+        addr_space.protect(region_base, region_len, region_flags)?;
+        image_end = max(image_end, region_end);
+    }
+
+    let init = ProcInit {
+        args,
+        envs,
+        auxv: BTreeMap::from([(AT_PAGESZ, PAGE_SZ), (AT_ENTRY, entry)]),
+    };
+    if init.checked_total_size()? > USR_STK_SZ {
+        return Err("e2big");
+    }
+
+    let stack = VmRegion::new(USR_STK_OFF, USR_STK_SZ, VM_READ | VM_WRITE | VM_GROWSDOWN);
+    addr_space.map_region(stack, pool)?;
+    let sp = init.push_at(addr_space, pool, USR_STK_OFF + USR_STK_SZ)?;
+    if sp < USR_STK_OFF || sp > USR_STK_OFF + USR_STK_SZ {
+        return Err("e2big");
+    }
+
+    addr_space.vm_map.brk = (image_end + PAGE_SZ - 1) & !(PAGE_SZ - 1);
+    let mut thd_ctx = ThdCtx::default();
+    thd_ctx.uctx.set_sp(sp as u64);
+    thd_ctx.uctx.set_ip(entry as u64);
+    Ok(thd_ctx)
+}
+
+// AGENT: seed stdio descriptors for a fresh user process without going through
+// fallible fd allocation; descriptors 0, 1, and 2 are known to be free here.
+fn install_initial_stdio(task: &Arc<Task>) {
+    let fd0 = FHandle::new(
+        "/dev/tty",
+        FdOpt {
+            rd: true,
+            wr: false,
+            ap: false,
+            nb: false,
+        },
+        false,
+        false,
+    );
+    let fd1 = FHandle::new(
+        "/dev/tty",
+        FdOpt {
+            rd: false,
+            wr: true,
+            ap: false,
+            nb: false,
+        },
+        false,
+        false,
+    );
+    let fd2 = fd1.dup(false);
+    {
+        let mut files = task.process.files.lock().unwrap();
+        files.insert(0, FdEntry::new(FLike::File(fd0)));
+        files.insert(1, FdEntry::new(FLike::File(fd1)));
+        files.insert(2, FdEntry::new(FLike::File(fd2)));
+    }
+    let mut free_fds = task.process.free_fds.lock().unwrap();
+    free_fds.remove(&0);
+    free_fds.remove(&1);
+    free_fds.remove(&2);
+}
+
 impl Task {
     pub fn make(id: usize, tag: &str) -> Arc<Self> {
         Self::make_with_process(id, tag, ProcessState::new_shared())
@@ -627,6 +759,8 @@ impl fmt::Debug for Task {
     }
 }
 
+// AGENT: TaskTable tracks schedulable task ids; process grouping remains
+// indexed by process pid instead of thread id.
 pub struct TaskTable {
     pub map: RwLock<BTreeMap<usize, Arc<Task>>>,
     // AGENT: process groups are indexed by pgid and store process pids, not
@@ -636,16 +770,17 @@ pub struct TaskTable {
     pub root: Mutex<Option<Arc<Task>>>,
     // AGENT: reserve capacity for task-table insertions before registration so
     // concurrent creators cannot all pass the N_PROC check at once.
-    process_reservations: AtomicUsize,
+    task_reservations: AtomicUsize,
 }
 impl TaskTable {
+    // AGENT: initialize task-slot reservations beside the task map they protect.
     pub fn new() -> Self {
         Self {
             map: RwLock::new(BTreeMap::new()),
             groups: Mutex::new(BTreeMap::new()),
             seq: AtomicUsize::new(1),
             root: Mutex::new(None),
-            process_reservations: AtomicUsize::new(0),
+            task_reservations: AtomicUsize::new(0),
         }
     }
     // AGENT: add a process pid to a group while the groups map is already held.
@@ -741,7 +876,7 @@ impl TaskTable {
     // AGENT: standalone spawned processes start as leaders of their own
     // session/process group; callers enqueue them separately when runnable.
     pub fn spawn(&self, tag: &str) -> Result<Arc<Task>, &'static str> {
-        let slot = self.reserve_process_slot()?;
+        let slot = self.reserve_task_slot()?;
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = self.insert_new_process(id, tag)?;
         slot.release();
@@ -758,7 +893,7 @@ impl TaskTable {
             return Err("ebusy");
         }
 
-        let slot = self.reserve_process_slot()?;
+        let slot = self.reserve_task_slot()?;
         if self
             .seq
             .compare_exchange(Pid::INIT, Pid::INIT + 1, Ordering::SeqCst, Ordering::SeqCst)
@@ -931,15 +1066,15 @@ impl TaskTable {
     }
     // AGENT: reserve one task-table slot while a creator builds and registers a
     // task, closing the old check-then-insert race for every process creator.
-    fn reserve_process_slot(&self) -> Result<TaskSlotReservation<'_>, &'static str> {
+    fn reserve_task_slot(&self) -> Result<TaskSlotReservation<'_>, &'static str> {
         loop {
             let live = self.count();
-            let reserved = self.process_reservations.load(Ordering::SeqCst);
+            let reserved = self.task_reservations.load(Ordering::SeqCst);
             if live.saturating_add(reserved) >= N_PROC {
                 return Err("eagain");
             }
             if self
-                .process_reservations
+                .task_reservations
                 .compare_exchange(reserved, reserved + 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
@@ -953,7 +1088,7 @@ impl TaskTable {
     // AGENT: keep fork readable by separating process-wide inherited state from
     // the caller thread context that receives the child-side zero return value.
     pub fn fork_task(&self, src: &Arc<Task>, pool: &FramePool) -> Result<Arc<Task>, &'static str> {
-        let process_slot = self.reserve_process_slot()?;
+        let task_slot = self.reserve_task_slot()?;
         let proc_src = self.process_of_tid(src.id()).unwrap_or_else(|| src.clone());
         let child_id = self.seq.fetch_add(1, Ordering::SeqCst);
         let tag = proc_src.tag();
@@ -1022,20 +1157,23 @@ impl TaskTable {
             .lock()
             .unwrap()
             .push(child.clone());
-        process_slot.release();
+        task_slot.release();
         Ok(child)
     }
+    // AGENT: clone a schedulable thread from the caller's saved user context
+    // while sharing the owning process state and address space.
     pub fn clone_thread(
         &self,
         src: &Arc<Task>,
         stack_top: u64,
         tls: u64,
         clear_tid: usize,
-    ) -> Arc<Task> {
-        let proc_src = self.process_of_tid(src.id()).unwrap_or_else(|| src.clone());
+    ) -> Result<Arc<Task>, &'static str> {
+        let task_slot = self.reserve_task_slot()?;
+        let proc_src = self.process_of_tid(src.id()).ok_or("esrch")?;
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = Task::make_with_process(id, &proc_src.tag(), proc_src.process.clone());
-        let mut ctx = ThdCtx::default();
+        let mut ctx = src.thd_ctx.lock().unwrap().clone().ok_or("enoctx")?;
         ctx.uctx.set_ret(0);
         ctx.uctx.set_sp(stack_top);
         ctx.uctx.set_tls(tls);
@@ -1044,82 +1182,44 @@ impl TaskTable {
         ctx.smask = caller_mask;
         *t.sig_mask.lock().unwrap() = caller_mask;
         *t.thd_ctx.lock().unwrap() = Some(ctx);
-        self.map.write().unwrap().insert(id, t.clone());
+        {
+            let mut map = self.map.write().unwrap();
+            if map.contains_key(&id) {
+                return Err("eexist");
+            }
+            map.insert(id, t.clone());
+        }
         proc_src.process.threads.lock().unwrap().push(id);
-        t
+        task_slot.release();
+        Ok(t)
     }
     pub fn new_user_task(
         &self,
         path: &str,
+        elf_data: &[u8],
         args: Vec<String>,
         envs: Vec<String>,
         pool: &FramePool,
-    ) -> Arc<Task> {
-        let t = self
-            .spawn(path)
-            .expect("new user task should reserve a task-table slot");
-        *t.process.exec_path.lock().unwrap() = path.to_string();
-        let _elf_entry = validate_elf_header(&[
-            0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0x3e, 0, 1, 0, 0, 0,
-            0, 0x40, 0, 0, 0, 0, 0, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0x40, 0, 0x38, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-        ]);
-        let mut ctx = ThdCtx::default();
-        let init = ProcInit {
-            args,
-            envs,
-            auxv: BTreeMap::new(),
+    ) -> Result<Arc<Task>, &'static str> {
+        let mut image = prepare_initial_user_image(elf_data, args, envs, pool)?;
+        let t = match self.spawn(path) {
+            Ok(task) => task,
+            Err(err) => {
+                image.addr_space.release_all_pages(pool);
+                return Err(err);
+            }
         };
+
+        *t.process.exec_path.lock().unwrap() = path.to_string();
+        *t.thd_ctx.lock().unwrap() = Some(image.thd_ctx);
         {
             let mut addr_space = t.process.addr_space.lock().unwrap();
-            addr_space
-                .map_region(
-                    VmRegion::new(USR_STK_OFF, USR_STK_SZ, VM_READ | VM_WRITE | VM_GROWSDOWN),
-                    pool,
-                )
-                .expect("initial user stack should map");
+            *addr_space = image.addr_space;
         }
-        let sp = {
-            let mut addr_space = t.process.addr_space.lock().unwrap();
-            init.push_at(&mut addr_space, pool, USR_STK_OFF + USR_STK_SZ)
-                .expect("initial user stack should be writable")
-        };
-        ctx.uctx.set_sp(sp as u64);
-        *t.thd_ctx.lock().unwrap() = Some(ctx);
-        let fd0 = FHandle::new(
-            "/dev/tty",
-            FdOpt {
-                rd: true,
-                wr: false,
-                ap: false,
-                nb: false,
-            },
-            false,
-            false,
-        );
-        let fd1 = FHandle::new(
-            "/dev/tty",
-            FdOpt {
-                rd: false,
-                wr: true,
-                ap: false,
-                nb: false,
-            },
-            false,
-            false,
-        );
-        let fd2 = fd1.dup(false);
-        // AGENT: install stdio through the fd allocator so descriptors 0/1/2
-        // are removed from the process free set.
-        t.add_file(FLike::File(fd0))
-            .expect("initial stdin fd should allocate");
-        t.add_file(FLike::File(fd1))
-            .expect("initial stdout fd should allocate");
-        t.add_file(FLike::File(fd2))
-            .expect("initial stderr fd should allocate");
+        install_initial_stdio(&t);
         // AGENT: spawn() already registered pid/pgid/sid membership and the
         // main thread for this standalone user process.
-        t
+        Ok(t)
     }
 
     pub fn active_tasks(&self) -> Vec<usize> {
@@ -1147,7 +1247,7 @@ impl TaskTable {
     }
 }
 
-// AGENT: release a provisional task-table reservation automatically if process
+// AGENT: release a provisional task-table reservation automatically if task
 // creation exits early.
 struct TaskSlotReservation<'a> {
     table: &'a TaskTable,
@@ -1159,12 +1259,12 @@ impl TaskSlotReservation<'_> {
         self.release_inner();
     }
 
+    // AGENT: return one provisional task-table slot to the shared reservation
+    // counter exactly once.
     fn release_inner(&mut self) {
         if self.active {
             self.active = false;
-            self.table
-                .process_reservations
-                .fetch_sub(1, Ordering::SeqCst);
+            self.table.task_reservations.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
