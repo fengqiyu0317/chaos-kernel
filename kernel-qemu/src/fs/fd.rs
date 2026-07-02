@@ -22,15 +22,10 @@ impl Default for FdOpt {
 pub(crate) struct FdState {
     pub(crate) off: u64,
     pub(crate) opt: FdOpt,
-    pub(crate) flk: u8,
 }
 impl FdState {
     fn create(opt: FdOpt) -> Arc<RwLock<Self>> {
-        Arc::new(RwLock::new(FdState {
-            off: 0,
-            opt,
-            flk: 0,
-        }))
+        Arc::new(RwLock::new(FdState { off: 0, opt }))
     }
 }
 
@@ -197,11 +192,7 @@ impl FdEntry {
 
     // AGENT: compatibility view for older tests and helpers that inspect FLike.
     pub fn as_flike(&self) -> FLike {
-        let mut file = self.desc.file().clone();
-        if let FLike::File(ref mut f) = file {
-            f.cloexec = self.cloexec;
-        }
-        file
+        self.desc.file().clone()
     }
 }
 
@@ -272,8 +263,6 @@ pub struct FHandle {
     pub path: String,
     pub node: Arc<FileNode>,
     pub(crate) desc: Arc<RwLock<FdState>>,
-    pub pipe: bool,
-    pub cloexec: bool,
 }
 
 #[derive(Debug)]
@@ -285,13 +274,11 @@ pub enum FSeek {
 
 impl FHandle {
     // AGENT: create a fresh standalone regular node for device-like handles.
-    pub fn new(path: &str, opt: FdOpt, pipe: bool, cloexec: bool) -> Self {
+    pub fn new(path: &str, opt: FdOpt) -> Self {
         Self {
             path: path.to_string(),
             node: Arc::new(FileNode::regular(Vec::new(), false)),
             desc: FdState::create(opt),
-            pipe,
-            cloexec,
         }
     }
     // AGENT: create a handle over a fresh regular file node.
@@ -300,28 +287,22 @@ impl FHandle {
             path: path.to_string(),
             node: Arc::new(FileNode::regular(d, false)),
             desc: FdState::create(opt),
-            pipe: false,
-            cloexec: false,
         }
     }
     // AGENT: open a descriptor over an existing shared FileNode.
-    pub fn with_node(path: &str, opt: FdOpt, node: Arc<FileNode>, cloexec: bool) -> Self {
+    pub fn with_node(path: &str, opt: FdOpt, node: Arc<FileNode>) -> Self {
         Self {
             path: path.to_string(),
             node,
             desc: FdState::create(opt),
-            pipe: false,
-            cloexec,
         }
     }
     // AGENT: duplicate only descriptor state; file contents stay shared.
-    pub fn dup(&self, cloexec: bool) -> Self {
+    pub fn dup(&self) -> Self {
         FHandle {
             path: self.path.clone(),
             node: self.node.clone(),
             desc: self.desc.clone(),
-            pipe: self.pipe,
-            cloexec,
         }
     }
     pub fn get_opt(&self) -> FdOpt {

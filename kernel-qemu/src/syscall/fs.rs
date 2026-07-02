@@ -112,7 +112,7 @@ pub(super) fn sys_open(
         ap: _append,
         nb: _nonblock,
     };
-    let fh = FHandle::with_node(&resolved, opt, node, _cloexec);
+    let fh = FHandle::with_node(&resolved, opt, node);
     if _truncate && wr {
         fh.set_len(0)?;
     }

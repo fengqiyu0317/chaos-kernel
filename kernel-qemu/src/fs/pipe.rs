@@ -223,29 +223,12 @@ pub enum FLike {
 }
 
 impl FLike {
-    pub fn fork_dup(&self) -> FLike {
-        match self {
-            FLike::File(f) => FLike::File(f.dup(f.cloexec)),
-            FLike::Pipe(_) => self.dup(false),
-            FLike::Ep(e) => FLike::Ep(e.clone()),
-        }
-    }
-
-    // AGENT: epoll fd duplicates must carry all shared EpInst queues and source
-    // subscriptions, so clone the EpInst directly.
-    pub fn dup(&self, cloexec: bool) -> FLike {
-        match self {
-            FLike::File(f) => FLike::File(f.dup(cloexec)),
-            FLike::Pipe(p) => FLike::Pipe(p.clone()),
-            FLike::Ep(e) => FLike::Ep(e.clone()),
-        }
-    }
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
         if buf.is_empty() {
             return Ok(0);
         }
         match self {
-            // HUMAN: delete the duplicate code
+            // AGENT: FLike only dispatches to the concrete readable object.
             FLike::File(f) => f.read(buf),
             FLike::Pipe(p) => p.read_at(buf),
             FLike::Ep(_) => Err("enosys"),
@@ -256,7 +239,7 @@ impl FLike {
             return Ok(0);
         }
         match self {
-            // HUMAN: delete the duplicate code
+            // AGENT: FLike only dispatches to the concrete writable object.
             FLike::File(f) => f.write(buf),
             FLike::Pipe(p) => p.write_at(buf),
             FLike::Ep(_) => Err("enosys"),
@@ -307,17 +290,9 @@ impl FLike {
     // AGENT: expose explicit readiness fields for epoll's final event mapping.
     pub fn poll(&self) -> PollStatus {
         match self {
-            // HUMAN: move the code to the implementation of the corresponding struct
             FLike::File(f) => f.poll_status(),
             FLike::Pipe(p) => p.poll(),
-            FLike::Ep(e) => {
-                let ready = e.ready.lock().unwrap();
-                let has_ready = !ready.is_empty();
-                PollStatus {
-                    readable: has_ready,
-                    ..PollStatus::default()
-                }
-            }
+            FLike::Ep(e) => e.poll_status(),
         }
     }
     // AGENT: register an epoll readiness callback when this file-like object

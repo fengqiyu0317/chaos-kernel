@@ -82,6 +82,15 @@ impl EpInst {
     pub fn replace_ready(&self, ready_fds: BTreeSet<usize>) {
         *self.ready.lock().unwrap() = ready_fds;
     }
+    // AGENT: expose epoll-fd readiness without making FLike inspect EpInst
+    // internals directly.
+    pub fn poll_status(&self) -> PollStatus {
+        let ready = self.ready.lock().unwrap();
+        PollStatus {
+            readable: !ready.is_empty(),
+            ..PollStatus::default()
+        }
+    }
     // AGENT: enqueue an epoll_wait token only if no readiness callback has
     // populated the cache since the last scan.
     pub fn prepare_wait(&self) -> Option<WaitToken> {
