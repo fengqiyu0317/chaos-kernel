@@ -3,7 +3,7 @@
 use core::arch::global_asm;
 use core::mem;
 
-use crate::kernel::Task;
+use crate::kernel::{Context, Task};
 use crate::{csr, println, sbi, timer};
 
 global_asm!(include_str!("trap.S"));
@@ -331,5 +331,37 @@ impl TrapFrame {
     // AGENT: Write the syscall return value into a0.
     pub fn set_return_value(&mut self, value: usize) {
         self.regs[10] = value;
+    }
+
+    // AGENT: capture only the simulator-visible user context fields; Context.r
+    // is an ABI argument array, not the raw x0..x31 register file.
+    pub fn capture_user_context(&self) -> Context {
+        let mut ctx = Context::new();
+        ctx.ip = self.sepc as u64;
+        ctx.flags = self.sstatus as u64;
+        ctx.r[0] = self.regs[10] as u64;
+        ctx.r[1] = self.regs[11] as u64;
+        ctx.r[2] = self.regs[12] as u64;
+        ctx.r[3] = self.regs[13] as u64;
+        ctx.r[4] = self.regs[14] as u64;
+        ctx.r[5] = self.regs[15] as u64;
+        ctx.r[crate::kernel::N_REGS - 1] = self.regs[2] as u64;
+        ctx.r[crate::kernel::N_REGS - 2] = self.regs[4] as u64;
+        ctx
+    }
+
+    // AGENT: write the simulator-visible user context back through the RISC-V
+    // ABI slots that can be changed by signal delivery and sigreturn.
+    pub fn apply_user_context(&mut self, ctx: &Context) {
+        self.sepc = ctx.ip as usize;
+        self.sstatus = ctx.flags as usize;
+        self.regs[10] = ctx.r[0] as usize;
+        self.regs[11] = ctx.r[1] as usize;
+        self.regs[12] = ctx.r[2] as usize;
+        self.regs[13] = ctx.r[3] as usize;
+        self.regs[14] = ctx.r[4] as usize;
+        self.regs[15] = ctx.r[5] as usize;
+        self.regs[2] = ctx.r[crate::kernel::N_REGS - 1] as usize;
+        self.regs[4] = ctx.r[crate::kernel::N_REGS - 2] as usize;
     }
 }

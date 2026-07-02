@@ -199,13 +199,20 @@ pub(super) fn sys_epoll_wait(
                     inst.remove_waiter(&token);
                     return Ok(0);
                 }
-                token.wait_until_tick(deadline)
+                token.wait_until_tick_interruptible(deadline)
             }
-            None => token.wait(None),
+            None => token.wait_interruptible(None),
         };
-        if outcome == WaitOutcome::Timeout {
-            inst.remove_waiter(&token);
-            return Ok(0);
+        match outcome {
+            WaitOutcome::Event => {}
+            WaitOutcome::Timeout => {
+                inst.remove_waiter(&token);
+                return Ok(0);
+            }
+            WaitOutcome::Signal => {
+                inst.remove_waiter(&token);
+                return Err("eintr");
+            }
         }
     }
 }

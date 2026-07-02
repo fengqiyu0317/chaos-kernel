@@ -49,33 +49,46 @@ pub fn decode_from_trap_frame(frame: &TrapFrame) -> SyscallRequest {
 // AGENT: Complete the RISC-V ABI adapter step and forward to migrated semantics.
 pub fn dispatch_from_trap_frame(frame: &mut TrapFrame) {
     let request = decode_from_trap_frame(frame);
-    let ret = dispatch_migrated_semantics(request);
-    write_return(frame, ret);
+    dispatch_migrated_semantics(request, frame);
 }
 
 // AGENT: Keep syscall behavior behind a semantic entry rather than in the trap layer.
-fn dispatch_migrated_semantics(request: SyscallRequest) -> usize {
+fn dispatch_migrated_semantics(request: SyscallRequest, frame: &mut TrapFrame) {
     match crate::kernel::qemu_wait_kernel() {
-        Some(kernel) => dispatch_installed_kernel(kernel, request),
-        None => crate::semantics::dispatch_syscall(request),
+        Some(kernel) => dispatch_installed_kernel(kernel, request, frame),
+        None => write_return(frame, crate::semantics::dispatch_syscall(request)),
     }
 }
 
 // AGENT: route RISC-V syscalls into the installed migrated Kernel instead of
 // keeping behavior in the early carrier-only semantics shim.
-fn dispatch_installed_kernel(kernel: &crate::kernel::Kernel, request: SyscallRequest) -> usize {
+fn dispatch_installed_kernel(
+    kernel: &crate::kernel::Kernel,
+    request: SyscallRequest,
+    frame: &mut TrapFrame,
+) {
     let Some(nr) = request.internal_nr else {
-        return ENOSYS_RET;
+        write_return(frame, ENOSYS_RET);
+        return;
     };
     let [a0, a1, a2, a3, a4, a5] = request.args;
-    match kernel.dispatch_syscall(nr, a0, a1, a2, a3, a4, a5) {
-        Ok(value) => {
-            if nr == INTERNAL_SYS_EXIT {
-                crate::sbi::shutdown();
-            }
-            value
-        }
+    let ret = match kernel.dispatch_syscall_without_signal_delivery(nr, a0, a1, a2, a3, a4, a5) {
+        Ok(value) => value,
         Err(err) => errno_ret(err),
+    };
+    write_return(frame, ret);
+    if nr == INTERNAL_SYS_EXIT {
+        crate::sbi::shutdown();
+    }
+    if nr == crate::kernel::SYS_SIGRETURN {
+        if let Some(ctx) = kernel.current_user_context(0) {
+            frame.apply_user_context(&ctx);
+        }
+        return;
+    }
+    let interrupted = frame.capture_user_context();
+    if let Some(next) = kernel.deliver_pending_signals_from_context(0, interrupted) {
+        frame.apply_user_context(&next);
     }
 }
 
@@ -86,6 +99,7 @@ fn errno_ret(err: &'static str) -> usize {
         "eperm" => 1,
         "enoent" => 2,
         "esrch" => 3,
+        "eintr" => 4,
         "eio" => 5,
         "e2big" => 7,
         "echild" => 10,

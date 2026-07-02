@@ -4,7 +4,9 @@ use super::*;
 use crate::kernel::kernel_core::{
     global_timer_wheel, init_timer_wheel, set_current_task_id, TimerTarget, TimerWheel, TIMER_WHEEL,
 };
-use crate::kernel::{EpCtlOp, EpData, EpEvent, EpInst, FLike, Kernel, PipeNode, TaskRunState};
+use crate::kernel::{
+    EpCtlOp, EpData, EpEvent, EpInst, FLike, Kernel, PipeNode, TaskRunState, SIGUSR1,
+};
 
 pub fn run_all() {
     wait_token_captures_current_task();
@@ -17,6 +19,7 @@ pub fn run_all() {
     wait_token_block_current_keeps_placeholder_stack();
     wait_token_current_wake_finishes_without_requeue();
     wait_token_tick_leaves_sleeping_current_parked();
+    wait_token_interruptible_wait_reports_signal_not_event();
     futex_wait_returns_changed_without_queueing();
     futex_wait_propagates_word_read_fault();
     futex_wait_timeout_removes_published_waiter();
@@ -266,6 +269,28 @@ fn wait_token_tick_leaves_sleeping_current_parked() {
     assert_eq!(task.sched_state(), TaskRunState::Sleeping);
     assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(task.id()));
     assert_eq!(kernel.run_queue.pick_next(), Some(peer.id()));
+
+    clear_wait_token_state();
+}
+
+// AGENT: interruptible waits must distinguish pending signals from real event
+// readiness so syscall callers can return EINTR.
+#[cfg_attr(test, test)]
+fn wait_token_interruptible_wait_reports_signal_not_event() {
+    reset_wait_token_state(27);
+
+    let kernel = Box::leak(Box::new(Kernel::new(test_frame_pool(8))));
+    kernel.proc_init();
+    install_qemu_wait_kernel(kernel);
+    let task = kernel.cur_task(0).expect("init task should be current");
+    set_current_task_id(Some(task.id()));
+    let token = WaitToken::current();
+
+    kernel.send_signal_to_task(&task, SIGUSR1 as i32, -1);
+
+    assert_eq!(token.wait_interruptible(None), WaitOutcome::Signal);
+    assert_eq!(token.outcome(), WaitOutcome::Signal);
+    assert_eq!(task.sched_state(), TaskRunState::Running);
 
     clear_wait_token_state();
 }

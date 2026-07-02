@@ -194,7 +194,6 @@ pub(super) fn sys_sigprocmask(
             }
         }
     }
-    kernel.deliver_pending_signals(0);
     Ok(0)
 }
 

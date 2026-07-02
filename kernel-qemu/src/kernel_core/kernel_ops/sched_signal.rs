@@ -9,6 +9,15 @@ impl Kernel {
             .unwrap_or(false)
     }
 
+    // AGENT: put a task back on CPU0's run queue unless its current stack is
+    // still the one executing the temporary spin-based wait bridge.
+    fn make_task_runnable(&self, task: &Arc<Task>) {
+        task.set_sched_state(TaskRunState::Runnable);
+        if !self.is_current_task_on_cpu0(task.id()) {
+            self.run_queue.enqueue(task.id(), task.sched_policy());
+        }
+    }
+
     // AGENT: common QEMU wait-token wake path. Event, futex, epoll, and timer
     // wakeups should make a sleeping task runnable through the run queue instead
     // of unparking a host thread.
@@ -20,10 +29,7 @@ impl Kernel {
             return false;
         }
         if task.sched_state() == TaskRunState::Sleeping {
-            task.set_sched_state(TaskRunState::Runnable);
-            if !self.is_current_task_on_cpu0(task_id) {
-                self.run_queue.enqueue(task.id(), task.sched_policy());
-            }
+            self.make_task_runnable(&task);
         }
         true
     }
@@ -37,6 +43,9 @@ impl Kernel {
             return false;
         };
         if task.done() {
+            return false;
+        }
+        if task.sched_state() == TaskRunState::Stopped {
             return false;
         }
         if task.sched_state() == TaskRunState::Sleeping {
@@ -58,6 +67,9 @@ impl Kernel {
             return false;
         };
         if task.done() {
+            return false;
+        }
+        if task.sched_state() == TaskRunState::Stopped {
             return false;
         }
 
@@ -96,33 +108,74 @@ impl Kernel {
     // AGENT: central signal send path so pending-signal enqueue and scheduler
     // wakeup stay together.
     pub fn send_signal_to_task(&self, task: &Arc<Task>, signo: i32, sender_tid: isize) {
-        task.enqueue_signal(signo, sender_tid);
-        if task.done() {
+        if !task.enqueue_signal(signo, sender_tid) || task.done() {
             return;
         }
-        if task.sched_state() == TaskRunState::Sleeping {
-            self.wake_task_for_wait(task.id());
+        match task.sched_state() {
+            TaskRunState::Sleeping => {
+                self.wake_task_for_wait(task.id());
+            }
+            TaskRunState::Stopped if signo as u32 == SIGCONT || signo as u32 == SIGKILL => {
+                self.make_task_runnable(task);
+            }
+            _ => {}
         }
+    }
+
+    // AGENT: WaitToken interruptible waits query this instead of removing the
+    // signal; actual delivery still belongs to the syscall/schedule boundary.
+    pub(crate) fn task_has_interrupting_signal(&self, task_id: usize) -> bool {
+        self.tasks
+            .find(task_id)
+            .is_some_and(|task| !task.done() && task.has_interrupting_signal())
     }
 
     // AGENT: deliver pending signals at simulator scheduling/syscall boundaries.
     pub fn deliver_pending_signals(&self, cpu: usize) -> usize {
+        self.deliver_pending_signals_inner(cpu, None).0
+    }
+
+    // AGENT: QEMU syscall return uses the live TrapFrame as the interrupted
+    // context, then receives an updated Context only when a handler is entered.
+    pub(crate) fn deliver_pending_signals_from_context(
+        &self,
+        cpu: usize,
+        interrupted: Context,
+    ) -> Option<Context> {
+        self.deliver_pending_signals_inner(cpu, Some(interrupted)).1
+    }
+
+    // AGENT: expose the current simulated user context to the RISC-V ABI layer
+    // for sigreturn, where the restored context is the syscall result.
+    pub(crate) fn current_user_context(&self, cpu: usize) -> Option<Context> {
+        self.cur_task(cpu)
+            .as_ref()
+            .and_then(|task| task_user_context(task))
+    }
+
+    fn deliver_pending_signals_inner(
+        &self,
+        cpu: usize,
+        mut active_context: Option<Context>,
+    ) -> (usize, Option<Context>) {
         if cpu != 0 {
-            return 0;
+            return (0, None);
         }
         let task = match self.cur_task(cpu) {
             Some(task) => task,
-            None => return 0,
+            None => return (0, None),
         };
         let mut delivered = 0usize;
+        let mut updated_context = None;
         while let Some(sig) = task.take_deliverable_signal() {
             delivered += 1;
             match sig.action.handler {
                 SIG_IGN => continue,
                 SIG_DFL => match sig.signo {
                     SIGCHLD => continue,
+                    SIGCONT => continue,
                     SIGSTOP => {
-                        task.set_sched_state(TaskRunState::Sleeping);
+                        task.set_sched_state(TaskRunState::Stopped);
                         self.run_queue.remove(task.id());
                         self.run_queue.clear_current();
                         self.set_cur(cpu, None);
@@ -135,34 +188,28 @@ impl Kernel {
                     }
                 },
                 handler => {
-                    let old_mask = *task.sig_mask.lock().unwrap();
-                    let mut thd = task.thd_ctx.lock().unwrap();
-                    let Some(ctx) = thd.as_mut() else {
-                        task.process
-                            .sig_queue
-                            .lock()
-                            .unwrap()
-                            .push_front((sig.signo as i32, sig.sender_tid));
-                        break;
-                    };
-                    let saved_ctx = ctx.uctx.clone();
-                    ctx.sig_frames.push(SigFrame {
-                        saved_ctx,
-                        saved_mask: old_mask,
-                    });
-                    let next_mask = (old_mask | sig.action.mask | (1u64 << sig.signo))
-                        & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
-                    *task.sig_mask.lock().unwrap() = next_mask;
-                    ctx.smask = next_mask;
-                    ctx.uctx.r[0] = sig.signo as u64;
-                    ctx.uctx.r[1] = sig.sender_tid as u64;
-                    ctx.uctx.r[2] = ctx.sig_frames.last().unwrap().saved_ctx.ip;
-                    ctx.uctx.set_ip(handler as u64);
+                    let interrupted =
+                        match active_context.take().or_else(|| task_user_context(&task)) {
+                            Some(ctx) => ctx,
+                            None => {
+                                task.requeue_signal_front(sig.signo as i32, sig.sender_tid);
+                                break;
+                            }
+                        };
+                    match enter_signal_handler(&task, sig, handler, interrupted) {
+                        Some(ctx) => {
+                            active_context = Some(ctx.clone());
+                            updated_context = Some(ctx);
+                        }
+                        None => {
+                            break;
+                        }
+                    }
                     break;
                 }
             }
         }
-        delivered
+        (delivered, updated_context)
     }
 
     // AGENT: advance global timers after CPU0 has advanced the logical clock.
@@ -292,4 +339,44 @@ impl Kernel {
         _imbalance.sort_by(|a, b| b.1.cmp(&a.1));
         compute_load_balance(&counts, &prios, &blocked)
     }
+}
+
+// AGENT: read the task's saved simulated user context without committing to a
+// signal frame yet; QEMU TrapFrame delivery supplies a fresher context instead.
+fn task_user_context(task: &Task) -> Option<Context> {
+    task.thd_ctx
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|ctx| ctx.uctx.clone())
+}
+
+// AGENT: install one userspace handler frame and return the context that must
+// run next, keeping mask/frame mutation in one place for simulator and TrapFrame delivery.
+fn enter_signal_handler(
+    task: &Task,
+    sig: PendingSignal,
+    handler: usize,
+    interrupted: Context,
+) -> Option<Context> {
+    let old_mask = *task.sig_mask.lock().unwrap();
+    let mut thd = task.thd_ctx.lock().unwrap();
+    let Some(ctx) = thd.as_mut() else {
+        task.requeue_signal_front(sig.signo as i32, sig.sender_tid);
+        return None;
+    };
+    ctx.sig_frames.push(SigFrame {
+        saved_ctx: interrupted.clone(),
+        saved_mask: old_mask,
+    });
+    let next_mask = (old_mask | sig.action.mask | (1u64 << sig.signo))
+        & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
+    *task.sig_mask.lock().unwrap() = next_mask;
+    ctx.smask = next_mask;
+    ctx.uctx = interrupted;
+    ctx.uctx.r[0] = sig.signo as u64;
+    ctx.uctx.r[1] = sig.sender_tid as u64;
+    ctx.uctx.r[2] = ctx.sig_frames.last().unwrap().saved_ctx.ip;
+    ctx.uctx.set_ip(handler as u64);
+    Some(ctx.uctx.clone())
 }

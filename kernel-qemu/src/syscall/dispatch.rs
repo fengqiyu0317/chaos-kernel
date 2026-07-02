@@ -6,7 +6,9 @@ fn returning(result: Result<usize, &'static str>) -> Result<SyscallOutcome, &'st
 }
 
 impl Kernel {
-    pub fn dispatch_syscall(
+    // AGENT: shared syscall decoder; callers choose whether signal delivery is
+    // the simulator Context path or the QEMU TrapFrame path.
+    fn dispatch_syscall_raw(
         &self,
         nr: usize,
         a0: usize,
@@ -15,7 +17,7 @@ impl Kernel {
         a3: usize,
         a4: usize,
         a5: usize,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<SyscallOutcome, &'static str> {
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
         let _ts_enter = CLK.load(Ordering::Relaxed);
         // AGENT: caller_token mirrors the current address-space token for syscall
@@ -27,7 +29,7 @@ impl Kernel {
                 .find_map(|(i, slot)| slot.as_ref().and_then(|t| t.vm_token().ok()))
                 .unwrap_or(0)
         };
-        let result = match nr {
+        match nr {
             SYS_READ => returning(sys_read(self, a0, a1, a2)),
             SYS_WRITE => returning(sys_write(self, a0, a1, a2)),
             SYS_OPEN => returning(sys_open(self, a0, a1, a2)),
@@ -60,8 +62,39 @@ impl Kernel {
             SYS_SIGRETURN => returning(sys_sigreturn(self)),
             SYS_FUTEX => returning(sys_futex(self, a0, a1, a2, a3, a4, a5)),
             _ => Err("enosys"),
-        };
-        match result? {
+        }
+    }
+
+    // AGENT: QEMU trap-frame dispatch writes signal handler state directly into
+    // the active TrapFrame, so it asks for syscall behavior without the legacy
+    // simulator Context delivery step.
+    pub(crate) fn dispatch_syscall_without_signal_delivery(
+        &self,
+        nr: usize,
+        a0: usize,
+        a1: usize,
+        a2: usize,
+        a3: usize,
+        a4: usize,
+        a5: usize,
+    ) -> Result<usize, &'static str> {
+        match self.dispatch_syscall_raw(nr, a0, a1, a2, a3, a4, a5)? {
+            SyscallOutcome::Return(value) => Ok(value),
+            SyscallOutcome::NoReturn => Ok(0),
+        }
+    }
+
+    pub fn dispatch_syscall(
+        &self,
+        nr: usize,
+        a0: usize,
+        a1: usize,
+        a2: usize,
+        a3: usize,
+        a4: usize,
+        a5: usize,
+    ) -> Result<usize, &'static str> {
+        match self.dispatch_syscall_raw(nr, a0, a1, a2, a3, a4, a5)? {
             SyscallOutcome::Return(value) => {
                 self.deliver_pending_signals(0);
                 Ok(value)

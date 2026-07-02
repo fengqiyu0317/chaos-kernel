@@ -468,11 +468,13 @@ pub(crate) fn qemu_wait_timer_tick() {
 pub enum WaitOutcome {
     Event,
     Timeout,
+    Signal,
 }
 
 const WAIT_PENDING: u8 = 0;
 const WAIT_EVENT: u8 = 1;
 const WAIT_TIMEOUT: u8 = 2;
+const WAIT_SIGNAL: u8 = 3;
 
 #[derive(Clone)]
 pub struct WaitToken {
@@ -552,6 +554,27 @@ impl WaitToken {
         }
     }
 
+    // AGENT: mark a wait as interrupted by a pending signal without pretending
+    // the watched futex/epoll/channel event became ready.
+    fn wake_signal(&self) -> bool {
+        if self
+            .state
+            .outcome
+            .compare_exchange(
+                WAIT_PENDING,
+                WAIT_SIGNAL,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.wake_waiter_task();
+            true
+        } else {
+            false
+        }
+    }
+
     // AGENT: wake the task that owns this token through the installed QEMU
     // scheduler backend. In early carrier smoke paths without a backend, the
     // atomic outcome alone lets a spinning waiter observe completion.
@@ -578,16 +601,22 @@ impl WaitToken {
         }
     }
 
-    // AGENT: QEMU has no host Instant/park_timeout. Optional timeouts are routed
-    // through the kernel timer wheel, while indefinite waits block the current
-    // task and spin until the eventual scheduler/context-switch layer resumes it.
-    pub fn wait(&self, timeout: Option<Duration>) -> WaitOutcome {
-        if let Some(timeout) = timeout {
-            return self.wait_with_timer(timeout);
-        }
+    // AGENT: interruptible waits observe pending task signals separately from
+    // resource readiness so syscall code can return EINTR instead of success.
+    fn has_interrupting_signal(&self) -> bool {
+        qemu_wait_kernel()
+            .is_some_and(|kernel| kernel.task_has_interrupting_signal(self.state.task_id))
+    }
 
+    // AGENT: shared wait loop for plain and signal-interruptible waits during
+    // the current spin-based QEMU scheduler bridge.
+    fn wait_inner(&self, interruptible: bool) -> WaitOutcome {
         let mut blocked = false;
         while !self.is_woken() {
+            if interruptible && self.has_interrupting_signal() {
+                self.wake_signal();
+                break;
+            }
             if !blocked {
                 self.block_waiter_task();
                 blocked = true;
@@ -603,21 +632,55 @@ impl WaitToken {
         self.outcome()
     }
 
+    // AGENT: QEMU has no host Instant/park_timeout. Optional timeouts are routed
+    // through the kernel timer wheel, while indefinite waits block the current
+    // task and spin until the eventual scheduler/context-switch layer resumes it.
+    pub fn wait(&self, timeout: Option<Duration>) -> WaitOutcome {
+        if let Some(timeout) = timeout {
+            return self.wait_with_timer(timeout);
+        }
+        self.wait_inner(false)
+    }
+
+    // AGENT: syscall-facing waits use this variant when a pending signal should
+    // interrupt the wait and be delivered at the syscall return boundary.
+    pub fn wait_interruptible(&self, timeout: Option<Duration>) -> WaitOutcome {
+        if let Some(timeout) = timeout {
+            return self.wait_with_timer_inner(timeout, true);
+        }
+        self.wait_inner(true)
+    }
+
     // AGENT: wait using the logical kernel timer wheel instead of host
     // Instant/park_timeout.
     pub fn wait_with_timer(&self, timeout: Duration) -> WaitOutcome {
+        self.wait_with_timer_inner(timeout, false)
+    }
+
+    // AGENT: keep timeout setup common between plain and interruptible waits.
+    fn wait_with_timer_inner(&self, timeout: Duration, interruptible: bool) -> WaitOutcome {
         let ticks = duration_to_ticks(timeout);
         if ticks == 0 {
             self.wake_timeout();
             return self.outcome();
         }
         let deadline = CLK.load(Ordering::Relaxed).saturating_add(ticks);
-        self.wait_until_tick(deadline)
+        self.wait_until_tick_inner(deadline, interruptible)
     }
 
     // AGENT: wait until an absolute logical tick deadline, using the same typed
     // timer target that QEMU timer interrupts will dispatch.
     pub fn wait_until_tick(&self, deadline: usize) -> WaitOutcome {
+        self.wait_until_tick_inner(deadline, false)
+    }
+
+    // AGENT: absolute-deadline variant for syscall waits that can be interrupted
+    // by signals before the timer fires.
+    pub fn wait_until_tick_interruptible(&self, deadline: usize) -> WaitOutcome {
+        self.wait_until_tick_inner(deadline, true)
+    }
+
+    fn wait_until_tick_inner(&self, deadline: usize, interruptible: bool) -> WaitOutcome {
         if self.is_woken() {
             return self.outcome();
         }
@@ -636,8 +699,8 @@ impl WaitToken {
                 },
             )
         };
-        let outcome = self.wait(None);
-        if outcome == WaitOutcome::Event {
+        let outcome = self.wait_inner(interruptible);
+        if outcome != WaitOutcome::Timeout {
             timers.lock().cancel(timer_id);
         }
         outcome
@@ -654,6 +717,7 @@ impl WaitToken {
     pub fn outcome(&self) -> WaitOutcome {
         match self.state.outcome.load(Ordering::Acquire) {
             WAIT_TIMEOUT => WaitOutcome::Timeout,
+            WAIT_SIGNAL => WaitOutcome::Signal,
             _ => WaitOutcome::Event,
         }
     }
@@ -1062,7 +1126,7 @@ impl FutexBucket {
             });
         }
 
-        let outcome = token.wait(timeout);
+        let outcome = token.wait_interruptible(timeout);
         self.finish_wait(&token, outcome)
     }
 
@@ -1073,6 +1137,11 @@ impl FutexBucket {
                 let mut w = self.waiters.lock().unwrap();
                 w.retain(|waiter| !waiter.token.same(token));
                 Err("timeout")
+            }
+            WaitOutcome::Signal => {
+                let mut w = self.waiters.lock().unwrap();
+                w.retain(|waiter| !waiter.token.same(token));
+                Err("eintr")
             }
         }
     }

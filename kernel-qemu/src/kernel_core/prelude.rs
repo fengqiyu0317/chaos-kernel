@@ -146,6 +146,7 @@ pub const SIG_IGN: usize = 1;
 pub const SIGKILL: u32 = 9;
 pub const SIGSTOP: u32 = 19;
 pub const SIGCHLD: u32 = 17;
+pub const SIGCONT: u32 = 18;
 pub const SIGUSR1: u32 = 10;
 pub const SIGUSR2: u32 = 12;
 pub const SIGALRM: u32 = 14;

@@ -27,11 +27,14 @@ pub struct TaskInfo {
     pub tag: String,
 }
 
+// AGENT: distinguish job-control stops from ordinary wait sleeps so signal
+// wakeups do not accidentally continue a stopped task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskRunState {
     Runnable,
     Running,
     Sleeping,
+    Stopped,
     Zombie,
 }
 
@@ -591,17 +594,48 @@ impl Task {
     // AGENT: enqueue a standard pending signal for this process. Scheduler
     // wakeups belong to Kernel::send_signal_to_task, so direct callers cannot
     // accidentally bypass the run-queue transition.
-    pub(crate) fn enqueue_signal(&self, signo: i32, sender_tid: isize) {
+    pub(crate) fn enqueue_signal(&self, signo: i32, sender_tid: isize) -> bool {
         if signo <= 0 || signo as u32 >= NSIG {
-            return;
+            return false;
         }
         let mut sq = self.process.sig_queue.lock().unwrap();
         if sq.iter().any(|(s, _)| *s == signo) {
-            return;
+            return false;
         }
         sq.push_back((signo, sender_tid));
         drop(sq);
         self.process.ev.lock().unwrap().set(EvFlag::RECV_SIG);
+        true
+    }
+
+    // AGENT: put back a signal that could not be delivered because the task
+    // currently has no user context to receive a handler frame.
+    pub(crate) fn requeue_signal_front(&self, signo: i32, sender_tid: isize) {
+        self.process
+            .sig_queue
+            .lock()
+            .unwrap()
+            .push_front((signo, sender_tid));
+        self.process.ev.lock().unwrap().set(EvFlag::RECV_SIG);
+    }
+
+    // AGENT: interruptible waits need a non-destructive pending-signal check;
+    // ignored and default-ignored signals should not break a blocking syscall.
+    pub fn has_interrupting_signal(&self) -> bool {
+        let mask = *self.sig_mask.lock().unwrap();
+        let sq = self.process.sig_queue.lock().unwrap();
+        let sig_state = self.process.sig_state.lock().unwrap();
+        sq.iter().any(|(sig, _)| {
+            if *sig <= 0 || (*sig as u32) >= NSIG {
+                return false;
+            }
+            let signo = *sig as u32;
+            if (mask & (1u64 << signo)) != 0 {
+                return false;
+            }
+            let action = sig_state.get_action(signo);
+            action.handler != SIG_IGN && !(action.handler == SIG_DFL && signo == SIGCHLD)
+        })
     }
 
     // AGENT: ProcessState.sig_queue is the pending source of truth; SigSet
