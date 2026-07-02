@@ -18,7 +18,3 @@ pub enum KernelPageFaultAccess {
     Load,
     Store,
 }
-
-// AGENT: expose the optional runtime ticker guard without making the runtime
-// helper module public.
-pub use self::runtime::KernelRuntimeTicker;
