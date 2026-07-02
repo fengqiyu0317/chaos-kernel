@@ -126,36 +126,35 @@ impl PipeNode {
             }
         }
     }
-    // AGENT: translate epoll interest into EvBus wake bits. ERR/HUP are
-    // reported even when not requested, so every pipe subscription watches
-    // closed/error transitions.
-    fn epoll_bus_mask(&self, interest: u32) -> u32 {
-        let readiness_mask = match self.dir {
+    // AGENT: translate epoll interest into EvBus wake bits. ERR/HUP are always
+    // reported by epoll, so pipe subscriptions always watch closed/error too.
+    fn epoll_wake_mask(&self, interest: u32) -> u32 {
+        let io_mask = match self.dir {
             PipeDir::Rd if interest & (EpEvent::IN | EpEvent::RDNORM) != 0 => EvFlag::READABLE,
             PipeDir::Wr if interest & (EpEvent::OUT | EpEvent::WRNORM) != 0 => EvFlag::WRITABLE,
             _ => 0,
         };
 
-        readiness_mask | EvFlag::CLOSED | EvFlag::ERROR
+        io_mask | EvFlag::CLOSED | EvFlag::ERROR
     }
     // AGENT: connect pipe readiness changes to an epoll instance through the
     // pipe's EvBus, while returning a cancellable subscription id.
     pub fn register_epoll(&self, fd: usize, ep: EpInst, ev: &EpEvent) -> Option<usize> {
-        let mask = self.epoll_bus_mask(ev.events);
-        let (sub_id, already_ready) = {
-            let mut d = self.data.lock().unwrap();
-            let ready = self.readiness_locked(&d);
-            let callback_ep = ep.clone();
-            let sub_id = d.bus.sub(
-                mask,
+        let wake_mask = self.epoll_wake_mask(ev.events);
+        let (sub_id, ready_now) = {
+            let mut pipe = self.data.lock().unwrap();
+            let ready = self.readiness_locked(&pipe);
+            let target_epoll = ep.clone();
+            let sub_id = pipe.bus.sub(
+                wake_mask,
                 Box::new(move |_bus_ev| {
-                    callback_ep.mark_ready(fd);
+                    target_epoll.mark_ready(fd);
                     false
                 }),
             );
-            (sub_id, (ready & mask) != 0)
+            (sub_id, (ready & wake_mask) != 0)
         };
-        if already_ready {
+        if ready_now {
             ep.mark_ready(fd);
         }
         Some(sub_id)
@@ -319,30 +318,6 @@ impl fmt::Debug for FLike {
             FLike::Pipe(_) => write!(f, "P"),
             FLike::Ep(_) => write!(f, "E"),
         }
-    }
-}
-
-pub struct PseudoNode {
-    pub content: Vec<u8>,
-    pub ftype: u8,
-}
-impl PseudoNode {
-    pub fn new(s: &str, ft: u8) -> Self {
-        Self {
-            content: s.as_bytes().to_vec(),
-            ftype: ft,
-        }
-    }
-    pub fn read_at(&self, off: usize, buf: &mut [u8]) -> usize {
-        if off >= self.content.len() {
-            return 0;
-        }
-        let n = min(self.content.len() - off, buf.len());
-        buf[..n].copy_from_slice(&self.content[off..off + n]);
-        n
-    }
-    pub fn write_at(&self, _off: usize, _buf: &[u8]) -> Result<usize, &'static str> {
-        Err("nosup")
     }
 }
 

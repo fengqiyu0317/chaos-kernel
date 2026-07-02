@@ -242,21 +242,19 @@ impl BlockCache {
         Ok(flushed)
     }
 
-    // AGENT: keep the legacy no-device sync entry as a GKL-only barrier; dirty
-    // cache entries must be flushed through flush_dirty() or sync_all_with_device().
+    // AGENT: no-device sync is only a GKL barrier; dirty cache entries must use
+    // flush_dirty() or sync_all_with_device() so writeback has a BlockDevice.
     pub fn sync_all(&self, id: usize) {
-        let _gkl = GKL.guard(id);
+        let _barrier = GKL.guard(id);
     }
 
-    // AGENT: sync with a device performs real dirty writeback instead of
-    // clearing cache state without I/O.
+    // AGENT: device-backed sync is the real dirty writeback path.
     pub fn sync_all_with_device<D: BlockDevice + ?Sized>(
         &self,
         id: usize,
         device: &D,
     ) -> Result<usize, &'static str> {
-        // AGENT: route GKL through the guard so Drop performs owner-checked release.
-        let _gkl = GKL.guard(id);
+        let _barrier = GKL.guard(id);
         self.flush_dirty(device)
     }
 

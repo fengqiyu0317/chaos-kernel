@@ -42,22 +42,27 @@ pub(super) fn sys_epoll_ctl(
     if ev_addr != 0 && !check_access(ev_addr, event_sz) {
         return Err("efault");
     }
+    let updates_interest = matches!(op, EpCtlOp::ADD | EpCtlOp::MOD);
     match op {
-        1 | 3 => {
+        EpCtlOp::ADD | EpCtlOp::MOD => {
             if ev_addr == 0 {
                 return Err("efault");
             }
         }
-        2 => {}
+        EpCtlOp::DEL => {}
         _ => return Err("einval"),
     }
 
     let task = kernel.cur_task(0).ok_or("esrch")?;
-    // AGENT: this only rejects direct self-watch; nested epoll instances would need cycle detection.
     if fd == epfd {
         return Err("einval");
     }
     let file = task.get_file(fd).ok_or("eperm")?;
+    // AGENT: nested epoll needs cycle detection plus a real source wakeup path;
+    // reject ADD/MOD explicitly instead of pretending level polling is enough.
+    if updates_interest && matches!(file, FLike::Ep(_)) {
+        return Err("einval");
+    }
 
     let ev = if ev_addr == 0 {
         EpEvent {
