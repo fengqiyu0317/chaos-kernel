@@ -20,48 +20,66 @@ impl Kernel {
         Ok(())
     }
 
-    // AGENT: keep process-exit teardown centralized and release each thread
-    // context once, even when the exiting task is listed in process.threads.
+    // AGENT: keep process-exit teardown centralized: record death once, drop
+    // thread/process resources, switch away from the dead current task, and
+    // notify the parent with the child process id.
     pub(crate) fn exit_task(&self, cpu: usize, task: &Arc<Task>, reason: ExitReason) {
         let thread_ids = task.process.threads.lock().unwrap().clone();
         if !task.exit_proc(reason) {
             return;
         }
+
         let parent = task.process.parent.lock().unwrap().clone();
-        let process_owner = task.process.clone();
-        let mut released_exiting_task = false;
+        let child_pid = task.process_pid();
+
+        self.release_exit_thread_resources(task, thread_ids);
+        task.release_process_exit_resources(&self.pool);
+        self.tasks.reparent_children_to_init(task);
+        self.switch_away_from_exited_current(cpu, task.id());
+
+        if let Some(parent) = parent {
+            self.send_signal_to_task(&parent, SIGCHLD as i32, child_pid as isize);
+        }
+    }
+
+    // AGENT: release each same-process thread exactly once and detach it from
+    // runnable scheduler state; the requested task is handled even if the thread
+    // list was stale or incomplete.
+    fn release_exit_thread_resources(&self, task: &Arc<Task>, thread_ids: Vec<usize>) {
+        let process = task.process.clone();
+        let mut released_requested_task = false;
+
         for tid in thread_ids {
             if let Some(thread) = self.tasks.find(tid) {
-                if !Arc::ptr_eq(&thread.process, &process_owner) {
+                if !Arc::ptr_eq(&thread.process, &process) {
                     continue;
                 }
                 if thread.id() == task.id() {
-                    released_exiting_task = true;
+                    released_requested_task = true;
                 }
                 thread.release_thread_exit_resources(&self.pool);
                 self.run_queue.remove(thread.id());
             }
         }
-        if !released_exiting_task {
-            task.release_thread_exit_resources(&self.pool);
-        }
-        let _released_pages = task.release_process_exit_resources(&self.pool);
-        self.tasks.reparent_children_to_init(task);
-        self.run_queue.remove(task.id());
 
+        if !released_requested_task {
+            task.release_thread_exit_resources(&self.pool);
+            self.run_queue.remove(task.id());
+        }
+    }
+
+    // AGENT: current QEMU scheduling is CPU0-only; this keeps that policy local
+    // while making the exit path read as a plain teardown sequence.
+    fn switch_away_from_exited_current(&self, cpu: usize, task_id: usize) {
         if cpu == 0
             && self
                 .cur_task(cpu)
                 .as_ref()
-                .is_some_and(|current| current.id() == task.id())
+                .is_some_and(|current| current.id() == task_id)
         {
             self.run_queue.clear_current();
             self.set_cur(cpu, None);
             self.schedule_next_runnable(cpu);
-        }
-
-        if let Some(parent) = parent {
-            self.send_signal_to_task(&parent, SIGCHLD as i32, task.id() as isize);
         }
     }
 
