@@ -5,6 +5,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::arch::global_asm;
 use core::hint::spin_loop;
 use core::panic::PanicInfo;
@@ -47,6 +48,11 @@ const QEMU_VIRT_RAM_END: usize = 0x8800_0000;
 // its PgFrame-backed root and intermediate table pages are never returned while
 // satp still points at them.
 static KERNEL_PAGE_TABLE: IrqOnceCell<kernel::PageTable> = IrqOnceCell::new();
+
+// AGENT: first-stage root block image. Keep this empty until a real RISC-V init
+// ELF or initramfs is produced; switching to include_bytes! later only changes
+// this constant.
+const ROOT_INIT_IMAGE: &[u8] = &[];
 
 // AGENT: First Rust entry point for the M9 QEMU carrier layer.
 #[no_mangle]
@@ -119,7 +125,15 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
 fn init_qemu_kernel_backend() -> &'static kernel::Kernel {
     let frame_pool = init_qemu_frame_pool();
     install_kernel_page_table(&frame_pool);
-    let kernel = Box::leak(Box::new(kernel::Kernel::new(frame_pool)));
+    let root_block = Arc::new(kernel::RamBlockDevice::from_bytes(ROOT_INIT_IMAGE));
+    let kernel = Box::leak(Box::new(kernel::Kernel::new_with_block_device(
+        frame_pool, root_block,
+    )));
+    match kernel.install_root_init_from_block_device() {
+        Ok(true) => println!("[kernel-qemu] installed /bin/init from root block device"),
+        Ok(false) => println!("[kernel-qemu] root block device has no init image"),
+        Err(err) => println!("[kernel-qemu] failed to install /bin/init: {}", err),
+    }
     kernel.proc_init();
     kernel::install_qemu_wait_kernel(kernel);
     let current = kernel.cur_task(0).map(|task| task.id()).unwrap_or(0);
