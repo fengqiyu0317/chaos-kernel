@@ -144,8 +144,8 @@ impl BlockCache {
         key.hash() % self.width
     }
 
-    // AGENT: read cached blocks through an explicit block device; miss I/O is
-    // outside the chain SpinGuard and insertion double-checks for races.
+    // AGENT: read cached blocks without the task-owned Spin guard so boot-time
+    // block reads work before the scheduler has installed a current task.
     pub fn read_block_cached<D: BlockDevice + ?Sized>(
         &self,
         device: &D,
@@ -157,9 +157,8 @@ impl BlockCache {
         let ch = &self.chains[ci];
 
         {
-            let _guard = ch.lk.guard();
-            let e = ch.items.lock().unwrap();
-            if let Some(slot) = e.iter().find(|slot| slot.key == key) {
+            let items = ch.items.lock().unwrap();
+            if let Some(slot) = items.iter().find(|slot| slot.key == key) {
                 return Ok(slot.payload.clone());
             }
         }
@@ -168,21 +167,18 @@ impl BlockCache {
         if block_data.len() != BLOCK_CACHE_BLOCK_SIZE {
             return Err("eio");
         }
-        let result = block_data.clone();
-        let slot = CacheSlot {
-            key,
-            payload: block_data,
-            modified: false,
-        };
         {
-            let _guard = ch.lk.guard();
             let mut items = ch.items.lock().unwrap();
             if let Some(slot) = items.iter().find(|slot| slot.key == key) {
                 return Ok(slot.payload.clone());
             }
-            items.push(slot);
+            items.push(CacheSlot {
+                key,
+                payload: block_data.clone(),
+                modified: false,
+            });
         }
-        Ok(result)
+        Ok(block_data)
     }
 
     // AGENT: update or insert one complete cached block and mark it dirty for a
