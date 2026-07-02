@@ -111,33 +111,23 @@ impl PipeNode {
             }
         }
     }
-    // AGENT: translate supported epoll interest into the EvBus bits that should
-    // wake this endpoint. ERROR/HUP-style states are reported regardless of the
-    // caller interest mask, so every pipe subscription watches them.
-    fn epoll_bus_mask(&self, events: u32) -> u32 {
-        let mut mask = EvFlag::CLOSED | EvFlag::ERROR;
-        match self.dir {
-            PipeDir::Rd => {
-                if events & (EpEvent::IN | EpEvent::RDNORM) != 0 {
-                    mask |= EvFlag::READABLE;
-                }
-            }
-            PipeDir::Wr => {
-                if events & (EpEvent::OUT | EpEvent::WRNORM) != 0 {
-                    mask |= EvFlag::WRITABLE;
-                }
-            }
-        }
-        mask
+    // AGENT: translate epoll interest into EvBus wake bits. ERR/HUP are
+    // reported even when not requested, so every pipe subscription watches
+    // closed/error transitions.
+    fn epoll_bus_mask(&self, interest: u32) -> u32 {
+        let readiness_mask = match self.dir {
+            PipeDir::Rd if interest & (EpEvent::IN | EpEvent::RDNORM) != 0 => EvFlag::READABLE,
+            PipeDir::Wr if interest & (EpEvent::OUT | EpEvent::WRNORM) != 0 => EvFlag::WRITABLE,
+            _ => 0,
+        };
+
+        readiness_mask | EvFlag::CLOSED | EvFlag::ERROR
     }
     // AGENT: connect pipe readiness changes to an epoll instance through the
     // pipe's EvBus, while returning a cancellable subscription id.
     pub fn register_epoll(&self, fd: usize, ep: EpInst, ev: &EpEvent) -> Option<usize> {
         let mask = self.epoll_bus_mask(ev.events);
-        if mask == 0 {
-            return None;
-        }
-        let (sub_id, notify_now) = {
+        let (sub_id, already_ready) = {
             let mut d = self.data.lock().unwrap();
             let ready = self.readiness_locked(&d);
             let callback_ep = ep.clone();
@@ -150,7 +140,7 @@ impl PipeNode {
             );
             (sub_id, (ready & mask) != 0)
         };
-        if notify_now {
+        if already_ready {
             ep.mark_ready(fd);
         }
         Some(sub_id)
