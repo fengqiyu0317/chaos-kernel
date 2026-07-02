@@ -36,14 +36,6 @@ pub enum SectionTag {
     Timers = 6,
 }
 
-// AGENT: restore only to a new pid in the first version; original pid reuse is
-// a later namespace/process-table feature.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u16)]
-pub enum RestorePolicy {
-    NewPid = 1,
-}
-
 // AGENT: store only safe states that do not require serializing a kernel stack
 // or a wait-queue position.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,7 +77,6 @@ pub struct CheckpointHeader {
     pub version: u16,
     pub arch: u16,
     pub page_size: u32,
-    pub flags: u64,
     pub section_count: u32,
 }
 
@@ -93,13 +84,9 @@ pub struct CheckpointHeader {
 // frame, including the first-version one-thread restriction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SavedProcess {
-    pub original_pid: u64,
     pub brk: u64,
-    pub stack_base: u64,
-    pub stack_len: u64,
     pub thread_count: u32,
     pub run_state: SavedRunState,
-    pub restore_policy: RestorePolicy,
 }
 
 // AGENT: architecture return frame captured at a syscall safe point after the
@@ -135,18 +122,15 @@ pub struct SavedFdEntry {
     pub cloexec: bool,
     pub status_flags: u32,
     pub kind: SavedFdKind,
-    pub object_id: u64,
     pub offset: u64,
 }
 
-// AGENT: minimal timer state for deadlines that can be restarted after restore,
-// including the task-bound target needed to reattach the timer to the new pid.
+// AGENT: minimal timer state for deadlines that can be restarted against the
+// freshly restored task without carrying stale live timer or task ids.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SavedTimer {
-    pub timer_id: u64,
     pub clock_id: u32,
     pub target_kind: SavedTimerTargetKind,
-    pub target_task_id: u64,
     pub signo: i32,
     pub sender_tid: i64,
     pub deadline_ticks: u64,
@@ -180,19 +164,6 @@ impl TryFrom<u16> for SectionTag {
             5 => Ok(Self::Fds),
             6 => Ok(Self::Timers),
             _ => Err(CheckpointError::BadSection),
-        }
-    }
-}
-
-// AGENT: convert serialized restore policy fields into checked enums.
-impl TryFrom<u16> for RestorePolicy {
-    type Error = CheckpointError;
-
-    // AGENT: accept only the first-version new-pid restore policy.
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::NewPid),
-            _ => Err(CheckpointError::InvalidEnum),
         }
     }
 }

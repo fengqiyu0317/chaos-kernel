@@ -14,9 +14,9 @@ mod types;
 mod validate;
 
 pub use self::types::{
-    CheckpointError, CheckpointHeader, CheckpointImage, RestorePolicy, SavedFdEntry, SavedFdKind,
-    SavedPage, SavedProcess, SavedRunState, SavedTimer, SavedTimerTargetKind, SavedTrapFrame,
-    SavedVma, SectionTag,
+    CheckpointError, CheckpointHeader, CheckpointImage, SavedFdEntry, SavedFdKind, SavedPage,
+    SavedProcess, SavedRunState, SavedTimer, SavedTimerTargetKind, SavedTrapFrame, SavedVma,
+    SectionTag,
 };
 
 // AGENT: fixed checkpoint image identity for guest-kernel process snapshots.
@@ -41,7 +41,6 @@ impl CheckpointImage {
                 version: CHECKPOINT_VERSION,
                 arch: CHECKPOINT_ARCH_RISCV64,
                 page_size: CHECKPOINT_PAGE_SIZE,
-                flags: 0,
                 section_count: 0,
             },
             process: None,

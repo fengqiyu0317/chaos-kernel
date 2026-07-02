@@ -124,7 +124,6 @@ fn checkpoint_round_trip_restores_task_timer(kernel: &Kernel) {
         image.timers[0].target_kind,
         SavedTimerTargetKind::SignalTask
     );
-    assert_eq!(image.timers[0].target_task_id, current.id() as u64);
     assert_eq!(image.timers[0].deadline_ticks, deadline as u64);
 
     assert!(kernel.timers.lock().cancel(original_timer_id));
@@ -142,7 +141,10 @@ fn checkpoint_round_trip_restores_task_timer(kernel: &Kernel) {
         .snapshot_checkpoint_timers(restored_id)
         .expect("restored timer should be serializable");
     assert_eq!(restored_timers.len(), 1);
-    assert_eq!(restored_timers[0].target_task_id, restored_id as u64);
+    assert_eq!(
+        restored_timers[0].target_kind,
+        SavedTimerTargetKind::SignalTask
+    );
 
     while CLK.load(Ordering::Relaxed) < deadline {
         kernel.schedule_tick(0);

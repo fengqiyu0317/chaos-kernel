@@ -291,7 +291,7 @@ fn checkpoint_stdio_handle(kind: SavedFdKind, status_flags: u32) -> Result<FHand
         SavedFdKind::Stderr => "/dev/stderr",
         _ => return Err("enotsup"),
     };
-    Ok(FHandle::new(path, opt, false, false))
+    Ok(FHandle::new(path, opt))
 }
 
 struct InitialUserImage {
@@ -399,8 +399,6 @@ fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str> {
             ap: false,
             nb: false,
         },
-        false,
-        false,
     );
     let fd1 = FHandle::new(
         "/dev/tty",
@@ -410,10 +408,8 @@ fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str> {
             ap: false,
             nb: false,
         },
-        false,
-        false,
     );
-    let fd2 = fd1.dup(false);
+    let fd2 = fd1.dup();
     let stdin = task.add_file(FLike::File(fd0))?;
     let stdout = task.add_file(FLike::File(fd1))?;
     let stderr = task.add_file(FLike::File(fd2))?;
@@ -631,7 +627,6 @@ impl Task {
                 cloexec: entry.is_cloexec(),
                 status_flags: u32::try_from(entry.status_flags_bits()).map_err(|_| "einval")?,
                 kind,
-                object_id: description_id as u64,
                 offset: handle.offset(),
             });
         }

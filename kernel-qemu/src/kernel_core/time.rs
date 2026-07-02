@@ -105,14 +105,14 @@ impl TimerEntry {
             return Ok(None);
         }
 
-        let (target_kind, target_task_id, signo, sender_tid) = match &self.target {
+        let (target_kind, signo, sender_tid) = match &self.target {
             TimerTarget::Noop => return Ok(None),
             TimerTarget::WakeToken { token } if token.task_id() == task_id => {
                 return Err("enotsup")
             }
             TimerTarget::WakeToken { .. } => return Ok(None),
             TimerTarget::WakeTask { task_id: target } if *target == task_id => {
-                (SavedTimerTargetKind::WakeTask, *target, 0, 0)
+                (SavedTimerTargetKind::WakeTask, 0, 0)
             }
             TimerTarget::WakeTask { .. } => return Ok(None),
             TimerTarget::SignalTask {
@@ -121,7 +121,6 @@ impl TimerEntry {
                 sender_tid,
             } if *target == task_id => (
                 SavedTimerTargetKind::SignalTask,
-                *target,
                 *signo,
                 i64::try_from(*sender_tid).map_err(|_| "einval")?,
             ),
@@ -129,10 +128,8 @@ impl TimerEntry {
         };
 
         Ok(Some(SavedTimer {
-            timer_id: u64::try_from(self.id).map_err(|_| "einval")?,
             clock_id: CHECKPOINT_TIMER_CLOCK_LOGICAL,
             target_kind,
-            target_task_id: u64::try_from(target_task_id).map_err(|_| "einval")?,
             signo,
             sender_tid,
             deadline_ticks: u64::try_from(self.deadline).map_err(|_| "einval")?,

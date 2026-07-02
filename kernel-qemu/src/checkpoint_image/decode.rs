@@ -4,9 +4,9 @@ use core::convert::TryFrom;
 use super::codec::{checked_u32_to_usize, checked_u64_to_usize, Cursor};
 use super::validate::{validate_first_version, validate_header_static};
 use super::{
-    CheckpointError, CheckpointHeader, CheckpointImage, RestorePolicy, SavedFdEntry, SavedFdKind,
-    SavedPage, SavedProcess, SavedRunState, SavedTimer, SavedTimerTargetKind, SavedTrapFrame,
-    SavedVma, SectionTag, IMAGE_HEADER_LEN,
+    CheckpointError, CheckpointHeader, CheckpointImage, SavedFdEntry, SavedFdKind, SavedPage,
+    SavedProcess, SavedRunState, SavedTimer, SavedTimerTargetKind, SavedTrapFrame, SavedVma,
+    SectionTag, IMAGE_HEADER_LEN,
 };
 
 // AGENT: decode bytes and immediately apply the first-version validation
@@ -81,13 +81,15 @@ fn decode_header(cursor: &mut Cursor<'_>) -> Result<CheckpointHeader, Checkpoint
     let flags = cursor.read_u64()?;
     let section_count = cursor.read_u32()?;
     let _reserved = cursor.read_u32()?;
+    if flags != 0 {
+        return Err(CheckpointError::UnsupportedState);
+    }
     debug_assert_eq!(IMAGE_HEADER_LEN, cursor.pos);
     Ok(CheckpointHeader {
         magic,
         version,
         arch,
         page_size,
-        flags,
         section_count,
     })
 }
@@ -96,13 +98,9 @@ fn decode_header(cursor: &mut Cursor<'_>) -> Result<CheckpointHeader, Checkpoint
 fn decode_process(bytes: &[u8]) -> Result<SavedProcess, CheckpointError> {
     let mut cursor = Cursor::new(bytes);
     let process = SavedProcess {
-        original_pid: cursor.read_u64()?,
         brk: cursor.read_u64()?,
-        stack_base: cursor.read_u64()?,
-        stack_len: cursor.read_u64()?,
         thread_count: cursor.read_u32()?,
         run_state: SavedRunState::try_from(cursor.read_u16()?)?,
-        restore_policy: RestorePolicy::try_from(cursor.read_u16()?)?,
     };
     cursor.expect_end()?;
     Ok(process)
@@ -180,7 +178,6 @@ fn decode_fds(bytes: &[u8]) -> Result<Vec<SavedFdEntry>, CheckpointError> {
             cloexec,
             status_flags,
             kind,
-            object_id: cursor.read_u64()?,
             offset: cursor.read_u64()?,
         });
     }
@@ -194,19 +191,15 @@ fn decode_timers(bytes: &[u8]) -> Result<Vec<SavedTimer>, CheckpointError> {
     let count = checked_u32_to_usize(cursor.read_u32()?)?;
     let mut timers = Vec::new();
     for _ in 0..count {
-        let timer_id = cursor.read_u64()?;
         let clock_id = cursor.read_u32()?;
         let target_kind = SavedTimerTargetKind::try_from(cursor.read_u16()?)?;
         let _reserved = cursor.read_u16()?;
-        let target_task_id = cursor.read_u64()?;
         let signo = cursor.read_u32()? as i32;
         let _reserved = cursor.read_u32()?;
         let sender_tid = cursor.read_u64()? as i64;
         timers.push(SavedTimer {
-            timer_id,
             clock_id,
             target_kind,
-            target_task_id,
             signo,
             sender_tid,
             deadline_ticks: cursor.read_u64()?,

@@ -15,27 +15,17 @@ impl Kernel {
             return Err("enotsup");
         }
 
-        let (brk, vmas, pages, stack_base, stack_len) = {
+        let (brk, vmas, pages) = {
             let addr_space = task.process.addr_space.lock().unwrap();
             let (vmas, pages) = addr_space.snapshot_checkpoint_memory()?;
-            let stack = vmas
-                .iter()
-                .find(|vma| vma.flags & VM_GROWSDOWN != 0)
-                .ok_or("enotsup")?;
-            let stack_base = stack.start;
-            let stack_len = stack.len;
-            (addr_space.vm_map.brk, vmas, pages, stack_base, stack_len)
+            (addr_space.vm_map.brk, vmas, pages)
         };
 
         let mut image = CheckpointImage::new_riscv64();
         image.process = Some(SavedProcess {
-            original_pid: task.process_pid() as u64,
             brk: brk as u64,
-            stack_base,
-            stack_len,
             thread_count,
             run_state: SavedRunState::SyscallSafePoint,
-            restore_policy: RestorePolicy::NewPid,
         });
         image.trap_frame = Some(trap_frame);
         image.vmas = vmas;

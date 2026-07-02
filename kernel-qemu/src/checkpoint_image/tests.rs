@@ -1,6 +1,7 @@
 use alloc::vec;
 
 use super::*;
+use crate::kernel::VM_GROWSDOWN;
 
 // AGENT: build the smallest valid first-version checkpoint image used by
 // the local round-trip and validation tests.
@@ -11,13 +12,9 @@ fn sample_image() -> CheckpointImage {
 
     let mut image = CheckpointImage::new_riscv64();
     image.process = Some(SavedProcess {
-        original_pid: 42,
         brk: 0x4000_0000,
-        stack_base: 0x7fff_0000,
-        stack_len: CHECKPOINT_PAGE_SIZE as u64,
         thread_count: 1,
         run_state: SavedRunState::SyscallSafePoint,
-        restore_policy: RestorePolicy::NewPid,
     });
     image.trap_frame = Some(SavedTrapFrame {
         regs,
@@ -27,7 +24,7 @@ fn sample_image() -> CheckpointImage {
     image.vmas.push(SavedVma {
         start: 0x1000_0000,
         len: CHECKPOINT_PAGE_SIZE as u64,
-        flags: 0b111,
+        flags: 0b111 | VM_GROWSDOWN,
     });
     image.pages.push(SavedPage {
         vaddr: 0x1000_0000,
@@ -39,14 +36,11 @@ fn sample_image() -> CheckpointImage {
         cloexec: false,
         status_flags: 0,
         kind: SavedFdKind::Stdout,
-        object_id: 1,
         offset: 7,
     });
     image.timers.push(SavedTimer {
-        timer_id: 9,
         clock_id: 0,
         target_kind: SavedTimerTargetKind::SignalTask,
-        target_task_id: 42,
         signo: 14,
         sender_tid: -1,
         deadline_ticks: 21,
@@ -114,7 +108,6 @@ fn validation_rejects_inconsistent_open_description() {
         cloexec: false,
         status_flags: 0,
         kind: SavedFdKind::Stdout,
-        object_id: 1,
         offset: 8,
     });
     assert_eq!(

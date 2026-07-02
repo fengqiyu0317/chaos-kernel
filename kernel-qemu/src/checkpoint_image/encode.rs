@@ -60,7 +60,7 @@ pub(super) fn encode_header(header: &CheckpointHeader, out: &mut Vec<u8>) {
     put_u16(out, header.version);
     put_u16(out, header.arch);
     put_u32(out, header.page_size);
-    put_u64(out, header.flags);
+    put_u64(out, 0);
     put_u32(out, header.section_count);
     put_u32(out, 0);
     debug_assert_eq!(IMAGE_HEADER_LEN, out.len());
@@ -84,13 +84,9 @@ fn encode_section_header(
 // AGENT: serialize process metadata.
 fn encode_process(process: &SavedProcess) -> Vec<u8> {
     let mut out = Vec::new();
-    put_u64(&mut out, process.original_pid);
     put_u64(&mut out, process.brk);
-    put_u64(&mut out, process.stack_base);
-    put_u64(&mut out, process.stack_len);
     put_u32(&mut out, process.thread_count);
     put_u16(&mut out, process.run_state as u16);
-    put_u16(&mut out, process.restore_policy as u16);
     out
 }
 
@@ -141,7 +137,6 @@ fn encode_fds(fds: &[SavedFdEntry]) -> Result<Vec<u8>, CheckpointError> {
         put_u32(&mut out, fd.status_flags);
         put_u16(&mut out, fd.kind as u16);
         put_u16(&mut out, 0);
-        put_u64(&mut out, fd.object_id);
         put_u64(&mut out, fd.offset);
     }
     Ok(out)
@@ -152,11 +147,9 @@ fn encode_timers(timers: &[SavedTimer]) -> Result<Vec<u8>, CheckpointError> {
     let mut out = Vec::new();
     put_u32(&mut out, checked_usize_to_u32(timers.len())?);
     for timer in timers {
-        put_u64(&mut out, timer.timer_id);
         put_u32(&mut out, timer.clock_id);
         put_u16(&mut out, timer.target_kind as u16);
         put_u16(&mut out, 0);
-        put_u64(&mut out, timer.target_task_id);
         put_u32(&mut out, timer.signo as u32);
         put_u32(&mut out, 0);
         put_u64(&mut out, timer.sender_tid as u64);

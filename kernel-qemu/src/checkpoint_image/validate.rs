@@ -1,8 +1,9 @@
 use super::{
-    CheckpointError, CheckpointHeader, CheckpointImage, RestorePolicy, SavedFdEntry, SavedFdKind,
-    SavedRunState, SavedTimer, SavedTimerTargetKind, CHECKPOINT_ARCH_RISCV64, CHECKPOINT_MAGIC,
+    CheckpointError, CheckpointHeader, CheckpointImage, SavedFdEntry, SavedFdKind, SavedRunState,
+    SavedTimer, SavedTimerTargetKind, SavedVma, CHECKPOINT_ARCH_RISCV64, CHECKPOINT_MAGIC,
     CHECKPOINT_PAGE_SIZE, CHECKPOINT_VERSION,
 };
+use crate::kernel::VM_GROWSDOWN;
 
 // AGENT: enforce the M10 first-version scope before checkpoint bytes are
 // emitted or accepted by restore.
@@ -15,14 +16,14 @@ pub(super) fn validate_first_version(image: &CheckpointImage) -> Result<(), Chec
     if image.trap_frame.is_none() {
         return Err(CheckpointError::MissingTrapFrame);
     }
-    if process.thread_count != 1 || process.restore_policy != RestorePolicy::NewPid {
+    if process.thread_count != 1 {
         return Err(CheckpointError::UnsupportedState);
     }
     match process.run_state {
         SavedRunState::SyscallSafePoint | SavedRunState::ExplicitQuiescentPoint => {}
         SavedRunState::BlockedWait => return Err(CheckpointError::UnsupportedState),
     }
-    validate_region(process.stack_base, process.stack_len)?;
+    validate_stack_vma(&image.vmas)?;
     for vma in &image.vmas {
         validate_region(vma.start, vma.len)?;
     }
@@ -81,7 +82,6 @@ fn validate_open_descriptions(fds: &[SavedFdEntry]) -> Result<(), CheckpointErro
             if fds[i].description_id == fds[j].description_id
                 && (fds[i].status_flags != fds[j].status_flags
                     || fds[i].kind != fds[j].kind
-                    || fds[i].object_id != fds[j].object_id
                     || fds[i].offset != fds[j].offset)
             {
                 return Err(CheckpointError::InconsistentOpenDescription);
@@ -98,9 +98,6 @@ fn validate_timer_scope(timers: &[SavedTimer]) -> Result<(), CheckpointError> {
         if timer.clock_id != 0 {
             return Err(CheckpointError::UnsupportedState);
         }
-        if timer.target_task_id == 0 {
-            return Err(CheckpointError::InvalidEnum);
-        }
         match timer.target_kind {
             SavedTimerTargetKind::WakeTask => {
                 if timer.signo != 0 || timer.sender_tid != 0 {
@@ -115,6 +112,16 @@ fn validate_timer_scope(timers: &[SavedTimer]) -> Result<(), CheckpointError> {
         }
     }
     Ok(())
+}
+
+// AGENT: stack identity is already part of the VMA list; require a grow-down
+// VMA without duplicating its base and length in SavedProcess.
+fn validate_stack_vma(vmas: &[SavedVma]) -> Result<(), CheckpointError> {
+    if vmas.iter().any(|vma| vma.flags & VM_GROWSDOWN != 0) {
+        Ok(())
+    } else {
+        Err(CheckpointError::UnsupportedState)
+    }
 }
 
 // AGENT: require page-granular mappings in the first version.
