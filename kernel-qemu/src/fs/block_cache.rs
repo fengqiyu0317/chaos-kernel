@@ -110,14 +110,16 @@ pub struct CacheSlot {
     pub payload: Vec<u8>,
     pub modified: bool,
 }
+
+// AGENT: QEMU block-cache chains are usable during early boot, before the
+// scheduler has installed a current task. Keep their locking independent from
+// task-owned Spin and protect the slots with this mutex only.
 pub struct CacheChain {
-    pub lk: Spin,
     pub items: Mutex<Vec<CacheSlot>>,
 }
 impl CacheChain {
     pub fn new() -> Self {
         Self {
-            lk: Spin::new(),
             items: Mutex::new(Vec::new()),
         }
     }
@@ -128,7 +130,8 @@ pub struct BlockCache {
     pub width: usize,
 }
 impl BlockCache {
-    // AGENT: BlockCache chains use SpinGuard for short metadata critical sections.
+    // AGENT: BlockCache chains are sharded by block key and each chain owns its
+    // slot mutex, so cache operations also work before current-task setup.
     pub fn new(w: usize) -> Self {
         let mut c = Vec::with_capacity(w);
         for _ in 0..w {
@@ -144,8 +147,8 @@ impl BlockCache {
         key.hash() % self.width
     }
 
-    // AGENT: read cached blocks without the task-owned Spin guard so boot-time
-    // block reads work before the scheduler has installed a current task.
+    // AGENT: read cached blocks with only the chain mutex so boot-time block
+    // reads work before the scheduler has installed a current task.
     pub fn read_block_cached<D: BlockDevice + ?Sized>(
         &self,
         device: &D,
@@ -182,7 +185,8 @@ impl BlockCache {
     }
 
     // AGENT: update or insert one complete cached block and mark it dirty for a
-    // later flush through the block-device interface.
+    // later flush through the block-device interface; this path must be usable
+    // before current-task setup just like read_block_cached().
     pub fn write_block_cached(
         &self,
         dev: usize,
@@ -195,11 +199,9 @@ impl BlockCache {
         let key = BlockKey::new(dev, block);
         let ci = self.idx(key);
         let ch = &self.chains[ci];
-        let _guard = ch.lk.guard();
         let mut items = ch.items.lock().unwrap();
         if let Some(slot) = items.iter_mut().find(|slot| slot.key == key) {
-            slot.payload.clear();
-            slot.payload.extend_from_slice(data);
+            slot.payload = data.to_vec();
             slot.modified = true;
             return Ok(());
         }
@@ -211,14 +213,13 @@ impl BlockCache {
         Ok(())
     }
 
-    // AGENT: write dirty blocks outside cache-chain SpinGuards, then clear the
-    // dirty bit only if the cached payload did not change during writeback.
+    // AGENT: clone dirty payloads under the chain mutex, write them outside the
+    // mutex, then clear the dirty bit only if the cached payload is unchanged.
     pub fn flush_dirty<D: BlockDevice + ?Sized>(&self, device: &D) -> Result<usize, &'static str> {
         let mut flushed = 0usize;
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
             let dirty = {
-                let _guard = ch.lk.guard();
                 let items = ch.items.lock().unwrap();
                 items
                     .iter()
@@ -229,7 +230,6 @@ impl BlockCache {
 
             for (key, payload) in dirty {
                 device.write_block(key.dev, key.block, &payload)?;
-                let _guard = ch.lk.guard();
                 let mut items = ch.items.lock().unwrap();
                 if let Some(slot) = items.iter_mut().find(|slot| slot.key == key) {
                     if slot.modified && slot.payload == payload {
@@ -260,43 +260,31 @@ impl BlockCache {
         self.flush_dirty(device)
     }
 
-    // AGENT: invalidate uses SpinGuard so early exits cannot leak the chain lock.
+    // AGENT: invalidate removes matching cached copies under the chain mutex.
     pub fn invalidate_block(&self, dev: usize, block: usize) {
         let key = BlockKey::new(dev, block);
         let ci = self.idx(key);
         let ch = &self.chains[ci];
-        let _guard = ch.lk.guard();
-        {
-            let mut items = ch.items.lock().unwrap();
-            let mut idx = 0;
-            while idx < items.len() {
-                if items[idx].key == key {
-                    items.remove(idx);
-                } else {
-                    idx += 1;
-                }
-            }
-        }
+        let mut items = ch.items.lock().unwrap();
+        items.retain(|slot| slot.key != key);
     }
 
-    // AGENT: total_entries observes each chain under SpinGuard.
+    // AGENT: total_entries observes each chain under its slot mutex.
     pub fn total_entries(&self) -> usize {
         let mut total = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
-            let _guard = ch.lk.guard();
             let n = ch.items.lock().unwrap().len();
             total += n;
         }
         total
     }
 
-    // AGENT: dirty_count observes each chain under SpinGuard.
+    // AGENT: dirty_count observes each chain under its slot mutex.
     pub fn dirty_count(&self) -> usize {
         let mut count = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
-            let _guard = ch.lk.guard();
             let items = ch.items.lock().unwrap();
             for slot in items.iter() {
                 if slot.modified {
@@ -308,22 +296,19 @@ impl BlockCache {
         count
     }
 
-    // AGENT: eviction holds each chain SpinGuard only while filtering metadata.
+    // AGENT: eviction filters each chain under its slot mutex.
     pub fn evict_cold(&self, max_age: usize) -> usize {
         let now = CLK.load(Ordering::Relaxed);
         let mut evicted = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
-            let _guard = ch.lk.guard();
-            {
-                let mut items = ch.items.lock().unwrap();
-                let before = items.len();
-                items.retain(|slot| {
-                    let age = now.wrapping_sub(slot.key.block.wrapping_mul(3) ^ slot.key.dev);
-                    slot.modified || age < max_age
-                });
-                evicted += before - items.len();
-            }
+            let mut items = ch.items.lock().unwrap();
+            let before = items.len();
+            items.retain(|slot| {
+                let age = now.wrapping_sub(slot.key.block.wrapping_mul(3) ^ slot.key.dev);
+                slot.modified || age < max_age
+            });
+            evicted += before - items.len();
         }
         evicted
     }
