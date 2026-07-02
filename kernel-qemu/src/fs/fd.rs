@@ -71,6 +71,7 @@ impl OpenFileDescription {
         self.file.write(buf)
     }
 
+    // AGENT: return explicit poll status so epoll can preserve closed peer state.
     pub fn poll(&self) -> PollStatus {
         self.file.poll()
     }
@@ -168,6 +169,7 @@ impl FdEntry {
         self.desc.write(buf)
     }
 
+    // AGENT: forward explicit poll status through the descriptor entry layer.
     pub fn poll(&self) -> PollStatus {
         self.desc.poll()
     }
@@ -474,6 +476,7 @@ impl FHandle {
         d.off += 1;
         Ok(format!("entry_{}", off))
     }
+    // AGENT: regular files do not carry pipe-style closed-peer state.
     pub fn poll_status(&self) -> PollStatus {
         let desc = self.desc.read().unwrap();
         let readable = desc.opt.rd;

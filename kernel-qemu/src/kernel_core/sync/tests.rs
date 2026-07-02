@@ -5,7 +5,8 @@ use crate::kernel::kernel_core::{
     global_timer_wheel, init_timer_wheel, set_current_task_id, TimerTarget, TimerWheel, TIMER_WHEEL,
 };
 use crate::kernel::{
-    EpCtlOp, EpData, EpEvent, EpInst, FLike, Kernel, PipeNode, TaskRunState, SIGUSR1,
+    epoll_ready_events, EpCtlOp, EpData, EpEvent, EpInst, FLike, Kernel, PipeNode, TaskRunState,
+    SIGUSR1,
 };
 
 pub fn run_all() {
@@ -25,6 +26,7 @@ pub fn run_all() {
     futex_wait_timeout_removes_published_waiter();
     futex_cmp_requeue_propagates_word_read_fault();
     futex_requeue_skips_completed_waiters_when_moving();
+    pipe_epoll_closed_status_reports_hup_and_err();
     fd_close_detaches_epoll_subscription_before_reuse();
 }
 
@@ -495,4 +497,33 @@ fn fd_close_detaches_epoll_subscription_before_reuse() {
     let _ = task.close_fd(write_fd);
     let _ = task.close_fd(epfd);
     clear_wait_token_state();
+}
+
+// AGENT: pipe peer-close state must wake epoll and also survive the level scan
+// as public HUP/ERR events.
+#[cfg_attr(test, test)]
+fn pipe_epoll_closed_status_reports_hup_and_err() {
+    let (read_end, write_end) = PipeNode::pair();
+    drop(write_end);
+
+    let read_status = read_end.poll();
+    assert!(read_status.readable);
+    assert!(read_status.closed);
+    let read_ready = epoll_ready_events(read_status, EpEvent::IN);
+    assert_eq!(read_ready & EpEvent::IN, EpEvent::IN);
+    assert_eq!(read_ready & EpEvent::HUP, EpEvent::HUP);
+    assert_eq!(
+        epoll_ready_events(read_status, EpEvent::HUP) & EpEvent::HUP,
+        EpEvent::HUP
+    );
+
+    let (read_end, write_end) = PipeNode::pair();
+    drop(read_end);
+
+    let write_status = write_end.poll();
+    assert!(write_status.error);
+    assert!(write_status.closed);
+    let write_ready = epoll_ready_events(write_status, 0);
+    assert_eq!(write_ready & EpEvent::ERR, EpEvent::ERR);
+    assert_eq!(write_ready & EpEvent::HUP, EpEvent::HUP);
 }

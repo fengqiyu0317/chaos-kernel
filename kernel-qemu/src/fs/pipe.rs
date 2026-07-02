@@ -300,6 +300,7 @@ impl FLike {
             FLike::Ep(_) => Err("enosys"),
         }
     }
+    // AGENT: expose explicit readiness fields for epoll's final event mapping.
     pub fn poll(&self) -> PollStatus {
         match self {
             // HUMAN: move the code to the implementation of the corresponding struct
