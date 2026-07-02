@@ -35,6 +35,39 @@ fn fdopt_to_open_flags(opt: FdOpt) -> usize {
     flags
 }
 
+// AGENT: ioctl integer arguments live in user memory; copy them through the
+// active address space instead of trusting the raw pointer.
+fn read_user_i32(task: &Task, addr: usize) -> Result<i32, &'static str> {
+    if addr == 0 {
+        return Err("efault");
+    }
+    let mut bytes = [0u8; mem::size_of::<i32>()];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(addr, &mut bytes)?;
+    Ok(i32::from_ne_bytes(bytes))
+}
+
+// AGENT: write ioctl integer results through AddrSpace so bad pointers report
+// efault rather than corrupting kernel memory.
+fn write_user_i32(
+    kernel: &Kernel,
+    task: &Task,
+    addr: usize,
+    value: i32,
+) -> Result<(), &'static str> {
+    if addr == 0 {
+        return Err("efault");
+    }
+    task.process.addr_space.lock().unwrap().write_user_bytes(
+        addr,
+        &value.to_ne_bytes(),
+        &kernel.pool,
+    )
+}
+
 // AGENT: keep the read syscall entry while standard QEMU usercopy-backed I/O is pending.
 pub(super) fn sys_read(
     _kernel: &Kernel,
@@ -168,6 +201,8 @@ pub(super) fn sys_stat(
     Ok(0)
 }
 
+// AGENT: validate the fd once, keep descriptor-wide ioctls here, and delegate
+// object-specific queries such as pipe FIONREAD through FdEntry::io_ctl.
 pub(super) fn sys_ioctl(
     kernel: &Kernel,
     a0: usize,
@@ -177,6 +212,11 @@ pub(super) fn sys_ioctl(
     let fd = a0;
     let cmd = a1;
     let arg = a2;
+    if fd >= MAX_FD {
+        return Err("ebadf");
+    }
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
     match cmd {
         TCGETS => {
             if !check_access(arg, mem::size_of::<TrmIO>()) {
@@ -208,12 +248,29 @@ pub(super) fn sys_ioctl(
             }
             Ok(0)
         }
-        FIONCLEX => Ok(0),
-        FIOCLEX => Ok(0),
+        FIONCLEX => {
+            task.set_cloexec(fd, false)?;
+            Ok(0)
+        }
+        FIOCLEX => {
+            task.set_cloexec(fd, true)?;
+            Ok(0)
+        }
         FIONBIO => {
-            if !check_access(arg, 4) {
-                return Err("efault");
+            let nonblock = read_user_i32(&task, arg)? != 0;
+            let mut flags = entry.status_flags_bits();
+            if nonblock {
+                flags |= O_NONBLOCK;
+            } else {
+                flags &= !O_NONBLOCK;
             }
+            entry.set_status_flags(flags)?;
+            Ok(0)
+        }
+        FIONREAD | TIOCINQ => {
+            let readable = entry.io_ctl(cmd, arg)?;
+            let readable = i32::try_from(readable).map_err(|_| "eoverflow")?;
+            write_user_i32(kernel, &task, arg, readable)?;
             Ok(0)
         }
         _ => Err("enotty"),

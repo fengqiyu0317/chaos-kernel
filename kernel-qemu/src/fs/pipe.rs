@@ -213,6 +213,10 @@ impl PipeNode {
         let d = self.data.lock().unwrap();
         PollStatus::from_ready_bits(self.readiness_locked(&d))
     }
+    // AGENT: FIONREAD/TIOCINQ reports the bytes currently buffered for the pipe.
+    pub fn readable_len(&self) -> usize {
+        self.data.lock().unwrap().buf.len()
+    }
 }
 
 #[derive(Clone)]
@@ -271,17 +275,13 @@ impl FLike {
             FLike::Pipe(_) | FLike::Ep(_) => Ok(()),
         }
     }
+    // AGENT: handle object-specific ioctl requests; fd-wide requests such as
+    // FIONBIO are applied by sys_ioctl because they mutate descriptor status.
     pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
         match self {
-            FLike::File(f) => {
-                let _opt = f.desc.read().unwrap().opt;
-                match req as u32 {
-                    0..=0xFF => Ok(0),
-                    _ => f.io_ctl(req as u32, a1),
-                }
-            }
-            FLike::Pipe(_) => match req {
-                0x5421 => Ok(0),
+            FLike::File(f) => f.io_ctl(req as u32, a1),
+            FLike::Pipe(p) => match req {
+                FIONREAD => Ok(p.readable_len()),
                 _ => Err("enotty"),
             },
             FLike::Ep(_) => Err("enosys"),
