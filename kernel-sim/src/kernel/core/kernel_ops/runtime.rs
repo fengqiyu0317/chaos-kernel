@@ -102,20 +102,9 @@ impl Kernel {
                 100
             }
         };
-        {
-            for ci in 0..self.cache.chains.len() {
-                let ch = &self.cache.chains[ci];
-                // AGENT: cache maintenance uses SpinGuard instead of touching
-                // the chain Spin internals directly.
-                let _guard = ch.lk.guard();
-                {
-                    let mut items = ch.items.lock().unwrap();
-                    for s in items.iter_mut() {
-                        s.modified = false;
-                    }
-                }
-            }
-        }
+        // AGENT: dirty block-cache entries are now written through
+        // BlockCache::flush_dirty() with an explicit block device; a timer tick
+        // must not silently clear writeback state.
     }
 
     // AGENT: expose the per-CPU current-task slot used by scheduling and syscalls.

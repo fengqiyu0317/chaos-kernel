@@ -54,15 +54,13 @@ pub enum SavedRunState {
     BlockedWait = 3,
 }
 
-// AGENT: classify mappings before the restore path recreates VMAs and pages.
+// AGENT: keep the first checkpoint VMA format to anonymous mappings plus stack
+// hints; heap/file-backed distinctions are intentionally not encoded yet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum MappingKind {
     Anonymous = 1,
-    Heap = 2,
     Stack = 3,
-    FilePrivate = 4,
-    FileShared = 5,
 }
 
 // AGENT: file descriptor kinds are deliberately narrow for the first restore
@@ -216,14 +214,12 @@ impl TryFrom<u16> for SavedRunState {
 impl TryFrom<u16> for MappingKind {
     type Error = CheckpointError;
 
-    // AGENT: map serialized VMA kind values into the checkpoint enum.
+    // AGENT: accept only the first checkpoint mapping kinds that restore can
+    // faithfully rebuild today.
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::Anonymous),
-            2 => Ok(Self::Heap),
             3 => Ok(Self::Stack),
-            4 => Ok(Self::FilePrivate),
-            5 => Ok(Self::FileShared),
             _ => Err(CheckpointError::InvalidEnum),
         }
     }

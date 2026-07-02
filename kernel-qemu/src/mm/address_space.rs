@@ -171,8 +171,7 @@ impl AddrSpace {
 
         for vma in vmas {
             match vma.kind {
-                MappingKind::Anonymous | MappingKind::Heap | MappingKind::Stack => {}
-                MappingKind::FilePrivate | MappingKind::FileShared => return Err("enotsup"),
+                MappingKind::Anonymous | MappingKind::Stack => {}
             }
             let start = checked_u64_to_usize(vma.start)?;
             let len = checked_u64_to_usize(vma.len)?;

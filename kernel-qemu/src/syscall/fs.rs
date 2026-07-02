@@ -134,21 +134,8 @@ pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static st
         return Err("ebadf");
     }
     let t = kernel.cur_task(0).ok_or("esrch")?;
-    let ci = (fd ^ (fd >> 7)) % kernel.cache.width; // AGENT: match fetch()/invalidate() hash
-    let ch = &kernel.cache.chains[ci];
-    // AGENT: cache close cleanup uses SpinGuard so every return path releases the chain lock.
-    let _guard = ch.lk.guard();
-    let was_cached = {
-        let mut items = ch.items.lock().unwrap();
-        let before = items.len();
-        items.retain(|s| s.id != fd);
-        items.len() < before
-    };
-    drop(_guard);
-    if was_cached {
-        kernel.tty_buf.lock().unwrap().drain(..).count();
-    }
-    // AGENT: remove fd from process file table so it can be reused
+    // AGENT: close only releases the process fd; block-cache keys are device
+    // blocks, not process-local descriptor numbers.
     t.close_fd(fd)?;
     Ok(0)
 }

@@ -71,10 +71,7 @@ impl EpInst {
             return;
         }
         self.ready.lock().unwrap().insert(fd);
-        let batch: Vec<WaitToken> = self.waiters.lock().unwrap().drain(..).collect();
-        for token in batch {
-            token.wake();
-        }
+        self.wake_all_waiters();
     }
     // AGENT: clear cached readiness before a level-triggered rescan; new
     // callbacks racing after this point repopulate the cache and wake waiters.
@@ -116,8 +113,7 @@ impl EpInst {
     // AGENT: closing a watched fd removes its registration and returns the
     // source subscription id that must be cancelled on the watched file object.
     pub fn remove_closed_fd(&self, fd: usize) -> Option<usize> {
-        self.events.lock().unwrap().remove(&fd);
-        self.ready.lock().unwrap().remove(&fd);
+        self.remove_interest(fd);
         self.source_subs.lock().unwrap().remove(&fd)
     }
 
@@ -136,21 +132,32 @@ impl EpInst {
 
         self.events.lock().unwrap().clear();
         self.ready.lock().unwrap().clear();
+        self.wake_all_waiters();
 
+        subs
+    }
+
+    // AGENT: remove the epoll-visible part of one watched fd registration.
+    fn remove_interest(&self, fd: usize) -> bool {
+        let existed = self.events.lock().unwrap().remove(&fd).is_some();
+        self.ready.lock().unwrap().remove(&fd);
+        existed
+    }
+
+    // AGENT: finish all waiters that are sleeping on this epoll instance.
+    fn wake_all_waiters(&self) {
         let waiters: Vec<WaitToken> = self.waiters.lock().unwrap().drain(..).collect();
         for token in waiters {
             token.wake();
         }
-
-        subs
     }
 
     // AGENT: EpInst clones share their tables through Arc<Mutex<_>>, so control
     // only needs &self and works for duplicated epoll fds.
     pub fn control(&self, op: i32, fd: usize, ev: &EpEvent) -> Result<(), &'static str> {
-        let mut events = self.events.lock().unwrap();
         match op {
             EpCtlOp::ADD => {
+                let mut events = self.events.lock().unwrap();
                 if events.contains_key(&fd) {
                     return Err("eexist");
                 }
@@ -158,6 +165,7 @@ impl EpInst {
                 Ok(())
             }
             EpCtlOp::MOD => {
+                let mut events = self.events.lock().unwrap();
                 if !events.contains_key(&fd) {
                     return Err("enoent");
                 }
@@ -165,10 +173,9 @@ impl EpInst {
                 Ok(())
             }
             EpCtlOp::DEL => {
-                if events.remove(&fd).is_none() {
+                if !self.remove_interest(fd) {
                     return Err("enoent");
                 }
-                self.ready.lock().unwrap().remove(&fd);
                 Ok(())
             }
             _ => Err("einval"),
