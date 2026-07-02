@@ -321,9 +321,9 @@ fn populate_initial_user_image(
     Ok(thd_ctx)
 }
 
-// AGENT: seed stdio descriptors for a fresh user process without going through
-// fallible fd allocation; descriptors 0, 1, and 2 are known to be free here.
-fn install_initial_stdio(task: &Arc<Task>) {
+// AGENT: seed stdio through the normal fd allocator so the descriptor table and
+// free-fd set stay consistent with every later open/dup/close path.
+fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str> {
     let fd0 = FHandle::new(
         "/dev/tty",
         FdOpt {
@@ -347,16 +347,13 @@ fn install_initial_stdio(task: &Arc<Task>) {
         false,
     );
     let fd2 = fd1.dup(false);
-    {
-        let mut files = task.process.files.lock().unwrap();
-        files.insert(0, FdEntry::new(FLike::File(fd0)));
-        files.insert(1, FdEntry::new(FLike::File(fd1)));
-        files.insert(2, FdEntry::new(FLike::File(fd2)));
+    let stdin = task.add_file(FLike::File(fd0))?;
+    let stdout = task.add_file(FLike::File(fd1))?;
+    let stderr = task.add_file(FLike::File(fd2))?;
+    if (stdin, stdout, stderr) != (0, 1, 2) {
+        return Err("ebadf");
     }
-    let mut free_fds = task.process.free_fds.lock().unwrap();
-    free_fds.remove(&0);
-    free_fds.remove(&1);
-    free_fds.remove(&2);
+    Ok(())
 }
 
 impl Task {
@@ -1216,7 +1213,7 @@ impl TaskTable {
             let mut addr_space = t.process.addr_space.lock().unwrap();
             *addr_space = image.addr_space;
         }
-        install_initial_stdio(&t);
+        install_initial_stdio(&t)?;
         // AGENT: spawn() already registered pid/pgid/sid membership and the
         // main thread for this standalone user process.
         Ok(t)
