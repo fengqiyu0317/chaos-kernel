@@ -269,7 +269,7 @@ impl FLike {
     // FIONBIO are applied by sys_ioctl because they mutate descriptor status.
     pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
         match self {
-            FLike::File(f) => f.io_ctl(req as u32, a1),
+            FLike::File(f) => f.io_ctl(req, a1),
             FLike::Pipe(p) => match req {
                 FIONREAD => Ok(p.readable_len()),
                 _ => Err("enotty"),

@@ -172,10 +172,10 @@ pub(super) fn sys_epoll_wait(
             if nready >= max_events {
                 break;
             }
-            let Some(fl) = task.get_file(fd) else {
+            let Some(entry) = task.get_fd_entry(fd) else {
                 continue;
             };
-            let ready = epoll_ready_events(fl.poll(), ev.events);
+            let ready = epoll_ready_events(entry.poll(), ev.events);
             if ready == 0 {
                 continue;
             }

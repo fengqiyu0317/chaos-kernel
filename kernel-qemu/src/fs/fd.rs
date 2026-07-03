@@ -446,6 +446,23 @@ impl FileNode {
         }
     }
 
+    // AGENT: grow file contents under one data lock so allocation cannot race
+    // with another writer and accidentally shrink a larger file.
+    pub(crate) fn ensure_data_len_at_least(&self, len: usize) {
+        let grew = {
+            let mut data = self.data.lock().unwrap();
+            if data.len() >= len {
+                false
+            } else {
+                data.resize(len, 0);
+                true
+            }
+        };
+        if grew {
+            self.note_resize();
+        }
+    }
+
     // AGENT: data-only sync clears dirty file contents but leaves metadata dirty.
     pub fn sync_data(&self) -> Result<(), &'static str> {
         self.dirty.lock().unwrap().data = false;
@@ -741,34 +758,52 @@ impl FHandle {
     // AGENT: let OpenFileDescription provide the visible access mode when fd
     // polling goes through the fd table.
     fn poll_status_with_status(&self, status: FdOpt) -> PollStatus {
-        let error = self.path.is_empty() && self.node.data.lock().unwrap().is_empty();
         PollStatus {
             readable: status.rd,
             writable: status.wr,
-            error,
+            error: false,
             closed: false,
         }
     }
-    pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> {
-        Ok(0)
+    // AGENT: regular files only report supported ioctl results; unknown
+    // requests must not be silently treated as success.
+    pub fn io_ctl(&self, cmd: usize, _arg: usize) -> Result<usize, &'static str> {
+        match cmd {
+            FIONREAD | TIOCINQ => {
+                let off = self.desc.read().unwrap().off;
+                let len = self.node.data.lock().unwrap().len() as u64;
+                usize::try_from(len.saturating_sub(off)).map_err(|_| "eoverflow")
+            }
+            _ => Err("enotty"),
+        }
     }
+    // AGENT: validate readahead hints without pretending the in-memory
+    // FileNode can warm a real block or page cache.
     pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> {
-        let d = self.node.data.lock().unwrap();
-        let requested_end = offset.saturating_add(len);
-        let actual_end = min(requested_end, d.len());
-        let _readahead_pages = (actual_end.saturating_sub(offset) + PAGE_SZ - 1) / PAGE_SZ;
+        if self.node.kind != FileKind::Regular {
+            return Err("enodev");
+        }
+        if !self.initial_status.rd {
+            return Err("ebadf");
+        }
+        offset.checked_add(len).ok_or("efbig")?;
         Ok(())
     }
 
-    // AGENT: direct allocation uses checked ranges and the handle's open-time
-    // write permission.
+    // AGENT: direct allocation validates regular-file semantics and grows the
+    // node through the single-lock FileNode helper.
     pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> {
+        if self.node.kind != FileKind::Regular {
+            return Err("enodev");
+        }
         if !self.initial_status.wr {
             return Err("ebadf");
         }
+        if len == 0 {
+            return Err("einval");
+        }
         let needed = offset.checked_add(len).ok_or("efbig")?;
-        let current_len = self.node.data.lock().unwrap().len();
-        self.node.set_data_len(max(current_len, needed));
+        self.node.ensure_data_len_at_least(needed);
         Ok(())
     }
 
@@ -787,9 +822,16 @@ impl FHandle {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "qemu-sync-selftest"))]
+pub(crate) mod tests {
     use super::*;
+
+    pub fn run_all() {
+        set_len_and_sync_update_dirty_state();
+        fallocate_validates_and_only_grows_regular_files();
+        lookup_reports_node_local_errors();
+        regular_file_poll_and_ioctl_are_explicit();
+    }
 
     fn writable_opt() -> FdOpt {
         FdOpt {
@@ -800,7 +842,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[cfg_attr(test, test)]
     fn set_len_and_sync_update_dirty_state() {
         let fh = FHandle::with_data("/tmp/file", writable_opt(), vec![1, 2, 3]);
         assert_eq!(fh.node.dirty_state(), FileDirty::clean());
@@ -831,7 +873,39 @@ mod tests {
         assert_eq!(ro.set_len(0), Err("ebadf"));
     }
 
-    #[test]
+    #[cfg_attr(test, test)]
+    fn fallocate_validates_and_only_grows_regular_files() {
+        let fh = FHandle::with_data("/tmp/file", writable_opt(), vec![1, 2, 3]);
+
+        fh.fallocate(5, 2).unwrap();
+        assert_eq!(
+            fh.node.data.lock().unwrap().as_slice(),
+            &[1, 2, 3, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            fh.node.dirty_state(),
+            FileDirty {
+                data: true,
+                metadata: true
+            }
+        );
+
+        fh.sync_all().unwrap();
+        fh.fallocate(1, 1).unwrap();
+        assert_eq!(fh.node.data.lock().unwrap().len(), 7);
+        assert_eq!(fh.node.dirty_state(), FileDirty::clean());
+
+        assert_eq!(fh.fallocate(0, 0), Err("einval"));
+        assert_eq!(fh.fallocate(usize::MAX, 1), Err("efbig"));
+
+        let ro = FHandle::with_data("/tmp/ro", FdOpt::default(), vec![1, 2, 3]);
+        assert_eq!(ro.fallocate(0, 1), Err("ebadf"));
+
+        let dir = FHandle::with_node("/tmp", writable_opt(), Arc::new(FileNode::directory()));
+        assert_eq!(dir.fallocate(0, 1), Err("enodev"));
+    }
+
+    #[cfg_attr(test, test)]
     fn lookup_reports_node_local_errors() {
         let file = FHandle::with_data("/tmp/file", writable_opt(), Vec::new());
         assert_eq!(file.lookup(".", 0), Err("enotdir"));
@@ -845,6 +919,21 @@ mod tests {
         assert_eq!(dir.lookup(".", 41), Err("eloop"));
         assert_eq!(dir.lookup("bad\0name", 0), Err("einval"));
         assert_eq!(dir.lookup("bad/name", 0), Err("einval"));
+    }
+
+    #[cfg_attr(test, test)]
+    fn regular_file_poll_and_ioctl_are_explicit() {
+        let file = FHandle::with_data("", writable_opt(), vec![1, 2, 3, 4]);
+        let poll = file.poll_status();
+        assert!(poll.readable);
+        assert!(poll.writable);
+        assert!(!poll.error);
+
+        assert_eq!(file.io_ctl(FIONREAD, 0), Ok(4));
+        let mut buf = [0; 2];
+        assert_eq!(file.read(&mut buf), Ok(2));
+        assert_eq!(file.io_ctl(TIOCINQ, 0), Ok(2));
+        assert_eq!(file.io_ctl(0xDEAD, 0), Err("enotty"));
     }
 }
 
