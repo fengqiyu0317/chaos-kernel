@@ -30,34 +30,30 @@ fn file_bytes(fh: &FHandle) -> Vec<u8> {
     data
 }
 
-// AGENT: regular-file dirty state now lives in BlockCache data/metadata classes.
+// AGENT: regular-file dirty state now lives as a unified BlockCache dirty count.
 #[cfg_attr(test, test)]
 fn set_len_and_sync_update_cache_dirty_state() {
     let fh = FHandle::with_data("/tmp/file", writable_opt(), vec![1, 2, 3]);
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 0);
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 0);
+    assert_eq!(fh.cached_dirty_blocks(), 0);
 
     fh.write_at(1, &[9]).unwrap();
     assert_eq!(file_bytes(&fh).as_slice(), &[1, 9, 3]);
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 1);
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 0);
+    assert_eq!(fh.cached_dirty_blocks(), 1);
 
     fh.sync_data().unwrap();
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 0);
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 0);
+    assert_eq!(fh.cached_dirty_blocks(), 0);
 
     fh.set_len(5).unwrap();
     assert_eq!(file_bytes(&fh).as_slice(), &[1, 9, 3, 0, 0]);
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 0);
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 1);
+    assert_eq!(fh.cached_dirty_blocks(), 1);
 
     fh.sync_data().unwrap();
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 0);
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 1);
+    assert_eq!(fh.cached_dirty_blocks(), 0);
 
+    fh.set_len(6).unwrap();
+    assert_eq!(fh.cached_dirty_blocks(), 1);
     fh.sync_all().unwrap();
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 0);
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 0);
+    assert_eq!(fh.cached_dirty_blocks(), 0);
 
     let ro = FHandle::with_data("/tmp/ro", FdOpt::default(), vec![1, 2, 3]);
     assert_eq!(ro.set_len(0), Err("ebadf"));
@@ -70,14 +66,12 @@ fn fallocate_validates_and_only_grows_regular_files() {
 
     fh.fallocate(5, 2).unwrap();
     assert_eq!(file_bytes(&fh).as_slice(), &[1, 2, 3, 0, 0, 0, 0]);
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 0);
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 1);
+    assert_eq!(fh.cached_dirty_blocks(), 1);
 
     fh.sync_all().unwrap();
     fh.fallocate(1, 1).unwrap();
     assert_eq!(fh.node.len(), 7);
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 0);
-    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 0);
+    assert_eq!(fh.cached_dirty_blocks(), 0);
 
     assert_eq!(fh.fallocate(0, 0), Err("einval"));
     assert_eq!(fh.fallocate(usize::MAX, 1), Err("efbig"));

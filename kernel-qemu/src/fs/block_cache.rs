@@ -22,14 +22,6 @@ impl BlockKey {
     }
 }
 
-// AGENT: let BlockCache own the data-vs-metadata dirty distinction needed by
-// fsync/fdatasync-style callers instead of keeping a parallel FileNode flag.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CachedBlockKind {
-    Data,
-    Metadata,
-}
-
 // AGENT: keep one exact block-sized payload per cache slot instead of a Vec so
 // cache residency has the same fixed block granularity as the backing device.
 pub type BlockPayload = [u8; BLOCK_CACHE_BLOCK_SIZE];
@@ -51,12 +43,11 @@ fn block_payload_from_slice(
     Ok(payload)
 }
 
-// AGENT: cache slots own the current cached block payload plus dirty metadata.
+// AGENT: cache slots own the current cached block payload plus one dirty flag.
 #[derive(Clone, Copy)]
 pub struct CacheSlot {
     pub key: BlockKey,
     pub payload: BlockPayload,
-    pub kind: CachedBlockKind,
     pub modified: bool,
 }
 
@@ -136,7 +127,6 @@ impl BlockCache {
             *empty_slot = Some(CacheSlot {
                 key,
                 payload,
-                kind: CachedBlockKind::Data,
                 modified: false,
             });
         }
@@ -151,19 +141,6 @@ impl BlockCache {
         dev: usize,
         block: usize,
         data: &[u8],
-    ) -> Result<(), &'static str> {
-        self.write_block_cached_as(device, dev, block, data, CachedBlockKind::Data)
-    }
-
-    // AGENT: write one complete block into the device, update the cached
-    // payload, and tag its dirty class for fdatasync/fsync distinction.
-    pub fn write_block_cached_as<D: BlockDevice + ?Sized>(
-        &self,
-        device: &D,
-        dev: usize,
-        block: usize,
-        data: &[u8],
-        kind: CachedBlockKind,
     ) -> Result<(), &'static str> {
         let payload = block_payload_from_slice(data, "einval")?;
         let key = BlockKey::new(dev, block);
@@ -188,7 +165,6 @@ impl BlockCache {
             .find(|slot| slot.key == key)
         {
             slot.payload = payload;
-            slot.kind = kind;
             slot.modified = true;
             return Ok(());
         }
@@ -198,40 +174,26 @@ impl BlockCache {
         *empty_slot = Some(CacheSlot {
             key,
             payload,
-            kind,
             modified: true,
         });
         Ok(())
     }
 
-    fn flush_dirty_where<F>(&self, mut include: F) -> Result<usize, &'static str>
-    where
-        F: FnMut(CachedBlockKind) -> bool,
-    {
+    // AGENT: writes are already in the block device; flush clears the unified
+    // cache dirty state without distinguishing data and metadata blocks.
+    pub fn flush_dirty(&self) -> Result<usize, &'static str> {
         let mut flushed = 0usize;
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
             let mut items = ch.items.lock().unwrap();
             for slot in items.iter_mut().filter_map(|entry| entry.as_mut()) {
-                if slot.modified && include(slot.kind) {
+                if slot.modified {
                     slot.modified = false;
                     flushed += 1;
                 }
             }
         }
         Ok(flushed)
-    }
-
-    // AGENT: writes are already in the block device; flush clears dirty state
-    // for slots whose data/metadata class still matches the sync request.
-    pub fn flush_dirty(&self) -> Result<usize, &'static str> {
-        self.flush_dirty_where(|_| true)
-    }
-
-    // AGENT: fdatasync-style sync clears data dirty bits while leaving cached
-    // metadata slots dirty for a later full sync.
-    pub fn flush_dirty_data(&self) -> Result<usize, &'static str> {
-        self.flush_dirty_where(|kind| kind == CachedBlockKind::Data)
     }
 
     // AGENT: no-device sync is only a GKL barrier; callers that need file dirty
@@ -293,21 +255,6 @@ impl BlockCache {
                 }
             }
             drop(items);
-        }
-        count
-    }
-
-    // AGENT: observe one dirty class for focused fsync/fdatasync regressions.
-    pub fn dirty_count_by_kind(&self, kind: CachedBlockKind) -> usize {
-        let mut count = 0;
-        for i in 0..self.chains.len() {
-            let ch = &self.chains[i];
-            let items = ch.items.lock().unwrap();
-            for slot in items.iter().filter_map(|entry| entry.as_ref()) {
-                if slot.modified && slot.kind == kind {
-                    count += 1;
-                }
-            }
         }
         count
     }
@@ -401,7 +348,7 @@ pub mod tests {
     }
 
     // AGENT: keep write-through behavior while ensuring the cache slot mirrors
-    // the latest full fixed-size payload and dirty class.
+    // the latest full fixed-size payload and unified dirty state.
     #[cfg_attr(test, test)]
     fn write_updates_cached_fixed_payload() {
         let cache = BlockCache::new(4);
@@ -419,16 +366,10 @@ pub mod tests {
                 .as_slice(),
             &first[..]
         );
-        assert_eq!(cache.dirty_count_by_kind(CachedBlockKind::Data), 1);
+        assert_eq!(cache.dirty_count(), 1);
 
         cache
-            .write_block_cached_as(
-                &device,
-                ROOT_BLOCK_DEVICE,
-                5,
-                &second,
-                CachedBlockKind::Metadata,
-            )
+            .write_block_cached(&device, ROOT_BLOCK_DEVICE, 5, &second)
             .unwrap();
         assert_eq!(
             cache
@@ -437,11 +378,7 @@ pub mod tests {
                 .as_slice(),
             &second[..]
         );
-        assert_eq!(cache.dirty_count_by_kind(CachedBlockKind::Data), 0);
-        assert_eq!(cache.dirty_count_by_kind(CachedBlockKind::Metadata), 1);
-
-        assert_eq!(cache.flush_dirty_data().unwrap(), 0);
-        assert_eq!(cache.dirty_count_by_kind(CachedBlockKind::Metadata), 1);
+        assert_eq!(cache.dirty_count(), 1);
         assert_eq!(cache.flush_dirty().unwrap(), 1);
         assert_eq!(cache.dirty_count(), 0);
     }

@@ -71,35 +71,20 @@ impl FileStorage {
             .read_block_cached(self.device.as_ref(), ROOT_BLOCK_DEVICE, block)
     }
 
-    // AGENT: route data writes through BlockCache's write-through device path.
+    // AGENT: route file-block writes through BlockCache's write-through device path.
     fn write_block(&self, block: usize, data: &[u8]) -> Result<(), &'static str> {
         self.cache
             .write_block_cached(self.device.as_ref(), ROOT_BLOCK_DEVICE, block, data)
     }
 
-    // AGENT: keep metadata dirty classification while storing bytes in the device.
-    fn write_metadata_block(&self, block: usize, data: &[u8]) -> Result<(), &'static str> {
-        self.cache.write_block_cached_as(
-            self.device.as_ref(),
-            ROOT_BLOCK_DEVICE,
-            block,
-            data,
-            CachedBlockKind::Metadata,
-        )
-    }
-
-    // AGENT: sync now clears data dirty bits; block bytes are already in RAM.
-    fn flush_data(&self) -> Result<usize, &'static str> {
-        self.cache.flush_dirty_data()
-    }
-
-    // AGENT: full sync clears both data and metadata dirty bits.
+    // AGENT: sync clears the unified dirty bitset; block bytes are already in RAM.
     fn flush(&self) -> Result<usize, &'static str> {
         self.cache.flush_dirty()
     }
 
-    pub fn dirty_count_by_kind(&self, kind: CachedBlockKind) -> usize {
-        self.cache.dirty_count_by_kind(kind)
+    // AGENT: expose unified cache dirty state to focused fd regressions.
+    pub fn dirty_count(&self) -> usize {
+        self.cache.dirty_count()
     }
 }
 
@@ -119,7 +104,7 @@ impl FileNodeBlocks {
 }
 
 // AGENT: FileNode owns metadata, directory entries, and the regular-file block
-// map; actual bytes and metadata dirty state live in the shared block cache.
+// map; actual bytes and unified dirty state live in the shared block cache.
 pub struct FileNode {
     pub kind: FileKind,
     pub executable: AtomicBool,
@@ -298,12 +283,12 @@ impl FileNode {
         Ok(block)
     }
 
-    // AGENT: encode FileNode-owned metadata through BlockCache so metadata dirty
-    // state is tracked as a cached metadata block instead of a parallel flag.
+    // AGENT: encode FileNode-owned metadata through BlockCache so metadata
+    // changes use the same dirty state as regular file-block writes.
     fn mark_metadata_dirty(&self, backend: &FileStorage) -> Result<(), &'static str> {
         let block = self.ensure_metadata_block(backend)?;
         let payload = self.metadata_payload();
-        backend.write_metadata_block(block, &payload)
+        backend.write_block(block, &payload)
     }
 
     fn write_may_change_metadata(
@@ -508,14 +493,14 @@ impl FileNode {
         Ok(())
     }
 
-    // AGENT: data-only sync flushes cached data blocks and leaves cached
-    // metadata blocks dirty for a later full sync.
+    // AGENT: data-only sync is intentionally equivalent to full sync in the
+    // current QEMU file layer because dirty state is no longer split by kind.
     pub fn sync_data(&self, backend: &FileStorage) -> Result<(), &'static str> {
-        backend.flush_data()?;
+        backend.flush()?;
         Ok(())
     }
 
-    // AGENT: full sync flushes both cached data and metadata blocks.
+    // AGENT: full sync clears all cached dirty state.
     pub fn sync_all(&self, backend: &FileStorage) -> Result<(), &'static str> {
         backend.flush()?;
         Ok(())

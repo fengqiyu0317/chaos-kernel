@@ -645,14 +645,15 @@ impl FHandle {
     pub fn sync_all(&self) -> Result<(), &'static str> {
         self.node.sync_all(&self.storage)
     }
-    // AGENT: sync only data contents, matching fdatasync-style metadata rules.
+    // AGENT: sync_data currently shares full-sync behavior because BlockCache
+    // no longer distinguishes data and metadata dirty classes.
     pub fn sync_data(&self) -> Result<(), &'static str> {
         self.node.sync_data(&self.storage)
     }
-    // AGENT: expose BlockCache-owned dirty classes for focused fsync/fdatasync
-    // regressions without reviving FileNode-local dirty flags.
-    pub fn cached_dirty_blocks(&self, kind: CachedBlockKind) -> usize {
-        self.storage.dirty_count_by_kind(kind)
+    // AGENT: expose BlockCache-owned dirty state for focused sync regressions
+    // without reviving FileNode-local dirty flags.
+    pub fn cached_dirty_blocks(&self) -> usize {
+        self.storage.dirty_count()
     }
     // AGENT: keep node-local lookup honest; full path lookup belongs to Kernel.
     pub fn lookup(&self, path: &str, depth: usize) -> Result<(), &'static str> {
