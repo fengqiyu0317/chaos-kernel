@@ -308,6 +308,7 @@ pub fn fdopt_to_open_flags(opt: FdOpt) -> usize {
 pub struct FHandle {
     pub path: String,
     pub node: Arc<FileNode>,
+    storage: FileStorage,
     initial_status: FdOpt,
     pub(crate) desc: Arc<RwLock<FdState>>,
 }
@@ -325,27 +326,46 @@ impl FHandle {
 
     // AGENT: create a fresh standalone regular node for device-like handles.
     pub fn new(path: &str, opt: FdOpt) -> Self {
+        let storage = FileStorage::standalone();
         Self {
             path: path.to_string(),
-            node: Arc::new(FileNode::regular(Vec::new(), false)),
+            node: Arc::new(FileNode::regular(false)),
+            storage,
             initial_status: opt,
             desc: FdState::create(),
         }
     }
     // AGENT: create a handle over a fresh regular file node.
     pub fn with_data(path: &str, opt: FdOpt, d: Vec<u8>) -> Self {
+        let storage = FileStorage::standalone();
+        let node = Arc::new(FileNode::regular(false));
+        node.write_initial_bytes(&storage, &d)
+            .expect("standalone RAM file seed should fit");
         Self {
             path: path.to_string(),
-            node: Arc::new(FileNode::regular(d, false)),
+            node,
+            storage,
             initial_status: opt,
             desc: FdState::create(),
         }
     }
     // AGENT: open a descriptor over an existing shared FileNode.
     pub fn with_node(path: &str, opt: FdOpt, node: Arc<FileNode>) -> Self {
+        Self::with_node_on_storage(path, opt, node, FileStorage::standalone())
+    }
+
+    // AGENT: open a descriptor over an existing FileNode using the Kernel-owned
+    // RAM block backend that stores that node's file contents.
+    pub fn with_node_on_storage(
+        path: &str,
+        opt: FdOpt,
+        node: Arc<FileNode>,
+        storage: FileStorage,
+    ) -> Self {
         Self {
             path: path.to_string(),
             node,
+            storage,
             initial_status: opt,
             desc: FdState::create(),
         }
@@ -355,6 +375,7 @@ impl FHandle {
         FHandle {
             path: self.path.clone(),
             node: self.node.clone(),
+            storage: self.storage.clone(),
             initial_status: self.initial_status,
             desc: self.desc.clone(),
         }
@@ -379,14 +400,8 @@ impl FHandle {
 
     // AGENT: copy from a regular file node at an explicit offset without
     // touching descriptor state.
-    fn copy_from_node_at(&self, off: usize, buf: &mut [u8]) -> usize {
-        let d = self.node.data.lock().unwrap();
-        if off >= d.len() {
-            return 0;
-        }
-        let n = min(buf.len(), d.len() - off);
-        buf[..n].copy_from_slice(&d[off..off + n]);
-        n
+    fn copy_from_node_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
+        self.node.read_bytes(&self.storage, off, buf)
     }
 
     // AGENT: read using status supplied by the owning OpenFileDescription and
@@ -397,7 +412,7 @@ impl FHandle {
         }
         let mut desc = self.desc.write().unwrap();
         let off = desc.off as usize;
-        let n = self.copy_from_node_at(off, buf);
+        let n = self.copy_from_node_at(off, buf)?;
         desc.off = (off + n) as u64;
         Ok(n)
     }
@@ -413,7 +428,7 @@ impl FHandle {
         if !status.rd {
             return Err("ebadf");
         }
-        Ok(self.copy_from_node_at(off, buf))
+        self.copy_from_node_at(off, buf)
     }
 
     // AGENT: direct handle positioned reads use the open-time status snapshot.
@@ -438,7 +453,7 @@ impl FHandle {
         } else {
             Some(desc.off as usize)
         };
-        let end = self.node.write_bytes(off, buf)?;
+        let end = self.node.write_bytes(&self.storage, off, buf)?;
         desc.off = end as u64;
         Ok(buf.len())
     }
@@ -454,7 +469,7 @@ impl FHandle {
         if !status.wr {
             return Err("ebadf");
         }
-        self.node.write_bytes(Some(off), buf)?;
+        self.node.write_bytes(&self.storage, Some(off), buf)?;
         Ok(buf.len())
     }
 
@@ -469,7 +484,7 @@ impl FHandle {
         let next = match pos {
             FSeek::Start(off) => off,
             FSeek::End(delta) => {
-                let end = self.node.data.lock().unwrap().len() as u64;
+                let end = self.node.len() as u64;
                 end.checked_add_signed(delta).ok_or("einval")?
             }
             FSeek::Cur(delta) => d.off.checked_add_signed(delta).ok_or("einval")?,
@@ -514,13 +529,14 @@ impl FHandle {
     }
 
     // AGENT: copy a regular-file byte range without changing descriptor state.
-    fn copy_chunk_at(&self, off: usize, count: usize) -> Vec<u8> {
-        let data = self.node.data.lock().unwrap();
-        if off >= data.len() || count == 0 {
-            return Vec::new();
+    fn copy_chunk_at(&self, off: usize, count: usize) -> Result<Vec<u8>, &'static str> {
+        if count == 0 {
+            return Ok(Vec::new());
         }
-        let n = min(count, data.len() - off);
-        data[off..off + n].to_vec()
+        let mut data = vec![0; count];
+        let n = self.node.read_bytes(&self.storage, off, &mut data)?;
+        data.truncate(n);
+        Ok(data)
     }
 
     // AGENT: splice with explicit fd status supplied by OpenFileDescription.
@@ -570,7 +586,7 @@ impl FHandle {
             Ok(off) => off,
             Err(_) => return Ok(0),
         };
-        let chunk = self.copy_chunk_at(src_off, count);
+        let chunk = self.copy_chunk_at(src_off, count)?;
         if chunk.is_empty() {
             return Ok(0);
         }
@@ -580,7 +596,7 @@ impl FHandle {
         } else {
             Some(src_off.checked_add(chunk.len()).ok_or("efbig")?)
         };
-        let end = dst.node.write_bytes(write_off, &chunk)?;
+        let end = dst.node.write_bytes(&dst.storage, write_off, &chunk)?;
         desc.off = u64::try_from(end).map_err(|_| "efbig")?;
         Ok(chunk.len())
     }
@@ -599,7 +615,7 @@ impl FHandle {
             Ok(off) => off,
             Err(_) => return Ok(0),
         };
-        let chunk = self.copy_chunk_at(src_off, count);
+        let chunk = self.copy_chunk_at(src_off, count)?;
         if chunk.is_empty() {
             return Ok(0);
         }
@@ -609,7 +625,7 @@ impl FHandle {
         } else {
             Some(usize::try_from(dst_desc.off).map_err(|_| "efbig")?)
         };
-        let end = dst.node.write_bytes(write_off, &chunk)?;
+        let end = dst.node.write_bytes(&dst.storage, write_off, &chunk)?;
         let moved = u64::try_from(chunk.len()).map_err(|_| "efbig")?;
         src_desc.off = src_desc.off.checked_add(moved).ok_or("efbig")?;
         dst_desc.off = u64::try_from(end).map_err(|_| "efbig")?;
@@ -622,16 +638,16 @@ impl FHandle {
             return Err("ebadf");
         }
         let len = usize::try_from(len).map_err(|_| "efbig")?;
-        self.node.set_data_len(len);
+        self.node.set_data_len(&self.storage, len)?;
         Ok(())
     }
-    // AGENT: sync a regular in-memory node through the shared FileNode state.
+    // AGENT: sync a regular file node through the shared block backend.
     pub fn sync_all(&self) -> Result<(), &'static str> {
-        self.node.sync_all()
+        self.node.sync_all(&self.storage)
     }
     // AGENT: sync only data contents, matching fdatasync-style metadata rules.
     pub fn sync_data(&self) -> Result<(), &'static str> {
-        self.node.sync_data()
+        self.node.sync_data(&self.storage)
     }
     // AGENT: keep node-local lookup honest; full path lookup belongs to Kernel.
     pub fn lookup(&self, path: &str, depth: usize) -> Result<(), &'static str> {
@@ -688,14 +704,14 @@ impl FHandle {
         match cmd {
             FIONREAD | TIOCINQ => {
                 let off = self.desc.read().unwrap().off;
-                let len = self.node.data.lock().unwrap().len() as u64;
+                let len = self.node.len() as u64;
                 usize::try_from(len.saturating_sub(off)).map_err(|_| "eoverflow")
             }
             _ => Err("enotty"),
         }
     }
-    // AGENT: validate readahead hints without pretending the in-memory
-    // FileNode can warm a real block or page cache.
+    // AGENT: validate readahead hints without claiming to prefetch through the
+    // current minimal RamBlockDevice backend.
     pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> {
         if self.node.kind != FileKind::Regular {
             return Err("enodev");

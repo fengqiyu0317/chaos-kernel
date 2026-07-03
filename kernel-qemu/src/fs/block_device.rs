@@ -2,6 +2,7 @@
 use super::*;
 
 pub const BLOCK_CACHE_BLOCK_SIZE: usize = 512;
+pub const ROOT_BLOCK_DEVICE: usize = 0;
 pub const DEFAULT_RAM_BLOCK_DEVICE_BYTES: usize = 16 * 1024 * 1024;
 
 // AGENT: narrow block-device interface used by BlockCache; concrete QEMU

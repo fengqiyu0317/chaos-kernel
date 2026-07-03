@@ -23,8 +23,7 @@ impl Kernel {
         if !node.executable.load(Ordering::Relaxed) {
             return Err("eacces");
         }
-        let snapshot = node.data.lock().unwrap().clone();
-        Ok(snapshot)
+        node.read_all(&self.file_storage())
     }
 
     // AGENT: prepare exec from a path-backed executable file snapshot.

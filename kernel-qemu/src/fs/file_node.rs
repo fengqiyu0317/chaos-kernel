@@ -1,5 +1,5 @@
-// AGENT: split FileNode storage semantics out of fd.rs so fd.rs can focus on
-// descriptor and handle behavior while file node mutation stays in one module.
+// AGENT: keep shared path-file metadata in FileNode while storing file bytes
+// in the QEMU block backend instead of duplicating contents in the node.
 use super::*;
 
 // AGENT: distinguish regular path files from directory nodes for exec checks.
@@ -9,8 +9,8 @@ pub enum FileKind {
     Directory,
 }
 
-// AGENT: track unsynced changes in the in-memory file node so sync methods
-// report real state transitions instead of being empty success stubs.
+// AGENT: track unsynced changes so sync_data() and sync_all() can keep their
+// different content-vs-metadata semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileDirty {
     pub data: bool,
@@ -26,23 +26,109 @@ impl FileDirty {
     }
 }
 
-// AGENT: share file contents, executable metadata, and simple directory entries
-// across all handles.
+// AGENT: allocate root RamBlockDevice blocks for FileNode-backed regular files.
+pub struct FileBlockAllocator {
+    next: AtomicUsize,
+}
+
+impl FileBlockAllocator {
+    pub fn new() -> Self {
+        Self {
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    fn allocate(&self, device: &RamBlockDevice) -> Result<usize, &'static str> {
+        let block = self.next.fetch_add(1, Ordering::Relaxed);
+        if block >= device.block_count() {
+            return Err("enospc");
+        }
+        Ok(block)
+    }
+}
+
+// AGENT: share the live block backend between all handles opened from the same
+// Kernel while keeping tests able to build standalone in-memory devices.
+#[derive(Clone)]
+pub struct FileStorage {
+    cache: Arc<BlockCache>,
+    device: Arc<RamBlockDevice>,
+    allocator: Arc<FileBlockAllocator>,
+}
+
+impl FileStorage {
+    pub fn new(
+        cache: Arc<BlockCache>,
+        device: Arc<RamBlockDevice>,
+        allocator: Arc<FileBlockAllocator>,
+    ) -> Self {
+        Self {
+            cache,
+            device,
+            allocator,
+        }
+    }
+
+    pub fn standalone() -> Self {
+        Self::new(
+            Arc::new(BlockCache::new(N_CHAINS)),
+            Arc::new(RamBlockDevice::empty()),
+            Arc::new(FileBlockAllocator::new()),
+        )
+    }
+
+    fn allocate_block(&self) -> Result<usize, &'static str> {
+        self.allocator.allocate(self.device.as_ref())
+    }
+
+    fn read_block(&self, block: usize) -> Result<Vec<u8>, &'static str> {
+        self.cache
+            .read_block_cached(self.device.as_ref(), ROOT_BLOCK_DEVICE, block)
+    }
+
+    fn write_block(&self, block: usize, data: &[u8]) -> Result<(), &'static str> {
+        self.cache
+            .write_block_cached(ROOT_BLOCK_DEVICE, block, data)
+    }
+
+    fn flush(&self) -> Result<usize, &'static str> {
+        self.cache.flush_dirty(self.device.as_ref())
+    }
+}
+
+#[derive(Debug)]
+struct FileNodeBlocks {
+    len: usize,
+    blocks: Vec<Option<usize>>,
+}
+
+impl FileNodeBlocks {
+    fn empty() -> Self {
+        Self {
+            len: 0,
+            blocks: Vec::new(),
+        }
+    }
+}
+
+// AGENT: FileNode owns only metadata, dirty state, directory entries, and the
+// regular-file block map; actual bytes live in the shared RamBlockDevice.
 pub struct FileNode {
     pub kind: FileKind,
     pub executable: AtomicBool,
-    pub data: Arc<Mutex<Vec<u8>>>,
+    storage: Mutex<FileNodeBlocks>,
     dirty: Mutex<FileDirty>,
     dir_entries: Arc<Mutex<Vec<String>>>,
 }
 
 impl FileNode {
-    // AGENT: create a regular in-memory file node with stable shared contents.
-    pub fn regular(data: Vec<u8>, executable: bool) -> Self {
+    // AGENT: create a regular file node whose contents will be read from the
+    // caller-provided FileStorage.
+    pub fn regular(executable: bool) -> Self {
         Self {
             kind: FileKind::Regular,
             executable: AtomicBool::new(executable),
-            data: Arc::new(Mutex::new(data)),
+            storage: Mutex::new(FileNodeBlocks::empty()),
             dirty: Mutex::new(FileDirty::clean()),
             dir_entries: Arc::new(Mutex::new(Vec::new())),
         }
@@ -53,7 +139,7 @@ impl FileNode {
         Self {
             kind: FileKind::Directory,
             executable: AtomicBool::new(false),
-            data: Arc::new(Mutex::new(Vec::new())),
+            storage: Mutex::new(FileNodeBlocks::empty()),
             dirty: Mutex::new(FileDirty::clean()),
             dir_entries: Arc::new(Mutex::new(Vec::new())),
         }
@@ -109,6 +195,11 @@ impl FileNode {
             .any(|entry| entry == name))
     }
 
+    // AGENT: expose the visible byte length without exposing storage blocks.
+    pub fn len(&self) -> usize {
+        self.storage.lock().unwrap().len
+    }
+
     // AGENT: expose dirty state for focused tests and future flush decisions.
     pub fn dirty_state(&self) -> FileDirty {
         *self.dirty.lock().unwrap()
@@ -128,56 +219,175 @@ impl FileNode {
         dirty.metadata = true;
     }
 
-    // AGENT: write a byte range while centralizing growth checks and dirty
-    // accounting for all FileNode-backed write paths.
+    fn ensure_block(
+        storage: &mut FileNodeBlocks,
+        backend: &FileStorage,
+        file_block: usize,
+    ) -> Result<usize, &'static str> {
+        while storage.blocks.len() <= file_block {
+            storage.blocks.push(None);
+        }
+        if let Some(block) = storage.blocks[file_block] {
+            return Ok(block);
+        }
+        let block = backend.allocate_block()?;
+        storage.blocks[file_block] = Some(block);
+        Ok(block)
+    }
+
+    fn blocks_for_len(len: usize) -> Result<usize, &'static str> {
+        if len == 0 {
+            return Ok(0);
+        }
+        len.checked_add(BLOCK_CACHE_BLOCK_SIZE - 1)
+            .map(|rounded| rounded / BLOCK_CACHE_BLOCK_SIZE)
+            .ok_or("efbig")
+    }
+
+    // AGENT: read bytes from the block backend through the node's block map,
+    // treating sparse or unallocated regions as zero-filled file holes.
+    pub(crate) fn read_bytes(
+        &self,
+        backend: &FileStorage,
+        off: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        if self.kind != FileKind::Regular {
+            return Err("eisdir");
+        }
+        let storage = self.storage.lock().unwrap();
+        if off >= storage.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let total = min(buf.len(), storage.len - off);
+        let mut copied = 0usize;
+        while copied < total {
+            let abs = off.checked_add(copied).ok_or("efbig")?;
+            let file_block = abs / BLOCK_CACHE_BLOCK_SIZE;
+            let block_off = abs % BLOCK_CACHE_BLOCK_SIZE;
+            let n = min(total - copied, BLOCK_CACHE_BLOCK_SIZE - block_off);
+            if let Some(Some(block)) = storage.blocks.get(file_block) {
+                let block_data = backend.read_block(*block)?;
+                buf[copied..copied + n].copy_from_slice(&block_data[block_off..block_off + n]);
+            } else {
+                buf[copied..copied + n].fill(0);
+            }
+            copied += n;
+        }
+        Ok(copied)
+    }
+
+    // AGENT: copy the complete visible file contents out of the block backend.
+    pub(crate) fn read_all(&self, backend: &FileStorage) -> Result<Vec<u8>, &'static str> {
+        let len = self.len();
+        let mut data = vec![0; len];
+        self.read_bytes(backend, 0, &mut data)?;
+        Ok(data)
+    }
+
+    // AGENT: write a byte range through the block cache and update only file
+    // metadata in FileNode.
     pub(crate) fn write_bytes(
         &self,
+        backend: &FileStorage,
         offset: Option<usize>,
         buf: &[u8],
     ) -> Result<usize, &'static str> {
-        let mut data = self.data.lock().unwrap();
-        let start = offset.unwrap_or_else(|| data.len());
+        if self.kind != FileKind::Regular {
+            return Err("eisdir");
+        }
+        let mut storage = self.storage.lock().unwrap();
+        let start = offset.unwrap_or(storage.len);
         let end = start.checked_add(buf.len()).ok_or("efbig")?;
-        let grew = end > data.len();
+        let grew = end > storage.len;
+
+        let mut copied = 0usize;
+        while copied < buf.len() {
+            let abs = start.checked_add(copied).ok_or("efbig")?;
+            let file_block = abs / BLOCK_CACHE_BLOCK_SIZE;
+            let block_off = abs % BLOCK_CACHE_BLOCK_SIZE;
+            let n = min(buf.len() - copied, BLOCK_CACHE_BLOCK_SIZE - block_off);
+            let block = Self::ensure_block(&mut storage, backend, file_block)?;
+            let mut block_data = if block_off == 0 && n == BLOCK_CACHE_BLOCK_SIZE {
+                vec![0; BLOCK_CACHE_BLOCK_SIZE]
+            } else {
+                backend.read_block(block)?
+            };
+            block_data[block_off..block_off + n].copy_from_slice(&buf[copied..copied + n]);
+            backend.write_block(block, &block_data)?;
+            copied += n;
+        }
         if grew {
-            data.resize(end, 0);
+            storage.len = end;
         }
-        if !buf.is_empty() {
-            data[start..end].copy_from_slice(buf);
-        }
-        drop(data);
+        drop(storage);
+
         if grew || !buf.is_empty() {
             self.note_write(grew);
         }
         Ok(end)
     }
 
-    // AGENT: resize file contents and mark both data and metadata dirty only
-    // when the visible file length actually changes.
-    pub(crate) fn set_data_len(&self, len: usize) {
+    // AGENT: seed a new file into the backend as already-synced contents.
+    pub(crate) fn write_initial_bytes(
+        &self,
+        backend: &FileStorage,
+        data: &[u8],
+    ) -> Result<(), &'static str> {
+        self.write_bytes(backend, Some(0), data)?;
+        backend.flush()?;
+        *self.dirty.lock().unwrap() = FileDirty::clean();
+        Ok(())
+    }
+
+    // AGENT: resize visible file length while keeping truncated stale blocks
+    // unreachable from later reads.
+    pub(crate) fn set_data_len(
+        &self,
+        backend: &FileStorage,
+        len: usize,
+    ) -> Result<(), &'static str> {
+        if self.kind != FileKind::Regular {
+            return Err("eisdir");
+        }
         let changed = {
-            let mut data = self.data.lock().unwrap();
-            if data.len() == len {
+            let mut storage = self.storage.lock().unwrap();
+            if storage.len == len {
                 false
             } else {
-                data.resize(len, 0);
+                if len < storage.len {
+                    let keep_blocks = Self::blocks_for_len(len)?;
+                    if keep_blocks > 0 {
+                        let tail_off = len % BLOCK_CACHE_BLOCK_SIZE;
+                        if tail_off != 0 {
+                            if let Some(Some(block)) = storage.blocks.get(keep_blocks - 1) {
+                                let mut block_data = backend.read_block(*block)?;
+                                block_data[tail_off..].fill(0);
+                                backend.write_block(*block, &block_data)?;
+                            }
+                        }
+                    }
+                    storage.blocks.truncate(keep_blocks);
+                }
+                storage.len = len;
                 true
             }
         };
         if changed {
             self.note_resize();
         }
+        Ok(())
     }
 
-    // AGENT: grow file contents under one data lock so allocation cannot race
-    // with another writer and accidentally shrink a larger file.
+    // AGENT: grow only the visible length; actual blocks are allocated lazily
+    // when a later write stores non-hole bytes.
     pub(crate) fn ensure_data_len_at_least(&self, len: usize) {
         let grew = {
-            let mut data = self.data.lock().unwrap();
-            if data.len() >= len {
+            let mut storage = self.storage.lock().unwrap();
+            if storage.len >= len {
                 false
             } else {
-                data.resize(len, 0);
+                storage.len = len;
                 true
             }
         };
@@ -186,14 +396,16 @@ impl FileNode {
         }
     }
 
-    // AGENT: data-only sync clears dirty file contents but leaves metadata dirty.
-    pub fn sync_data(&self) -> Result<(), &'static str> {
+    // AGENT: data-only sync flushes dirty cached blocks and leaves metadata dirty.
+    pub fn sync_data(&self, backend: &FileStorage) -> Result<(), &'static str> {
+        backend.flush()?;
         self.dirty.lock().unwrap().data = false;
         Ok(())
     }
 
-    // AGENT: full sync clears both content and metadata dirty bits.
-    pub fn sync_all(&self) -> Result<(), &'static str> {
+    // AGENT: full sync flushes cached blocks and clears all node dirty bits.
+    pub fn sync_all(&self, backend: &FileStorage) -> Result<(), &'static str> {
+        backend.flush()?;
         *self.dirty.lock().unwrap() = FileDirty::clean();
         Ok(())
     }
@@ -201,10 +413,12 @@ impl FileNode {
 
 impl fmt::Debug for FileNode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let storage = self.storage.lock().unwrap();
         f.debug_struct("FileNode")
             .field("kind", &self.kind)
             .field("executable", &self.executable.load(Ordering::Relaxed))
-            .field("len", &self.data.lock().unwrap().len())
+            .field("len", &storage.len)
+            .field("blocks", &storage.blocks.len())
             .field("dirty", &self.dirty_state())
             .field("entries", &self.dir_entries.lock().unwrap().len())
             .finish()

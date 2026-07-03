@@ -109,7 +109,7 @@ pub(super) fn sys_open(
     let node = match existing {
         Some(node) => node,
         None if _create => {
-            let node = Arc::new(FileNode::regular(Vec::new(), false));
+            let node = Arc::new(FileNode::regular(false));
             kernel
                 .file_nodes
                 .write()
@@ -131,7 +131,7 @@ pub(super) fn sys_open(
         ap: _append,
         nb: _nonblock,
     };
-    let fh = FHandle::with_node(&resolved, opt, node);
+    let fh = FHandle::with_node_on_storage(&resolved, opt, node, kernel.file_storage());
     if _truncate && wr {
         fh.set_len(0)?;
     }

@@ -22,6 +22,14 @@ fn writable_opt() -> FdOpt {
     }
 }
 
+// AGENT: observe regular-file contents through the public read path now that
+// FileNode no longer stores a Vec of bytes.
+fn file_bytes(fh: &FHandle) -> Vec<u8> {
+    let mut data = vec![0; fh.node.len()];
+    fh.read_at(0, &mut data).unwrap();
+    data
+}
+
 // AGENT: moved dirty-state regression out of fd.rs without changing behavior.
 #[cfg_attr(test, test)]
 fn set_len_and_sync_update_dirty_state() {
@@ -29,7 +37,7 @@ fn set_len_and_sync_update_dirty_state() {
     assert_eq!(fh.node.dirty_state(), FileDirty::clean());
 
     fh.set_len(5).unwrap();
-    assert_eq!(fh.node.data.lock().unwrap().as_slice(), &[1, 2, 3, 0, 0]);
+    assert_eq!(file_bytes(&fh).as_slice(), &[1, 2, 3, 0, 0]);
     assert_eq!(
         fh.node.dirty_state(),
         FileDirty {
@@ -60,10 +68,7 @@ fn fallocate_validates_and_only_grows_regular_files() {
     let fh = FHandle::with_data("/tmp/file", writable_opt(), vec![1, 2, 3]);
 
     fh.fallocate(5, 2).unwrap();
-    assert_eq!(
-        fh.node.data.lock().unwrap().as_slice(),
-        &[1, 2, 3, 0, 0, 0, 0]
-    );
+    assert_eq!(file_bytes(&fh).as_slice(), &[1, 2, 3, 0, 0, 0, 0]);
     assert_eq!(
         fh.node.dirty_state(),
         FileDirty {
@@ -74,7 +79,7 @@ fn fallocate_validates_and_only_grows_regular_files() {
 
     fh.sync_all().unwrap();
     fh.fallocate(1, 1).unwrap();
-    assert_eq!(fh.node.data.lock().unwrap().len(), 7);
+    assert_eq!(fh.node.len(), 7);
     assert_eq!(fh.node.dirty_state(), FileDirty::clean());
 
     assert_eq!(fh.fallocate(0, 0), Err("einval"));
@@ -131,7 +136,7 @@ fn splice_checks_permissions_before_moving_offsets() {
     assert_eq!(src_entry.splice_to(&dst_entry, 2), Err("ebadf"));
     assert_eq!(src.offset(), 0);
     assert_eq!(dst.offset(), 0);
-    assert!(dst.node.data.lock().unwrap().is_empty());
+    assert_eq!(dst.node.len(), 0);
 
     let unreadable = FdOpt {
         rd: false,
@@ -146,7 +151,7 @@ fn splice_checks_permissions_before_moving_offsets() {
 
     assert_eq!(src_entry.splice_to(&dst_entry, 2), Err("ebadf"));
     assert_eq!(src.offset(), 0);
-    assert!(dst.node.data.lock().unwrap().is_empty());
+    assert_eq!(dst.node.len(), 0);
 }
 
 // AGENT: moved shared append-status splice regression out of fd.rs unchanged.
@@ -162,5 +167,5 @@ fn splice_uses_shared_append_status() {
     assert_eq!(src_entry.splice_to(&dst_entry, 2), Ok(2));
     assert_eq!(src.offset(), 2);
     assert_eq!(dst.offset(), 4);
-    assert_eq!(dst.node.data.lock().unwrap().as_slice(), &[9, 9, 1, 2]);
+    assert_eq!(file_bytes(&dst).as_slice(), &[9, 9, 1, 2]);
 }

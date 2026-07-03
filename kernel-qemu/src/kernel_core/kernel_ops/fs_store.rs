@@ -69,7 +69,9 @@ impl Kernel {
         executable: bool,
     ) -> Result<(), &'static str> {
         let resolved = self.lookup_path(path)?;
-        let node = Arc::new(FileNode::regular(data, executable));
+        let storage = self.file_storage();
+        let node = Arc::new(FileNode::regular(executable));
+        node.write_initial_bytes(&storage, &data)?;
         self.file_nodes
             .write()
             .unwrap()
@@ -112,7 +114,7 @@ impl Kernel {
         if node.kind == FileKind::Directory {
             return Err("eisdir");
         }
-        node.write_bytes(Some(offset), data)?;
+        node.write_bytes(&self.file_storage(), Some(offset), data)?;
         Ok(data.len())
     }
 }

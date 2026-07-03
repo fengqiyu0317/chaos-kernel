@@ -6,8 +6,9 @@ use super::*;
 pub struct Kernel {
     pub tasks: TaskTable,
     pub run_queue: RunQueue,
-    pub cache: BlockCache,
+    pub cache: Arc<BlockCache>,
     pub block_device: Arc<RamBlockDevice>,
+    file_blocks: Arc<FileBlockAllocator>,
     pub pool: FramePool,
     pub cpus: Mutex<[Option<Arc<Task>>; MAX_CPU]>,
     pub mnt: MountTable,
@@ -32,8 +33,9 @@ impl Kernel {
         Self {
             tasks: TaskTable::new(),
             run_queue: RunQueue::new(),
-            cache: BlockCache::new(N_CHAINS),
+            cache: Arc::new(BlockCache::new(N_CHAINS)),
             block_device,
+            file_blocks: Arc::new(FileBlockAllocator::new()),
             pool,
             cpus: Mutex::new([None, None, None, None, None, None, None, None]),
             mnt: MountTable::new(),
@@ -43,5 +45,15 @@ impl Kernel {
             shm_store: RwLock::new(BTreeMap::new()),
             tty_buf: Mutex::new(VecDeque::new()),
         }
+    }
+
+    // AGENT: build the shared FileNode backend from the Kernel-owned RAM block
+    // device and cache instead of storing file bytes inside each FileNode.
+    pub fn file_storage(&self) -> FileStorage {
+        FileStorage::new(
+            self.cache.clone(),
+            self.block_device.clone(),
+            self.file_blocks.clone(),
+        )
     }
 }
