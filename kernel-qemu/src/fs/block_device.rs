@@ -39,12 +39,10 @@ impl RamBlockDevice {
 }
 
 impl BlockDevice for RamBlockDevice {
-    // AGENT: enforce the fixed RAM-device capacity and return zeros for sparse
-    // blocks that have never been written.
+    // AGENT: enforce the fixed RAM-device block range and return zeros for
+    // sparse blocks that have never been written.
     fn read_block(&self, _dev: usize, block: usize) -> Result<Vec<u8>, &'static str> {
-        let start = block.checked_mul(BLOCK_CACHE_BLOCK_SIZE).ok_or("eio")?;
-        let end = start.checked_add(BLOCK_CACHE_BLOCK_SIZE).ok_or("eio")?;
-        if end > self.capacity_bytes() {
+        if block >= self.block_count() {
             return Err("eio");
         }
         let blocks = self.blocks.lock().unwrap();
@@ -55,15 +53,13 @@ impl BlockDevice for RamBlockDevice {
         }
     }
 
-    // AGENT: store only non-zero blocks in the sparse RAM map; all-zero writes
-    // remove the block without tracking a separate valid length.
+    // AGENT: store only in-range non-zero blocks in the sparse RAM map;
+    // all-zero writes remove the block.
     fn write_block(&self, _dev: usize, block: usize, data: &[u8]) -> Result<(), &'static str> {
         if data.len() != BLOCK_CACHE_BLOCK_SIZE {
             return Err("einval");
         }
-        let start = block.checked_mul(BLOCK_CACHE_BLOCK_SIZE).ok_or("eio")?;
-        let end = start.checked_add(BLOCK_CACHE_BLOCK_SIZE).ok_or("eio")?;
-        if end > self.capacity_bytes() {
+        if block >= self.block_count() {
             return Err("eio");
         }
         let mut blocks = self.blocks.lock().unwrap();
