@@ -1,10 +1,10 @@
 // AGENT
 use kernel_sim::{
     check_access, compute_inet_checksum, parse_ipv4_header, set_current_task_id, wait_ev,
-    AddrSpace, BlockCache, BlockDevice, Channel, EpData, EpEvent, EvBus, EvFlag, ExitReason,
-    FHandle, FLike, FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking, PageTableEntry,
-    SchedulePolicy, SemCtx, Sema, Spin, SpinLock, SyncQueue, Task, TaskRunState, TaskTable,
-    TimerEntry, VmMap, VmRegion, WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ,
+    AddrSpace, BlockCache, BlockDevice, Channel, CircBuf, EpData, EpEvent, EvBus, EvFlag,
+    ExitReason, FHandle, FLike, FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking,
+    PageTableEntry, SchedulePolicy, SemCtx, Sema, Spin, SpinLock, SyncQueue, Task, TaskRunState,
+    TaskTable, TimerEntry, VmMap, VmRegion, WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ,
     BLOCK_CACHE_BLOCK_SIZE, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, N_FRAMES, N_PROC,
     N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP,
     SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX,
@@ -31,6 +31,42 @@ static TIMER_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 // AGENT: focused low-level Spin tests share timing-sensitive helper threads;
 // serialize them to avoid harness-level interleavings in lock-state assertions.
 static CURRENT_TASK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+// AGENT: zero-capacity rings must fail gracefully without modulo-by-zero paths.
+#[test]
+fn circbuf_zero_capacity_rejects_writes() {
+    let mut ring = CircBuf::new(0);
+    let mut out = Vec::new();
+
+    assert_eq!(ring.len(), 0);
+    assert_eq!(ring.remaining(), 0);
+    assert!(ring.empty());
+    assert!(ring.full());
+    assert!(!ring.push(1));
+    assert_eq!(ring.fill_from(b"abc"), 0);
+    assert_eq!(ring.peek(), None);
+    assert_eq!(ring.pop(), None);
+    assert_eq!(ring.drain_to(&mut out, 4), 0);
+    assert!(out.is_empty());
+}
+
+// AGENT: with_pos treats inputs as ring cursor positions and keeps length bounded.
+#[test]
+fn circbuf_with_pos_handles_wrapped_cursors() {
+    let mut ring = CircBuf::with_pos(4, 3, 1);
+
+    assert_eq!(ring.len(), 2);
+    assert_eq!(ring.remaining(), 2);
+    assert_eq!(ring.peek(), Some(0));
+    assert_eq!(ring.pop(), Some(0));
+    assert_eq!(ring.pop(), Some(0));
+    assert_eq!(ring.pop(), None);
+
+    assert_eq!(ring.fill_from(&[0xA0, 0xB0, 0xC0]), 3);
+    let mut out = Vec::new();
+    assert_eq!(ring.drain_to(&mut out, 8), 3);
+    assert_eq!(out, vec![0xA0, 0xB0, 0xC0]);
+}
 
 fn lock_timer_tests() -> std::sync::MutexGuard<'static, ()> {
     TIMER_TEST_LOCK

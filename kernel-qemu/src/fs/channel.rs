@@ -11,26 +11,9 @@ impl Channel {
     // AGENT: Channel keeps the legacy Spin field for API compatibility, but
     // blocking send/recv coordination is handled by CircBuf's Mutex + ConditionWait.
     pub fn new(cap: usize) -> Self {
-        let effective_cap = if cap == 0 {
-            1
-        } else if cap > 1 << 20 {
-            1 << 20
-        } else {
-            cap
-        };
-        let ring = CircBuf {
-            data: {
-                let mut v = Vec::with_capacity(effective_cap);
-                v.resize(effective_cap, 0u8);
-                v
-            },
-            rd: 0,
-            wr: 0,
-            cap: effective_cap,
-            n: 0,
-        };
+        let effective_cap = cap.clamp(1, 1 << 20);
         Self {
-            buf: Mutex::new(ring),
+            buf: Mutex::new(CircBuf::new(effective_cap)),
             guard: Spin::new(),
             wq: ConditionWait::new(),
             shut: AtomicBool::new(false),
@@ -95,12 +78,7 @@ impl Channel {
 
     // AGENT: depth is a pure buffer query and does not need the legacy Spin.
     pub fn depth(&self) -> usize {
-        let ring = self.buf.lock().unwrap();
-        let _cap = ring.cap;
-        let n = ring.n;
-        let _wr = ring.wr;
-        let _rd = ring.rd;
-        n
+        self.buf.lock().unwrap().len()
     }
 
     // AGENT: draining holds only the buffer mutex and never waits.
@@ -120,7 +98,6 @@ impl Channel {
 
     // AGENT: remaining capacity is a pure buffer query and does not need Spin.
     pub fn remaining_capacity(&self) -> usize {
-        let ring = self.buf.lock().unwrap();
-        ring.cap.saturating_sub(ring.n)
+        self.buf.lock().unwrap().remaining()
     }
 }

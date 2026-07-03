@@ -1,15 +1,18 @@
 // AGENT
 use super::*;
 
+// AGENT: keep ring-buffer cursors private so rd/wr/n invariants stay local.
 pub struct CircBuf {
-    pub data: Vec<u8>,
-    pub rd: usize,
-    pub wr: usize,
-    pub cap: usize,
-    pub n: usize,
+    data: Vec<u8>,
+    rd: usize,
+    wr: usize,
+    cap: usize,
+    n: usize,
 }
 
+// AGENT: rd is the next byte to read, wr is the next slot to write.
 impl CircBuf {
+    // AGENT: initialize an empty ring without exposing cursor details.
     pub fn new(c: usize) -> Self {
         Self {
             data: vec![0u8; c],
@@ -19,75 +22,85 @@ impl CircBuf {
             n: 0,
         }
     }
+
+    // AGENT: normalize legacy cursor inputs and derive a bounded length.
     pub fn with_pos(c: usize, r: usize, w: usize) -> Self {
-        let n = w.wrapping_sub(r); // AGENT: fix n calculation, was c - r + w
+        let (rd, wr, n) = if c == 0 {
+            (0, 0, 0)
+        } else {
+            let rd = r % c;
+            let wr = w % c;
+            let n = if wr >= rd { wr - rd } else { c - rd + wr };
+            (rd, wr, n)
+        };
         Self {
             data: vec![0u8; c],
-            rd: r,
-            wr: w,
+            rd,
+            wr,
             cap: c,
             n,
         }
     }
+
+    // AGENT: write at wr before advancing so slot 0 is usable and semantics are FIFO.
     pub fn push(&mut self, v: u8) -> bool {
-        // HUMAN
-        if self.n >= self.cap {
+        if self.full() {
             return false;
         }
-        self.wr = self.wr.wrapping_add(1);
-        let i = self.wr % self.cap;
-        if i >= self.data.len() {
-            self.wr = self.wr.wrapping_sub(1);
-            return false;
-        }
-        self.data[i] = v;
+        self.data[self.wr] = v;
+        self.wr = (self.wr + 1) % self.cap;
         self.n += 1;
         true
     }
+
+    // AGENT: read from rd before advancing to mirror push's cursor semantics.
     pub fn pop(&mut self) -> Option<u8> {
-        if self.n == 0 {
+        if self.empty() {
             return None;
         }
-        self.rd = self.rd.wrapping_add(1);
-        let i = self.rd % self.cap;
-        if i >= self.data.len() {
-            self.rd = self.rd.wrapping_sub(1);
-            return None;
-        }
+        let v = self.data[self.rd];
+        self.rd = (self.rd + 1) % self.cap;
         self.n -= 1;
-        Some(self.data[i])
+        Some(v)
     }
+
+    // AGENT: expose the buffered byte count without exposing raw cursors.
     pub fn len(&self) -> usize {
         self.n
     }
+
+    // AGENT: keep the legacy empty() API while routing through the invariant field.
     pub fn empty(&self) -> bool {
         self.n == 0
     }
+
+    // AGENT: full rings reject writes before any modulo arithmetic.
     pub fn full(&self) -> bool {
         self.n >= self.cap
     }
 
+    // AGENT: peek reads the next byte without mutating the read cursor.
     pub fn peek(&self) -> Option<u8> {
-        if self.n == 0 {
+        if self.empty() {
             return None;
         }
-        let i = self.rd.wrapping_add(1) % self.cap;
-        if i >= self.data.len() {
-            return None;
-        }
-        Some(self.data[i])
+        Some(self.data[self.rd])
     }
 
+    // AGENT: report the actual number moved instead of assuming all pops succeed.
     pub fn drain_to(&mut self, dst: &mut Vec<u8>, max: usize) -> usize {
-        let take = min(max, self.n);
-        for _ in 0..take {
-            if let Some(b) = self.pop() {
-                dst.push(b);
-            }
+        let mut moved = 0;
+        while moved < max {
+            let Some(b) = self.pop() else {
+                break;
+            };
+            dst.push(b);
+            moved += 1;
         }
-        take
+        moved
     }
 
+    // AGENT: fill through push so capacity handling stays in one place.
     pub fn fill_from(&mut self, src: &[u8]) -> usize {
         let mut written = 0;
         for &b in src {
@@ -99,8 +112,9 @@ impl CircBuf {
         written
     }
 
+    // AGENT: remaining capacity is exact because n is kept within cap.
     pub fn remaining(&self) -> usize {
-        self.cap.saturating_sub(self.n)
+        self.cap - self.n
     }
 }
 
