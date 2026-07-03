@@ -6,7 +6,7 @@ const FILE_NODE_METADATA_MAGIC: &[u8; 4] = b"FNMD";
 
 // AGENT: keep standalone/test file handles small; full-chain writeback now
 // preserves correctness when a single chain has to recycle slots.
-const STANDALONE_BLOCK_CACHE_CHAINS: usize = 1;
+const STANDALONE_BLOCK_CACHE_CHAINS: usize = 10;
 
 // AGENT: distinguish regular path files from directory nodes for exec checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,9 +145,6 @@ impl FileNode {
     pub fn add_dir_entry(&self, backend: &FileStorage, name: &str) -> Result<(), &'static str> {
         if self.kind != FileKind::Directory {
             return Err("enotdir");
-        }
-        if name.is_empty() || name.contains('/') || name.bytes().any(|b| b == 0) {
-            return Err("einval");
         }
         {
             let entries = self.dir_entries.lock().unwrap();
