@@ -2,6 +2,7 @@
 use super::*;
 
 pub mod block_cache;
+pub mod block_device;
 pub mod channel;
 pub mod epoll;
 pub mod fd;
@@ -12,6 +13,7 @@ pub mod pipe;
 pub mod tty;
 
 pub use self::block_cache::*;
+pub use self::block_device::*;
 pub use self::channel::*;
 pub use self::epoll::*;
 pub use self::fd::*;

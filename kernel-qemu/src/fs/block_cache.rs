@@ -1,8 +1,6 @@
 // AGENT
+use super::block_device::{BlockDevice, BLOCK_CACHE_BLOCK_SIZE};
 use super::*;
-
-pub const BLOCK_CACHE_BLOCK_SIZE: usize = 512;
-pub const ROOT_BLOCK_DEVICE: usize = 0;
 
 // AGENT: identify cached data by block-device namespace plus block number
 // instead of overloading file-descriptor ids as cache keys.
@@ -21,87 +19,6 @@ impl BlockKey {
         let mut h = self.block ^ (self.block >> 7);
         h ^= self.dev.wrapping_mul(0x9E37_79B9);
         h ^ (h >> 11)
-    }
-}
-
-// AGENT: narrow block-device interface used by BlockCache; concrete QEMU
-// drivers can later implement this over virtio-blk or another real device.
-pub trait BlockDevice {
-    fn read_block(&self, dev: usize, block: usize) -> Result<Vec<u8>, &'static str>;
-    fn write_block(&self, dev: usize, block: usize, data: &[u8]) -> Result<(), &'static str>;
-}
-
-// AGENT: fixed-size in-memory block device used as the first QEMU-side backend
-// for initramfs or embedded init images before virtio-blk is introduced.
-pub struct RamBlockDevice {
-    valid_len: AtomicUsize,
-    data: Mutex<Vec<u8>>,
-}
-
-impl RamBlockDevice {
-    // AGENT: build a RAM block device from bytes and pad the backing store to a
-    // complete block while preserving the original payload length.
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        let mut data = bytes.to_vec();
-        let valid_len = data.len();
-        if valid_len > 0 {
-            let rem = valid_len % BLOCK_CACHE_BLOCK_SIZE;
-            if rem != 0 {
-                data.resize(valid_len + (BLOCK_CACHE_BLOCK_SIZE - rem), 0);
-            }
-        }
-        Self {
-            valid_len: AtomicUsize::new(valid_len),
-            data: Mutex::new(data),
-        }
-    }
-
-    // AGENT: keep the default kernel backend explicit when no boot image has
-    // been linked yet.
-    pub fn empty() -> Self {
-        Self::from_bytes(&[])
-    }
-
-    pub fn byte_len(&self) -> usize {
-        self.valid_len.load(Ordering::Relaxed)
-    }
-}
-
-impl BlockDevice for RamBlockDevice {
-    fn read_block(&self, _dev: usize, block: usize) -> Result<Vec<u8>, &'static str> {
-        let start = block.checked_mul(BLOCK_CACHE_BLOCK_SIZE).ok_or("eio")?;
-        let end = start.checked_add(BLOCK_CACHE_BLOCK_SIZE).ok_or("eio")?;
-        let data = self.data.lock().unwrap();
-        if end > data.len() {
-            return Err("eio");
-        }
-        Ok(data[start..end].to_vec())
-    }
-
-    fn write_block(&self, _dev: usize, block: usize, data: &[u8]) -> Result<(), &'static str> {
-        if data.len() != BLOCK_CACHE_BLOCK_SIZE {
-            return Err("einval");
-        }
-        let start = block.checked_mul(BLOCK_CACHE_BLOCK_SIZE).ok_or("eio")?;
-        let end = start.checked_add(BLOCK_CACHE_BLOCK_SIZE).ok_or("eio")?;
-        let mut backing = self.data.lock().unwrap();
-        if end > backing.len() {
-            return Err("eio");
-        }
-        backing[start..end].copy_from_slice(data);
-        let mut old_len = self.valid_len.load(Ordering::Relaxed);
-        while end > old_len {
-            match self.valid_len.compare_exchange(
-                old_len,
-                end,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(current) => old_len = current,
-            }
-        }
-        Ok(())
     }
 }
 

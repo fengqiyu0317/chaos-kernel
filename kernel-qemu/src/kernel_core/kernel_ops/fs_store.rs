@@ -83,54 +83,6 @@ impl Kernel {
         self.install_file(path, data, true)
     }
 
-    // AGENT: read a byte range from consecutive cached blocks on the installed
-    // QEMU block backend; callers pass the exact byte length to trim padding.
-    pub fn read_cached_block_bytes(
-        &self,
-        dev: usize,
-        first_block: usize,
-        byte_len: usize,
-    ) -> Result<Vec<u8>, &'static str> {
-        if byte_len == 0 {
-            return Ok(Vec::new());
-        }
-        let blocks = (byte_len + BLOCK_CACHE_BLOCK_SIZE - 1) / BLOCK_CACHE_BLOCK_SIZE;
-        let mut out = Vec::with_capacity(blocks * BLOCK_CACHE_BLOCK_SIZE);
-        for offset in 0..blocks {
-            let block = first_block.checked_add(offset).ok_or("eio")?;
-            let bytes = self
-                .cache
-                .read_block_cached(self.block_device.as_ref(), dev, block)?;
-            out.extend_from_slice(&bytes);
-        }
-        out.truncate(byte_len);
-        Ok(out)
-    }
-
-    // AGENT: install one executable file from the QEMU block backend through
-    // BlockCache, preserving the existing path-backed exec data source.
-    pub fn install_exec_file_from_cached_blocks(
-        &self,
-        path: &str,
-        dev: usize,
-        first_block: usize,
-        byte_len: usize,
-    ) -> Result<(), &'static str> {
-        let data = self.read_cached_block_bytes(dev, first_block, byte_len)?;
-        self.install_exec_file(path, data)
-    }
-
-    // AGENT: seed /bin/init from block 0 of the root block device when boot code
-    // links a non-empty image; an empty image keeps today's carrier-only boot.
-    pub fn install_root_init_from_block_device(&self) -> Result<bool, &'static str> {
-        let byte_len = self.block_device.byte_len();
-        if byte_len == 0 {
-            return Ok(false);
-        }
-        self.install_exec_file_from_cached_blocks("/bin/init", ROOT_BLOCK_DEVICE, 0, byte_len)?;
-        Ok(true)
-    }
-
     // AGENT: install a directory node so exec can distinguish directories.
     pub fn install_directory(&self, path: &str) -> Result<(), &'static str> {
         let resolved = self.lookup_path(path)?;

@@ -6,6 +6,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::hint::spin_loop;
 use core::panic::PanicInfo;
@@ -49,10 +50,9 @@ const QEMU_VIRT_RAM_END: usize = 0x8800_0000;
 // satp still points at them.
 static KERNEL_PAGE_TABLE: IrqOnceCell<kernel::PageTable> = IrqOnceCell::new();
 
-// AGENT: first-stage root block image. Keep this empty until a real RISC-V init
-// ELF or initramfs is produced; switching to include_bytes! later only changes
-// this constant.
-const ROOT_INIT_IMAGE: &[u8] = &[];
+// AGENT: optional first-stage init ELF installed as the normal /bin/init file.
+// Keep this empty until a real RISC-V user ELF is produced.
+const ROOT_INIT_ELF: &[u8] = &[];
 
 // AGENT: First Rust entry point for the M9 QEMU carrier layer.
 #[no_mangle]
@@ -125,13 +125,13 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
 fn init_qemu_kernel_backend() -> &'static kernel::Kernel {
     let frame_pool = init_qemu_frame_pool();
     install_kernel_page_table(&frame_pool);
-    let root_block = Arc::new(kernel::RamBlockDevice::from_bytes(ROOT_INIT_IMAGE));
+    let root_block = Arc::new(kernel::RamBlockDevice::empty());
     let kernel = Box::leak(Box::new(kernel::Kernel::new_with_block_device(
         frame_pool, root_block,
     )));
-    match kernel.install_root_init_from_block_device() {
-        Ok(true) => println!("[kernel-qemu] installed /bin/init from root block device"),
-        Ok(false) => println!("[kernel-qemu] root block device has no init image"),
+    match install_embedded_root_init(kernel, ROOT_INIT_ELF) {
+        Ok(true) => println!("[kernel-qemu] installed embedded /bin/init"),
+        Ok(false) => println!("[kernel-qemu] no embedded /bin/init"),
         Err(err) => println!("[kernel-qemu] failed to install /bin/init: {}", err),
     }
     kernel.proc_init();
@@ -142,6 +142,19 @@ fn init_qemu_kernel_backend() -> &'static kernel::Kernel {
         current
     );
     kernel
+}
+
+// AGENT: install the linked init payload through the same path-backed file store
+// used by exec and file handles, instead of treating it as raw block data.
+fn install_embedded_root_init(
+    kernel: &kernel::Kernel,
+    init_elf: &[u8],
+) -> Result<bool, &'static str> {
+    if init_elf.is_empty() {
+        return Ok(false);
+    }
+    kernel.install_exec_file("/bin/init", Vec::from(init_elf))?;
+    Ok(true)
 }
 
 // AGENT: switch from bare addressing to an Sv39 root that keeps the current
