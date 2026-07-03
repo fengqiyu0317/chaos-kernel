@@ -101,33 +101,11 @@ impl MountTable {
         result
     }
 
-    // AGENT: Scan a caller-held mount table snapshot without locking again.
+    // AGENT: Use a caller-held mount table snapshot to rebuild and query the
+    // prefix cache without taking another lock.
     fn find_mount_id_locked(tbl: &[MountEntry], path: &str) -> Option<usize> {
-        let mut best_match_idx: Option<usize> = None;
-        let mut best_prefix_len = 0;
-        for (idx, m) in tbl.iter().enumerate() {
-            if m.prefix.is_empty() {
-                continue;
-            }
-            let plen = m.prefix.len();
-            if plen > path.len() {
-                continue;
-            }
-            let mut matches = true;
-            let pbytes = m.prefix.as_bytes();
-            let pathbytes = path.as_bytes();
-            for j in 0..plen {
-                if pbytes[j] != pathbytes[j] {
-                    matches = false;
-                    break;
-                }
-            }
-            if matches && plen > best_prefix_len {
-                best_prefix_len = plen;
-                best_match_idx = Some(idx);
-            }
-        }
-        best_match_idx
+        let cache = rehash_mount_cache(tbl);
+        lookup_mount_cache(tbl, &cache, path)
     }
 
     // AGENT: Keep the legacy helper API while delegating to the non-locking

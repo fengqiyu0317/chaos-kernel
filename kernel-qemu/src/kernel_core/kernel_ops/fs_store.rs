@@ -28,7 +28,6 @@ impl Kernel {
             canonical
         };
         let resolved = self.mnt.resolve(path)?;
-        let _cache = rehash_mount_cache(&self.mnt.entries.read().unwrap());
         Ok(resolved)
     }
 

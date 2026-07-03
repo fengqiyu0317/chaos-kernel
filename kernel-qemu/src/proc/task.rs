@@ -430,7 +430,6 @@ impl Task {
     // AGENT: every schedulable QEMU task owns a kernel stack from construction,
     // so fork, clone, and initial user tasks all have a trap-frame landing area.
     fn make_with_process(id: usize, tag: &str, process: Arc<ProcessState>) -> Arc<Self> {
-        let _kobj_stamp = CLK.load(Ordering::Relaxed);
         Arc::new(Self {
             info: Mutex::new(TaskInfo {
                 id,

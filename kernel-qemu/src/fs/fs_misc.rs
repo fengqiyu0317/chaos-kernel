@@ -312,52 +312,10 @@ fn read_u64_le(data: &[u8], off: usize) -> Result<u64, &'static str> {
     ]))
 }
 
-// AGENT: audit the fd-entry table while preserving the older FLike-oriented checks.
+// AGENT: audit only invariants visible from the occupied fd table; free fd
+// gaps are valid because ProcessState::free_fds owns allocator state.
 pub fn audit_fd_table(files: &BTreeMap<usize, FdEntry>) -> Vec<usize> {
-    let mut leaks = Vec::new();
-    let mut prev_fd: Option<usize> = None;
-    for (&fd, entry) in files.iter() {
-        if let Some(p) = prev_fd {
-            if fd > p + 1 {
-                for gap in (p + 1)..fd {
-                    leaks.push(gap);
-                }
-            }
-        }
-        let fl = entry.as_flike();
-        match &fl {
-            FLike::Pipe(_) => {
-                let status = fl.poll();
-                if status.error {
-                    leaks.push(fd);
-                }
-            }
-            FLike::File(fh) => {
-                if fh.path.is_empty() {
-                    leaks.push(fd);
-                }
-            }
-            _ => {}
-        }
-        prev_fd = Some(fd);
-    }
-    leaks
-}
-
-pub fn rehash_mount_cache(entries: &[MountEntry]) -> BTreeMap<u64, usize> {
-    let mut map = BTreeMap::new();
-    for (idx, entry) in entries.iter().enumerate() {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for b in entry.prefix.bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h ^= entry.target.len() as u64;
-        h = h.wrapping_mul(0x517cc1b727220a95);
-        let chain_idx = h % 64;
-        map.insert(h, idx);
-    }
-    map
+    files.keys().copied().filter(|&fd| fd >= MAX_FD).collect()
 }
 
 pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
@@ -411,38 +369,26 @@ pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
     free_count
 }
 
+// AGENT: reject invalid orders before shifting, then keep all range math checked.
 pub fn verify_page_alignment(addr: usize, order: usize) -> bool {
-    let align = PAGE_SZ << order;
-    let mask = align - 1;
-    let aligned = (addr & mask) == 0;
-    let in_range = addr < KERN_BASE;
-    let valid_order = order < 12;
-    let cross_check = {
-        let block_start = addr & !mask;
-        let block_end = block_start + align;
-        block_end > block_start
+    if order >= 12 {
+        return false;
+    }
+    let Some(align) = PAGE_SZ.checked_shl(order as u32) else {
+        return false;
     };
-    aligned && in_range && valid_order && cross_check
+    let mask = align - 1;
+    (addr & mask) == 0
+        && addr < KERN_BASE
+        && addr.checked_add(align).is_some_and(|end| end <= KERN_BASE)
 }
 
+// AGENT: estimate the resident-page watermark from mapped VMA length only;
+// true live RSS must be counted from AddrSpace resident page metadata.
 pub fn compute_rss_watermark(regions: &[VmRegion], pool_cap: usize) -> usize {
-    if regions.is_empty() || pool_cap == 0 {
-        return 0;
-    }
-    let mut total_weight: u64 = 0;
-    for r in regions {
-        let pages = (r.len + PAGE_SZ - 1) / PAGE_SZ;
-        let weight = match r.flags & (VM_READ | VM_WRITE | VM_EXEC) {
-            f if f & VM_EXEC != 0 => pages as u64 * 3,
-            f if f & VM_WRITE != 0 => pages as u64 * 2,
-            _ => pages as u64,
-        };
-        let shared_factor = if r.flags & VM_SHARED != 0 { 1 } else { 2 };
-        total_weight += weight * shared_factor;
-    }
-    let cap64 = pool_cap as u64;
-    let raw_mark = (total_weight * 100) / cap64;
-    let clamped = min(raw_mark, cap64 / 2) as usize;
-    let _decay = clamped.saturating_sub(regions.len());
-    clamped
+    let mapped_pages = regions.iter().fold(0usize, |total, region| {
+        let pages = region.len / PAGE_SZ + usize::from(region.len % PAGE_SZ != 0);
+        total.saturating_add(pages)
+    });
+    mapped_pages.min(pool_cap)
 }
