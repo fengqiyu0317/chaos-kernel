@@ -50,6 +50,15 @@ pub struct CacheSlot {
     pub payload: BlockPayload,
     pub modified: bool,
 }
+impl CacheSlot {
+    // AGENT: keep single-slot writeback with the slot that owns the dirty flag.
+    fn flush_to<D: BlockDevice + ?Sized>(&self, device: &D) -> Result<(), &'static str> {
+        if self.modified {
+            device.write_block(self.key.dev, self.key.block, &self.payload)?;
+        }
+        Ok(())
+    }
+}
 
 // AGENT: QEMU block-cache chains use a fixed slot array so cache residency has
 // a hard per-chain bound while staying usable during early boot.
@@ -62,29 +71,6 @@ impl CacheChain {
         Self {
             items: Mutex::new([None; BLOCK_CACHE_CHAIN_SLOTS]),
         }
-    }
-}
-
-pub struct BlockCache {
-    pub chains: Vec<CacheChain>,
-    pub width: usize,
-}
-impl BlockCache {
-    // AGENT: BlockCache chains are sharded by block key and each chain owns its
-    // slot mutex, so cache operations also work before current-task setup.
-    pub fn new(w: usize) -> Self {
-        let mut c = Vec::with_capacity(w);
-        for _ in 0..w {
-            c.push(CacheChain::new());
-        }
-        Self {
-            chains: c,
-            width: w,
-        }
-    }
-    // AGENT: keep all chain hashing through one helper.
-    pub fn idx(&self, key: BlockKey) -> usize {
-        key.hash() % self.width
     }
 
     // AGENT: locate cache slots by block identity without returning an index
@@ -134,17 +120,28 @@ impl BlockCache {
                     .find_map(|(idx, entry)| (*entry).map(|slot| (idx, slot)))
             })
     }
+}
 
-    // AGENT: write back a dirty cache snapshot before it is marked clean or
-    // reused for another block key.
-    fn flush_slot<D: BlockDevice + ?Sized>(
-        device: &D,
-        slot: CacheSlot,
-    ) -> Result<(), &'static str> {
-        if slot.modified {
-            device.write_block(slot.key.dev, slot.key.block, &slot.payload)?;
+pub struct BlockCache {
+    pub chains: Vec<CacheChain>,
+    pub width: usize,
+}
+impl BlockCache {
+    // AGENT: BlockCache chains are sharded by block key and each chain owns its
+    // slot mutex, so cache operations also work before current-task setup.
+    pub fn new(w: usize) -> Self {
+        let mut c = Vec::with_capacity(w);
+        for _ in 0..w {
+            c.push(CacheChain::new());
         }
-        Ok(())
+        Self {
+            chains: c,
+            width: w,
+        }
+    }
+    // AGENT: keep all chain hashing through one helper.
+    pub fn idx(&self, key: BlockKey) -> usize {
+        key.hash() % self.width
     }
 
     // AGENT: return cached payloads on hit and only read the device on miss,
@@ -161,7 +158,7 @@ impl BlockCache {
 
         {
             let items = ch.items.lock().unwrap();
-            if let Some(slot) = Self::slot_ref(&items, key) {
+            if let Some(slot) = CacheChain::slot_ref(&items, key) {
                 return Ok(slot.payload.to_vec());
             }
         }
@@ -170,7 +167,7 @@ impl BlockCache {
         let payload = block_payload_from_slice(&block_data, "eio")?;
         {
             let mut items = ch.items.lock().unwrap();
-            if let Some(slot) = Self::slot_ref(&items, key) {
+            if let Some(slot) = CacheChain::slot_ref(&items, key) {
                 return Ok(slot.payload.to_vec());
             }
             let new_slot = CacheSlot {
@@ -178,14 +175,14 @@ impl BlockCache {
                 payload,
                 modified: false,
             };
-            if let Some(empty_idx) = Self::empty_slot_index(&items) {
+            if let Some(empty_idx) = CacheChain::empty_slot_index(&items) {
                 items[empty_idx] = Some(new_slot);
                 return Ok(block_data);
             }
-            let Some((victim_idx, victim)) = Self::victim_slot(&items) else {
+            let Some((victim_idx, victim)) = CacheChain::victim_slot(&items) else {
                 return Err("enospc");
             };
-            Self::flush_slot(device, victim)?;
+            victim.flush_to(device)?;
             items[victim_idx] = Some(new_slot);
         }
         Ok(block_data)
@@ -205,7 +202,7 @@ impl BlockCache {
         let ci = self.idx(key);
         let ch = &self.chains[ci];
         let mut items = ch.items.lock().unwrap();
-        if let Some(slot) = Self::slot_mut(&mut items, key) {
+        if let Some(slot) = CacheChain::slot_mut(&mut items, key) {
             slot.payload = payload;
             slot.modified = true;
             return Ok(());
@@ -215,14 +212,14 @@ impl BlockCache {
             payload,
             modified: true,
         };
-        if let Some(empty_idx) = Self::empty_slot_index(&items) {
+        if let Some(empty_idx) = CacheChain::empty_slot_index(&items) {
             items[empty_idx] = Some(new_slot);
             return Ok(());
         }
-        let Some((victim_idx, victim)) = Self::victim_slot(&items) else {
+        let Some((victim_idx, victim)) = CacheChain::victim_slot(&items) else {
             return Err("enospc");
         };
-        Self::flush_slot(device, victim)?;
+        victim.flush_to(device)?;
         items[victim_idx] = Some(new_slot);
         Ok(())
     }
@@ -243,10 +240,10 @@ impl BlockCache {
 
         let mut flushed = 0usize;
         for snapshot in dirty {
-            Self::flush_slot(device, snapshot)?;
+            snapshot.flush_to(device)?;
             let ch = &self.chains[self.idx(snapshot.key)];
             let mut items = ch.items.lock().unwrap();
-            if let Some(slot) = Self::slot_mut(&mut items, snapshot.key) {
+            if let Some(slot) = CacheChain::slot_mut(&mut items, snapshot.key) {
                 if slot.modified && slot.payload == snapshot.payload {
                     slot.modified = false;
                     flushed += 1;
