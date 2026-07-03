@@ -153,6 +153,23 @@ impl OpenFileDescription {
             },
         }
     }
+
+    // AGENT: keep splice on the shared open-file-description path so mutable
+    // status flags such as O_APPEND are honored for both ends.
+    pub fn splice_to(
+        &self,
+        dst: &OpenFileDescription,
+        count: usize,
+    ) -> Result<usize, &'static str> {
+        let src_status = self.status_flags();
+        let dst_status = dst.status_flags();
+        match (&self.file, &dst.file) {
+            (FLike::File(src), FLike::File(dst)) => {
+                src.splice_to_with_status(src_status, dst, dst_status, count)
+            }
+            _ => Err("enosys"),
+        }
+    }
 }
 
 impl FdEntry {
@@ -254,6 +271,12 @@ impl FdEntry {
         buf_wr: Option<&[u8]>,
     ) -> Result<usize, &'static str> {
         self.desc.transfer(dir, offset, buf_rd, buf_wr)
+    }
+
+    // AGENT: fd-table callers splice through descriptor entries rather than
+    // raw handles, preserving shared status and offset semantics.
+    pub fn splice_to(&self, dst: &FdEntry, count: usize) -> Result<usize, &'static str> {
+        self.desc.splice_to(dst.desc.as_ref(), count)
     }
 
     // AGENT: compatibility view for older tests and helpers that inspect FLike.
@@ -699,6 +722,109 @@ impl FHandle {
         self.transfer_with_status(self.get_opt(), dir, offset, buf_rd, buf_wr)
     }
 
+    // AGENT: copy a regular-file byte range without changing descriptor state.
+    fn copy_chunk_at(&self, off: usize, count: usize) -> Vec<u8> {
+        let data = self.node.data.lock().unwrap();
+        if off >= data.len() || count == 0 {
+            return Vec::new();
+        }
+        let n = min(count, data.len() - off);
+        data[off..off + n].to_vec()
+    }
+
+    // AGENT: splice with explicit fd status supplied by OpenFileDescription.
+    fn splice_to_with_status(
+        &self,
+        src_status: FdOpt,
+        dst: &FHandle,
+        dst_status: FdOpt,
+        count: usize,
+    ) -> Result<usize, &'static str> {
+        if !src_status.rd || !dst_status.wr {
+            return Err("ebadf");
+        }
+        if self.node.kind != FileKind::Regular || dst.node.kind != FileKind::Regular {
+            return Err("enodev");
+        }
+        if count == 0 {
+            return Ok(0);
+        }
+        if Arc::ptr_eq(&self.desc, &dst.desc) {
+            return self.splice_same_description(dst, dst_status, count);
+        }
+
+        let src_key = Arc::as_ptr(&self.desc) as usize;
+        let dst_key = Arc::as_ptr(&dst.desc) as usize;
+        if src_key < dst_key {
+            let mut src_desc = self.desc.write().unwrap();
+            let mut dst_desc = dst.desc.write().unwrap();
+            self.splice_locked(&mut src_desc, dst, &mut dst_desc, dst_status, count)
+        } else {
+            let mut dst_desc = dst.desc.write().unwrap();
+            let mut src_desc = self.desc.write().unwrap();
+            self.splice_locked(&mut src_desc, dst, &mut dst_desc, dst_status, count)
+        }
+    }
+
+    // AGENT: handle dup-style self-splice without trying to take the same
+    // descriptor lock twice.
+    fn splice_same_description(
+        &self,
+        dst: &FHandle,
+        dst_status: FdOpt,
+        count: usize,
+    ) -> Result<usize, &'static str> {
+        let mut desc = self.desc.write().unwrap();
+        let src_off = match usize::try_from(desc.off) {
+            Ok(off) => off,
+            Err(_) => return Ok(0),
+        };
+        let chunk = self.copy_chunk_at(src_off, count);
+        if chunk.is_empty() {
+            return Ok(0);
+        }
+
+        let write_off = if dst_status.ap {
+            None
+        } else {
+            Some(src_off.checked_add(chunk.len()).ok_or("efbig")?)
+        };
+        let end = dst.node.write_bytes(write_off, &chunk)?;
+        desc.off = u64::try_from(end).map_err(|_| "efbig")?;
+        Ok(chunk.len())
+    }
+
+    // AGENT: commit source and destination offsets only after the destination
+    // write has succeeded.
+    fn splice_locked(
+        &self,
+        src_desc: &mut FdState,
+        dst: &FHandle,
+        dst_desc: &mut FdState,
+        dst_status: FdOpt,
+        count: usize,
+    ) -> Result<usize, &'static str> {
+        let src_off = match usize::try_from(src_desc.off) {
+            Ok(off) => off,
+            Err(_) => return Ok(0),
+        };
+        let chunk = self.copy_chunk_at(src_off, count);
+        if chunk.is_empty() {
+            return Ok(0);
+        }
+
+        let write_off = if dst_status.ap {
+            None
+        } else {
+            Some(usize::try_from(dst_desc.off).map_err(|_| "efbig")?)
+        };
+        let end = dst.node.write_bytes(write_off, &chunk)?;
+        let moved = u64::try_from(chunk.len()).map_err(|_| "efbig")?;
+        src_desc.off = src_desc.off.checked_add(moved).ok_or("efbig")?;
+        dst_desc.off = u64::try_from(end).map_err(|_| "efbig")?;
+        Ok(chunk.len())
+    }
+
     // AGENT: direct truncation uses the handle's open-time write permission.
     pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
         if !self.initial_status.wr {
@@ -806,20 +932,6 @@ impl FHandle {
         self.node.ensure_data_len_at_least(needed);
         Ok(())
     }
-
-    pub fn splice_to(&self, dst: &FHandle, count: usize) -> Result<usize, &'static str> {
-        let src_off = self.desc.read().unwrap().off;
-        let sd = self.node.data.lock().unwrap();
-        if src_off as usize >= sd.len() {
-            return Ok(0);
-        }
-        let avail = sd.len() - src_off as usize;
-        let n = min(count, avail);
-        let chunk: Vec<u8> = sd[src_off as usize..src_off as usize + n].to_vec();
-        drop(sd);
-        self.desc.write().unwrap().off += n as u64;
-        dst.write(&chunk)
-    }
 }
 
 #[cfg(any(test, feature = "qemu-sync-selftest"))]
@@ -831,6 +943,8 @@ pub(crate) mod tests {
         fallocate_validates_and_only_grows_regular_files();
         lookup_reports_node_local_errors();
         regular_file_poll_and_ioctl_are_explicit();
+        splice_checks_permissions_before_moving_offsets();
+        splice_uses_shared_append_status();
     }
 
     fn writable_opt() -> FdOpt {
@@ -934,6 +1048,49 @@ pub(crate) mod tests {
         assert_eq!(file.read(&mut buf), Ok(2));
         assert_eq!(file.io_ctl(TIOCINQ, 0), Ok(2));
         assert_eq!(file.io_ctl(0xDEAD, 0), Err("enotty"));
+    }
+
+    #[cfg_attr(test, test)]
+    fn splice_checks_permissions_before_moving_offsets() {
+        let src = FHandle::with_data("/src", FdOpt::default(), vec![1, 2, 3]);
+        let dst = FHandle::with_data("/dst", FdOpt::default(), Vec::new());
+        let src_entry = FdEntry::new(FLike::File(src.clone()));
+        let dst_entry = FdEntry::new(FLike::File(dst.clone()));
+
+        assert_eq!(src_entry.splice_to(&dst_entry, 2), Err("ebadf"));
+        assert_eq!(src.offset(), 0);
+        assert_eq!(dst.offset(), 0);
+        assert!(dst.node.data.lock().unwrap().is_empty());
+
+        let unreadable = FdOpt {
+            rd: false,
+            wr: true,
+            ap: false,
+            nb: false,
+        };
+        let src = FHandle::with_data("/src", unreadable, vec![1, 2, 3]);
+        let dst = FHandle::with_data("/dst", writable_opt(), Vec::new());
+        let src_entry = FdEntry::new(FLike::File(src.clone()));
+        let dst_entry = FdEntry::new(FLike::File(dst.clone()));
+
+        assert_eq!(src_entry.splice_to(&dst_entry, 2), Err("ebadf"));
+        assert_eq!(src.offset(), 0);
+        assert!(dst.node.data.lock().unwrap().is_empty());
+    }
+
+    #[cfg_attr(test, test)]
+    fn splice_uses_shared_append_status() {
+        let src = FHandle::with_data("/src", FdOpt::default(), vec![1, 2, 3]);
+        let dst = FHandle::with_data("/dst", writable_opt(), vec![9, 9]);
+        dst.seek(FSeek::Start(1)).unwrap();
+        let src_entry = FdEntry::new(FLike::File(src.clone()));
+        let dst_entry = FdEntry::new(FLike::File(dst.clone()));
+
+        dst_entry.set_status_flags(O_APPEND).unwrap();
+        assert_eq!(src_entry.splice_to(&dst_entry, 2), Ok(2));
+        assert_eq!(src.offset(), 2);
+        assert_eq!(dst.offset(), 4);
+        assert_eq!(dst.node.data.lock().unwrap().as_slice(), &[9, 9, 1, 2]);
     }
 }
 
