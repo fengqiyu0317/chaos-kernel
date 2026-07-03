@@ -51,6 +51,8 @@
 - 2026-06-28：完成 M9 trap 第 4 点 Rust trap handler 核心分发：`kernel-qemu/src/trap.rs` 将 timer interrupt、user `ecall`、page fault、非法指令和其他未处理 trap 拆成独立路径；user `ecall` 只推进 `sepc` 并转入 `kernel-qemu/src/syscall.rs` 的 RISC-V ABI 适配出口，syscall 语义入口仍以 `-ENOSYS` 占位等待后续迁移。
 - 2026-06-28：完成 M9 syscall ABI 第 5 点最小语义入口：`kernel-qemu/src/syscall.rs` 继续只做 RISC-V `a7` / `a0..a5` 解码和 `a0` 写回，新增 `kernel-qemu/src/semantics.rs` 承接第一批 `read` / `write` / `exit` / `getpid` 语义；当前 `write(1/2)` 走 SBI console，`exit` 通过 SBI shutdown 结束单 init 路径，`getpid` 暂返回 1，`read(0)` 暂按 EOF 返回 0。
 - 2026-06-28：完成 M9 trap 第 6 点早期异常失败路径：`kernel-qemu/src/trap.rs` 将 page fault 细分为 instruction/load/store fault，非法指令独立记录，失败日志统一输出 origin、cause/access、`sepc`、`stval`、`sstatus` 和 `sp`；当前没有 task exit / Sv39 recovery 时仍通过明确 fallback action 后 shutdown。
+- 2026-06-28：完成 M9 早期全局堆承载：`kernel-qemu` 启用 `extern crate alloc`，新增 linker 预留 early heap 和 `kernel-qemu/src/heap.rs` bump allocator，并在 QEMU 启动路径实际构造 `Vec`、`Box`、`BTreeMap`、`Arc`；该堆只承载早期 `alloc` 类型和迁移元数据，不作为最终用户页或页表页 frame allocator。
+- 2026-06-30：`kernel-qemu` 的迁入地址空间已新增最小 Sv39 helper：`PageTableEntry` 不再保存 `SharedPage` / resident `Vec<u8>` 页面内容，而是保存真实 `PgFrame` metadata；`map_region()` / `map_file_region()` 会建立 Sv39 leaf PTE，`read_user_bytes()` / `write_user_bytes()` 通过页表翻译和物理页 copy 访问用户页。当前仍未开启全局分页，也未完成 trap 级 COW/page fault recovery。
 
 ## 关键文件
 
@@ -75,12 +77,45 @@
 - `chaos/kernel-qemu/src/trap.rs`：kernel/user trap vector 安装、trap frame helper、早期 trap 分发和 page fault / illegal instruction 结构化失败诊断。
 - `chaos/kernel-qemu/src/syscall.rs`：RISC-V `a7` / `a0..a5` syscall ABI 解码、`kernel-sim` 风格内部 syscall 编号映射和返回值写回。
 - `chaos/kernel-qemu/src/semantics.rs`：M9 第一批 `read` / `write` / `exit` / `getpid` 最小 syscall 语义入口，后续替换为迁移后的 `kernel-sim` 进程、fd 和用户内存语义。
+- `chaos/kernel-qemu/src/heap.rs`：M9 early global heap，提供 `alloc` crate 的早期 bump allocator、自检和 OOM handler。
+- `chaos/kernel-qemu/linker-qemu.ld`：预留 `sheap..eheap` early heap 区间，并让 `ekernel` 位于该保留区之后。
+- `chaos/kernel-qemu/src/mm/sv39.rs`：最小 Sv39 page-table walk / map / unmap / translate helper 和物理页 copy/zero helper。
+- `chaos/kernel-qemu/src/mm/address_space.rs`：迁入地址空间的 VMA、PTE metadata、真实 frame 映射、COW metadata 和 usercopy 入口。
 - `chaos/kernel-qemu/src/csr.rs`：`stvec`、`sscratch`、`sstatus`、`scause`、`stval`、`sie`、`time` 等 CSR helper。
 - `chaos/kernel-qemu/src/timer.rs`：QEMU/OpenSBI timer interrupt 初始化、tick 计数和下一 tick 编程。
 - `chaos/tools/qemu-smoke.sh`：构建并运行 `kernel-qemu` 的 QEMU 启动/关机 smoke 脚本。
 - `chaos/kernel/src/kernel.rs`：禁止修改的原始内核文件。
 
 ## 测试结果
+
+本次 M9 MM/Sv39 地址空间修改后执行过：
+
+```bash
+cd kernel-qemu
+cargo check --target riscv64gc-unknown-none-elf
+cargo build --release
+cargo fmt --check
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check -- kernel-qemu/src/csr.rs kernel-qemu/src/mm/address_space.rs kernel-qemu/src/mm/mod.rs kernel-qemu/src/mm/sv39.rs kernel-qemu/src/proc/task.rs kernel-qemu/src/kernel_core/kernel_ops/process.rs kernel-qemu/src/mm/TODO.md
+```
+
+结果：`cargo check --target riscv64gc-unknown-none-elf` 通过；`cargo build --release` 通过；`tools/qemu-smoke.sh` 通过，QEMU 输出 `[kernel-qemu] frame pool ready ... free_pages=31930`、`[kernel-qemu] timer tick observed ticks=1`、`[kernel-qemu] timer wheel target observed clk=1 active=0` 和 `[kernel-qemu] shutdown`；`git diff --check` 通过。`cargo fmt --check` 当前仍未通过，但差异只在既有未改文件 `kernel-qemu/src/irq_lock.rs` 和 `kernel-qemu/src/kernel_core/time.rs` 的格式化，未在本轮混入无关格式化。
+
+本次 M9 early heap 修改后执行过：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo build --release
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check -- kernel-qemu/src/heap.rs kernel-qemu/src/main.rs kernel-qemu/linker-qemu.ld tools/qemu-smoke.sh
+```
+
+结果：`cargo fmt --check` 通过；`cargo build --release` 通过；`tools/qemu-smoke.sh` 通过，QEMU 输出 `[kernel-qemu] heap ready base=0x80216000 end=0x80316000 bytes=1048576`、`[kernel-qemu] heap alloc smoke vec=2 box=41 map=2 arc_strong=1 used=360/1048576`、`[kernel-qemu] timer tick observed ticks=1` 和 `[kernel-qemu] shutdown`；`git diff --check -- kernel-qemu/src/heap.rs kernel-qemu/src/main.rs kernel-qemu/linker-qemu.ld tools/qemu-smoke.sh` 通过。未修改 `kernel-sim` 源码路径，本轮未重跑 host `kernel-sim` 测试。
 
 本次 M9 trap 第 6 点修改后执行过：
 
@@ -301,10 +336,26 @@ cargo test --test advanced
 cargo test --test pressure
 ```
 
+2026-06-28 复查当前 `kernel-sim` / `chaos-tests` 测试现状：
+
+```bash
+cd kernel-sim
+cargo test
+
+cd ../chaos-tests
+cargo test --test basic
+cargo test --test basic -- --test-threads=1
+cargo test --test advanced
+cargo test --test pressure
+```
+
+结果：`kernel-sim` 自身完整 `cargo test` 通过，其中 `tests/elf.rs` 为 `3 passed`、`tests/smoke.rs` 为 `74 passed`；`chaos-tests basic` 默认和串行运行均为 `21 passed; 12 failed`；`chaos-tests advanced` / `pressure` 因缺少 `tests/advanced/main.rs`、`tests/pressure/main.rs` 无法解析测试目标。当前 `chaos-tests/Cargo.toml` 也尚未依赖 `kernel-sim`，basic 用例实际测的是 `chaos-tests/src/lib.rs` 导出的独立模型。
+
 ## 未解决问题
 
 ### 分类号
 
+- `T0`: 测试验收 / `chaos-tests` 接入
 - `M0`: 仓库维护 / 交接记录
 - `M1`: 进程、fork、身份、安全与 session/job-control
 - `M2`: exec / ELF 装载
@@ -315,6 +366,18 @@ cargo test --test pressure
 - `M7`: 网络协议 helper 与 socket 路径
 - `M8`: 同步原语、锁与 futex
 - `M9`: `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
+- `M10`: QEMU 进程级 checkpoint / restore
+
+### T0 测试验收 / `chaos-tests` 接入
+
+- `[T0][重要] TODO`: 明确并实现 `chaos-tests` 到 `kernel-sim` 的验收接入方式。当前 `chaos-tests/Cargo.toml` 没有依赖 `kernel-sim`，basic 用例 `use chaos_tests::*` 实际测的是 `chaos-tests/src/lib.rs`，因此在接入完成前不能把 basic 的 12 个失败直接归因于 `kernel-sim` 源码。
+- `[T0][重要] TODO`: 补齐或修正 `chaos-tests` 的 test target 声明。当前 `Cargo.toml` 声明了 `advanced` / `pressure`，但仓库中缺少 `chaos-tests/tests/advanced/main.rs` 和 `chaos-tests/tests/pressure/main.rs`，导致这两组测试无法运行。
+- `[T0][重要] TODO`: 将 `chaos-tests basic` 当前失败清单作为第一轮验收修复目标；默认并行和 `--test-threads=1` 串行结果一致，当前基线为 `21 passed; 12 failed`。
+- `[T0][M8][重要] TODO`: basic 同步类失败：`group_01::{basic_bkl_single_acquire_release,basic_bkl_double_acquire_single_release,basic_cross_module_lock_order}` 暴露 BKL 不能接受测试使用的高 thread id；`group_02::basic_sleep_under_spinlock_uniprocessor` 暴露空 channel 接收路径阻塞时仍持有 spin guard；`group_03::{basic_condvar_signal_before_wait,basic_spurious_wakeup_no_recheck}` 暴露 `SyncQueue` 缺少先 signal 记账和唤醒后条件重检。
+- `[T0][M5][重要] TODO`: basic I/O 与路径类失败：`group_06::basic_block_read_success` 期望 `Disk::read_block()` 成功路径填充 `0xAA`；`group_07::basic_concurrent_mount_and_lookup` 暴露 `MountTable::resolve()` / `find_mount_id()` 读锁嵌套或递归解析路径存在卡住风险。
+- `[T0][M4][重要] TODO`: basic 用户地址检查失败：`group_10::basic_access_ok_overflow` 和 `group_11::basic_mmap_file_io_workload` 均要求 `check_access()` 拒绝 `addr + len` 溢出的用户区间，当前 `wrapping_add` 路径会误判为合法。
+- `[T0][普通] TODO`: basic trap/context 类失败：`group_09::basic_interrupt_mask_set` 期望 `TrapCtl::configure(0xFF, 0x00)` 后硬件 mask 为 `0`；`group_09::basic_page_fault_in_process_context` 期望默认 `TrapCtl::on_pgfault(0x1000)` 返回 `Ok(())`。
+- `[T0][普通] TODO`: 每次推进 `chaos-tests` 接入或 basic 修复后，同步记录命令与结果：`cd kernel-sim && cargo test`，`cd chaos-tests && cargo test --test basic`，必要时再跑对应的分组命令如 `cargo test --test basic -- group_01 -- --test-threads=1`。
 
 ### M0 仓库维护 / 交接记录
 
@@ -399,11 +462,11 @@ cargo test --test pressure
 ### M8 同步原语、锁与 futex
 
 - `[M8][普通] TODO`: `kernel-sim` 的 futex 模型尚未覆盖真实 Linux 的 shared futex key、priority-inheritance futex、robust futex list、`OWNER_DIED` 标记和 owner 退出时唤醒等待者等语义。
-- `[M8][重要] TODO`: `kernel-sim/src/kernel/core/sync.rs` 的 `SyncQueue` 通用等待 helper 尚未实现真实 condition-variable / wait-queue 原子语义；`park_on()` / `wait_ev()` / `wait_events()` 会在检查条件后释放条件锁，再把 `WaitToken` 放入队列，存在条件变化与 `signal()` 发生在入队前导致 lost wakeup 的风险。
-- `[M8][重要] TODO`: `SyncQueue::wait_guard()` / `SyncQueue::wait_timeout()` 当前只接收 `&Mutex<T>` 并在内部重新 `lock()` 后立即 `drop()`，不能释放调用者已经持有的 `MutexGuard`，也不能在唤醒后重新持有该 guard；后续应改成接收 guard/token registration 的 API，明确“入队、释放锁、睡眠、唤醒后重拿锁”的边界，避免自死锁和误用。
+- `[M8][重要] TODO`: `kernel-sim/src/kernel/core/sync.rs` / `kernel-qemu/src/kernel_core/sync.rs` 的 `SyncQueue` 仍未实现完整 condition-variable / wait-queue 原子语义；`park_on()` / `wait_ev()` / `wait_events()` 已改为在持有条件 `Mutex` 时登记 `WaitToken`，但仍依赖调用者遵守“状态修改在同一条件锁下完成、随后 signal/broadcast”的约定。
+- `[M8][重要] TODO`: `SyncQueue::wait_guard()` / `SyncQueue::wait_timeout()` 当前只接收 `&Mutex<T>` 并在内部重新 `lock()` 后登记 waiter，不能释放调用者已经持有的 `MutexGuard`，也不能在唤醒后重新持有该 guard；后续应改成接收 guard/token registration 的 API，明确“入队、释放锁、睡眠、唤醒后重拿锁”的边界，避免自死锁和误用。
 - `[M8][普通] TODO`: `SyncQueue::wait_timeout()` 仍通过 `WaitToken::wait(Some(timeout))` 使用 host `Instant` / `thread::park_timeout`；后续应接入已有 `WaitToken::wait_with_timer()` / timer wheel deadline，并与 `WaitQueue::sleep_timeout`、`epoll_wait(timeout)` 的超时语义统一。
 - `[M8][普通] TODO`: `SyncQueue` 的 `RegEp` / `eq` 目前只是本地登记表，`signal()` / `broadcast()` / `signal_n()` 不会向 `EpInst` 或 `sys_epoll_wait()` 发布 readiness；当前 pipe-backed epoll 已有 `EvBus` callback 唤醒路径，但 `SyncQueue` 自身仍未接线，后续应把 readiness、等待队列和 epoll wakeup 接成同一条路径，或删除未接线的 `RegEp` 接口。
-- `[M8][普通] TODO`: `Channel` 目前绕过 `SyncQueue` 通用 helper，直接访问 `wq.q` 并依赖 `buf` 锁与队列锁的手写顺序避免丢失唤醒；后续应为该模式提供安全封装或专用 API，避免其他调用者复制裸队列访问方式，并补充 send/recv/close 并发回归。
+- `[M8][普通] TODO`: `Channel` 已通过 `SyncQueue::enqueue_current_locked()` 收敛等待登记，不再直接访问 `wq.q`；后续仍应补充 send/recv/close 并发回归，并继续审查其它等待路径是否需要同样的条件锁登记封装。
 - `[M8][普通] TODO`: `kernel-sim/src/kernel/core/sync.rs` 的 `EvBus` 目前只是 `u32` 事件位图加 callback 列表，缺少事件来源、事件类型载荷、事件计数、一次性/持续性事件、边沿触发/水平触发等完整事件模型；连续同类事件会被同一个 bit 合并。
 - `[M8][普通] TODO`: `EvBus::sub()` 已用于 pipe -> epoll readiness 唤醒，顶层 `wait_ev()` 仍没有接入主要 syscall 等待路径；实际阻塞等待仍分散在 `WaitToken` / `SyncQueue` / `WaitQueue` / `EpInst.waiters`。后续应继续统一 readiness state、wait queue、epoll registration、取消注册、timeout 和 wake one/all 语义。
 - `[M8][普通] TODO`: `EvBus::change()` 在事件状态更新过程中同步执行 callbacks，且通常发生在外层 `Mutex<EvBus>` 持锁期间；后续应拆分状态更新、待唤醒对象收集和锁外分发，降低 callback 重入、锁顺序反转或死锁风险。
@@ -413,18 +476,17 @@ cargo test --test pressure
 
 ### M9 `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
 
-- `[M9][重要] TODO`: 迁移设计以 `docs/kernel-sim-qemu-migration-design.md` 为准；核心目标是把 `kernel-sim` 已稳定的进程、地址空间、ELF/exec、fd/open-file-description、exit/wait、timer、pipe/epoll、同步等待等语义迁移到 QEMU 裸机环境，而不是重新设计一套新内核。
-- `[M9][重要] TODO`: 建立迁移清单和语义基线：每个第一批迁移对象都要标出 `kernel-sim` 中的语义源文件或 smoke/elf 测试、QEMU 侧必须替换的 host 依赖、可抽到 `kernel-common/` 的 no_std/alloc 纯逻辑，以及必须留在 `kernel-qemu/` 的裸机适配代码。
-- `[M9][重要] TODO`: 保留 `kernel-sim/` 作为 host 语义回归基准；迁移过程中不得删除或替换 `kernel-sim/`，不得把 host 测试路径改成依赖 QEMU，也不得修改 `chaos/kernel/src/kernel.rs`。
-- `[M9][重要] TODO`: 实现 RISC-V trap / interrupt / syscall ABI 适配层：设置 `stvec`，定义 trap frame，处理 user `ecall`、timer interrupt、page fault 和非法指令；syscall 层只负责从 `a7` / `a0..a5` 解码到迁移后的 `kernel-sim` syscall 语义入口，返回值写回 `a0` 并推进 `sepc`，不要在 trap 层重新定义 syscall 行为。
-- `[M9][重要] TODO`: 用真实 timer interrupt 替换 host 后台时间推进：`KernelRuntimeTicker` 不进入裸机路径，timer tick 需要对接后续 `kernel-sim` 等待/超时语义所需的 deadline、timeout 和 wakeup 接口。
-- `[M9][重要] TODO`: 用真实物理页和 Sv39 页表承载 `kernel-sim` 地址空间语义：从 QEMU 物理内存范围初始化 frame allocator，映射 kernel text/rodata/data/bss、内核栈、trap/trampoline 和用户页；`AddrSpace` 的 VMA 权限、映射生命周期、COW、`mmap`/`munmap`/`brk` 错误返回和 frame 回收语义要保留，底层页内容不能继续依赖 `Arc<Mutex<Vec<u8>>>`。
-- `[M9][重要] TODO`: 迁移第一个用户进程路径：内嵌 init ELF 或 initramfs 只作为启动载体，ELF `PT_LOAD`、用户栈 `argc/argv/envp/auxv`、pid/task 初始化和 `exec` 地址空间替换语义应对齐 `kernel-sim`；第一阶段成功标准是 init 能通过 `write` 输出并 `exit`。
-- `[M9][普通] TODO`: 把等待、同步和调度从 host-thread 承载改成 task 承载：`WaitToken`、futex、epoll、pipe、timer timeout 的可观察唤醒语义要迁移到 `TaskRunState`、run queue、wait queue 和 trap/tick 调度边界，而不是 `std::thread::park()` / `unpark()`。
-- `[M9][普通] TODO`: fd/文件层先迁移 `kernel-sim` 的 fd table、open-file-description、共享 offset、`FD_CLOEXEC`、dup/dup2/fcntl、pipe readiness、epoll ready list 和 waiter 唤醒语义；SBI/UART 只是 fd `1`/`2` 的最小字符设备后端，不要先扩展完整文件系统、网络或 virtio-blk。
-- `[M9][普通] TODO`: `kernel-common/` 只能放不依赖 `std`、host 线程、host 锁、host 文件系统的代码，例如 syscall 常量、ELF 解析结构、地址对齐 helper、纯数据结构和部分错误码定义；暂时不要共享 `KernelRuntimeTicker`、host lock/thread/time、模拟地址空间或测试专用 helper。
-- `[M9][普通] TODO`: 保留 `kernel-sim` 的 `cargo test` / `smoke.rs` 作为 host 语义回归，同时新增 QEMU smoke 测试脚本，至少自动检查裸机启动打印、timer trap 生效、内嵌 init 输出、`exit` 后关机；不要把 `chaos-tests` 直接当成 QEMU 移植的回归标准，除非后续明确接入该测试体系。
-- `[M9][普通] TODO`: 每完成一个 M9 里程碑后，同步更新 `TASK.md` / `docs/ai-record.md`，记录目标、已完成修改、关键文件、QEMU 命令、host 测试结果、QEMU smoke 结果、剩余限制和禁止修改范围；新增 QEMU 行为时必须说明对应的 `kernel-sim` 语义是否已经存在，不存在则进入 TODO。
+
+### M10 QEMU 进程级 checkpoint / restore
+
+- `[M10][重要] TODO`: 在未来 QEMU 项目中设计并实现类似 CRIU 的进程级 checkpoint / restore；该能力应定义为 guest 内核中的 task/process 状态保存与恢复，不等同于 QEMU `savevm` / `loadvm` 这类整机虚拟机快照。
+- `[M10][重要] TODO`: checkpoint / restore 必须排在 M9 核心迁移之后推进；前置条件包括真实用户地址空间和 Sv39 页表、用户 trap frame / `sret` 返回路径、`Task` / `ProcessState` / run queue、fd table / open-file-description、基础 timer / wait 后端已经在 `kernel-qemu` 中稳定。
+- `[M10][重要] TODO`: 第一版范围限制为单进程、单线程、syscall 安全点或显式 quiescent point checkpoint；保存 trap frame、用户寄存器、`sepc` / `sp`、VMA 列表、匿名用户页内容、brk / stack、基础 fd entry、open-file-description offset / flags，以及必要的 timer deadline。
+- `[M10][普通] TODO`: 第一版 restore 可以创建新 pid，不强求原 pid 复用；复杂 pid namespace、父子关系重建、跨线程组恢复、阻塞中的 futex / epoll wait、socket、TTY、namespace、cgroup、seccomp、ptrace、credential / capability 完整恢复全部后置。
+- `[M10][普通] TODO`: checkpoint image 格式应优先抽成 `kernel-common/` 可复用的 `no_std` / `alloc` 纯数据结构和序列化常量；不得把 host thread、host lock、host filesystem、`Arc<Mutex<Vec<u8>>>` 模拟页面或 QEMU trap live state 抽进共享层。
+- `[M10][普通] TODO`: 实现顺序应先在 `kernel-sim` 中定义可测试语义和 smoke 回归，再按 M9 source-first 路线迁入 `kernel-qemu`；QEMU 侧只替换真实 frame allocator、Sv39 页表、usercopy、trap frame 和设备 / 文件后端。
+- `[M10][普通] TODO`: 验收建议为 `kernel-sim` smoke 覆盖 checkpoint / restore 后内存、PC/SP、brk、fd offset 可恢复；QEMU smoke 覆盖 init 触发 checkpoint、修改用户内存或 fd offset 后 restore、恢复态继续执行并输出预期日志。
+
 
 ## 不要改的部分
 
