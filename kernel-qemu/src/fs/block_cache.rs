@@ -22,9 +22,18 @@ impl BlockKey {
     }
 }
 
+// AGENT: let BlockCache own the data-vs-metadata dirty distinction needed by
+// fsync/fdatasync-style callers instead of keeping a parallel FileNode flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CachedBlockKind {
+    Data,
+    Metadata,
+}
+
 pub struct CacheSlot {
     pub key: BlockKey,
     pub payload: Vec<u8>,
+    pub kind: CachedBlockKind,
     pub modified: bool,
 }
 
@@ -95,6 +104,7 @@ impl BlockCache {
             items.push(CacheSlot {
                 key,
                 payload: block_data.clone(),
+                kind: CachedBlockKind::Data,
                 modified: false,
             });
         }
@@ -110,6 +120,18 @@ impl BlockCache {
         block: usize,
         data: &[u8],
     ) -> Result<(), &'static str> {
+        self.write_block_cached_as(dev, block, data, CachedBlockKind::Data)
+    }
+
+    // AGENT: write one complete cached block and tag its dirty class so metadata
+    // writeback policy can live in BlockCache.
+    pub fn write_block_cached_as(
+        &self,
+        dev: usize,
+        block: usize,
+        data: &[u8],
+        kind: CachedBlockKind,
+    ) -> Result<(), &'static str> {
         if data.len() != BLOCK_CACHE_BLOCK_SIZE {
             return Err("einval");
         }
@@ -119,20 +141,24 @@ impl BlockCache {
         let mut items = ch.items.lock().unwrap();
         if let Some(slot) = items.iter_mut().find(|slot| slot.key == key) {
             slot.payload = data.to_vec();
+            slot.kind = kind;
             slot.modified = true;
             return Ok(());
         }
         items.push(CacheSlot {
             key,
             payload: data.to_vec(),
+            kind,
             modified: true,
         });
         Ok(())
     }
 
-    // AGENT: clone dirty payloads under the chain mutex, write them outside the
-    // mutex, then clear the dirty bit only if the cached payload is unchanged.
-    pub fn flush_dirty<D: BlockDevice + ?Sized>(&self, device: &D) -> Result<usize, &'static str> {
+    fn flush_dirty_where<D, F>(&self, device: &D, mut include: F) -> Result<usize, &'static str>
+    where
+        D: BlockDevice + ?Sized,
+        F: FnMut(CachedBlockKind) -> bool,
+    {
         let mut flushed = 0usize;
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
@@ -140,16 +166,16 @@ impl BlockCache {
                 let items = ch.items.lock().unwrap();
                 items
                     .iter()
-                    .filter(|slot| slot.modified)
-                    .map(|slot| (slot.key, slot.payload.clone()))
+                    .filter(|slot| slot.modified && include(slot.kind))
+                    .map(|slot| (slot.key, slot.kind, slot.payload.clone()))
                     .collect::<Vec<_>>()
             };
 
-            for (key, payload) in dirty {
+            for (key, kind, payload) in dirty {
                 device.write_block(key.dev, key.block, &payload)?;
                 let mut items = ch.items.lock().unwrap();
                 if let Some(slot) = items.iter_mut().find(|slot| slot.key == key) {
-                    if slot.modified && slot.payload == payload {
+                    if slot.modified && slot.kind == kind && slot.payload == payload {
                         slot.modified = false;
                         flushed += 1;
                     }
@@ -157,6 +183,21 @@ impl BlockCache {
             }
         }
         Ok(flushed)
+    }
+
+    // AGENT: clone dirty payloads under the chain mutex, write them outside the
+    // mutex, then clear the dirty bit only if the cached payload is unchanged.
+    pub fn flush_dirty<D: BlockDevice + ?Sized>(&self, device: &D) -> Result<usize, &'static str> {
+        self.flush_dirty_where(device, |_| true)
+    }
+
+    // AGENT: fdatasync-style writeback flushes data blocks while leaving cached
+    // metadata blocks dirty for a later full sync.
+    pub fn flush_dirty_data<D: BlockDevice + ?Sized>(
+        &self,
+        device: &D,
+    ) -> Result<usize, &'static str> {
+        self.flush_dirty_where(device, |kind| kind == CachedBlockKind::Data)
     }
 
     // AGENT: no-device sync is only a GKL barrier; dirty cache entries must use
@@ -207,6 +248,21 @@ impl BlockCache {
                 }
             }
             drop(items);
+        }
+        count
+    }
+
+    // AGENT: observe one dirty class for focused fsync/fdatasync regressions.
+    pub fn dirty_count_by_kind(&self, kind: CachedBlockKind) -> usize {
+        let mut count = 0;
+        for i in 0..self.chains.len() {
+            let ch = &self.chains[i];
+            let items = ch.items.lock().unwrap();
+            for slot in items.iter() {
+                if slot.modified && slot.kind == kind {
+                    count += 1;
+                }
+            }
         }
         count
     }

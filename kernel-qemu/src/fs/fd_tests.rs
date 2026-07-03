@@ -4,7 +4,7 @@ use super::*;
 
 // AGENT: keep the QEMU boot selftest aggregator in the moved fd test module.
 pub fn run_all() {
-    set_len_and_sync_update_dirty_state();
+    set_len_and_sync_update_cache_dirty_state();
     fallocate_validates_and_only_grows_regular_files();
     lookup_reports_node_local_errors();
     regular_file_poll_and_ioctl_are_explicit();
@@ -30,33 +30,34 @@ fn file_bytes(fh: &FHandle) -> Vec<u8> {
     data
 }
 
-// AGENT: moved dirty-state regression out of fd.rs without changing behavior.
+// AGENT: regular-file dirty state now lives in BlockCache data/metadata classes.
 #[cfg_attr(test, test)]
-fn set_len_and_sync_update_dirty_state() {
+fn set_len_and_sync_update_cache_dirty_state() {
     let fh = FHandle::with_data("/tmp/file", writable_opt(), vec![1, 2, 3]);
-    assert_eq!(fh.node.dirty_state(), FileDirty::clean());
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 0);
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 0);
 
-    fh.set_len(5).unwrap();
-    assert_eq!(file_bytes(&fh).as_slice(), &[1, 2, 3, 0, 0]);
-    assert_eq!(
-        fh.node.dirty_state(),
-        FileDirty {
-            data: true,
-            metadata: true
-        }
-    );
+    fh.write_at(1, &[9]).unwrap();
+    assert_eq!(file_bytes(&fh).as_slice(), &[1, 9, 3]);
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 1);
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 0);
 
     fh.sync_data().unwrap();
-    assert_eq!(
-        fh.node.dirty_state(),
-        FileDirty {
-            data: false,
-            metadata: true
-        }
-    );
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 0);
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 0);
+
+    fh.set_len(5).unwrap();
+    assert_eq!(file_bytes(&fh).as_slice(), &[1, 9, 3, 0, 0]);
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 0);
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 1);
+
+    fh.sync_data().unwrap();
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 0);
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 1);
 
     fh.sync_all().unwrap();
-    assert_eq!(fh.node.dirty_state(), FileDirty::clean());
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 0);
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 0);
 
     let ro = FHandle::with_data("/tmp/ro", FdOpt::default(), vec![1, 2, 3]);
     assert_eq!(ro.set_len(0), Err("ebadf"));
@@ -69,18 +70,14 @@ fn fallocate_validates_and_only_grows_regular_files() {
 
     fh.fallocate(5, 2).unwrap();
     assert_eq!(file_bytes(&fh).as_slice(), &[1, 2, 3, 0, 0, 0, 0]);
-    assert_eq!(
-        fh.node.dirty_state(),
-        FileDirty {
-            data: true,
-            metadata: true
-        }
-    );
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 0);
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 1);
 
     fh.sync_all().unwrap();
     fh.fallocate(1, 1).unwrap();
     assert_eq!(fh.node.len(), 7);
-    assert_eq!(fh.node.dirty_state(), FileDirty::clean());
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Data), 0);
+    assert_eq!(fh.cached_dirty_blocks(CachedBlockKind::Metadata), 0);
 
     assert_eq!(fh.fallocate(0, 0), Err("einval"));
     assert_eq!(fh.fallocate(usize::MAX, 1), Err("efbig"));
@@ -101,7 +98,7 @@ fn lookup_reports_node_local_errors() {
     let dir = FHandle::with_node("/tmp", FdOpt::default(), Arc::new(FileNode::directory()));
     assert_eq!(dir.lookup(".", 0), Ok(()));
     assert_eq!(dir.lookup("", 0), Ok(()));
-    dir.node.add_dir_entry("child").unwrap();
+    dir.node.add_dir_entry(&dir.storage, "child").unwrap();
     assert_eq!(dir.lookup("child", 0), Ok(()));
     assert_eq!(dir.lookup("missing", 0), Err("enoent"));
     assert_eq!(dir.lookup(".", 41), Err("eloop"));

@@ -55,7 +55,7 @@ impl Kernel {
         let parent_node = self.file_nodes.read().unwrap().get(&parent).cloned();
         if let Some(node) = parent_node {
             if node.kind == FileKind::Directory {
-                node.add_dir_entry(&name)?;
+                node.add_dir_entry(&self.file_storage(), &name)?;
             }
         }
         Ok(())

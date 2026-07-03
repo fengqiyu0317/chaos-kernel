@@ -2,28 +2,13 @@
 // in the QEMU block backend instead of duplicating contents in the node.
 use super::*;
 
+const FILE_NODE_METADATA_MAGIC: &[u8; 4] = b"FNMD";
+
 // AGENT: distinguish regular path files from directory nodes for exec checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     Regular,
     Directory,
-}
-
-// AGENT: track unsynced changes so sync_data() and sync_all() can keep their
-// different content-vs-metadata semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileDirty {
-    pub data: bool,
-    pub metadata: bool,
-}
-
-impl FileDirty {
-    pub const fn clean() -> Self {
-        Self {
-            data: false,
-            metadata: false,
-        }
-    }
 }
 
 // AGENT: allocate root RamBlockDevice blocks for FileNode-backed regular files.
@@ -91,8 +76,21 @@ impl FileStorage {
             .write_block_cached(ROOT_BLOCK_DEVICE, block, data)
     }
 
+    fn write_metadata_block(&self, block: usize, data: &[u8]) -> Result<(), &'static str> {
+        self.cache
+            .write_block_cached_as(ROOT_BLOCK_DEVICE, block, data, CachedBlockKind::Metadata)
+    }
+
+    fn flush_data(&self) -> Result<usize, &'static str> {
+        self.cache.flush_dirty_data(self.device.as_ref())
+    }
+
     fn flush(&self) -> Result<usize, &'static str> {
         self.cache.flush_dirty(self.device.as_ref())
+    }
+
+    pub fn dirty_count_by_kind(&self, kind: CachedBlockKind) -> usize {
+        self.cache.dirty_count_by_kind(kind)
     }
 }
 
@@ -111,13 +109,13 @@ impl FileNodeBlocks {
     }
 }
 
-// AGENT: FileNode owns only metadata, dirty state, directory entries, and the
-// regular-file block map; actual bytes live in the shared RamBlockDevice.
+// AGENT: FileNode owns metadata, directory entries, and the regular-file block
+// map; actual bytes and metadata dirty state live in the shared block cache.
 pub struct FileNode {
     pub kind: FileKind,
     pub executable: AtomicBool,
     storage: Mutex<FileNodeBlocks>,
-    dirty: Mutex<FileDirty>,
+    metadata_block: Mutex<Option<usize>>,
     dir_entries: Arc<Mutex<Vec<String>>>,
 }
 
@@ -129,7 +127,7 @@ impl FileNode {
             kind: FileKind::Regular,
             executable: AtomicBool::new(executable),
             storage: Mutex::new(FileNodeBlocks::empty()),
-            dirty: Mutex::new(FileDirty::clean()),
+            metadata_block: Mutex::new(None),
             dir_entries: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -140,19 +138,26 @@ impl FileNode {
             kind: FileKind::Directory,
             executable: AtomicBool::new(false),
             storage: Mutex::new(FileNodeBlocks::empty()),
-            dirty: Mutex::new(FileDirty::clean()),
+            metadata_block: Mutex::new(None),
             dir_entries: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     // AGENT: add one child name to a directory node without duplicating entries.
-    pub fn add_dir_entry(&self, name: &str) -> Result<(), &'static str> {
+    pub fn add_dir_entry(&self, backend: &FileStorage, name: &str) -> Result<(), &'static str> {
         if self.kind != FileKind::Directory {
             return Err("enotdir");
         }
         if name.is_empty() || name.contains('/') || name.bytes().any(|b| b == 0) {
             return Err("einval");
         }
+        {
+            let entries = self.dir_entries.lock().unwrap();
+            if entries.iter().any(|entry| entry == name) {
+                return Ok(());
+            }
+        }
+        self.ensure_metadata_block(backend)?;
         let inserted = {
             let mut entries = self.dir_entries.lock().unwrap();
             if entries.iter().any(|entry| entry == name) {
@@ -163,7 +168,7 @@ impl FileNode {
             }
         };
         if inserted {
-            self.dirty.lock().unwrap().metadata = true;
+            self.mark_metadata_dirty(backend)?;
         }
         Ok(())
     }
@@ -200,39 +205,20 @@ impl FileNode {
         self.storage.lock().unwrap().len
     }
 
-    // AGENT: expose dirty state for focused tests and future flush decisions.
-    pub fn dirty_state(&self) -> FileDirty {
-        *self.dirty.lock().unwrap()
-    }
-
-    // AGENT: mark content writes dirty and record metadata changes when size grew.
-    pub(crate) fn note_write(&self, metadata_changed: bool) {
-        let mut dirty = self.dirty.lock().unwrap();
-        dirty.data = true;
-        dirty.metadata |= metadata_changed;
-    }
-
-    // AGENT: mark operations such as truncate/fallocate that change file size.
-    pub(crate) fn note_resize(&self) {
-        let mut dirty = self.dirty.lock().unwrap();
-        dirty.data = true;
-        dirty.metadata = true;
-    }
-
     fn ensure_block(
         storage: &mut FileNodeBlocks,
         backend: &FileStorage,
         file_block: usize,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<(usize, bool), &'static str> {
         while storage.blocks.len() <= file_block {
             storage.blocks.push(None);
         }
         if let Some(block) = storage.blocks[file_block] {
-            return Ok(block);
+            return Ok((block, false));
         }
         let block = backend.allocate_block()?;
         storage.blocks[file_block] = Some(block);
-        Ok(block)
+        Ok((block, true))
     }
 
     fn blocks_for_len(len: usize) -> Result<usize, &'static str> {
@@ -242,6 +228,95 @@ impl FileNode {
         len.checked_add(BLOCK_CACHE_BLOCK_SIZE - 1)
             .map(|rounded| rounded / BLOCK_CACHE_BLOCK_SIZE)
             .ok_or("efbig")
+    }
+
+    fn put_metadata_bytes(payload: &mut [u8], cursor: &mut usize, bytes: &[u8]) {
+        if *cursor < payload.len() {
+            let n = min(bytes.len(), payload.len() - *cursor);
+            payload[*cursor..*cursor + n].copy_from_slice(&bytes[..n]);
+        }
+        *cursor = (*cursor).saturating_add(bytes.len());
+    }
+
+    fn put_metadata_u64(payload: &mut [u8], cursor: &mut usize, value: usize) {
+        let value = u64::try_from(value).unwrap_or(u64::MAX);
+        Self::put_metadata_bytes(payload, cursor, &value.to_le_bytes());
+    }
+
+    fn metadata_payload(&self) -> Vec<u8> {
+        let storage = self.storage.lock().unwrap();
+        let entries = self.dir_entries.lock().unwrap();
+        let mut payload = vec![0; BLOCK_CACHE_BLOCK_SIZE];
+        let mut cursor = 0usize;
+
+        Self::put_metadata_bytes(&mut payload, &mut cursor, FILE_NODE_METADATA_MAGIC);
+        Self::put_metadata_bytes(
+            &mut payload,
+            &mut cursor,
+            &[match self.kind {
+                FileKind::Regular => 1,
+                FileKind::Directory => 2,
+            }],
+        );
+        Self::put_metadata_bytes(
+            &mut payload,
+            &mut cursor,
+            &[self.executable.load(Ordering::Relaxed) as u8],
+        );
+        Self::put_metadata_u64(&mut payload, &mut cursor, storage.len);
+        Self::put_metadata_u64(&mut payload, &mut cursor, storage.blocks.len());
+        Self::put_metadata_u64(&mut payload, &mut cursor, entries.len());
+
+        for block in storage.blocks.iter() {
+            let encoded = block.map(|nr| nr.saturating_add(1)).unwrap_or(0);
+            Self::put_metadata_u64(&mut payload, &mut cursor, encoded);
+        }
+        for entry in entries.iter() {
+            Self::put_metadata_u64(&mut payload, &mut cursor, entry.len());
+            Self::put_metadata_bytes(&mut payload, &mut cursor, entry.as_bytes());
+        }
+
+        payload
+    }
+
+    fn ensure_metadata_block(&self, backend: &FileStorage) -> Result<usize, &'static str> {
+        let mut metadata_block = self.metadata_block.lock().unwrap();
+        if let Some(block) = *metadata_block {
+            return Ok(block);
+        }
+        let block = backend.allocate_block()?;
+        *metadata_block = Some(block);
+        Ok(block)
+    }
+
+    // AGENT: encode FileNode-owned metadata through BlockCache so metadata dirty
+    // state is tracked as a cached metadata block instead of a parallel flag.
+    fn mark_metadata_dirty(&self, backend: &FileStorage) -> Result<(), &'static str> {
+        let block = self.ensure_metadata_block(backend)?;
+        let payload = self.metadata_payload();
+        backend.write_metadata_block(block, &payload)
+    }
+
+    fn write_may_change_metadata(
+        storage: &FileNodeBlocks,
+        start: usize,
+        len: usize,
+    ) -> Result<bool, &'static str> {
+        let end = start.checked_add(len).ok_or("efbig")?;
+        if end > storage.len {
+            return Ok(true);
+        }
+        if len == 0 {
+            return Ok(false);
+        }
+        let first = start / BLOCK_CACHE_BLOCK_SIZE;
+        let last = (end - 1) / BLOCK_CACHE_BLOCK_SIZE;
+        for file_block in first..=last {
+            if !matches!(storage.blocks.get(file_block), Some(Some(_))) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     // AGENT: read bytes from the block backend through the node's block map,
@@ -296,10 +371,19 @@ impl FileNode {
         if self.kind != FileKind::Regular {
             return Err("eisdir");
         }
+        {
+            let storage = self.storage.lock().unwrap();
+            let start = offset.unwrap_or(storage.len);
+            if Self::write_may_change_metadata(&storage, start, buf.len())? {
+                drop(storage);
+                self.ensure_metadata_block(backend)?;
+            }
+        }
         let mut storage = self.storage.lock().unwrap();
         let start = offset.unwrap_or(storage.len);
         let end = start.checked_add(buf.len()).ok_or("efbig")?;
         let grew = end > storage.len;
+        let mut metadata_changed = grew;
 
         let mut copied = 0usize;
         while copied < buf.len() {
@@ -307,7 +391,8 @@ impl FileNode {
             let file_block = abs / BLOCK_CACHE_BLOCK_SIZE;
             let block_off = abs % BLOCK_CACHE_BLOCK_SIZE;
             let n = min(buf.len() - copied, BLOCK_CACHE_BLOCK_SIZE - block_off);
-            let block = Self::ensure_block(&mut storage, backend, file_block)?;
+            let (block, allocated) = Self::ensure_block(&mut storage, backend, file_block)?;
+            metadata_changed |= allocated;
             let mut block_data = if block_off == 0 && n == BLOCK_CACHE_BLOCK_SIZE {
                 vec![0; BLOCK_CACHE_BLOCK_SIZE]
             } else {
@@ -322,8 +407,8 @@ impl FileNode {
         }
         drop(storage);
 
-        if grew || !buf.is_empty() {
-            self.note_write(grew);
+        if metadata_changed {
+            self.mark_metadata_dirty(backend)?;
         }
         Ok(end)
     }
@@ -336,7 +421,6 @@ impl FileNode {
     ) -> Result<(), &'static str> {
         self.write_bytes(backend, Some(0), data)?;
         backend.flush()?;
-        *self.dirty.lock().unwrap() = FileDirty::clean();
         Ok(())
     }
 
@@ -349,6 +433,13 @@ impl FileNode {
     ) -> Result<(), &'static str> {
         if self.kind != FileKind::Regular {
             return Err("eisdir");
+        }
+        {
+            let storage = self.storage.lock().unwrap();
+            if storage.len != len {
+                drop(storage);
+                self.ensure_metadata_block(backend)?;
+            }
         }
         let changed = {
             let mut storage = self.storage.lock().unwrap();
@@ -374,14 +465,25 @@ impl FileNode {
             }
         };
         if changed {
-            self.note_resize();
+            self.mark_metadata_dirty(backend)?;
         }
         Ok(())
     }
 
     // AGENT: grow only the visible length; actual blocks are allocated lazily
     // when a later write stores non-hole bytes.
-    pub(crate) fn ensure_data_len_at_least(&self, len: usize) {
+    pub(crate) fn ensure_data_len_at_least(
+        &self,
+        backend: &FileStorage,
+        len: usize,
+    ) -> Result<(), &'static str> {
+        {
+            let storage = self.storage.lock().unwrap();
+            if storage.len < len {
+                drop(storage);
+                self.ensure_metadata_block(backend)?;
+            }
+        }
         let grew = {
             let mut storage = self.storage.lock().unwrap();
             if storage.len >= len {
@@ -392,21 +494,21 @@ impl FileNode {
             }
         };
         if grew {
-            self.note_resize();
+            self.mark_metadata_dirty(backend)?;
         }
-    }
-
-    // AGENT: data-only sync flushes dirty cached blocks and leaves metadata dirty.
-    pub fn sync_data(&self, backend: &FileStorage) -> Result<(), &'static str> {
-        backend.flush()?;
-        self.dirty.lock().unwrap().data = false;
         Ok(())
     }
 
-    // AGENT: full sync flushes cached blocks and clears all node dirty bits.
+    // AGENT: data-only sync flushes cached data blocks and leaves cached
+    // metadata blocks dirty for a later full sync.
+    pub fn sync_data(&self, backend: &FileStorage) -> Result<(), &'static str> {
+        backend.flush_data()?;
+        Ok(())
+    }
+
+    // AGENT: full sync flushes both cached data and metadata blocks.
     pub fn sync_all(&self, backend: &FileStorage) -> Result<(), &'static str> {
         backend.flush()?;
-        *self.dirty.lock().unwrap() = FileDirty::clean();
         Ok(())
     }
 }
@@ -419,7 +521,7 @@ impl fmt::Debug for FileNode {
             .field("executable", &self.executable.load(Ordering::Relaxed))
             .field("len", &storage.len)
             .field("blocks", &storage.blocks.len())
-            .field("dirty", &self.dirty_state())
+            .field("metadata_block", &*self.metadata_block.lock().unwrap())
             .field("entries", &self.dir_entries.lock().unwrap().len())
             .finish()
     }

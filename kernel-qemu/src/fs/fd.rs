@@ -649,6 +649,11 @@ impl FHandle {
     pub fn sync_data(&self) -> Result<(), &'static str> {
         self.node.sync_data(&self.storage)
     }
+    // AGENT: expose BlockCache-owned dirty classes for focused fsync/fdatasync
+    // regressions without reviving FileNode-local dirty flags.
+    pub fn cached_dirty_blocks(&self, kind: CachedBlockKind) -> usize {
+        self.storage.dirty_count_by_kind(kind)
+    }
     // AGENT: keep node-local lookup honest; full path lookup belongs to Kernel.
     pub fn lookup(&self, path: &str, depth: usize) -> Result<(), &'static str> {
         if depth > 40 {
@@ -736,7 +741,7 @@ impl FHandle {
             return Err("einval");
         }
         let needed = offset.checked_add(len).ok_or("efbig")?;
-        self.node.ensure_data_len_at_least(needed);
+        self.node.ensure_data_len_at_least(&self.storage, needed)?;
         Ok(())
     }
 }
