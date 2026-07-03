@@ -71,22 +71,31 @@ impl FileStorage {
             .read_block_cached(self.device.as_ref(), ROOT_BLOCK_DEVICE, block)
     }
 
+    // AGENT: route data writes through BlockCache's write-through device path.
     fn write_block(&self, block: usize, data: &[u8]) -> Result<(), &'static str> {
         self.cache
-            .write_block_cached(ROOT_BLOCK_DEVICE, block, data)
+            .write_block_cached(self.device.as_ref(), ROOT_BLOCK_DEVICE, block, data)
     }
 
+    // AGENT: keep metadata dirty classification while storing bytes in the device.
     fn write_metadata_block(&self, block: usize, data: &[u8]) -> Result<(), &'static str> {
-        self.cache
-            .write_block_cached_as(ROOT_BLOCK_DEVICE, block, data, CachedBlockKind::Metadata)
+        self.cache.write_block_cached_as(
+            self.device.as_ref(),
+            ROOT_BLOCK_DEVICE,
+            block,
+            data,
+            CachedBlockKind::Metadata,
+        )
     }
 
+    // AGENT: sync now clears data dirty bits; block bytes are already in RAM.
     fn flush_data(&self) -> Result<usize, &'static str> {
-        self.cache.flush_dirty_data(self.device.as_ref())
+        self.cache.flush_dirty_data()
     }
 
+    // AGENT: full sync clears both data and metadata dirty bits.
     fn flush(&self) -> Result<usize, &'static str> {
-        self.cache.flush_dirty(self.device.as_ref())
+        self.cache.flush_dirty()
     }
 
     pub fn dirty_count_by_kind(&self, kind: CachedBlockKind) -> usize {

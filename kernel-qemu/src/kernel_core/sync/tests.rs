@@ -9,9 +9,12 @@ use crate::kernel::{
     SIGUSR1,
 };
 
+// AGENT: include BlockCache fixed-payload regressions in the sync selftest set.
 pub fn run_all() {
     #[cfg(feature = "qemu-sync-selftest")]
     crate::kernel::fs::block_device::tests::run_all();
+    #[cfg(feature = "qemu-sync-selftest")]
+    crate::kernel::fs::block_cache::tests::run_all();
     crate::kernel::fs::fd::tests::run_all();
     crate::kernel::fs::mount_io_disk::tests::run_all();
     wait_token_captures_current_task();

@@ -30,9 +30,27 @@ pub enum CachedBlockKind {
     Metadata,
 }
 
+// AGENT: keep one exact block-sized payload per cache slot instead of a Vec so
+// cache residency has the same fixed block granularity as the backing device.
+pub type BlockPayload = [u8; BLOCK_CACHE_BLOCK_SIZE];
+
+// AGENT: normalize device Vec/slice data into the fixed cache payload shape.
+fn block_payload_from_slice(
+    data: &[u8],
+    len_error: &'static str,
+) -> Result<BlockPayload, &'static str> {
+    if data.len() != BLOCK_CACHE_BLOCK_SIZE {
+        return Err(len_error);
+    }
+    let mut payload = [0u8; BLOCK_CACHE_BLOCK_SIZE];
+    payload.copy_from_slice(data);
+    Ok(payload)
+}
+
+// AGENT: cache slots own the current cached block payload plus dirty metadata.
 pub struct CacheSlot {
     pub key: BlockKey,
-    pub payload: Vec<u8>,
+    pub payload: BlockPayload,
     pub kind: CachedBlockKind,
     pub modified: bool,
 }
@@ -73,8 +91,8 @@ impl BlockCache {
         key.hash() % self.width
     }
 
-    // AGENT: read cached blocks with only the chain mutex so boot-time block
-    // reads work before the scheduler has installed a current task.
+    // AGENT: return cached payloads on hit and only read the device on miss,
+    // while keeping the miss I/O outside the chain mutex for boot-time safety.
     pub fn read_block_cached<D: BlockDevice + ?Sized>(
         &self,
         device: &D,
@@ -88,22 +106,20 @@ impl BlockCache {
         {
             let items = ch.items.lock().unwrap();
             if let Some(slot) = items.iter().find(|slot| slot.key == key) {
-                return Ok(slot.payload.clone());
+                return Ok(slot.payload.to_vec());
             }
         }
 
         let block_data = device.read_block(dev, block)?;
-        if block_data.len() != BLOCK_CACHE_BLOCK_SIZE {
-            return Err("eio");
-        }
+        let payload = block_payload_from_slice(&block_data, "eio")?;
         {
             let mut items = ch.items.lock().unwrap();
             if let Some(slot) = items.iter().find(|slot| slot.key == key) {
-                return Ok(slot.payload.clone());
+                return Ok(slot.payload.to_vec());
             }
             items.push(CacheSlot {
                 key,
-                payload: block_data.clone(),
+                payload,
                 kind: CachedBlockKind::Data,
                 modified: false,
             });
@@ -111,109 +127,94 @@ impl BlockCache {
         Ok(block_data)
     }
 
-    // AGENT: update or insert one complete cached block and mark it dirty for a
-    // later flush through the block-device interface; this path must be usable
-    // before current-task setup just like read_block_cached().
-    pub fn write_block_cached(
+    // AGENT: write through to the block device and mirror the full fixed-size
+    // payload in the cache slot; this path stays usable before current-task setup.
+    pub fn write_block_cached<D: BlockDevice + ?Sized>(
         &self,
+        device: &D,
         dev: usize,
         block: usize,
         data: &[u8],
     ) -> Result<(), &'static str> {
-        self.write_block_cached_as(dev, block, data, CachedBlockKind::Data)
+        self.write_block_cached_as(device, dev, block, data, CachedBlockKind::Data)
     }
 
-    // AGENT: write one complete cached block and tag its dirty class so metadata
-    // writeback policy can live in BlockCache.
-    pub fn write_block_cached_as(
+    // AGENT: write one complete block into the device, update the cached
+    // payload, and tag its dirty class for fdatasync/fsync distinction.
+    pub fn write_block_cached_as<D: BlockDevice + ?Sized>(
         &self,
+        device: &D,
         dev: usize,
         block: usize,
         data: &[u8],
         kind: CachedBlockKind,
     ) -> Result<(), &'static str> {
-        if data.len() != BLOCK_CACHE_BLOCK_SIZE {
-            return Err("einval");
-        }
+        let payload = block_payload_from_slice(data, "einval")?;
+        device.write_block(dev, block, data)?;
         let key = BlockKey::new(dev, block);
         let ci = self.idx(key);
         let ch = &self.chains[ci];
         let mut items = ch.items.lock().unwrap();
         if let Some(slot) = items.iter_mut().find(|slot| slot.key == key) {
-            slot.payload = data.to_vec();
+            slot.payload = payload;
             slot.kind = kind;
             slot.modified = true;
             return Ok(());
         }
         items.push(CacheSlot {
             key,
-            payload: data.to_vec(),
+            payload,
             kind,
             modified: true,
         });
         Ok(())
     }
 
-    fn flush_dirty_where<D, F>(&self, device: &D, mut include: F) -> Result<usize, &'static str>
+    fn flush_dirty_where<F>(&self, mut include: F) -> Result<usize, &'static str>
     where
-        D: BlockDevice + ?Sized,
         F: FnMut(CachedBlockKind) -> bool,
     {
         let mut flushed = 0usize;
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
-            let dirty = {
-                let items = ch.items.lock().unwrap();
-                items
-                    .iter()
-                    .filter(|slot| slot.modified && include(slot.kind))
-                    .map(|slot| (slot.key, slot.kind, slot.payload.clone()))
-                    .collect::<Vec<_>>()
-            };
-
-            for (key, kind, payload) in dirty {
-                device.write_block(key.dev, key.block, &payload)?;
-                let mut items = ch.items.lock().unwrap();
-                if let Some(slot) = items.iter_mut().find(|slot| slot.key == key) {
-                    if slot.modified && slot.kind == kind && slot.payload == payload {
-                        slot.modified = false;
-                        flushed += 1;
-                    }
+            let mut items = ch.items.lock().unwrap();
+            for slot in items.iter_mut() {
+                if slot.modified && include(slot.kind) {
+                    slot.modified = false;
+                    flushed += 1;
                 }
             }
         }
         Ok(flushed)
     }
 
-    // AGENT: clone dirty payloads under the chain mutex, write them outside the
-    // mutex, then clear the dirty bit only if the cached payload is unchanged.
-    pub fn flush_dirty<D: BlockDevice + ?Sized>(&self, device: &D) -> Result<usize, &'static str> {
-        self.flush_dirty_where(device, |_| true)
+    // AGENT: writes are already in the block device; flush clears dirty state
+    // for slots whose data/metadata class still matches the sync request.
+    pub fn flush_dirty(&self) -> Result<usize, &'static str> {
+        self.flush_dirty_where(|_| true)
     }
 
-    // AGENT: fdatasync-style writeback flushes data blocks while leaving cached
-    // metadata blocks dirty for a later full sync.
-    pub fn flush_dirty_data<D: BlockDevice + ?Sized>(
-        &self,
-        device: &D,
-    ) -> Result<usize, &'static str> {
-        self.flush_dirty_where(device, |kind| kind == CachedBlockKind::Data)
+    // AGENT: fdatasync-style sync clears data dirty bits while leaving cached
+    // metadata slots dirty for a later full sync.
+    pub fn flush_dirty_data(&self) -> Result<usize, &'static str> {
+        self.flush_dirty_where(|kind| kind == CachedBlockKind::Data)
     }
 
-    // AGENT: no-device sync is only a GKL barrier; dirty cache entries must use
-    // flush_dirty() or sync_all_with_device() so writeback has a BlockDevice.
+    // AGENT: no-device sync is only a GKL barrier; callers that need file dirty
+    // state cleared must use flush_dirty() or sync_all_with_device().
     pub fn sync_all(&self, id: usize) {
         let _barrier = GKL.guard(id);
     }
 
-    // AGENT: device-backed sync is the real dirty writeback path.
+    // AGENT: keep the device-backed API for existing callers; RamBlockDevice
+    // writes are already write-through, so the sync step clears cache dirtiness.
     pub fn sync_all_with_device<D: BlockDevice + ?Sized>(
         &self,
         id: usize,
-        device: &D,
+        _device: &D,
     ) -> Result<usize, &'static str> {
         let _barrier = GKL.guard(id);
-        self.flush_dirty(device)
+        self.flush_dirty()
     }
 
     // AGENT: invalidate removes matching cached copies under the chain mutex.
@@ -282,5 +283,115 @@ impl BlockCache {
             evicted += before - items.len();
         }
         evicted
+    }
+}
+
+#[cfg(any(test, feature = "qemu-sync-selftest"))]
+pub mod tests {
+    use super::*;
+
+    // AGENT: expose BlockCache payload regressions through qemu-sync-selftest.
+    pub fn run_all() {
+        cache_hit_returns_fixed_payload_without_second_device_read();
+        write_updates_cached_fixed_payload();
+    }
+
+    // AGENT: test-only device that changes data on every read so cache hits are
+    // distinguishable from accidental second device reads.
+    struct ChangingReadDevice {
+        reads: AtomicUsize,
+    }
+
+    impl ChangingReadDevice {
+        // AGENT: initialize the read counter for deterministic payload values.
+        fn new() -> Self {
+            Self {
+                reads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl BlockDevice for ChangingReadDevice {
+        // AGENT: return a different full-block payload on each device read.
+        fn read_block(&self, _dev: usize, _block: usize) -> Result<Vec<u8>, &'static str> {
+            let value = self.reads.fetch_add(1, Ordering::Relaxed).wrapping_add(1) as u8;
+            Ok(vec![value; BLOCK_CACHE_BLOCK_SIZE])
+        }
+
+        // AGENT: accept writes because these tests only care about read-hit
+        // residency and cached write payload updates.
+        fn write_block(
+            &self,
+            _dev: usize,
+            _block: usize,
+            _data: &[u8],
+        ) -> Result<(), &'static str> {
+            Ok(())
+        }
+    }
+
+    // AGENT: verify read hits return the slot-owned fixed payload without a
+    // second device read that could replace cached contents.
+    #[cfg_attr(test, test)]
+    fn cache_hit_returns_fixed_payload_without_second_device_read() {
+        let cache = BlockCache::new(4);
+        let device = ChangingReadDevice::new();
+
+        let first = cache
+            .read_block_cached(&device, ROOT_BLOCK_DEVICE, 3)
+            .unwrap();
+        let second = cache
+            .read_block_cached(&device, ROOT_BLOCK_DEVICE, 3)
+            .unwrap();
+
+        assert_eq!(first.as_slice(), &[1u8; BLOCK_CACHE_BLOCK_SIZE][..]);
+        assert_eq!(second, first);
+        assert_eq!(device.reads.load(Ordering::Relaxed), 1);
+    }
+
+    // AGENT: keep write-through behavior while ensuring the cache slot mirrors
+    // the latest full fixed-size payload and dirty class.
+    #[cfg_attr(test, test)]
+    fn write_updates_cached_fixed_payload() {
+        let cache = BlockCache::new(4);
+        let device = RamBlockDevice::empty();
+        let first = [0x11u8; BLOCK_CACHE_BLOCK_SIZE];
+        let second = [0x22u8; BLOCK_CACHE_BLOCK_SIZE];
+
+        cache
+            .write_block_cached(&device, ROOT_BLOCK_DEVICE, 5, &first)
+            .unwrap();
+        assert_eq!(
+            cache
+                .read_block_cached(&device, ROOT_BLOCK_DEVICE, 5)
+                .unwrap()
+                .as_slice(),
+            &first[..]
+        );
+        assert_eq!(cache.dirty_count_by_kind(CachedBlockKind::Data), 1);
+
+        cache
+            .write_block_cached_as(
+                &device,
+                ROOT_BLOCK_DEVICE,
+                5,
+                &second,
+                CachedBlockKind::Metadata,
+            )
+            .unwrap();
+        assert_eq!(
+            cache
+                .read_block_cached(&device, ROOT_BLOCK_DEVICE, 5)
+                .unwrap()
+                .as_slice(),
+            &second[..]
+        );
+        assert_eq!(cache.dirty_count_by_kind(CachedBlockKind::Data), 0);
+        assert_eq!(cache.dirty_count_by_kind(CachedBlockKind::Metadata), 1);
+
+        assert_eq!(cache.flush_dirty_data().unwrap(), 0);
+        assert_eq!(cache.dirty_count_by_kind(CachedBlockKind::Metadata), 1);
+        assert_eq!(cache.flush_dirty().unwrap(), 1);
+        assert_eq!(cache.dirty_count(), 0);
     }
 }
