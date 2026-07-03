@@ -115,6 +115,7 @@ pub(super) fn sys_open(
                 .write()
                 .unwrap()
                 .insert(resolved.clone(), node.clone());
+            kernel.note_path_in_parent_dir(&resolved)?;
             node
         }
         None => return Err("enoent"),

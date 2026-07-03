@@ -132,6 +132,27 @@ impl OpenFileDescription {
             _ => None,
         }
     }
+
+    // AGENT: keep transfer-shaped callers on the shared open-file description
+    // path so fd status changes such as O_APPEND remain visible.
+    pub fn transfer(
+        &self,
+        dir: u8,
+        offset: Option<usize>,
+        buf_rd: Option<&mut [u8]>,
+        buf_wr: Option<&[u8]>,
+    ) -> Result<usize, &'static str> {
+        let status = self.status_flags();
+        match &self.file {
+            FLike::File(f) => f.transfer_with_status(status, dir, offset, buf_rd, buf_wr),
+            _ => match (dir, offset, buf_rd, buf_wr) {
+                (FHandle::TRANSFER_READ, None, Some(buf), None) => self.read(buf),
+                (FHandle::TRANSFER_WRITE, None, None, Some(buf)) => self.write(buf),
+                (FHandle::TRANSFER_READ | FHandle::TRANSFER_WRITE, Some(_), _, _) => Err("espipe"),
+                _ => Err("einval"),
+            },
+        }
+    }
 }
 
 impl FdEntry {
@@ -223,6 +244,18 @@ impl FdEntry {
         self.desc.regular_handle()
     }
 
+    // AGENT: expose the transfer helper at the fd-entry layer so callers do not
+    // bypass shared open-file-description status.
+    pub fn transfer(
+        &self,
+        dir: u8,
+        offset: Option<usize>,
+        buf_rd: Option<&mut [u8]>,
+        buf_wr: Option<&[u8]>,
+    ) -> Result<usize, &'static str> {
+        self.desc.transfer(dir, offset, buf_rd, buf_wr)
+    }
+
     // AGENT: compatibility view for older tests and helpers that inspect FLike.
     pub fn as_flike(&self) -> FLike {
         self.desc.file().clone()
@@ -253,11 +286,31 @@ pub enum FileKind {
     Directory,
 }
 
-// AGENT: share file contents and executable metadata across all handles.
+// AGENT: track unsynced changes in the in-memory file node so sync methods
+// report real state transitions instead of being empty success stubs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileDirty {
+    pub data: bool,
+    pub metadata: bool,
+}
+
+impl FileDirty {
+    pub const fn clean() -> Self {
+        Self {
+            data: false,
+            metadata: false,
+        }
+    }
+}
+
+// AGENT: share file contents, executable metadata, and simple directory entries
+// across all handles.
 pub struct FileNode {
     pub kind: FileKind,
     pub executable: AtomicBool,
     pub data: Arc<Mutex<Vec<u8>>>,
+    dirty: Mutex<FileDirty>,
+    dir_entries: Arc<Mutex<Vec<String>>>,
 }
 
 impl FileNode {
@@ -267,16 +320,142 @@ impl FileNode {
             kind: FileKind::Regular,
             executable: AtomicBool::new(executable),
             data: Arc::new(Mutex::new(data)),
+            dirty: Mutex::new(FileDirty::clean()),
+            dir_entries: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    // AGENT: create a directory node so exec can reject it distinctly.
+    // AGENT: create a directory node with a real entry list for read_entry().
     pub fn directory() -> Self {
         Self {
             kind: FileKind::Directory,
             executable: AtomicBool::new(false),
             data: Arc::new(Mutex::new(Vec::new())),
+            dirty: Mutex::new(FileDirty::clean()),
+            dir_entries: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    // AGENT: add one child name to a directory node without duplicating entries.
+    pub fn add_dir_entry(&self, name: &str) -> Result<(), &'static str> {
+        if self.kind != FileKind::Directory {
+            return Err("enotdir");
+        }
+        if name.is_empty() || name.contains('/') || name.bytes().any(|b| b == 0) {
+            return Err("einval");
+        }
+        let inserted = {
+            let mut entries = self.dir_entries.lock().unwrap();
+            if entries.iter().any(|entry| entry == name) {
+                false
+            } else {
+                entries.push(name.to_string());
+                true
+            }
+        };
+        if inserted {
+            self.dirty.lock().unwrap().metadata = true;
+        }
+        Ok(())
+    }
+
+    // AGENT: fetch one directory entry by offset for handle-based iteration.
+    pub fn dir_entry_at(&self, idx: usize) -> Result<String, &'static str> {
+        if self.kind != FileKind::Directory {
+            return Err("enotdir");
+        }
+        self.dir_entries
+            .lock()
+            .unwrap()
+            .get(idx)
+            .cloned()
+            .ok_or("enoent")
+    }
+
+    // AGENT: check one directory-local child name without claiming to resolve
+    // full paths; Kernel::lookup_path owns global path resolution.
+    pub fn has_dir_entry(&self, name: &str) -> Result<bool, &'static str> {
+        if self.kind != FileKind::Directory {
+            return Err("enotdir");
+        }
+        Ok(self
+            .dir_entries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry == name))
+    }
+
+    // AGENT: expose dirty state for focused tests and future flush decisions.
+    pub fn dirty_state(&self) -> FileDirty {
+        *self.dirty.lock().unwrap()
+    }
+
+    // AGENT: mark content writes dirty and record metadata changes when size grew.
+    pub(crate) fn note_write(&self, metadata_changed: bool) {
+        let mut dirty = self.dirty.lock().unwrap();
+        dirty.data = true;
+        dirty.metadata |= metadata_changed;
+    }
+
+    // AGENT: mark operations such as truncate/fallocate that change file size.
+    pub(crate) fn note_resize(&self) {
+        let mut dirty = self.dirty.lock().unwrap();
+        dirty.data = true;
+        dirty.metadata = true;
+    }
+
+    // AGENT: write a byte range while centralizing growth checks and dirty
+    // accounting for all FileNode-backed write paths.
+    pub(crate) fn write_bytes(
+        &self,
+        offset: Option<usize>,
+        buf: &[u8],
+    ) -> Result<usize, &'static str> {
+        let mut data = self.data.lock().unwrap();
+        let start = offset.unwrap_or_else(|| data.len());
+        let end = start.checked_add(buf.len()).ok_or("efbig")?;
+        let grew = end > data.len();
+        if grew {
+            data.resize(end, 0);
+        }
+        if !buf.is_empty() {
+            data[start..end].copy_from_slice(buf);
+        }
+        drop(data);
+        if grew || !buf.is_empty() {
+            self.note_write(grew);
+        }
+        Ok(end)
+    }
+
+    // AGENT: resize file contents and mark both data and metadata dirty only
+    // when the visible file length actually changes.
+    pub(crate) fn set_data_len(&self, len: usize) {
+        let changed = {
+            let mut data = self.data.lock().unwrap();
+            if data.len() == len {
+                false
+            } else {
+                data.resize(len, 0);
+                true
+            }
+        };
+        if changed {
+            self.note_resize();
+        }
+    }
+
+    // AGENT: data-only sync clears dirty file contents but leaves metadata dirty.
+    pub fn sync_data(&self) -> Result<(), &'static str> {
+        self.dirty.lock().unwrap().data = false;
+        Ok(())
+    }
+
+    // AGENT: full sync clears both content and metadata dirty bits.
+    pub fn sync_all(&self) -> Result<(), &'static str> {
+        *self.dirty.lock().unwrap() = FileDirty::clean();
+        Ok(())
     }
 }
 
@@ -286,6 +465,8 @@ impl fmt::Debug for FileNode {
             .field("kind", &self.kind)
             .field("executable", &self.executable.load(Ordering::Relaxed))
             .field("len", &self.data.lock().unwrap().len())
+            .field("dirty", &self.dirty_state())
+            .field("entries", &self.dir_entries.lock().unwrap().len())
             .finish()
     }
 }
@@ -308,6 +489,9 @@ pub enum FSeek {
 }
 
 impl FHandle {
+    const TRANSFER_WRITE: u8 = 0;
+    const TRANSFER_READ: u8 = 1;
+
     // AGENT: create a fresh standalone regular node for device-like handles.
     pub fn new(path: &str, opt: FdOpt) -> Self {
         Self {
@@ -387,13 +571,23 @@ impl FHandle {
         Ok(n)
     }
 
-    // AGENT: positioned reads use only the immutable read access mode and do
-    // not advance the shared descriptor offset.
-    pub fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
-        if !self.initial_status.rd {
+    // AGENT: positioned reads use the supplied status and do not advance the
+    // shared descriptor offset.
+    fn read_at_with_status(
+        &self,
+        status: FdOpt,
+        off: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        if !status.rd {
             return Err("ebadf");
         }
         Ok(self.copy_from_node_at(off, buf))
+    }
+
+    // AGENT: direct handle positioned reads use the open-time status snapshot.
+    pub fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
+        self.read_at_with_status(self.get_opt(), off, buf)
     }
     // AGENT: append/offset selection and offset advancement happen under one
     // shared descriptor state write lock.
@@ -408,40 +602,34 @@ impl FHandle {
         if !status.wr {
             return Err("ebadf");
         }
-        let mut d = self.node.data.lock().unwrap();
         let off = if status.ap {
-            d.len()
+            None
         } else {
-            desc.off as usize
+            Some(desc.off as usize)
         };
-        let end = Self::write_data_at(&mut d, off, buf)?;
+        let end = self.node.write_bytes(off, buf)?;
         desc.off = end as u64;
         Ok(buf.len())
     }
 
-    // AGENT: grow and copy one regular-file byte range with overflow checked in
-    // one place so offset writes and append writes share the same bounds logic.
-    fn write_data_at(d: &mut Vec<u8>, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
-        if buf.is_empty() {
-            return Ok(off);
-        }
-        let end = off.checked_add(buf.len()).ok_or("efbig")?;
-        if end > d.len() {
-            d.resize(end, 0);
-        }
-        d[off..end].copy_from_slice(buf);
-        Ok(end)
-    }
-
-    // AGENT: explicit-offset writes do not advance the shared file offset, but
-    // they still use the same checked range write as ordinary writes.
-    pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
-        if !self.initial_status.wr {
+    // AGENT: explicit-offset writes use the supplied status and do not advance
+    // the shared file offset.
+    fn write_at_with_status(
+        &self,
+        status: FdOpt,
+        off: usize,
+        buf: &[u8],
+    ) -> Result<usize, &'static str> {
+        if !status.wr {
             return Err("ebadf");
         }
-        let mut d = self.node.data.lock().unwrap();
-        Self::write_data_at(&mut d, off, buf)?;
+        self.node.write_bytes(Some(off), buf)?;
         Ok(buf.len())
+    }
+
+    // AGENT: direct handle positioned writes use the open-time status snapshot.
+    pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
+        self.write_at_with_status(self.get_opt(), off, buf)
     }
     // AGENT: compute seek targets with checked signed deltas so invalid offsets
     // fail instead of wrapping into huge u64 values.
@@ -459,6 +647,31 @@ impl FHandle {
         Ok(next)
     }
 
+    // AGENT: validate the legacy transfer-shaped API explicitly instead of
+    // accepting arbitrary odd/even direction values or extra buffers.
+    fn transfer_with_status(
+        &self,
+        status: FdOpt,
+        dir: u8,
+        offset: Option<usize>,
+        buf_rd: Option<&mut [u8]>,
+        buf_wr: Option<&[u8]>,
+    ) -> Result<usize, &'static str> {
+        match (dir, offset, buf_rd, buf_wr) {
+            (Self::TRANSFER_READ, Some(off), Some(buf), None) => {
+                self.read_at_with_status(status, off, buf)
+            }
+            (Self::TRANSFER_READ, None, Some(buf), None) => self.read_with_status(status, buf),
+            (Self::TRANSFER_WRITE, Some(off), None, Some(buf)) => {
+                self.write_at_with_status(status, off, buf)
+            }
+            (Self::TRANSFER_WRITE, None, None, Some(buf)) => self.write_with_status(status, buf),
+            _ => Err("einval"),
+        }
+    }
+
+    // AGENT: retained for direct-handle compatibility; fd-table callers should
+    // prefer FdEntry::transfer so mutable fd status is not bypassed.
     pub fn transfer(
         &self,
         dir: u8,
@@ -466,27 +679,7 @@ impl FHandle {
         buf_rd: Option<&mut [u8]>,
         buf_wr: Option<&[u8]>,
     ) -> Result<usize, &'static str> {
-        let _path_hash = {
-            let mut h: u64 = 0x811c9dc5;
-            for b in self.path.bytes() {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x01000193);
-            }
-            h
-        };
-        if dir & 1 != 0 {
-            match (offset, buf_rd) {
-                (Some(off), Some(buf)) => self.read_at(off, buf),
-                (None, Some(buf)) => self.read(buf),
-                _ => Err("einval"),
-            }
-        } else {
-            match (offset, buf_wr) {
-                (Some(off), Some(buf)) => self.write_at(off, buf),
-                (None, Some(buf)) => self.write(buf),
-                _ => Err("einval"),
-            }
-        }
+        self.transfer_with_status(self.get_opt(), dir, offset, buf_rd, buf_wr)
     }
 
     // AGENT: direct truncation uses the handle's open-time write permission.
@@ -494,28 +687,51 @@ impl FHandle {
         if !self.initial_status.wr {
             return Err("ebadf");
         }
-        self.node.data.lock().unwrap().resize(len as usize, 0);
+        let len = usize::try_from(len).map_err(|_| "efbig")?;
+        self.node.set_data_len(len);
         Ok(())
     }
+    // AGENT: sync a regular in-memory node through the shared FileNode state.
     pub fn sync_all(&self) -> Result<(), &'static str> {
-        Ok(())
+        self.node.sync_all()
     }
+    // AGENT: sync only data contents, matching fdatasync-style metadata rules.
     pub fn sync_data(&self) -> Result<(), &'static str> {
-        Ok(())
+        self.node.sync_data()
     }
-    pub fn lookup(&self, _path: &str, _depth: usize) -> Result<(), &'static str> {
-        Ok(())
+    // AGENT: keep node-local lookup honest; full path lookup belongs to Kernel.
+    pub fn lookup(&self, path: &str, depth: usize) -> Result<(), &'static str> {
+        if depth > 40 {
+            return Err("eloop");
+        }
+        if path.bytes().any(|b| b == 0) {
+            return Err("einval");
+        }
+        if self.node.kind != FileKind::Directory {
+            return Err("enotdir");
+        }
+        if path.is_empty() || path == "." {
+            return Ok(());
+        }
+        if path.contains('/') {
+            return Err("einval");
+        }
+        if self.node.has_dir_entry(path)? {
+            Ok(())
+        } else {
+            Err("enoent")
+        }
     }
-    // AGENT: directory-style iteration uses the handle's open-time read
-    // permission and advances only the regular handle offset.
+    // AGENT: directory-style iteration reads real directory entries and advances
+    // the handle offset only after a name is returned.
     pub fn read_entry(&self) -> Result<String, &'static str> {
-        let mut d = self.desc.write().unwrap();
         if !self.initial_status.rd {
             return Err("ebadf");
         }
-        let off = d.off;
-        d.off += 1;
-        Ok(format!("entry_{}", off))
+        let mut desc = self.desc.write().unwrap();
+        let entry = self.node.dir_entry_at(desc.off as usize)?;
+        desc.off += 1;
+        Ok(entry)
     }
     // AGENT: regular files do not carry pipe-style closed-peer state.
     pub fn poll_status(&self) -> PollStatus {
@@ -550,11 +766,9 @@ impl FHandle {
         if !self.initial_status.wr {
             return Err("ebadf");
         }
-        let mut d = self.node.data.lock().unwrap();
         let needed = offset.checked_add(len).ok_or("efbig")?;
-        if needed > d.len() {
-            d.resize(needed, 0);
-        }
+        let current_len = self.node.data.lock().unwrap().len();
+        self.node.set_data_len(max(current_len, needed));
         Ok(())
     }
 
@@ -570,6 +784,67 @@ impl FHandle {
         drop(sd);
         self.desc.write().unwrap().off += n as u64;
         dst.write(&chunk)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn writable_opt() -> FdOpt {
+        FdOpt {
+            rd: true,
+            wr: true,
+            ap: false,
+            nb: false,
+        }
+    }
+
+    #[test]
+    fn set_len_and_sync_update_dirty_state() {
+        let fh = FHandle::with_data("/tmp/file", writable_opt(), vec![1, 2, 3]);
+        assert_eq!(fh.node.dirty_state(), FileDirty::clean());
+
+        fh.set_len(5).unwrap();
+        assert_eq!(fh.node.data.lock().unwrap().as_slice(), &[1, 2, 3, 0, 0]);
+        assert_eq!(
+            fh.node.dirty_state(),
+            FileDirty {
+                data: true,
+                metadata: true
+            }
+        );
+
+        fh.sync_data().unwrap();
+        assert_eq!(
+            fh.node.dirty_state(),
+            FileDirty {
+                data: false,
+                metadata: true
+            }
+        );
+
+        fh.sync_all().unwrap();
+        assert_eq!(fh.node.dirty_state(), FileDirty::clean());
+
+        let ro = FHandle::with_data("/tmp/ro", FdOpt::default(), vec![1, 2, 3]);
+        assert_eq!(ro.set_len(0), Err("ebadf"));
+    }
+
+    #[test]
+    fn lookup_reports_node_local_errors() {
+        let file = FHandle::with_data("/tmp/file", writable_opt(), Vec::new());
+        assert_eq!(file.lookup(".", 0), Err("enotdir"));
+
+        let dir = FHandle::with_node("/tmp", FdOpt::default(), Arc::new(FileNode::directory()));
+        assert_eq!(dir.lookup(".", 0), Ok(()));
+        assert_eq!(dir.lookup("", 0), Ok(()));
+        dir.node.add_dir_entry("child").unwrap();
+        assert_eq!(dir.lookup("child", 0), Ok(()));
+        assert_eq!(dir.lookup("missing", 0), Err("enoent"));
+        assert_eq!(dir.lookup(".", 41), Err("eloop"));
+        assert_eq!(dir.lookup("bad\0name", 0), Err("einval"));
+        assert_eq!(dir.lookup("bad/name", 0), Err("einval"));
     }
 }
 
