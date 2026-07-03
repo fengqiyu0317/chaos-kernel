@@ -11,6 +11,7 @@ use crate::kernel::{
 
 pub fn run_all() {
     crate::kernel::fs::fd::tests::run_all();
+    crate::kernel::fs::mount_io_disk::tests::run_all();
     wait_token_captures_current_task();
     wait_token_event_wake_wins_once();
     wait_token_timeout_wake_wins_once();

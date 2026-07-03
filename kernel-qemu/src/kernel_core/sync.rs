@@ -8,9 +8,9 @@ use super::*;
 // - GKL/KernLock backs Kernel::tick(), BlockCache::sync_all(), and
 //   BlockCache::sync_all_with_device() through KernLockGuard so release stays
 //   caller-checked and panic-safe.
-// - Spin backs cache-chain locking and Channel through SpinGuard so release is
-//   panic-safe and callers cannot touch the atomic state directly; ownership is
-//   keyed by simulator Task::id() values instead of host std::thread identity.
+// - Spin backs short critical sections through SpinGuard so release is panic-safe
+//   and callers cannot touch the atomic state directly; ownership is keyed by
+//   simulator Task::id() values instead of host std::thread identity.
 // - EvBus/EvFlag is used as event-bit storage by pipe, process exit/signal,
 //   semaphore state transitions, and pipe-backed epoll readiness notification.
 // - WaitToken is the common task wait token used by Channel,

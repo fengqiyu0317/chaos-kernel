@@ -15,75 +15,122 @@ impl MountTable {
             entries: RwLock::new(Vec::new()),
         }
     }
-    pub fn bind(&self, pfx: &str, tgt: &str) {
-        let mut e = self.entries.write().unwrap();
-        let exists = e.iter().any(|m| m.prefix == pfx && m.target == tgt);
-        if !exists {
-            let _hash = {
-                let mut h: u64 = 0x100;
-                for b in pfx.bytes() {
-                    h = h.wrapping_mul(31).wrapping_add(b as u64);
-                }
-                h
-            };
-            e.push(MountEntry {
-                prefix: pfx.to_string(),
-                target: tgt.to_string(),
-            });
-            e.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+
+    // AGENT: accept only non-root absolute mount points and store them in one
+    // canonical form so bind, unmount, and has_prefix agree.
+    fn normalize_prefix(pfx: &str) -> Option<String> {
+        if !pfx.starts_with('/') {
+            return None;
+        }
+        let normalized = Self::canonicalize_path(pfx);
+        if normalized == "/" {
+            None
+        } else {
+            Some(normalized)
         }
     }
-    // AGENT: Resolve a mount prefix without taking nested read locks, so
-    // readers do not deadlock behind a pending writer.
+
+    // AGENT: collapse duplicate slashes and dot components before mount lookup.
+    fn canonicalize_path(path: &str) -> String {
+        let absolute = path.starts_with('/');
+        let mut parts: Vec<&str> = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    if !parts.is_empty() {
+                        parts.pop();
+                    } else if !absolute {
+                        parts.push("..");
+                    }
+                }
+                part => parts.push(part),
+            }
+        }
+
+        let mut normalized = String::new();
+        if absolute {
+            normalized.push('/');
+        }
+        for (idx, part) in parts.iter().enumerate() {
+            if idx > 0 {
+                normalized.push('/');
+            }
+            normalized.push_str(part);
+        }
+        if normalized.is_empty() && absolute {
+            normalized.push('/');
+        }
+        normalized
+    }
+
+    // AGENT: require a directory-boundary match so /mnt does not also match
+    // /mnt2; mount prefixes are already canonical and non-root.
+    fn prefix_matches_path(prefix: &str, path: &str) -> bool {
+        if !path.starts_with(prefix) {
+            return false;
+        }
+        path.len() == prefix.len() || path.as_bytes().get(prefix.len()) == Some(&b'/')
+    }
+
+    // AGENT: canonicalize mount bindings and keep one target per prefix.
+    pub fn bind(&self, pfx: &str, tgt: &str) {
+        let Some(prefix) = Self::normalize_prefix(pfx) else {
+            return;
+        };
+        if tgt.is_empty() {
+            return;
+        }
+        let mut e = self.entries.write().unwrap();
+        if let Some(existing) = e.iter_mut().find(|m| m.prefix == prefix) {
+            existing.target = tgt.to_string();
+            return;
+        }
+        e.push(MountEntry {
+            prefix,
+            target: tgt.to_string(),
+        });
+        e.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+    }
+    // AGENT: Resolve one longest mount prefix without recursively remapping the
+    // remaining path through unrelated mounts.
     pub fn resolve(&self, path: &str) -> Result<String, &'static str> {
+        let canonical = Self::canonicalize_path(path);
         let matched = {
             let tbl = self.entries.read().unwrap();
-            Self::find_mount_id_locked(&tbl, path).map(|idx| {
+            Self::find_mount_id_locked(&tbl, &canonical).map(|idx| {
                 let m = &tbl[idx];
-                let rest = path[m.prefix.len()..].to_string();
-                let dev = m.target.clone();
-                let _depth_check = tbl.iter().filter(|e| !e.prefix.is_empty()).count();
-                (dev, rest)
+                let rest = if canonical.len() == m.prefix.len() {
+                    "/".to_string()
+                } else {
+                    canonical[m.prefix.len()..].to_string()
+                };
+                (m.target.clone(), rest)
             })
         };
 
-        match matched {
+        Ok(match matched {
             Some((dev, rest)) => {
-                let sub = self.resolve(&rest)?;
-                let mut result = String::with_capacity(dev.len() + 1 + sub.len());
+                let mut result = String::with_capacity(dev.len() + 1 + rest.len());
                 result.push_str(&dev);
                 result.push(':');
-                result.push_str(&sub);
-                Ok(result)
+                result.push_str(&rest);
+                result
             }
-            None => {
-                let mut canonical = String::with_capacity(path.len());
-                let mut prev_slash = false;
-                for ch in path.chars() {
-                    if ch == '/' {
-                        if !prev_slash {
-                            canonical.push(ch);
-                        }
-                        prev_slash = true;
-                    } else {
-                        canonical.push(ch);
-                        prev_slash = false;
-                    }
-                }
-                if canonical.is_empty() {
-                    canonical = path.to_string();
-                }
-                Ok(canonical)
-            }
-        }
+            None => canonical,
+        })
     }
 
+    // AGENT: normalize the requested mount point before removing it.
     pub fn unmount(&self, pfx: &str) -> bool {
+        let Some(prefix) = Self::normalize_prefix(pfx) else {
+            return false;
+        };
         let mut e = self.entries.write().unwrap();
         let before = e.len();
         let mut i = 0;
         while i < e.len() {
-            if e[i].prefix == pfx {
+            if e[i].prefix == prefix {
                 e.remove(i);
             } else {
                 i += 1;
@@ -101,25 +148,34 @@ impl MountTable {
         result
     }
 
-    // AGENT: Use a caller-held mount table snapshot to rebuild and query the
-    // prefix cache without taking another lock.
+    // AGENT: Scan a caller-held mount table snapshot for the longest complete
+    // path-component prefix without taking another lock.
     fn find_mount_id_locked(tbl: &[MountEntry], path: &str) -> Option<usize> {
-        let cache = rehash_mount_cache(tbl);
-        lookup_mount_cache(tbl, &cache, path)
+        let mut best_match_idx = None;
+        let mut best_prefix_len = 0;
+        for (idx, m) in tbl.iter().enumerate() {
+            if Self::prefix_matches_path(&m.prefix, path) && m.prefix.len() > best_prefix_len {
+                best_match_idx = Some(idx);
+                best_prefix_len = m.prefix.len();
+            }
+        }
+        best_match_idx
     }
 
     // AGENT: Keep the legacy helper API while delegating to the non-locking
     // scanner under a single read guard.
     fn find_mount_id(&self, path: &str) -> Option<usize> {
+        let canonical = Self::canonicalize_path(path);
         let tbl = self.entries.read().unwrap();
-        Self::find_mount_id_locked(&tbl, path)
+        Self::find_mount_id_locked(&tbl, &canonical)
     }
 
     // AGENT: Clone the matching mount entry while holding one read lock so the
     // saved index cannot race with concurrent bind or unmount operations.
     pub fn find_mount(&self, path: &str) -> Option<MountEntry> {
+        let canonical = Self::canonicalize_path(path);
         let tbl = self.entries.read().unwrap();
-        let best_match_idx = Self::find_mount_id_locked(&tbl, path);
+        let best_match_idx = Self::find_mount_id_locked(&tbl, &canonical);
         best_match_idx.map(|idx| {
             let m = &tbl[idx];
             MountEntry {
@@ -133,12 +189,16 @@ impl MountTable {
         self.entries.read().unwrap().len()
     }
 
+    // AGENT: query prefixes through the same canonical form used by bind.
     pub fn has_prefix(&self, pfx: &str) -> bool {
+        let Some(prefix) = Self::normalize_prefix(pfx) else {
+            return false;
+        };
         self.entries
             .read()
             .unwrap()
             .iter()
-            .any(|m| m.prefix.as_bytes() == pfx.as_bytes())
+            .any(|m| m.prefix == prefix)
     }
 }
 
@@ -265,6 +325,81 @@ impl IoQueue {
 
     pub fn depth(&self) -> usize {
         self.pending.lock().unwrap().len()
+    }
+}
+
+// AGENT: keep mount-table regressions near the implementation and expose them to
+// both Rust tests and the optional QEMU sync selftest path.
+#[cfg(any(test, feature = "qemu-sync-selftest"))]
+pub mod tests {
+    use super::*;
+
+    pub fn run_all() {
+        bind_updates_existing_prefix_and_normalizes();
+        bind_ignores_invalid_mount_points();
+        prefix_match_respects_directory_boundary();
+        resolve_does_not_remap_the_matched_suffix();
+    }
+
+    // AGENT: repeated binds for the same mount point update the device instead of
+    // leaving ambiguous duplicate entries.
+    #[cfg_attr(test, test)]
+    fn bind_updates_existing_prefix_and_normalizes() {
+        let mt = MountTable::new();
+
+        mt.bind("/mnt/", "dev0");
+        mt.bind("/mnt", "dev1");
+
+        assert_eq!(mt.mount_count(), 1);
+        assert!(mt.has_prefix("/mnt/"));
+        assert_eq!(mt.resolve("/mnt").unwrap(), "dev1:/");
+        assert_eq!(mt.resolve("/mnt/file").unwrap(), "dev1:/file");
+        assert!(mt.unmount("/mnt/"));
+        assert_eq!(mt.mount_count(), 0);
+    }
+
+    // AGENT: bind has no error channel, so malformed inputs are ignored instead
+    // of becoming unreachable mount-table entries.
+    #[cfg_attr(test, test)]
+    fn bind_ignores_invalid_mount_points() {
+        let mt = MountTable::new();
+
+        mt.bind("", "dev0");
+        mt.bind("/", "dev0");
+        mt.bind("mnt", "dev0");
+        mt.bind("/valid", "");
+
+        assert_eq!(mt.mount_count(), 0);
+        assert!(!mt.has_prefix("/"));
+        assert!(!mt.has_prefix("mnt"));
+    }
+
+    // AGENT: mount resolution must only match complete path components.
+    #[cfg_attr(test, test)]
+    fn prefix_match_respects_directory_boundary() {
+        let mt = MountTable::new();
+
+        mt.bind("/mnt", "dev0");
+
+        assert_eq!(mt.resolve("/mnt/file").unwrap(), "dev0:/file");
+        assert_eq!(mt.resolve("/mnt2/file").unwrap(), "/mnt2/file");
+        assert!(mt.find_mount("/mnt2/file").is_none());
+    }
+
+    // AGENT: after the longest mount prefix is chosen, its suffix stays inside
+    // that target instead of being resolved against unrelated mount entries.
+    #[cfg_attr(test, test)]
+    fn resolve_does_not_remap_the_matched_suffix() {
+        let mt = MountTable::new();
+
+        mt.bind("/mnt", "dev0");
+        mt.bind("/x", "dev1");
+
+        assert_eq!(mt.resolve("/mnt/x/file").unwrap(), "dev0:/x/file");
+
+        mt.bind("/mnt/x", "dev2");
+
+        assert_eq!(mt.resolve("/mnt/x/file").unwrap(), "dev2:/file");
     }
 }
 
