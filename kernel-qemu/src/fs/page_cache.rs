@@ -1,65 +1,67 @@
 // AGENT
 use super::*;
 
+// AGENT: keep only entry state that affects cache behavior.
 pub struct PageCacheEntry {
-    pub page_id: usize,
     pub data: Vec<u8>,
     pub dirty: bool,
-    pub access_tick: usize,
     pub pin_count: usize,
 }
 
+// AGENT: keep only the storage, capacity, and LRU state needed by the cache.
 pub struct PageCache {
     pub entries: HashMap<usize, PageCacheEntry>,
     pub capacity: usize,
-    pub hits: AtomicUsize,
-    pub misses: AtomicUsize,
-    pub evictions: AtomicUsize,
     pub lru_order: VecDeque<usize>,
 }
 
 impl PageCache {
+    // AGENT: initialize the minimal page-cache state.
     pub fn new(capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
             capacity,
-            hits: AtomicUsize::new(0),
-            misses: AtomicUsize::new(0),
-            evictions: AtomicUsize::new(0),
             lru_order: VecDeque::new(),
         }
     }
 
+    // AGENT: use lru_order as the single source of recency state.
     pub fn lookup(&mut self, page_id: usize) -> Option<&[u8]> {
         if self.entries.contains_key(&page_id) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
             self.lru_order.retain(|&id| id != page_id);
             self.lru_order.push_back(page_id);
-            if let Some(e) = self.entries.get_mut(&page_id) {
-                e.access_tick = CLK.load(Ordering::Relaxed);
-            }
             self.entries.get(&page_id).map(|e| e.data.as_slice())
         } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
             None
         }
     }
 
+    // AGENT: replace an existing page in place so lru_order never keeps
+    // duplicate entries for the same page id.
     pub fn insert(&mut self, page_id: usize, data: Vec<u8>) {
+        if let Some(entry) = self.entries.get_mut(&page_id) {
+            entry.data = data;
+            entry.dirty = false;
+            self.lru_order.retain(|&id| id != page_id);
+            self.lru_order.push_back(page_id);
+            return;
+        }
+        if self.capacity == 0 {
+            return;
+        }
         if self.entries.len() >= self.capacity {
             self.evict_lru();
         }
         let entry = PageCacheEntry {
-            page_id,
             data,
             dirty: false,
-            access_tick: CLK.load(Ordering::Relaxed),
             pin_count: 0,
         };
         self.entries.insert(page_id, entry);
         self.lru_order.push_back(page_id);
     }
 
+    // AGENT: eviction only needs pin state and the maintained LRU order.
     pub fn evict_lru(&mut self) -> bool {
         let mut victim = None;
         for &id in self.lru_order.iter() {
@@ -73,7 +75,6 @@ impl PageCache {
         if let Some(id) = victim {
             self.entries.remove(&id);
             self.lru_order.retain(|&x| x != id);
-            self.evictions.fetch_add(1, Ordering::Relaxed);
             true
         } else {
             false
@@ -95,14 +96,6 @@ impl PageCache {
             }
         }
         count
-    }
-
-    pub fn stats(&self) -> (usize, usize, usize) {
-        (
-            self.hits.load(Ordering::Relaxed),
-            self.misses.load(Ordering::Relaxed),
-            self.evictions.load(Ordering::Relaxed),
-        )
     }
 
     pub fn pin(&mut self, page_id: usize) -> bool {
