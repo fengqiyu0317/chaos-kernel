@@ -34,6 +34,10 @@ pub enum CachedBlockKind {
 // cache residency has the same fixed block granularity as the backing device.
 pub type BlockPayload = [u8; BLOCK_CACHE_BLOCK_SIZE];
 
+// AGENT: bound each hash chain to a compile-time slot array instead of allowing
+// per-chain cache residency to grow through Vec allocation.
+pub const BLOCK_CACHE_CHAIN_SLOTS: usize = 16;
+
 // AGENT: normalize device Vec/slice data into the fixed cache payload shape.
 fn block_payload_from_slice(
     data: &[u8],
@@ -48,6 +52,7 @@ fn block_payload_from_slice(
 }
 
 // AGENT: cache slots own the current cached block payload plus dirty metadata.
+#[derive(Clone, Copy)]
 pub struct CacheSlot {
     pub key: BlockKey,
     pub payload: BlockPayload,
@@ -55,16 +60,16 @@ pub struct CacheSlot {
     pub modified: bool,
 }
 
-// AGENT: QEMU block-cache chains are usable during early boot, before the
-// scheduler has installed a current task. Keep their locking independent from
-// task-owned Spin and protect the slots with this mutex only.
+// AGENT: QEMU block-cache chains use a fixed slot array so cache residency has
+// a hard per-chain bound while staying usable during early boot.
 pub struct CacheChain {
-    pub items: Mutex<Vec<CacheSlot>>,
+    pub items: Mutex<[Option<CacheSlot>; BLOCK_CACHE_CHAIN_SLOTS]>,
 }
 impl CacheChain {
+    // AGENT: initialize every fixed cache-chain slot as empty.
     pub fn new() -> Self {
         Self {
-            items: Mutex::new(Vec::new()),
+            items: Mutex::new([None; BLOCK_CACHE_CHAIN_SLOTS]),
         }
     }
 }
@@ -105,7 +110,11 @@ impl BlockCache {
 
         {
             let items = ch.items.lock().unwrap();
-            if let Some(slot) = items.iter().find(|slot| slot.key == key) {
+            if let Some(slot) = items
+                .iter()
+                .filter_map(|entry| entry.as_ref())
+                .find(|slot| slot.key == key)
+            {
                 return Ok(slot.payload.to_vec());
             }
         }
@@ -114,10 +123,17 @@ impl BlockCache {
         let payload = block_payload_from_slice(&block_data, "eio")?;
         {
             let mut items = ch.items.lock().unwrap();
-            if let Some(slot) = items.iter().find(|slot| slot.key == key) {
+            if let Some(slot) = items
+                .iter()
+                .filter_map(|entry| entry.as_ref())
+                .find(|slot| slot.key == key)
+            {
                 return Ok(slot.payload.to_vec());
             }
-            items.push(CacheSlot {
+            let Some(empty_slot) = items.iter_mut().find(|entry| entry.is_none()) else {
+                return Ok(block_data);
+            };
+            *empty_slot = Some(CacheSlot {
                 key,
                 payload,
                 kind: CachedBlockKind::Data,
@@ -150,18 +166,36 @@ impl BlockCache {
         kind: CachedBlockKind,
     ) -> Result<(), &'static str> {
         let payload = block_payload_from_slice(data, "einval")?;
-        device.write_block(dev, block, data)?;
         let key = BlockKey::new(dev, block);
         let ci = self.idx(key);
         let ch = &self.chains[ci];
+        {
+            let items = ch.items.lock().unwrap();
+            let has_slot = items
+                .iter()
+                .filter_map(|entry| entry.as_ref())
+                .any(|slot| slot.key == key);
+            let has_empty = items.iter().any(|entry| entry.is_none());
+            if !has_slot && !has_empty {
+                return Err("enospc");
+            }
+        }
+        device.write_block(dev, block, data)?;
         let mut items = ch.items.lock().unwrap();
-        if let Some(slot) = items.iter_mut().find(|slot| slot.key == key) {
+        if let Some(slot) = items
+            .iter_mut()
+            .filter_map(|entry| entry.as_mut())
+            .find(|slot| slot.key == key)
+        {
             slot.payload = payload;
             slot.kind = kind;
             slot.modified = true;
             return Ok(());
         }
-        items.push(CacheSlot {
+        let Some(empty_slot) = items.iter_mut().find(|entry| entry.is_none()) else {
+            return Err("enospc");
+        };
+        *empty_slot = Some(CacheSlot {
             key,
             payload,
             kind,
@@ -178,7 +212,7 @@ impl BlockCache {
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
             let mut items = ch.items.lock().unwrap();
-            for slot in items.iter_mut() {
+            for slot in items.iter_mut().filter_map(|entry| entry.as_mut()) {
                 if slot.modified && include(slot.kind) {
                     slot.modified = false;
                     flushed += 1;
@@ -223,7 +257,11 @@ impl BlockCache {
         let ci = self.idx(key);
         let ch = &self.chains[ci];
         let mut items = ch.items.lock().unwrap();
-        items.retain(|slot| slot.key != key);
+        for entry in items.iter_mut() {
+            if entry.as_ref().is_some_and(|slot| slot.key == key) {
+                *entry = None;
+            }
+        }
     }
 
     // AGENT: total_entries observes each chain under its slot mutex.
@@ -231,7 +269,13 @@ impl BlockCache {
         let mut total = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
-            let n = ch.items.lock().unwrap().len();
+            let n = ch
+                .items
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.is_some())
+                .count();
             total += n;
         }
         total
@@ -243,7 +287,7 @@ impl BlockCache {
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
             let items = ch.items.lock().unwrap();
-            for slot in items.iter() {
+            for slot in items.iter().filter_map(|entry| entry.as_ref()) {
                 if slot.modified {
                     count += 1;
                 }
@@ -259,7 +303,7 @@ impl BlockCache {
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
             let items = ch.items.lock().unwrap();
-            for slot in items.iter() {
+            for slot in items.iter().filter_map(|entry| entry.as_ref()) {
                 if slot.modified && slot.kind == kind {
                     count += 1;
                 }
@@ -275,12 +319,18 @@ impl BlockCache {
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
             let mut items = ch.items.lock().unwrap();
-            let before = items.len();
-            items.retain(|slot| {
+            let before = items.iter().filter(|entry| entry.is_some()).count();
+            for entry in items.iter_mut() {
+                let Some(slot) = entry.as_ref() else {
+                    continue;
+                };
                 let age = now.wrapping_sub(slot.key.block.wrapping_mul(3) ^ slot.key.dev);
-                slot.modified || age < max_age
-            });
-            evicted += before - items.len();
+                if !slot.modified && age >= max_age {
+                    *entry = None;
+                }
+            }
+            let after = items.iter().filter(|entry| entry.is_some()).count();
+            evicted += before - after;
         }
         evicted
     }
@@ -294,6 +344,7 @@ pub mod tests {
     pub fn run_all() {
         cache_hit_returns_fixed_payload_without_second_device_read();
         write_updates_cached_fixed_payload();
+        fixed_chain_capacity_rejects_overflow();
     }
 
     // AGENT: test-only device that changes data on every read so cache hits are
@@ -393,5 +444,32 @@ pub mod tests {
         assert_eq!(cache.dirty_count_by_kind(CachedBlockKind::Metadata), 1);
         assert_eq!(cache.flush_dirty().unwrap(), 1);
         assert_eq!(cache.dirty_count(), 0);
+    }
+
+    // AGENT: lock in the fixed-size chain bound so future changes do not
+    // accidentally reintroduce growable per-chain cache storage.
+    #[cfg_attr(test, test)]
+    fn fixed_chain_capacity_rejects_overflow() {
+        let cache = BlockCache::new(1);
+        let device = RamBlockDevice::empty();
+        let payload = [0x33u8; BLOCK_CACHE_BLOCK_SIZE];
+
+        for block in 0..BLOCK_CACHE_CHAIN_SLOTS {
+            cache
+                .write_block_cached(&device, ROOT_BLOCK_DEVICE, block, &payload)
+                .unwrap();
+        }
+
+        assert_eq!(cache.total_entries(), BLOCK_CACHE_CHAIN_SLOTS);
+        assert_eq!(
+            cache.write_block_cached(
+                &device,
+                ROOT_BLOCK_DEVICE,
+                BLOCK_CACHE_CHAIN_SLOTS,
+                &payload
+            ),
+            Err("enospc")
+        );
+        assert_eq!(cache.total_entries(), BLOCK_CACHE_CHAIN_SLOTS);
     }
 }
