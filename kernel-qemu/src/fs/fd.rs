@@ -28,13 +28,14 @@ impl FdOpt {
     }
 }
 
+// AGENT: regular-file descriptor state owns only the mutable offset; fd status
+// flags live in OpenFileDescription so fcntl/ioctl updates have one authority.
 pub(crate) struct FdState {
     pub(crate) off: u64,
-    pub(crate) opt: FdOpt,
 }
 impl FdState {
-    fn create(opt: FdOpt) -> Arc<RwLock<Self>> {
-        Arc::new(RwLock::new(FdState { off: 0, opt }))
+    fn create() -> Arc<RwLock<Self>> {
+        Arc::new(RwLock::new(FdState { off: 0 }))
     }
 }
 
@@ -289,11 +290,13 @@ impl fmt::Debug for FileNode {
     }
 }
 
-// AGENT: file descriptors keep per-handle state while sharing FileNode data.
+// AGENT: regular file handles keep the offset state plus the open-time status
+// snapshot; fd-table I/O reads mutable status from OpenFileDescription.
 #[derive(Clone)]
 pub struct FHandle {
     pub path: String,
     pub node: Arc<FileNode>,
+    initial_status: FdOpt,
     pub(crate) desc: Arc<RwLock<FdState>>,
 }
 
@@ -310,7 +313,8 @@ impl FHandle {
         Self {
             path: path.to_string(),
             node: Arc::new(FileNode::regular(Vec::new(), false)),
-            desc: FdState::create(opt),
+            initial_status: opt,
+            desc: FdState::create(),
         }
     }
     // AGENT: create a handle over a fresh regular file node.
@@ -318,7 +322,8 @@ impl FHandle {
         Self {
             path: path.to_string(),
             node: Arc::new(FileNode::regular(d, false)),
-            desc: FdState::create(opt),
+            initial_status: opt,
+            desc: FdState::create(),
         }
     }
     // AGENT: open a descriptor over an existing shared FileNode.
@@ -326,7 +331,8 @@ impl FHandle {
         Self {
             path: path.to_string(),
             node,
-            desc: FdState::create(opt),
+            initial_status: opt,
+            desc: FdState::create(),
         }
     }
     // AGENT: duplicate only descriptor state; file contents stay shared.
@@ -334,11 +340,14 @@ impl FHandle {
         FHandle {
             path: self.path.clone(),
             node: self.node.clone(),
+            initial_status: self.initial_status,
             desc: self.desc.clone(),
         }
     }
+    // AGENT: expose the immutable open-time access mode used to seed a new
+    // OpenFileDescription; mutable status changes are read from FdEntry instead.
     pub fn get_opt(&self) -> FdOpt {
-        self.desc.read().unwrap().opt
+        self.initial_status
     }
 
     // AGENT: expose the shared open-file-description offset for checkpoint fd
@@ -347,49 +356,44 @@ impl FHandle {
         self.desc.read().unwrap().off
     }
 
-    // AGENT: advance the shared open-file-description offset while holding the
-    // descriptor state write lock.
+    // AGENT: direct handle reads use the open-time status snapshot; normal
+    // fd-table reads pass the current OpenFileDescription status below.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
         self.read_with_status(self.get_opt(), buf)
     }
 
-    // AGENT: read using status supplied by the owning OpenFileDescription while
-    // keeping the regular-file offset in FHandle's descriptor state.
+    // AGENT: copy from a regular file node at an explicit offset without
+    // touching descriptor state.
+    fn copy_from_node_at(&self, off: usize, buf: &mut [u8]) -> usize {
+        let d = self.node.data.lock().unwrap();
+        if off >= d.len() {
+            return 0;
+        }
+        let n = min(buf.len(), d.len() - off);
+        buf[..n].copy_from_slice(&d[off..off + n]);
+        n
+    }
+
+    // AGENT: read using status supplied by the owning OpenFileDescription and
+    // advance the shared regular-file offset under one descriptor-state lock.
     fn read_with_status(&self, status: FdOpt, buf: &mut [u8]) -> Result<usize, &'static str> {
-        let mut desc = self.desc.write().unwrap();
         if !status.rd {
             return Err("ebadf");
         }
+        let mut desc = self.desc.write().unwrap();
         let off = desc.off as usize;
-        let d = self.node.data.lock().unwrap();
-        if off >= d.len() {
-            return Ok(0);
-        }
-        let n = min(buf.len(), d.len() - off);
-        buf[..n].copy_from_slice(&d[off..off + n]);
+        let n = self.copy_from_node_at(off, buf);
         desc.off = (off + n) as u64;
         Ok(n)
     }
+
+    // AGENT: positioned reads use only the immutable read access mode and do
+    // not advance the shared descriptor offset.
     pub fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
-        if !self.desc.read().unwrap().opt.rd {
+        if !self.initial_status.rd {
             return Err("ebadf");
         }
-        if self.desc.read().unwrap().opt.nb {
-            let d = self.node.data.lock().unwrap();
-            if off >= d.len() {
-                return Ok(0);
-            }
-            let n = min(buf.len(), d.len() - off);
-            buf[..n].copy_from_slice(&d[off..off + n]);
-            return Ok(n);
-        }
-        let d = self.node.data.lock().unwrap();
-        if off >= d.len() {
-            return Ok(0);
-        }
-        let n = min(buf.len(), d.len() - off);
-        buf[..n].copy_from_slice(&d[off..off + n]);
-        Ok(n)
+        Ok(self.copy_from_node_at(off, buf))
     }
     // AGENT: append/offset selection and offset advancement happen under one
     // shared descriptor state write lock.
@@ -410,33 +414,49 @@ impl FHandle {
         } else {
             desc.off as usize
         };
+        let end = Self::write_data_at(&mut d, off, buf)?;
+        desc.off = end as u64;
+        Ok(buf.len())
+    }
+
+    // AGENT: grow and copy one regular-file byte range with overflow checked in
+    // one place so offset writes and append writes share the same bounds logic.
+    fn write_data_at(d: &mut Vec<u8>, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
+        if buf.is_empty() {
+            return Ok(off);
+        }
         let end = off.checked_add(buf.len()).ok_or("efbig")?;
         if end > d.len() {
             d.resize(end, 0);
         }
         d[off..end].copy_from_slice(buf);
-        desc.off = end as u64;
-        Ok(buf.len())
+        Ok(end)
     }
+
+    // AGENT: explicit-offset writes do not advance the shared file offset, but
+    // they still use the same checked range write as ordinary writes.
     pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
-        if !self.desc.read().unwrap().opt.wr {
+        if !self.initial_status.wr {
             return Err("ebadf");
         }
         let mut d = self.node.data.lock().unwrap();
-        if off + buf.len() > d.len() {
-            d.resize(off + buf.len(), 0);
-        }
-        d[off..off + buf.len()].copy_from_slice(buf);
+        Self::write_data_at(&mut d, off, buf)?;
         Ok(buf.len())
     }
+    // AGENT: compute seek targets with checked signed deltas so invalid offsets
+    // fail instead of wrapping into huge u64 values.
     pub fn seek(&self, pos: FSeek) -> Result<u64, &'static str> {
         let mut d = self.desc.write().unwrap();
-        d.off = match pos {
-            FSeek::Start(o) => o,
-            FSeek::End(o) => (self.node.data.lock().unwrap().len() as i64 + o) as u64,
-            FSeek::Cur(o) => (d.off as i64 + o) as u64,
+        let next = match pos {
+            FSeek::Start(off) => off,
+            FSeek::End(delta) => {
+                let end = self.node.data.lock().unwrap().len() as u64;
+                end.checked_add_signed(delta).ok_or("einval")?
+            }
+            FSeek::Cur(delta) => d.off.checked_add_signed(delta).ok_or("einval")?,
         };
-        Ok(d.off)
+        d.off = next;
+        Ok(next)
     }
 
     pub fn transfer(
@@ -469,8 +489,9 @@ impl FHandle {
         }
     }
 
+    // AGENT: direct truncation uses the handle's open-time write permission.
     pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
-        if !self.desc.read().unwrap().opt.wr {
+        if !self.initial_status.wr {
             return Err("ebadf");
         }
         self.node.data.lock().unwrap().resize(len as usize, 0);
@@ -485,9 +506,11 @@ impl FHandle {
     pub fn lookup(&self, _path: &str, _depth: usize) -> Result<(), &'static str> {
         Ok(())
     }
+    // AGENT: directory-style iteration uses the handle's open-time read
+    // permission and advances only the regular handle offset.
     pub fn read_entry(&self) -> Result<String, &'static str> {
         let mut d = self.desc.write().unwrap();
-        if !d.opt.rd {
+        if !self.initial_status.rd {
             return Err("ebadf");
         }
         let off = d.off;
@@ -515,17 +538,20 @@ impl FHandle {
     }
     pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> {
         let d = self.node.data.lock().unwrap();
-        let actual_end = min(offset + len, d.len());
+        let requested_end = offset.saturating_add(len);
+        let actual_end = min(requested_end, d.len());
         let _readahead_pages = (actual_end.saturating_sub(offset) + PAGE_SZ - 1) / PAGE_SZ;
         Ok(())
     }
 
+    // AGENT: direct allocation uses checked ranges and the handle's open-time
+    // write permission.
     pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> {
-        if !self.desc.read().unwrap().opt.wr {
+        if !self.initial_status.wr {
             return Err("ebadf");
         }
         let mut d = self.node.data.lock().unwrap();
-        let needed = offset + len;
+        let needed = offset.checked_add(len).ok_or("efbig")?;
         if needed > d.len() {
             d.resize(needed, 0);
         }
