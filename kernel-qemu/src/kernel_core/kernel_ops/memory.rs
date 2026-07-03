@@ -57,7 +57,4 @@ impl Kernel {
         used.saturating_mul(100) / total
     }
 
-    pub fn cache_stats(&self) -> (usize, usize) {
-        (self.cache.total_entries(), self.cache.dirty_count())
-    }
 }

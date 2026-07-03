@@ -4,6 +4,10 @@ use super::*;
 
 const FILE_NODE_METADATA_MAGIC: &[u8; 4] = b"FNMD";
 
+// AGENT: keep standalone/test file handles small; full-chain writeback now
+// preserves correctness when a single chain has to recycle slots.
+const STANDALONE_BLOCK_CACHE_CHAINS: usize = 1;
+
 // AGENT: distinguish regular path files from directory nodes for exec checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
@@ -56,7 +60,7 @@ impl FileStorage {
 
     pub fn standalone() -> Self {
         Self::new(
-            Arc::new(BlockCache::new(N_CHAINS)),
+            Arc::new(BlockCache::new(STANDALONE_BLOCK_CACHE_CHAINS)),
             Arc::new(RamBlockDevice::empty()),
             Arc::new(FileBlockAllocator::new()),
         )
@@ -71,15 +75,15 @@ impl FileStorage {
             .read_block_cached(self.device.as_ref(), ROOT_BLOCK_DEVICE, block)
     }
 
-    // AGENT: route file-block writes through BlockCache's write-through device path.
+    // AGENT: route file-block writes through BlockCache's write-back path.
     fn write_block(&self, block: usize, data: &[u8]) -> Result<(), &'static str> {
         self.cache
             .write_block_cached(self.device.as_ref(), ROOT_BLOCK_DEVICE, block, data)
     }
 
-    // AGENT: sync clears the unified dirty bitset; block bytes are already in RAM.
+    // AGENT: sync writes dirty cache slots back to the shared RAM block device.
     fn flush(&self) -> Result<usize, &'static str> {
-        self.cache.flush_dirty()
+        self.cache.flush_dirty(self.device.as_ref())
     }
 
     // AGENT: expose unified cache dirty state to focused fd regressions.
