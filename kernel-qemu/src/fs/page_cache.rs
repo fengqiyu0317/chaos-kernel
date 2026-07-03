@@ -2,17 +2,45 @@
 use super::*;
 
 // AGENT: keep only entry state that affects cache behavior.
-pub struct PageCacheEntry {
-    pub data: Vec<u8>,
-    pub dirty: bool,
-    pub pin_count: usize,
+struct PageCacheEntry {
+    data: Vec<u8>,
+    dirty: bool,
+    pin_count: usize,
+}
+
+impl PageCacheEntry {
+    // AGENT: new cache entries start clean because insert() represents data
+    // already loaded from backing storage.
+    fn clean(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            dirty: false,
+            pin_count: 0,
+        }
+    }
+
+    // AGENT: dirty pages must survive LRU pressure until an explicit writeback
+    // path marks them clean.
+    fn can_evict(&self) -> bool {
+        self.pin_count == 0 && !self.dirty
+    }
+
+    // AGENT: centralize dirty-bit clearing so writeback helpers count exactly
+    // the pages they changed.
+    fn mark_clean(&mut self) -> bool {
+        if !self.dirty {
+            return false;
+        }
+        self.dirty = false;
+        true
+    }
 }
 
 // AGENT: keep only the storage, capacity, and LRU state needed by the cache.
 pub struct PageCache {
-    pub entries: HashMap<usize, PageCacheEntry>,
-    pub capacity: usize,
-    pub lru_order: VecDeque<usize>,
+    entries: HashMap<usize, PageCacheEntry>,
+    capacity: usize,
+    lru_order: VecDeque<usize>,
 }
 
 impl PageCache {
@@ -30,6 +58,26 @@ impl PageCache {
     fn touch(&mut self, page_id: usize) {
         self.lru_order.retain(|&id| id != page_id);
         self.lru_order.push_back(page_id);
+    }
+
+    // AGENT: choose the oldest page that can be discarded without writeback.
+    fn lru_victim(&self) -> Option<usize> {
+        self.lru_order.iter().copied().find(|id| {
+            self.entries
+                .get(id)
+                .map(PageCacheEntry::can_evict)
+                .unwrap_or(false)
+        })
+    }
+
+    // AGENT: keep entry removal and LRU cleanup together so callers cannot
+    // forget one half of the cache state.
+    fn remove_entry(&mut self, page_id: usize) -> bool {
+        if self.entries.remove(&page_id).is_none() {
+            return false;
+        }
+        self.lru_order.retain(|&id| id != page_id);
+        true
     }
 
     // AGENT: use lru_order as the single source of recency state.
@@ -54,52 +102,37 @@ impl PageCache {
         if self.entries.len() >= self.capacity && !self.evict_lru() {
             return;
         }
-        let entry = PageCacheEntry {
-            data,
-            dirty: false,
-            pin_count: 0,
-        };
-        self.entries.insert(page_id, entry);
+        self.entries.insert(page_id, PageCacheEntry::clean(data));
         self.touch(page_id);
     }
 
-    // AGENT: eviction only needs pin state and the maintained LRU order.
+    // AGENT: evict only clean, unpinned pages; dirty pages need an explicit
+    // writeback path before they can be discarded.
     pub fn evict_lru(&mut self) -> bool {
-        let mut victim = None;
-        for &id in self.lru_order.iter() {
-            if let Some(e) = self.entries.get(&id) {
-                if e.pin_count == 0 {
-                    victim = Some(id);
-                    break;
-                }
-            }
-        }
-        if let Some(id) = victim {
-            self.entries.remove(&id);
-            self.lru_order.retain(|&x| x != id);
-            true
-        } else {
-            false
-        }
+        self.lru_victim()
+            .map(|page_id| self.remove_entry(page_id))
+            .unwrap_or(false)
     }
 
+    // AGENT: record that a cached page now has data not yet safe to evict.
     pub fn mark_dirty(&mut self, page_id: usize) {
         if let Some(e) = self.entries.get_mut(&page_id) {
             e.dirty = true;
         }
     }
 
+    // AGENT: mark all dirty pages clean after the caller's writeback boundary.
     pub fn writeback_all(&mut self) -> usize {
         let mut count = 0;
-        for (_, e) in self.entries.iter_mut() {
-            if e.dirty {
-                e.dirty = false;
+        for e in self.entries.values_mut() {
+            if e.mark_clean() {
                 count += 1;
             }
         }
         count
     }
 
+    // AGENT: pinned pages are protected from LRU eviction.
     pub fn pin(&mut self, page_id: usize) -> bool {
         if let Some(e) = self.entries.get_mut(&page_id) {
             e.pin_count += 1;
@@ -109,6 +142,7 @@ impl PageCache {
         }
     }
 
+    // AGENT: unpin saturates at zero so repeated cleanup calls do not underflow.
     pub fn unpin(&mut self, page_id: usize) -> bool {
         if let Some(e) = self.entries.get_mut(&page_id) {
             if e.pin_count > 0 {
@@ -120,15 +154,12 @@ impl PageCache {
         }
     }
 
+    // AGENT: invalidation is an explicit discard and keeps the LRU queue in sync.
     pub fn invalidate(&mut self, page_id: usize) -> bool {
-        if self.entries.remove(&page_id).is_some() {
-            self.lru_order.retain(|&x| x != page_id);
-            true
-        } else {
-            false
-        }
+        self.remove_entry(page_id)
     }
 
+    // AGENT: mark dirty pages clean after the caller flushes this page range.
     pub fn flush_range(&mut self, start: usize, end: usize) -> usize {
         let mut count = 0;
         let ids: Vec<usize> = self
@@ -139,8 +170,7 @@ impl PageCache {
             .collect();
         for id in ids {
             if let Some(e) = self.entries.get_mut(&id) {
-                if e.dirty {
-                    e.dirty = false;
+                if e.mark_clean() {
                     count += 1;
                 }
             }
