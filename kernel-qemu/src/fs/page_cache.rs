@@ -25,15 +25,18 @@ impl PageCache {
         }
     }
 
+    // AGENT: keep the LRU update in one place so lookup and insert cannot
+    // drift into different recency rules.
+    fn touch(&mut self, page_id: usize) {
+        self.lru_order.retain(|&id| id != page_id);
+        self.lru_order.push_back(page_id);
+    }
+
     // AGENT: use lru_order as the single source of recency state.
     pub fn lookup(&mut self, page_id: usize) -> Option<&[u8]> {
-        if self.entries.contains_key(&page_id) {
-            self.lru_order.retain(|&id| id != page_id);
-            self.lru_order.push_back(page_id);
-            self.entries.get(&page_id).map(|e| e.data.as_slice())
-        } else {
-            None
-        }
+        self.entries.get(&page_id)?;
+        self.touch(page_id);
+        self.entries.get(&page_id).map(|e| e.data.as_slice())
     }
 
     // AGENT: replace an existing page in place so lru_order never keeps
@@ -42,15 +45,14 @@ impl PageCache {
         if let Some(entry) = self.entries.get_mut(&page_id) {
             entry.data = data;
             entry.dirty = false;
-            self.lru_order.retain(|&id| id != page_id);
-            self.lru_order.push_back(page_id);
+            self.touch(page_id);
             return;
         }
         if self.capacity == 0 {
             return;
         }
-        if self.entries.len() >= self.capacity {
-            self.evict_lru();
+        if self.entries.len() >= self.capacity && !self.evict_lru() {
+            return;
         }
         let entry = PageCacheEntry {
             data,
@@ -58,7 +60,7 @@ impl PageCache {
             pin_count: 0,
         };
         self.entries.insert(page_id, entry);
-        self.lru_order.push_back(page_id);
+        self.touch(page_id);
     }
 
     // AGENT: eviction only needs pin state and the maintained LRU order.
