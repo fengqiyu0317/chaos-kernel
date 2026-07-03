@@ -1,20 +1,19 @@
 // AGENT
 use super::*;
 
+// AGENT: keep Channel internals private so buffer, shutdown, and wakeup
+// invariants are maintained only through the methods below.
 pub struct Channel {
-    pub buf: Mutex<CircBuf>,
-    pub guard: Spin,
-    pub wq: ConditionWait,
-    pub shut: AtomicBool,
+    buf: Mutex<CircBuf>,
+    wq: ConditionWait,
+    shut: AtomicBool,
 }
 impl Channel {
-    // AGENT: Channel keeps the legacy Spin field for API compatibility, but
-    // blocking send/recv coordination is handled by CircBuf's Mutex + ConditionWait.
+    // AGENT: Channel state is coordinated by CircBuf's Mutex plus ConditionWait.
     pub fn new(cap: usize) -> Self {
         let effective_cap = cap.clamp(1, 1 << 20);
         Self {
             buf: Mutex::new(CircBuf::new(effective_cap)),
-            guard: Spin::new(),
             wq: ConditionWait::new(),
             shut: AtomicBool::new(false),
         }
@@ -32,23 +31,25 @@ impl Channel {
             }
         })
     }
-    // AGENT: data insertion uses the buffer mutex and wakes waiters after the
-    // mutation; no Spin is held during wakeup.
+    // AGENT: reject writes after close and wake one receiver only after a byte
+    // has been published under the buffer mutex.
     pub fn send(&self, v: u8) -> bool {
-        let success = {
-            let mut ring = self.buf.lock().unwrap();
-            ring.push(v)
-        };
-        if success {
-            // HUMAN
-            self.wq.signal();
+        let mut ring = self.buf.lock().unwrap();
+        if self.shut.load(Ordering::Acquire) || !ring.push(v) {
+            return false;
         }
-        success
+        drop(ring);
+        // HUMAN
+        self.wq.signal();
+        true
     }
-    // AGENT: close publishes shutdown before broadcasting so recv either sees
-    // shut while holding buf or has already queued its WaitToken.
+    // AGENT: publish shutdown while holding buf so recv cannot miss the close
+    // between checking the predicate and enqueueing its WaitToken.
     pub fn close(&self) {
-        self.shut.store(true, Ordering::Release);
+        {
+            let _ring = self.buf.lock().unwrap();
+            self.shut.store(true, Ordering::Release);
+        }
         // HUMAN
         self.wq.broadcast();
     }
@@ -58,17 +59,13 @@ impl Channel {
         self.buf.lock().unwrap().pop()
     }
 
-    // AGENT: batch send performs all buffer writes under the mutex and wakes up
-    // to the number of bytes inserted after releasing the data lock.
+    // AGENT: batch send shares the same closed-state and wakeup rules as send().
     pub fn send_batch(&self, data: &[u8]) -> usize {
         let mut ring = self.buf.lock().unwrap();
-        let mut written = 0;
-        for &byte in data {
-            if !ring.push(byte) {
-                break;
-            }
-            written += 1;
+        if self.shut.load(Ordering::Acquire) {
+            return 0;
         }
+        let written = ring.fill_from(data);
         if written > 0 {
             drop(ring);
             self.wq.signal_n(written);
@@ -76,18 +73,17 @@ impl Channel {
         written
     }
 
-    // AGENT: depth is a pure buffer query and does not need the legacy Spin.
+    // AGENT: depth is a pure buffer query over the protected ring buffer.
     pub fn depth(&self) -> usize {
         self.buf.lock().unwrap().len()
     }
 
     // AGENT: draining holds only the buffer mutex and never waits.
     pub fn drain_all(&self) -> Vec<u8> {
-        let mut result = Vec::new();
         let mut ring = self.buf.lock().unwrap();
-        while let Some(byte) = ring.pop() {
-            result.push(byte);
-        }
+        let len = ring.len();
+        let mut result = Vec::with_capacity(len);
+        ring.drain_to(&mut result, len);
         result
     }
 
@@ -96,7 +92,7 @@ impl Channel {
         self.shut.load(Ordering::Acquire)
     }
 
-    // AGENT: remaining capacity is a pure buffer query and does not need Spin.
+    // AGENT: remaining capacity is a pure buffer query over the protected ring buffer.
     pub fn remaining_capacity(&self) -> usize {
         self.buf.lock().unwrap().remaining()
     }
