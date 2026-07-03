@@ -73,7 +73,8 @@ impl MountTable {
         path.len() == prefix.len() || path.as_bytes().get(prefix.len()) == Some(&b'/')
     }
 
-    // AGENT: canonicalize mount bindings and keep one target per prefix.
+    // AGENT: canonicalize mount bindings, keep one target per prefix, and
+    // preserve longest-prefix-first order for lookup.
     pub fn bind(&self, pfx: &str, tgt: &str) {
         let Some(prefix) = Self::normalize_prefix(pfx) else {
             return;
@@ -86,11 +87,17 @@ impl MountTable {
             existing.target = tgt.to_string();
             return;
         }
-        e.push(MountEntry {
-            prefix,
-            target: tgt.to_string(),
-        });
-        e.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        let insert_at = e
+            .iter()
+            .position(|m| m.prefix.len() < prefix.len())
+            .unwrap_or(e.len());
+        e.insert(
+            insert_at,
+            MountEntry {
+                prefix,
+                target: tgt.to_string(),
+            },
+        );
     }
     // AGENT: Resolve one longest mount prefix without recursively remapping the
     // remaining path through unrelated mounts.
@@ -148,18 +155,16 @@ impl MountTable {
         result
     }
 
-    // AGENT: Scan a caller-held mount table snapshot for the longest complete
-    // path-component prefix without taking another lock.
+    // AGENT: Scan a caller-held mount table snapshot in longest-prefix-first
+    // order, returning the first complete path-component prefix without taking
+    // another lock.
     fn find_mount_id_locked(tbl: &[MountEntry], path: &str) -> Option<usize> {
-        let mut best_match_idx = None;
-        let mut best_prefix_len = 0;
         for (idx, m) in tbl.iter().enumerate() {
-            if Self::prefix_matches_path(&m.prefix, path) && m.prefix.len() > best_prefix_len {
-                best_match_idx = Some(idx);
-                best_prefix_len = m.prefix.len();
+            if Self::prefix_matches_path(&m.prefix, path) {
+                return Some(idx);
             }
         }
-        best_match_idx
+        None
     }
 
     // AGENT: Keep the legacy helper API while delegating to the non-locking
