@@ -138,10 +138,6 @@ pub const SCHED_FIFO: u8 = 1;
 pub const SCHED_RR: u8 = 2;
 pub const SCHED_BATCH: u8 = 3;
 
-pub const SLAB_OBJ_MIN: usize = 8;
-pub const SLAB_OBJ_MAX: usize = 2048;
-pub const SLAB_ALIGN: usize = 8;
-
 pub const NSIG: u32 = 64;
 pub const SIG_DFL: usize = 0;
 pub const SIG_IGN: usize = 1;
