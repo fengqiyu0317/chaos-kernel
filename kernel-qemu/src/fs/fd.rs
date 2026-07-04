@@ -168,7 +168,7 @@ impl OpenFileDescription {
         let next = match pos {
             FSeek::Start(off) => off,
             FSeek::End(delta) => {
-                let end = file.node.len() as u64;
+                let end = file.len() as u64;
                 end.checked_add_signed(delta).ok_or("einval")?
             }
             FSeek::Cur(delta) => state.offset.checked_add_signed(delta).ok_or("einval")?,

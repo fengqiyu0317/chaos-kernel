@@ -4,7 +4,7 @@ use super::*;
 
 // AGENT: keep the QEMU boot selftest aggregator in the moved fd test module.
 pub fn run_all() {
-    set_len_tracks_block_rounded_growth();
+    set_len_tracks_byte_length_and_block_capacity();
     truncate_releases_blocks_for_reuse_without_old_contents();
     fallocate_validates_and_only_grows_regular_files();
     lookup_reports_node_local_errors();
@@ -37,22 +37,26 @@ fn file_bytes(fh: &FHandle, off: usize, len: usize) -> Vec<u8> {
     data
 }
 
-// AGENT: regular-file length follows the block map because FileNode no longer
-// stores a byte-precise visible length.
+// AGENT: FileNode owns byte-precise EOF while still rounding allocation up to
+// whole backend blocks.
 #[cfg_attr(test, test)]
-fn set_len_tracks_block_rounded_growth() {
+fn set_len_tracks_byte_length_and_block_capacity() {
     let fh = FHandle::with_data("/tmp/file", vec![1, 2, 3]);
     let entry = file_entry(&fh, writable_opt());
-    assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE);
+    assert_eq!(fh.len(), 3);
+    assert_eq!(fh.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE);
 
     fh.write_at(1, &[9]).unwrap();
     assert_eq!(file_bytes(&fh, 0, 3).as_slice(), &[1, 9, 3]);
+    assert_eq!(fh.len(), 3);
 
     entry.set_len(5).unwrap();
-    assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE);
+    assert_eq!(fh.len(), 5);
+    assert_eq!(fh.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE);
 
     entry.set_len((BLOCK_CACHE_BLOCK_SIZE + 1) as u64).unwrap();
-    assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE * 2);
+    assert_eq!(fh.len(), BLOCK_CACHE_BLOCK_SIZE + 1);
+    assert_eq!(fh.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
 
     let ro = FHandle::with_data("/tmp/ro", vec![1, 2, 3]);
     let ro_entry = file_entry(&ro, FdOpt::default());
@@ -77,7 +81,8 @@ fn truncate_releases_blocks_for_reuse_without_old_contents() {
     assert_eq!(storage.allocator_stats(), (3, 0));
 
     first_entry.set_len(0).unwrap();
-    assert_eq!(first.node.len(), 0);
+    assert_eq!(first.len(), 0);
+    assert_eq!(first.node.allocated_len(), 0);
     assert_eq!(storage.allocator_stats(), (3, 2));
 
     let second_node = Arc::new(FileNode::regular(false));
@@ -90,18 +95,20 @@ fn truncate_releases_blocks_for_reuse_without_old_contents() {
     assert!(reused.iter().all(|&byte| byte == 0));
 }
 
-// AGENT: moved fallocate regression to block-rounded FileNode length behavior.
+// AGENT: fallocate grows visible EOF exactly while allocation stays block-rounded.
 #[cfg_attr(test, test)]
 fn fallocate_validates_and_only_grows_regular_files() {
     let fh = FHandle::with_data("/tmp/file", vec![1, 2, 3]);
     let entry = file_entry(&fh, writable_opt());
 
     entry.fallocate(BLOCK_CACHE_BLOCK_SIZE + 5, 2).unwrap();
-    assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE * 2);
+    assert_eq!(fh.len(), BLOCK_CACHE_BLOCK_SIZE + 7);
+    assert_eq!(fh.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
     assert_eq!(file_bytes(&fh, 0, 3).as_slice(), &[1, 2, 3]);
 
     entry.fallocate(1, 1).unwrap();
-    assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE * 2);
+    assert_eq!(fh.len(), BLOCK_CACHE_BLOCK_SIZE + 7);
+    assert_eq!(fh.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
     assert_eq!(file_bytes(&fh, 0, 3).as_slice(), &[1, 2, 3]);
 
     assert_eq!(entry.fallocate(0, 0), Err("einval"));
@@ -133,7 +140,7 @@ fn lookup_reports_node_local_errors() {
     assert_eq!(dir.lookup("bad/name", 0), Err("einval"));
 }
 
-// AGENT: regular-file ioctl observes block-rounded FileNode length.
+// AGENT: regular-file ioctl observes FileNode's byte-precise visible length.
 #[cfg_attr(test, test)]
 fn regular_file_poll_and_ioctl_are_explicit() {
     let file = FHandle::with_data("", vec![1, 2, 3, 4]);
@@ -143,10 +150,10 @@ fn regular_file_poll_and_ioctl_are_explicit() {
     assert!(poll.writable);
     assert!(!poll.error);
 
-    assert_eq!(entry.io_ctl(FIONREAD, 0), Ok(BLOCK_CACHE_BLOCK_SIZE));
+    assert_eq!(entry.io_ctl(FIONREAD, 0), Ok(4));
     let mut buf = [0; 2];
     assert_eq!(entry.read(&mut buf), Ok(2));
-    assert_eq!(entry.io_ctl(TIOCINQ, 0), Ok(BLOCK_CACHE_BLOCK_SIZE - 2));
+    assert_eq!(entry.io_ctl(TIOCINQ, 0), Ok(2));
     assert_eq!(entry.io_ctl(0xDEAD, 0), Err("enotty"));
 }
 
@@ -161,7 +168,7 @@ fn splice_checks_permissions_before_moving_offsets() {
     assert_eq!(src_entry.splice_to(&dst_entry, 2), Err("ebadf"));
     assert_eq!(src_entry.offset(), 0);
     assert_eq!(dst_entry.offset(), 0);
-    assert_eq!(dst.node.len(), 0);
+    assert_eq!(dst.len(), 0);
 
     let unreadable = FdOpt {
         rd: false,
@@ -176,10 +183,10 @@ fn splice_checks_permissions_before_moving_offsets() {
 
     assert_eq!(src_entry.splice_to(&dst_entry, 2), Err("ebadf"));
     assert_eq!(src_entry.offset(), 0);
-    assert_eq!(dst.node.len(), 0);
+    assert_eq!(dst.len(), 0);
 }
 
-// AGENT: append-status splice appends at the block-rounded FileNode end.
+// AGENT: append-status splice appends at the byte-precise FileNode EOF.
 #[cfg_attr(test, test)]
 fn splice_uses_shared_append_status() {
     let src = FHandle::with_data("/src", vec![1, 2, 3]);
@@ -191,10 +198,6 @@ fn splice_uses_shared_append_status() {
     dst_entry.set_status_flags(O_APPEND).unwrap();
     assert_eq!(src_entry.splice_to(&dst_entry, 2), Ok(2));
     assert_eq!(src_entry.offset(), 2);
-    assert_eq!(dst_entry.offset(), (BLOCK_CACHE_BLOCK_SIZE + 2) as u64);
-    assert_eq!(file_bytes(&dst, 0, 2).as_slice(), &[9, 9]);
-    assert_eq!(
-        file_bytes(&dst, BLOCK_CACHE_BLOCK_SIZE, 2).as_slice(),
-        &[1, 2]
-    );
+    assert_eq!(dst_entry.offset(), 4);
+    assert_eq!(file_bytes(&dst, 0, 4).as_slice(), &[9, 9, 1, 2]);
 }

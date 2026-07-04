@@ -66,6 +66,11 @@ impl FHandle {
         }
     }
 
+    // AGENT: expose the FileNode-owned byte-precise EOF through regular handles.
+    pub fn len(&self) -> usize {
+        self.node.len()
+    }
+
     // AGENT: copy from a regular file node at an explicit offset without
     // touching descriptor state.
     fn copy_from_node_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
@@ -253,7 +258,7 @@ impl FHandle {
     ) -> Result<usize, &'static str> {
         match cmd {
             FIONREAD | TIOCINQ => {
-                let len = self.node.len() as u64;
+                let len = self.len() as u64;
                 usize::try_from(len.saturating_sub(offset)).map_err(|_| "eoverflow")
             }
             _ => Err("enotty"),
