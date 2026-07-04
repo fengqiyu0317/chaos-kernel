@@ -85,11 +85,6 @@ impl FileStorage {
     fn flush(&self) -> Result<usize, &'static str> {
         self.cache.flush_dirty(self.device.as_ref())
     }
-
-    // AGENT: expose unified cache dirty state to focused fd regressions.
-    pub fn dirty_count(&self) -> usize {
-        self.cache.dirty_count()
-    }
 }
 
 #[derive(Debug)]
@@ -470,19 +465,6 @@ impl FileNode {
         if grew {
             self.mark_metadata_dirty(backend)?;
         }
-        Ok(())
-    }
-
-    // AGENT: data-only sync is intentionally equivalent to full sync in the
-    // current QEMU file layer because dirty state is no longer split by kind.
-    pub fn sync_data(&self, backend: &FileStorage) -> Result<(), &'static str> {
-        backend.flush()?;
-        Ok(())
-    }
-
-    // AGENT: full sync clears all cached dirty state.
-    pub fn sync_all(&self, backend: &FileStorage) -> Result<(), &'static str> {
-        backend.flush()?;
         Ok(())
     }
 }

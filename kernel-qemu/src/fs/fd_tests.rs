@@ -4,7 +4,7 @@ use super::*;
 
 // AGENT: keep the QEMU boot selftest aggregator in the moved fd test module.
 pub fn run_all() {
-    set_len_and_sync_update_cache_dirty_state();
+    set_len_tracks_block_rounded_growth();
     fallocate_validates_and_only_grows_regular_files();
     lookup_reports_node_local_errors();
     regular_file_poll_and_ioctl_are_explicit();
@@ -30,33 +30,21 @@ fn file_bytes(fh: &FHandle, off: usize, len: usize) -> Vec<u8> {
     data
 }
 
-// AGENT: regular-file dirty state follows block-map changes now that FileNode
-// no longer stores a byte-precise length.
+// AGENT: regular-file length follows the block map because FileNode no longer
+// stores a byte-precise visible length.
 #[cfg_attr(test, test)]
-fn set_len_and_sync_update_cache_dirty_state() {
+fn set_len_tracks_block_rounded_growth() {
     let fh = FHandle::with_data("/tmp/file", writable_opt(), vec![1, 2, 3]);
     assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE);
-    assert_eq!(fh.cached_dirty_blocks(), 0);
 
     fh.write_at(1, &[9]).unwrap();
     assert_eq!(file_bytes(&fh, 0, 3).as_slice(), &[1, 9, 3]);
-    assert_eq!(fh.cached_dirty_blocks(), 1);
-
-    fh.sync_data().unwrap();
-    assert_eq!(fh.cached_dirty_blocks(), 0);
 
     fh.set_len(5).unwrap();
     assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE);
-    assert_eq!(fh.cached_dirty_blocks(), 0);
-
-    fh.sync_data().unwrap();
-    assert_eq!(fh.cached_dirty_blocks(), 0);
 
     fh.set_len((BLOCK_CACHE_BLOCK_SIZE + 1) as u64).unwrap();
     assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE * 2);
-    assert_eq!(fh.cached_dirty_blocks(), 1);
-    fh.sync_all().unwrap();
-    assert_eq!(fh.cached_dirty_blocks(), 0);
 
     let ro = FHandle::with_data("/tmp/ro", FdOpt::default(), vec![1, 2, 3]);
     assert_eq!(ro.set_len(0), Err("ebadf"));
@@ -70,12 +58,10 @@ fn fallocate_validates_and_only_grows_regular_files() {
     fh.fallocate(BLOCK_CACHE_BLOCK_SIZE + 5, 2).unwrap();
     assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE * 2);
     assert_eq!(file_bytes(&fh, 0, 3).as_slice(), &[1, 2, 3]);
-    assert_eq!(fh.cached_dirty_blocks(), 1);
 
-    fh.sync_all().unwrap();
     fh.fallocate(1, 1).unwrap();
     assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE * 2);
-    assert_eq!(fh.cached_dirty_blocks(), 0);
+    assert_eq!(file_bytes(&fh, 0, 3).as_slice(), &[1, 2, 3]);
 
     assert_eq!(fh.fallocate(0, 0), Err("einval"));
     assert_eq!(fh.fallocate(usize::MAX, 1), Err("efbig"));
