@@ -1,12 +1,15 @@
 // AGENT: keep WaitToken regressions next to the QEMU sync primitives and expose
 // them through the same run_all + cfg_attr(test, test) pattern as mm/tests.rs.
+use super::futex::FutexWaiter;
+use super::wait::WAIT_KERNEL;
 use super::*;
+use crate::kernel::kernel_core::prelude::*;
 use crate::kernel::kernel_core::{
     global_timer_wheel, init_timer_wheel, set_current_task_id, TimerTarget, TimerWheel, TIMER_WHEEL,
 };
 use crate::kernel::{
-    epoll_ready_events, EpCtlOp, EpData, EpEvent, EpInst, FLike, Kernel, PipeNode, TaskRunState,
-    SIGUSR1,
+    epoll_ready_events, EpCtlOp, EpData, EpEvent, EpInst, FLike, FramePool, Kernel, PipeNode,
+    TaskRunState, CLK, CLK_ALL, SIGUSR1,
 };
 
 // AGENT: include BlockCache fixed-payload regressions in the sync selftest set.

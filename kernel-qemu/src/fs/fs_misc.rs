@@ -23,25 +23,6 @@ impl CircBuf {
         }
     }
 
-    // AGENT: normalize legacy cursor inputs and derive a bounded length.
-    pub fn with_pos(c: usize, r: usize, w: usize) -> Self {
-        let (rd, wr, n) = if c == 0 {
-            (0, 0, 0)
-        } else {
-            let rd = r % c;
-            let wr = w % c;
-            let n = if wr >= rd { wr - rd } else { c - rd + wr };
-            (rd, wr, n)
-        };
-        Self {
-            data: vec![0u8; c],
-            rd,
-            wr,
-            cap: c,
-            n,
-        }
-    }
-
     // AGENT: write at wr before advancing so slot 0 is usable and semantics are FIFO.
     pub fn push(&mut self, v: u8) -> bool {
         if self.full() {
@@ -77,14 +58,6 @@ impl CircBuf {
     // AGENT: full rings reject writes before any modulo arithmetic.
     pub fn full(&self) -> bool {
         self.n >= self.cap
-    }
-
-    // AGENT: peek reads the next byte without mutating the read cursor.
-    pub fn peek(&self) -> Option<u8> {
-        if self.empty() {
-            return None;
-        }
-        Some(self.data[self.rd])
     }
 
     // AGENT: report the actual number moved instead of assuming all pops succeed.

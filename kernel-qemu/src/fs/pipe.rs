@@ -22,6 +22,163 @@ struct PipeBuf {
     writers: i32,
 }
 
+impl PipeBuf {
+    // AGENT: centralize pipe-buffer construction so PipeNode no longer reaches
+    // into CircBuf/EvBus fields when creating endpoint pairs.
+    fn new() -> Self {
+        let mut bus = EvBus::default();
+        bus.set(EvFlag::WRITABLE);
+        Self {
+            buf: CircBuf::new(PIPE_BUF_CAPACITY),
+            bus,
+            readers: 1,
+            writers: 1,
+        }
+    }
+
+    // AGENT: keep endpoint reference accounting with the shared buffer state it
+    // protects instead of open-coding reader/writer mutations in PipeNode.
+    fn add_endpoint_ref(&mut self, dir: PipeDir) {
+        match dir {
+            PipeDir::Rd => self.readers += 1,
+            PipeDir::Wr => self.writers += 1,
+        }
+    }
+
+    // AGENT: publish peer-close readiness from the buffer owner whenever the
+    // last reader or writer endpoint is dropped.
+    fn release_endpoint_ref(&mut self, dir: PipeDir) {
+        match dir {
+            PipeDir::Rd => self.readers -= 1,
+            PipeDir::Wr => self.writers -= 1,
+        }
+        if self.readers == 0 || self.writers == 0 {
+            self.bus.set(EvFlag::CLOSED);
+        }
+    }
+
+    // AGENT: compute endpoint-local readiness from the pipe buffer and peer
+    // counters in one place for poll and epoll registration.
+    fn readiness(&self, dir: PipeDir) -> u32 {
+        match dir {
+            PipeDir::Rd => {
+                let eof = self.writers == 0;
+                let mut ready = 0;
+                if !self.buf.empty() || eof {
+                    ready |= EvFlag::READABLE;
+                }
+                if eof {
+                    ready |= EvFlag::CLOSED;
+                }
+                ready
+            }
+            PipeDir::Wr => {
+                let broken = self.readers == 0;
+                let mut ready = 0;
+                if broken {
+                    ready |= EvFlag::CLOSED | EvFlag::ERROR;
+                } else if self.buf.remaining() > 0 {
+                    ready |= EvFlag::WRITABLE;
+                }
+                ready
+            }
+        }
+    }
+
+    // AGENT: attach epoll callbacks to the buffer's EvBus while using the same
+    // readiness calculation that poll() observes.
+    fn subscribe_epoll(
+        &mut self,
+        dir: PipeDir,
+        wake_mask: u32,
+        fd: usize,
+        ep: &EpInst,
+    ) -> (usize, bool) {
+        let ready = self.readiness(dir);
+        let target_epoll = ep.clone();
+        let sub_id = self.bus.sub(
+            wake_mask,
+            Box::new(move |_bus_ev| {
+                target_epoll.mark_ready(fd);
+                false
+            }),
+        );
+        (sub_id, (ready & wake_mask) != 0)
+    }
+
+    // AGENT: remove epoll source subscriptions from the buffer-owned EvBus.
+    fn unsubscribe_epoll(&mut self, sub_id: usize) -> bool {
+        self.bus.unsub(sub_id)
+    }
+
+    // AGENT: keep pipe read-side buffer mutation and readiness publication
+    // inside PipeBuf; PipeNode only decides whether the endpoint may read.
+    fn read_into(&mut self, out: &mut [u8]) -> Result<usize, &'static str> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.buf.empty() {
+            return if self.writers == 0 {
+                Ok(0)
+            } else {
+                Err("again")
+            };
+        }
+
+        let n = min(out.len(), self.buf.len());
+        for dst in out.iter_mut().take(n) {
+            *dst = self.buf.pop().unwrap();
+        }
+        let mut clear = 0;
+        let mut set = 0;
+        if self.buf.empty() {
+            clear |= EvFlag::READABLE;
+        }
+        if self.writers > 0 && self.buf.remaining() > 0 {
+            set |= EvFlag::WRITABLE;
+        }
+        self.bus.change(clear, set);
+        Ok(n)
+    }
+
+    // AGENT: keep write-side capacity checks, broken-pipe state, and EvBus
+    // publication with the buffer state they mutate.
+    fn write_from(&mut self, input: &[u8]) -> Result<usize, &'static str> {
+        if input.is_empty() {
+            return Ok(0);
+        }
+        if self.readers == 0 {
+            self.bus.set(EvFlag::CLOSED | EvFlag::ERROR);
+            return Err("broken");
+        }
+        if self.buf.remaining() == 0 {
+            self.bus.clear(EvFlag::WRITABLE);
+            return Err("again");
+        }
+
+        let written = self.buf.fill_from(input);
+        let clear = if self.buf.remaining() == 0 {
+            EvFlag::WRITABLE
+        } else {
+            0
+        };
+        let set = EvFlag::READABLE
+            | if self.buf.remaining() > 0 {
+                EvFlag::WRITABLE
+            } else {
+                0
+            };
+        self.bus.change(clear, set);
+        Ok(written)
+    }
+
+    // AGENT: keep buffered-byte queries with PipeBuf so ioctl callers do not
+    // require direct access to CircBuf.
+    fn readable_len(&self) -> usize {
+        self.buf.len()
+    }
+}
+
 pub struct PipeNode {
     data: Arc<Mutex<PipeBuf>>,
     dir: PipeDir,
@@ -60,10 +217,7 @@ impl Clone for PipeNode {
         };
         {
             let mut d = cloned.data.lock().unwrap();
-            match cloned.dir {
-                PipeDir::Rd => d.readers += 1,
-                PipeDir::Wr => d.writers += 1,
-            }
+            d.add_endpoint_ref(cloned.dir);
         }
         cloned
     }
@@ -73,27 +227,15 @@ impl Clone for PipeNode {
 impl Drop for PipeNode {
     fn drop(&mut self) {
         let mut d = self.data.lock().unwrap();
-        match self.dir {
-            PipeDir::Rd => d.readers -= 1,
-            PipeDir::Wr => d.writers -= 1,
-        }
-        if d.readers == 0 || d.writers == 0 {
-            d.bus.set(EvFlag::CLOSED);
-        }
+        d.release_endpoint_ref(self.dir);
     }
 }
 
 impl PipeNode {
+    // AGENT: keep endpoint-pair construction at PipeNode while delegating shared
+    // buffer initialization to PipeBuf.
     pub fn pair() -> (PipeNode, PipeNode) {
-        let mut bus = EvBus::default();
-        bus.set(EvFlag::WRITABLE);
-        let inner = PipeBuf {
-            buf: CircBuf::new(PIPE_BUF_CAPACITY),
-            bus,
-            readers: 1,
-            writers: 1,
-        };
-        let d = Arc::new(Mutex::new(inner));
+        let d = Arc::new(Mutex::new(PipeBuf::new()));
         (
             PipeNode {
                 data: d.clone(),
@@ -104,33 +246,6 @@ impl PipeNode {
                 dir: PipeDir::Wr,
             },
         )
-    }
-    // AGENT: compute endpoint-local readiness from the pipe state already
-    // protected by PipeBuf's mutex.
-    fn readiness_locked(&self, d: &PipeBuf) -> u32 {
-        match self.dir {
-            PipeDir::Rd => {
-                let eof = d.writers == 0;
-                let mut ready = 0;
-                if !d.buf.empty() || eof {
-                    ready |= EvFlag::READABLE;
-                }
-                if eof {
-                    ready |= EvFlag::CLOSED;
-                }
-                ready
-            }
-            PipeDir::Wr => {
-                let broken = d.readers == 0;
-                let mut ready = 0;
-                if broken {
-                    ready |= EvFlag::CLOSED | EvFlag::ERROR;
-                } else if d.buf.remaining() > 0 {
-                    ready |= EvFlag::WRITABLE;
-                }
-                ready
-            }
-        }
     }
     // AGENT: translate epoll interest into EvBus wake bits. ERR/HUP are always
     // reported by epoll, so pipe subscriptions always watch closed/error too.
@@ -149,16 +264,7 @@ impl PipeNode {
         let wake_mask = self.epoll_wake_mask(ev.events);
         let (sub_id, ready_now) = {
             let mut pipe = self.data.lock().unwrap();
-            let ready = self.readiness_locked(&pipe);
-            let target_epoll = ep.clone();
-            let sub_id = pipe.bus.sub(
-                wake_mask,
-                Box::new(move |_bus_ev| {
-                    target_epoll.mark_ready(fd);
-                    false
-                }),
-            );
-            (sub_id, (ready & wake_mask) != 0)
+            pipe.subscribe_epoll(self.dir, wake_mask, fd, &ep)
         };
         if ready_now {
             ep.mark_ready(fd);
@@ -168,76 +274,31 @@ impl PipeNode {
     // AGENT: remove an epoll readiness subscription previously installed on
     // this pipe's EvBus.
     pub fn unregister_epoll(&self, sub_id: usize) -> bool {
-        self.data.lock().unwrap().bus.unsub(sub_id)
+        self.data.lock().unwrap().unsubscribe_epoll(sub_id)
     }
     // AGENT: empty reads are a no-op; an empty pipe returns AGAIN while writers
     // exist and EOF once the last writer is gone.
     pub fn read_at(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
         if self.dir != PipeDir::Rd {
             return Ok(0);
         }
         let mut d = self.data.lock().unwrap();
-        if d.buf.empty() {
-            return if d.writers == 0 { Ok(0) } else { Err("again") };
-        }
-
-        let n = min(buf.len(), d.buf.len());
-        for dst in buf.iter_mut().take(n) {
-            *dst = d.buf.pop().unwrap();
-        }
-        let mut clear = 0;
-        let mut set = 0;
-        if d.buf.empty() {
-            clear |= EvFlag::READABLE;
-        }
-        if d.writers > 0 && d.buf.remaining() > 0 {
-            set |= EvFlag::WRITABLE;
-        }
-        d.bus.change(clear, set);
-        Ok(n)
+        d.read_into(buf)
     }
     // AGENT: writes publish READABLE/WRITABLE transitions and broken-pipe
     // ERROR/CLOSED readiness to EvBus subscribers.
     pub fn write_at(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
         if self.dir != PipeDir::Wr {
             return Ok(0);
         }
         let mut d = self.data.lock().unwrap();
-        if d.readers == 0 {
-            d.bus.set(EvFlag::CLOSED | EvFlag::ERROR);
-            return Err("broken");
-        }
-        if d.buf.remaining() == 0 {
-            d.bus.clear(EvFlag::WRITABLE);
-            return Err("again");
-        }
-
-        let written = d.buf.fill_from(buf);
-        let clear = if d.buf.remaining() == 0 {
-            EvFlag::WRITABLE
-        } else {
-            0
-        };
-        let set = EvFlag::READABLE
-            | if d.buf.remaining() > 0 {
-                EvFlag::WRITABLE
-            } else {
-                0
-            };
-        d.bus.change(clear, set);
-        Ok(written)
+        d.write_from(buf)
     }
     // AGENT: poll reuses the same readiness bit calculation as epoll
     // registration, so pipe readiness has one local source of truth.
     pub fn poll(&self) -> PollStatus {
         let d = self.data.lock().unwrap();
-        PollStatus::from_ready_bits(self.readiness_locked(&d))
+        PollStatus::from_ready_bits(d.readiness(self.dir))
     }
     // AGENT: expose endpoint access mode to FLike without leaking PipeDir.
     pub fn status_flags(&self) -> FdOpt {
@@ -250,7 +311,7 @@ impl PipeNode {
     }
     // AGENT: FIONREAD/TIOCINQ reports the bytes currently buffered for the pipe.
     pub fn readable_len(&self) -> usize {
-        self.data.lock().unwrap().buf.len()
+        self.data.lock().unwrap().readable_len()
     }
 }
 

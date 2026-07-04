@@ -56,5 +56,4 @@ impl Kernel {
         let used = total.saturating_sub(free);
         used.saturating_mul(100) / total
     }
-
 }
