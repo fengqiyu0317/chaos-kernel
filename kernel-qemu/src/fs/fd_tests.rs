@@ -164,7 +164,8 @@ fn read_entry_uses_open_description_offset() {
     assert_eq!(file_entry.read_entry(), Err("enotdir"));
 }
 
-// AGENT: regular-file ioctl observes FileNode's byte-precise visible length.
+// AGENT: regular-file poll follows open-description access flags, while ioctl
+// observes FileNode's byte-precise visible length.
 #[cfg_attr(test, test)]
 fn regular_file_poll_and_ioctl_are_explicit() {
     let file = FHandle::with_data("", vec![1, 2, 3, 4]);
@@ -173,6 +174,24 @@ fn regular_file_poll_and_ioctl_are_explicit() {
     assert!(poll.readable);
     assert!(poll.writable);
     assert!(!poll.error);
+
+    let read_only = file_entry(&file, FdOpt::default());
+    let read_only_poll = read_only.poll();
+    assert!(read_only_poll.readable);
+    assert!(!read_only_poll.writable);
+
+    let write_only = file_entry(
+        &file,
+        FdOpt {
+            rd: false,
+            wr: true,
+            ap: false,
+            nb: false,
+        },
+    );
+    let write_only_poll = write_only.poll();
+    assert!(!write_only_poll.readable);
+    assert!(write_only_poll.writable);
 
     assert_eq!(entry.io_ctl(FIONREAD, 0), Ok(4));
     let mut buf = [0; 2];

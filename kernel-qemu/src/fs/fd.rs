@@ -110,7 +110,8 @@ impl OpenFileDescription {
     pub fn poll(&self) -> PollStatus {
         match &self.file {
             FLike::File(f) => f.poll_status_with_status(self.status_flags()),
-            _ => self.file.poll(),
+            FLike::Pipe(p) => p.poll(),
+            FLike::Ep(e) => e.poll_status(),
         }
     }
 

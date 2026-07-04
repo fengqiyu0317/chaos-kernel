@@ -210,11 +210,6 @@ impl FHandle {
     pub fn read_entry(&self, idx: usize) -> Result<String, &'static str> {
         self.node.dir_entry_at(idx)
     }
-    // AGENT: regular files do not carry pipe-style closed-peer state.
-    pub fn poll_status(&self) -> PollStatus {
-        self.poll_status_with_status(FdOpt::default())
-    }
-
     // AGENT: let OpenFileDescription provide the visible access mode when fd
     // polling goes through the fd table.
     pub(super) fn poll_status_with_status(&self, status: FdOpt) -> PollStatus {
@@ -242,9 +237,6 @@ impl FHandle {
         }
     }
 
-    pub fn io_ctl(&self, cmd: usize, arg: usize) -> Result<usize, &'static str> {
-        self.io_ctl_with_offset(cmd, arg, 0)
-    }
     // AGENT: validate readahead hints without claiming to prefetch through the
     // current minimal RamBlockDevice backend.
     pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> {

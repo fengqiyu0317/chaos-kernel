@@ -56,21 +56,14 @@ impl FLike {
     // FIONBIO are applied by sys_ioctl because they mutate descriptor status.
     pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
         match self {
-            FLike::File(f) => f.io_ctl(req, a1),
+            // AGENT: regular-file ioctl needs open-description offset, so
+            // fd-table ioctl must dispatch through OpenFileDescription.
+            FLike::File(_) => Err("enosys"),
             FLike::Pipe(p) => match req {
                 FIONREAD => Ok(p.readable_len()),
                 _ => Err("enotty"),
             },
             FLike::Ep(_) => Err("enosys"),
-        }
-    }
-
-    // AGENT: expose explicit readiness fields for epoll's final event mapping.
-    pub fn poll(&self) -> PollStatus {
-        match self {
-            FLike::File(f) => f.poll_status(),
-            FLike::Pipe(p) => p.poll(),
-            FLike::Ep(e) => e.poll_status(),
         }
     }
 
