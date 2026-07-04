@@ -131,11 +131,11 @@ pub(super) fn sys_open(
         ap: _append,
         nb: _nonblock,
     };
-    let fh = FHandle::with_node_on_storage(&resolved, opt, node, kernel.file_storage());
+    let fh = FHandle::with_node_on_storage(&resolved, node, kernel.file_storage());
     if _truncate && wr {
         fh.set_len(0)?;
     }
-    let fd = task.add_file_with_cloexec(FLike::File(fh), _cloexec)?;
+    let fd = task.add_file_with_cloexec_and_status(FLike::File(fh), opt, _cloexec)?;
     let _perm_check = {
         let owner_r = (mode >> 8) & 0x4;
         let owner_w = (mode >> 8) & 0x2;

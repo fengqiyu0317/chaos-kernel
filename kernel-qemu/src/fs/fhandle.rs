@@ -1,26 +1,13 @@
 // AGENT
 use super::*;
 
-// AGENT: regular-file descriptor state owns only the mutable offset; fd status
-// flags live in OpenFileDescription so fcntl/ioctl updates have one authority.
-pub(crate) struct FdState {
-    pub(crate) off: u64,
-}
-impl FdState {
-    fn create() -> Arc<RwLock<Self>> {
-        Arc::new(RwLock::new(FdState { off: 0 }))
-    }
-}
-
-// AGENT: regular file handles keep the offset state plus the open-time status
-// snapshot; fd-table I/O reads mutable status from OpenFileDescription.
+// AGENT: regular file handles only identify the backing file object. Per-open
+// access flags, status flags, and current offset live in OpenFileDescription.
 #[derive(Clone)]
 pub struct FHandle {
     pub path: String,
     pub node: Arc<FileNode>,
     pub(super) storage: FileStorage,
-    initial_status: FdOpt,
-    pub(crate) desc: Arc<RwLock<FdState>>,
 }
 
 #[derive(Debug)]
@@ -35,18 +22,16 @@ impl FHandle {
     pub(super) const TRANSFER_READ: u8 = 1;
 
     // AGENT: create a fresh standalone regular node for device-like handles.
-    pub fn new(path: &str, opt: FdOpt) -> Self {
+    pub fn new(path: &str) -> Self {
         let storage = FileStorage::standalone();
         Self {
             path: path.to_string(),
             node: Arc::new(FileNode::regular(false)),
             storage,
-            initial_status: opt,
-            desc: FdState::create(),
         }
     }
     // AGENT: create a handle over a fresh regular file node.
-    pub fn with_data(path: &str, opt: FdOpt, d: Vec<u8>) -> Self {
+    pub fn with_data(path: &str, d: Vec<u8>) -> Self {
         let storage = FileStorage::standalone();
         let node = Arc::new(FileNode::regular(false));
         node.write_initial_bytes(&storage, &d)
@@ -55,57 +40,30 @@ impl FHandle {
             path: path.to_string(),
             node,
             storage,
-            initial_status: opt,
-            desc: FdState::create(),
         }
     }
     // AGENT: open a descriptor over an existing shared FileNode.
-    pub fn with_node(path: &str, opt: FdOpt, node: Arc<FileNode>) -> Self {
-        Self::with_node_on_storage(path, opt, node, FileStorage::standalone())
+    pub fn with_node(path: &str, node: Arc<FileNode>) -> Self {
+        Self::with_node_on_storage(path, node, FileStorage::standalone())
     }
 
     // AGENT: open a descriptor over an existing FileNode using the Kernel-owned
     // RAM block backend that stores that node's file contents.
-    pub fn with_node_on_storage(
-        path: &str,
-        opt: FdOpt,
-        node: Arc<FileNode>,
-        storage: FileStorage,
-    ) -> Self {
+    pub fn with_node_on_storage(path: &str, node: Arc<FileNode>, storage: FileStorage) -> Self {
         Self {
             path: path.to_string(),
             node,
             storage,
-            initial_status: opt,
-            desc: FdState::create(),
         }
     }
-    // AGENT: duplicate only descriptor state; file contents stay shared.
+    // AGENT: duplicate only the file object reference; open-description state is
+    // intentionally not part of FHandle.
     pub fn dup(&self) -> Self {
         FHandle {
             path: self.path.clone(),
             node: self.node.clone(),
             storage: self.storage.clone(),
-            initial_status: self.initial_status,
-            desc: self.desc.clone(),
         }
-    }
-    // AGENT: expose the immutable open-time access mode used to seed a new
-    // OpenFileDescription; mutable status changes are read from FdEntry instead.
-    pub fn get_opt(&self) -> FdOpt {
-        self.initial_status
-    }
-
-    // AGENT: expose the shared open-file-description offset for checkpoint fd
-    // snapshots without leaking the descriptor lock itself.
-    pub fn offset(&self) -> u64 {
-        self.desc.read().unwrap().off
-    }
-
-    // AGENT: direct handle reads use the open-time status snapshot; normal
-    // fd-table reads pass the current OpenFileDescription status below.
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        self.read_with_status(self.get_opt(), buf)
     }
 
     // AGENT: copy from a regular file node at an explicit offset without
@@ -114,20 +72,23 @@ impl FHandle {
         self.node.read_bytes(&self.storage, off, buf)
     }
 
-    // AGENT: read using status supplied by the owning OpenFileDescription and
-    // advance the shared regular-file offset under one descriptor-state lock.
-    pub(super) fn read_with_status(
+    // AGENT: read using state supplied by the owning OpenFileDescription.
+    pub(super) fn read_with_state(
         &self,
         status: FdOpt,
+        offset: &mut u64,
         buf: &mut [u8],
     ) -> Result<usize, &'static str> {
         if !status.rd {
             return Err("ebadf");
         }
-        let mut desc = self.desc.write().unwrap();
-        let off = desc.off as usize;
+        let off = match usize::try_from(*offset) {
+            Ok(off) => off,
+            Err(_) => return Ok(0),
+        };
         let n = self.copy_from_node_at(off, buf)?;
-        desc.off = (off + n) as u64;
+        let moved = u64::try_from(n).map_err(|_| "efbig")?;
+        *offset = offset.checked_add(moved).ok_or("efbig")?;
         Ok(n)
     }
 
@@ -145,34 +106,29 @@ impl FHandle {
         self.copy_from_node_at(off, buf)
     }
 
-    // AGENT: direct handle positioned reads use the open-time status snapshot.
+    // AGENT: direct positioned reads are pure file-object reads; fd permission
+    // checks belong to OpenFileDescription.
     pub fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
-        self.read_at_with_status(self.get_opt(), off, buf)
-    }
-    // AGENT: append/offset selection and offset advancement happen under one
-    // shared descriptor state write lock.
-    pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        self.write_with_status(self.get_opt(), buf)
+        self.copy_from_node_at(off, buf)
     }
 
-    // AGENT: write using open-file-description status so F_SETFL changes are
-    // visible without copying mutable flags back into FHandle.
-    pub(super) fn write_with_status(
+    // AGENT: write using state supplied by the owning OpenFileDescription.
+    pub(super) fn write_with_state(
         &self,
         status: FdOpt,
+        offset: &mut u64,
         buf: &[u8],
     ) -> Result<usize, &'static str> {
-        let mut desc = self.desc.write().unwrap();
         if !status.wr {
             return Err("ebadf");
         }
         let off = if status.ap {
             None
         } else {
-            Some(desc.off as usize)
+            Some(usize::try_from(*offset).map_err(|_| "efbig")?)
         };
         let end = self.node.write_bytes(&self.storage, off, buf)?;
-        desc.off = end as u64;
+        *offset = u64::try_from(end).map_err(|_| "efbig")?;
         Ok(buf.len())
     }
 
@@ -191,63 +147,43 @@ impl FHandle {
         Ok(buf.len())
     }
 
-    // AGENT: direct handle positioned writes use the open-time status snapshot.
+    // AGENT: direct positioned writes are pure file-object writes; fd permission
+    // checks belong to OpenFileDescription.
     pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
-        self.write_at_with_status(self.get_opt(), off, buf)
-    }
-    // AGENT: compute seek targets with checked signed deltas so invalid offsets
-    // fail instead of wrapping into huge u64 values.
-    pub fn seek(&self, pos: FSeek) -> Result<u64, &'static str> {
-        let mut d = self.desc.write().unwrap();
-        let next = match pos {
-            FSeek::Start(off) => off,
-            FSeek::End(delta) => {
-                let end = self.node.len() as u64;
-                end.checked_add_signed(delta).ok_or("einval")?
-            }
-            FSeek::Cur(delta) => d.off.checked_add_signed(delta).ok_or("einval")?,
-        };
-        d.off = next;
-        Ok(next)
+        self.node.write_bytes(&self.storage, Some(off), buf)?;
+        Ok(buf.len())
     }
 
     // AGENT: validate the legacy transfer-shaped API explicitly instead of
     // accepting arbitrary odd/even direction values or extra buffers.
-    pub(super) fn transfer_with_status(
+    pub(super) fn transfer_with_state(
         &self,
         status: FdOpt,
+        offset: &mut u64,
         dir: u8,
-        offset: Option<usize>,
+        positioned_offset: Option<usize>,
         buf_rd: Option<&mut [u8]>,
         buf_wr: Option<&[u8]>,
     ) -> Result<usize, &'static str> {
-        match (dir, offset, buf_rd, buf_wr) {
+        match (dir, positioned_offset, buf_rd, buf_wr) {
             (Self::TRANSFER_READ, Some(off), Some(buf), None) => {
                 self.read_at_with_status(status, off, buf)
             }
-            (Self::TRANSFER_READ, None, Some(buf), None) => self.read_with_status(status, buf),
+            (Self::TRANSFER_READ, None, Some(buf), None) => {
+                self.read_with_state(status, offset, buf)
+            }
             (Self::TRANSFER_WRITE, Some(off), None, Some(buf)) => {
                 self.write_at_with_status(status, off, buf)
             }
-            (Self::TRANSFER_WRITE, None, None, Some(buf)) => self.write_with_status(status, buf),
+            (Self::TRANSFER_WRITE, None, None, Some(buf)) => {
+                self.write_with_state(status, offset, buf)
+            }
             _ => Err("einval"),
         }
     }
 
-    // AGENT: retained for direct-handle compatibility; fd-table callers should
-    // prefer FdEntry::transfer so mutable fd status is not bypassed.
-    pub fn transfer(
-        &self,
-        dir: u8,
-        offset: Option<usize>,
-        buf_rd: Option<&mut [u8]>,
-        buf_wr: Option<&[u8]>,
-    ) -> Result<usize, &'static str> {
-        self.transfer_with_status(self.get_opt(), dir, offset, buf_rd, buf_wr)
-    }
-
     // AGENT: copy a regular-file byte range without changing descriptor state.
-    fn copy_chunk_at(&self, off: usize, count: usize) -> Result<Vec<u8>, &'static str> {
+    pub(super) fn copy_chunk_at(&self, off: usize, count: usize) -> Result<Vec<u8>, &'static str> {
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -257,104 +193,9 @@ impl FHandle {
         Ok(data)
     }
 
-    // AGENT: splice with explicit fd status supplied by OpenFileDescription.
-    pub(super) fn splice_to_with_status(
-        &self,
-        src_status: FdOpt,
-        dst: &FHandle,
-        dst_status: FdOpt,
-        count: usize,
-    ) -> Result<usize, &'static str> {
-        if !src_status.rd || !dst_status.wr {
-            return Err("ebadf");
-        }
-        if self.node.kind != FileKind::Regular || dst.node.kind != FileKind::Regular {
-            return Err("enodev");
-        }
-        if count == 0 {
-            return Ok(0);
-        }
-        if Arc::ptr_eq(&self.desc, &dst.desc) {
-            return self.splice_same_description(dst, dst_status, count);
-        }
-
-        let src_key = Arc::as_ptr(&self.desc) as usize;
-        let dst_key = Arc::as_ptr(&dst.desc) as usize;
-        if src_key < dst_key {
-            let mut src_desc = self.desc.write().unwrap();
-            let mut dst_desc = dst.desc.write().unwrap();
-            self.splice_locked(&mut src_desc, dst, &mut dst_desc, dst_status, count)
-        } else {
-            let mut dst_desc = dst.desc.write().unwrap();
-            let mut src_desc = self.desc.write().unwrap();
-            self.splice_locked(&mut src_desc, dst, &mut dst_desc, dst_status, count)
-        }
-    }
-
-    // AGENT: handle dup-style self-splice without trying to take the same
-    // descriptor lock twice.
-    fn splice_same_description(
-        &self,
-        dst: &FHandle,
-        dst_status: FdOpt,
-        count: usize,
-    ) -> Result<usize, &'static str> {
-        let mut desc = self.desc.write().unwrap();
-        let src_off = match usize::try_from(desc.off) {
-            Ok(off) => off,
-            Err(_) => return Ok(0),
-        };
-        let chunk = self.copy_chunk_at(src_off, count)?;
-        if chunk.is_empty() {
-            return Ok(0);
-        }
-
-        let write_off = if dst_status.ap {
-            None
-        } else {
-            Some(src_off.checked_add(chunk.len()).ok_or("efbig")?)
-        };
-        let end = dst.node.write_bytes(&dst.storage, write_off, &chunk)?;
-        desc.off = u64::try_from(end).map_err(|_| "efbig")?;
-        Ok(chunk.len())
-    }
-
-    // AGENT: commit source and destination offsets only after the destination
-    // write has succeeded.
-    fn splice_locked(
-        &self,
-        src_desc: &mut FdState,
-        dst: &FHandle,
-        dst_desc: &mut FdState,
-        dst_status: FdOpt,
-        count: usize,
-    ) -> Result<usize, &'static str> {
-        let src_off = match usize::try_from(src_desc.off) {
-            Ok(off) => off,
-            Err(_) => return Ok(0),
-        };
-        let chunk = self.copy_chunk_at(src_off, count)?;
-        if chunk.is_empty() {
-            return Ok(0);
-        }
-
-        let write_off = if dst_status.ap {
-            None
-        } else {
-            Some(usize::try_from(dst_desc.off).map_err(|_| "efbig")?)
-        };
-        let end = dst.node.write_bytes(&dst.storage, write_off, &chunk)?;
-        let moved = u64::try_from(chunk.len()).map_err(|_| "efbig")?;
-        src_desc.off = src_desc.off.checked_add(moved).ok_or("efbig")?;
-        dst_desc.off = u64::try_from(end).map_err(|_| "efbig")?;
-        Ok(chunk.len())
-    }
-
-    // AGENT: direct truncation uses the handle's open-time write permission.
+    // AGENT: direct truncation mutates only the backing file object; write
+    // permission checks belong to OpenFileDescription.
     pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
-        if !self.initial_status.wr {
-            return Err("ebadf");
-        }
         let len = usize::try_from(len).map_err(|_| "efbig")?;
         self.node.set_data_len(&self.storage, len)?;
         Ok(())
@@ -382,20 +223,14 @@ impl FHandle {
             Err("enoent")
         }
     }
-    // AGENT: directory-style iteration reads real directory entries and advances
-    // the handle offset only after a name is returned.
+    // AGENT: direct directory inspection stays stateless; descriptor-level
+    // directory iteration should advance offset in OpenFileDescription.
     pub fn read_entry(&self) -> Result<String, &'static str> {
-        if !self.initial_status.rd {
-            return Err("ebadf");
-        }
-        let mut desc = self.desc.write().unwrap();
-        let entry = self.node.dir_entry_at(desc.off as usize)?;
-        desc.off += 1;
-        Ok(entry)
+        self.node.dir_entry_at(0)
     }
     // AGENT: regular files do not carry pipe-style closed-peer state.
     pub fn poll_status(&self) -> PollStatus {
-        self.poll_status_with_status(self.get_opt())
+        self.poll_status_with_status(FdOpt::default())
     }
 
     // AGENT: let OpenFileDescription provide the visible access mode when fd
@@ -410,24 +245,29 @@ impl FHandle {
     }
     // AGENT: regular files only report supported ioctl results; unknown
     // requests must not be silently treated as success.
-    pub fn io_ctl(&self, cmd: usize, _arg: usize) -> Result<usize, &'static str> {
+    pub(super) fn io_ctl_with_offset(
+        &self,
+        cmd: usize,
+        _arg: usize,
+        offset: u64,
+    ) -> Result<usize, &'static str> {
         match cmd {
             FIONREAD | TIOCINQ => {
-                let off = self.desc.read().unwrap().off;
                 let len = self.node.len() as u64;
-                usize::try_from(len.saturating_sub(off)).map_err(|_| "eoverflow")
+                usize::try_from(len.saturating_sub(offset)).map_err(|_| "eoverflow")
             }
             _ => Err("enotty"),
         }
+    }
+
+    pub fn io_ctl(&self, cmd: usize, arg: usize) -> Result<usize, &'static str> {
+        self.io_ctl_with_offset(cmd, arg, 0)
     }
     // AGENT: validate readahead hints without claiming to prefetch through the
     // current minimal RamBlockDevice backend.
     pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> {
         if self.node.kind != FileKind::Regular {
             return Err("enodev");
-        }
-        if !self.initial_status.rd {
-            return Err("ebadf");
         }
         offset.checked_add(len).ok_or("efbig")?;
         Ok(())
@@ -438,9 +278,6 @@ impl FHandle {
     pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> {
         if self.node.kind != FileKind::Regular {
             return Err("enodev");
-        }
-        if !self.initial_status.wr {
-            return Err("ebadf");
         }
         if len == 0 {
             return Err("einval");
@@ -453,10 +290,6 @@ impl FHandle {
 
 impl fmt::Debug for FHandle {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let d = self.desc.read().unwrap();
-        f.debug_struct("FH")
-            .field("off", &d.off)
-            .field("path", &self.path)
-            .finish()
+        f.debug_struct("FH").field("path", &self.path).finish()
     }
 }

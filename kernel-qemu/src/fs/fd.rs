@@ -36,20 +36,33 @@ pub struct FdEntry {
     cloexec: bool,
 }
 
+// AGENT: shared state produced by one open. dup/fork share this through
+// OpenFileDescription instead of storing fd semantics on FHandle.
+struct OpenFileDescriptionState {
+    offset: u64,
+    status: FdOpt,
+}
+
 // AGENT: shared open-file description; dup/fork clone FdEntry while sharing
 // this object, so offset/status state and pipe endpoint lifetime remain shared.
 pub struct OpenFileDescription {
     file: FLike,
-    status: RwLock<FdOpt>,
+    state: RwLock<OpenFileDescriptionState>,
 }
 
 impl OpenFileDescription {
     // AGENT: build an open-file description around a concrete file object.
     pub fn new(file: FLike) -> Self {
         let status = file.status_flags();
+        Self::new_with_status(file, status)
+    }
+
+    // AGENT: build an open-file description with explicit open-time access and
+    // initial status flags, used when FHandle carries only the file object.
+    pub fn new_with_status(file: FLike, status: FdOpt) -> Self {
         Self {
             file,
-            status: RwLock::new(status),
+            state: RwLock::new(OpenFileDescriptionState { offset: 0, status }),
         }
     }
 
@@ -60,13 +73,17 @@ impl OpenFileDescription {
     // AGENT: enforce open-file-description access flags before dispatching to
     // the concrete file-like object.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        let status = self.status_flags();
-        if !status.rd {
-            return Err("ebadf");
-        }
         match &self.file {
-            FLike::File(f) => f.read_with_status(status, buf),
-            FLike::Pipe(p) => p.read_at(buf),
+            FLike::File(f) => {
+                let mut state = self.state.write().unwrap();
+                f.read_with_state(state.status, &mut state.offset, buf)
+            }
+            FLike::Pipe(p) => {
+                if !self.status_flags().rd {
+                    return Err("ebadf");
+                }
+                p.read_at(buf)
+            }
             FLike::Ep(_) => Err("enosys"),
         }
     }
@@ -74,13 +91,17 @@ impl OpenFileDescription {
     // AGENT: keep append/write permission checks in the shared open-file
     // description instead of duplicating mutable status in FHandle.
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        let status = self.status_flags();
-        if !status.wr {
-            return Err("ebadf");
-        }
         match &self.file {
-            FLike::File(f) => f.write_with_status(status, buf),
-            FLike::Pipe(p) => p.write_at(buf),
+            FLike::File(f) => {
+                let mut state = self.state.write().unwrap();
+                f.write_with_state(state.status, &mut state.offset, buf)
+            }
+            FLike::Pipe(p) => {
+                if !self.status_flags().wr {
+                    return Err("ebadf");
+                }
+                p.write_at(buf)
+            }
             FLike::Ep(_) => Err("enosys"),
         }
     }
@@ -94,11 +115,66 @@ impl OpenFileDescription {
     }
 
     pub fn io_ctl(&self, req: usize, arg: usize) -> Result<usize, &'static str> {
-        self.file.io_ctl(req, arg)
+        match &self.file {
+            FLike::File(f) => {
+                let state = self.state.read().unwrap();
+                f.io_ctl_with_offset(req, arg, state.offset)
+            }
+            _ => self.file.io_ctl(req, arg),
+        }
+    }
+
+    // AGENT: fd-level truncation checks the open-description write permission;
+    // FHandle only performs the backing file mutation.
+    pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
+        let status = self.status_flags();
+        if !status.wr {
+            return Err("ebadf");
+        }
+        match &self.file {
+            FLike::File(f) => f.set_len(len),
+            _ => Err("enodev"),
+        }
+    }
+
+    // AGENT: allocation is a regular-file operation gated by the shared open
+    // access mode, not by state stored on FHandle.
+    pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> {
+        let status = self.status_flags();
+        if !status.wr {
+            return Err("ebadf");
+        }
+        match &self.file {
+            FLike::File(f) => f.fallocate(offset, len),
+            _ => Err("enodev"),
+        }
     }
 
     pub fn status_flags(&self) -> FdOpt {
-        *self.status.read().unwrap()
+        self.state.read().unwrap().status
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.state.read().unwrap().offset
+    }
+
+    // AGENT: lseek mutates the shared open-file-description offset. The backing
+    // FHandle only supplies regular-file length for SEEK_END.
+    pub fn seek(&self, pos: FSeek) -> Result<u64, &'static str> {
+        let FLike::File(file) = &self.file else {
+            return Err("espipe");
+        };
+        let mut state = self.state.write().unwrap();
+        let next = match pos {
+            FSeek::Start(off) => off,
+            FSeek::End(delta) => {
+                let end = file.node.len() as u64;
+                end.checked_add_signed(delta).ok_or("einval")?
+            }
+            FSeek::Cur(delta) => state.offset.checked_add_signed(delta).ok_or("einval")?,
+        };
+        state.offset = next;
+        Ok(next)
     }
 
     // AGENT: expose status flags in the same bit shape returned by F_GETFL so
@@ -110,8 +186,8 @@ impl OpenFileDescription {
     // AGENT: update only the mutable open-file status bits; access mode remains
     // fixed from open/pipe creation.
     pub fn set_status_flags(&self, flags: usize) -> Result<(), &'static str> {
-        let mut status = self.status.write().unwrap();
-        status.apply_status_flags(flags);
+        let mut state = self.state.write().unwrap();
+        state.status.apply_status_flags(flags);
         Ok(())
     }
 
@@ -131,9 +207,11 @@ impl OpenFileDescription {
         buf_rd: Option<&mut [u8]>,
         buf_wr: Option<&[u8]>,
     ) -> Result<usize, &'static str> {
-        let status = self.status_flags();
         match &self.file {
-            FLike::File(f) => f.transfer_with_status(status, dir, offset, buf_rd, buf_wr),
+            FLike::File(f) => {
+                let mut state = self.state.write().unwrap();
+                f.transfer_with_state(state.status, &mut state.offset, dir, offset, buf_rd, buf_wr)
+            }
             _ => match (dir, offset, buf_rd, buf_wr) {
                 (FHandle::TRANSFER_READ, None, Some(buf), None) => self.read(buf),
                 (FHandle::TRANSFER_WRITE, None, None, Some(buf)) => self.write(buf),
@@ -150,14 +228,100 @@ impl OpenFileDescription {
         dst: &OpenFileDescription,
         count: usize,
     ) -> Result<usize, &'static str> {
-        let src_status = self.status_flags();
-        let dst_status = dst.status_flags();
         match (&self.file, &dst.file) {
-            (FLike::File(src), FLike::File(dst)) => {
-                src.splice_to_with_status(src_status, dst, dst_status, count)
+            (FLike::File(src), FLike::File(dst_file)) => {
+                if ::core::ptr::eq(self, dst) {
+                    let mut state = self.state.write().unwrap();
+                    Self::splice_same_description(src, dst_file, &mut state, count)
+                } else {
+                    let self_key = self as *const OpenFileDescription as usize;
+                    let dst_key = dst as *const OpenFileDescription as usize;
+                    if self_key < dst_key {
+                        let mut src_state = self.state.write().unwrap();
+                        let mut dst_state = dst.state.write().unwrap();
+                        Self::splice_locked(src, &mut src_state, dst_file, &mut dst_state, count)
+                    } else {
+                        let mut dst_state = dst.state.write().unwrap();
+                        let mut src_state = self.state.write().unwrap();
+                        Self::splice_locked(src, &mut src_state, dst_file, &mut dst_state, count)
+                    }
+                }
             }
             _ => Err("enosys"),
         }
+    }
+
+    // AGENT: self-splice observes one shared open-file-description offset instead
+    // of trying to borrow the same state lock twice.
+    fn splice_same_description(
+        src: &FHandle,
+        dst: &FHandle,
+        state: &mut OpenFileDescriptionState,
+        count: usize,
+    ) -> Result<usize, &'static str> {
+        if !state.status.rd || !state.status.wr {
+            return Err("ebadf");
+        }
+        if src.node.kind != FileKind::Regular || dst.node.kind != FileKind::Regular {
+            return Err("enodev");
+        }
+        if count == 0 {
+            return Ok(0);
+        }
+        let src_off = match usize::try_from(state.offset) {
+            Ok(off) => off,
+            Err(_) => return Ok(0),
+        };
+        let chunk = src.copy_chunk_at(src_off, count)?;
+        if chunk.is_empty() {
+            return Ok(0);
+        }
+        let write_off = if state.status.ap {
+            None
+        } else {
+            Some(src_off.checked_add(chunk.len()).ok_or("efbig")?)
+        };
+        let end = dst.node.write_bytes(&dst.storage, write_off, &chunk)?;
+        state.offset = u64::try_from(end).map_err(|_| "efbig")?;
+        Ok(chunk.len())
+    }
+
+    // AGENT: copy regular-file bytes and commit both open-description offsets only
+    // after the destination write succeeds.
+    fn splice_locked(
+        src: &FHandle,
+        src_state: &mut OpenFileDescriptionState,
+        dst: &FHandle,
+        dst_state: &mut OpenFileDescriptionState,
+        count: usize,
+    ) -> Result<usize, &'static str> {
+        if !src_state.status.rd || !dst_state.status.wr {
+            return Err("ebadf");
+        }
+        if src.node.kind != FileKind::Regular || dst.node.kind != FileKind::Regular {
+            return Err("enodev");
+        }
+        if count == 0 {
+            return Ok(0);
+        }
+        let src_off = match usize::try_from(src_state.offset) {
+            Ok(off) => off,
+            Err(_) => return Ok(0),
+        };
+        let chunk = src.copy_chunk_at(src_off, count)?;
+        if chunk.is_empty() {
+            return Ok(0);
+        }
+        let write_off = if dst_state.status.ap {
+            None
+        } else {
+            Some(usize::try_from(dst_state.offset).map_err(|_| "efbig")?)
+        };
+        let end = dst.node.write_bytes(&dst.storage, write_off, &chunk)?;
+        let moved = u64::try_from(chunk.len()).map_err(|_| "efbig")?;
+        src_state.offset = src_state.offset.checked_add(moved).ok_or("efbig")?;
+        dst_state.offset = u64::try_from(end).map_err(|_| "efbig")?;
+        Ok(chunk.len())
     }
 }
 
@@ -171,6 +335,15 @@ impl FdEntry {
     pub fn with_cloexec(file: FLike, cloexec: bool) -> Self {
         Self {
             desc: Arc::new(OpenFileDescription::new(file)),
+            cloexec,
+        }
+    }
+
+    // AGENT: create a descriptor entry with explicit open-file-description state
+    // for regular files whose FHandle no longer stores fd status.
+    pub fn with_status(file: FLike, status: FdOpt, cloexec: bool) -> Self {
+        Self {
+            desc: Arc::new(OpenFileDescription::new_with_status(file, status)),
             cloexec,
         }
     }
@@ -233,8 +406,24 @@ impl FdEntry {
         self.desc.io_ctl(req, arg)
     }
 
+    pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
+        self.desc.set_len(len)
+    }
+
+    pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> {
+        self.desc.fallocate(offset, len)
+    }
+
     pub fn status_flags(&self) -> FdOpt {
         self.desc.status_flags()
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.desc.offset()
+    }
+
+    pub fn seek(&self, pos: FSeek) -> Result<u64, &'static str> {
+        self.desc.seek(pos)
     }
 
     // AGENT: expose serialized status flags for checkpoint fd table snapshots.

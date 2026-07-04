@@ -16,8 +16,9 @@ impl FLike {
             return Ok(0);
         }
         match self {
-            // AGENT: FLike only dispatches to the concrete readable object.
-            FLike::File(f) => f.read(buf),
+            // AGENT: regular-file reads need open-description offset/status, so
+            // fd-table I/O must dispatch through FdEntry/OpenFileDescription.
+            FLike::File(_) => Err("enosys"),
             FLike::Pipe(p) => p.read_at(buf),
             FLike::Ep(_) => Err("enosys"),
         }
@@ -28,8 +29,9 @@ impl FLike {
             return Ok(0);
         }
         match self {
-            // AGENT: FLike only dispatches to the concrete writable object.
-            FLike::File(f) => f.write(buf),
+            // AGENT: regular-file writes need open-description offset/status, so
+            // fd-table I/O must dispatch through FdEntry/OpenFileDescription.
+            FLike::File(_) => Err("enosys"),
             FLike::Pipe(p) => p.write_at(buf),
             FLike::Ep(_) => Err("enosys"),
         }
@@ -37,7 +39,9 @@ impl FLike {
 
     pub fn status_flags(&self) -> FdOpt {
         match self {
-            FLike::File(f) => f.get_opt(),
+            // AGENT: file access/status is supplied explicitly when the open-file
+            // description is created; this default is only a compatibility seed.
+            FLike::File(_) => FdOpt::default(),
             FLike::Pipe(p) => p.status_flags(),
             FLike::Ep(_) => FdOpt {
                 rd: true,

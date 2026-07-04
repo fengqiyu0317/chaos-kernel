@@ -263,7 +263,10 @@ fn checkpoint_description_id(
 
 // AGENT: rebuild the stdio-like handles supported by the first checkpoint
 // restore pass; regular path files need a later file-object section.
-fn checkpoint_stdio_handle(kind: SavedFdKind, status_flags: u32) -> Result<FHandle, &'static str> {
+fn checkpoint_stdio_handle(
+    kind: SavedFdKind,
+    status_flags: u32,
+) -> Result<(FHandle, FdOpt), &'static str> {
     let mut opt = match kind {
         SavedFdKind::Stdin => FdOpt {
             rd: true,
@@ -290,7 +293,7 @@ fn checkpoint_stdio_handle(kind: SavedFdKind, status_flags: u32) -> Result<FHand
         SavedFdKind::Stderr => "/dev/stderr",
         _ => return Err("enotsup"),
     };
-    Ok(FHandle::new(path, opt))
+    Ok((FHandle::new(path), opt))
 }
 
 struct InitialUserImage {
@@ -390,28 +393,24 @@ fn populate_initial_user_image(
 // AGENT: seed stdio through the normal fd allocator so the descriptor table and
 // free-fd set stay consistent with every later open/dup/close path.
 fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str> {
-    let fd0 = FHandle::new(
-        "/dev/tty",
-        FdOpt {
-            rd: true,
-            wr: false,
-            ap: false,
-            nb: false,
-        },
-    );
-    let fd1 = FHandle::new(
-        "/dev/tty",
-        FdOpt {
-            rd: false,
-            wr: true,
-            ap: false,
-            nb: false,
-        },
-    );
+    let stdin_opt = FdOpt {
+        rd: true,
+        wr: false,
+        ap: false,
+        nb: false,
+    };
+    let stdout_opt = FdOpt {
+        rd: false,
+        wr: true,
+        ap: false,
+        nb: false,
+    };
+    let fd0 = FHandle::new("/dev/tty");
+    let fd1 = FHandle::new("/dev/tty");
     let fd2 = fd1.dup();
-    let stdin = task.add_file(FLike::File(fd0))?;
-    let stdout = task.add_file(FLike::File(fd1))?;
-    let stderr = task.add_file(FLike::File(fd2))?;
+    let stdin = task.add_file_with_status(FLike::File(fd0), stdin_opt)?;
+    let stdout = task.add_file_with_status(FLike::File(fd1), stdout_opt)?;
+    let stderr = task.add_file_with_status(FLike::File(fd2), stdout_opt)?;
     if (stdin, stdout, stderr) != (0, 1, 2) {
         return Err("ebadf");
     }
@@ -561,12 +560,33 @@ impl Task {
         self.add_file_with_cloexec(fl, false)
     }
 
+    // AGENT: install a new fd entry with explicit open-file-description state for
+    // regular files whose FHandle only stores the backing object.
+    pub fn add_file_with_status(&self, fl: FLike, status: FdOpt) -> Result<usize, &'static str> {
+        self.add_file_with_cloexec_and_status(fl, status, false)
+    }
+
     // AGENT: install a new fd entry and record per-fd close-on-exec state.
     pub fn add_file_with_cloexec(&self, fl: FLike, cloexec: bool) -> Result<usize, &'static str> {
         let mut files = self.process.files.lock().unwrap();
         let mut free_fds = self.process.free_fds.lock().unwrap();
         let fd = Self::reserve_fd_from_locked(&mut free_fds, 0)?;
         files.insert(fd, FdEntry::with_cloexec(fl, cloexec));
+        Ok(fd)
+    }
+
+    // AGENT: install a new fd entry while supplying the open-file-description
+    // status explicitly instead of reading it from the file object.
+    pub fn add_file_with_cloexec_and_status(
+        &self,
+        fl: FLike,
+        status: FdOpt,
+        cloexec: bool,
+    ) -> Result<usize, &'static str> {
+        let mut files = self.process.files.lock().unwrap();
+        let mut free_fds = self.process.free_fds.lock().unwrap();
+        let fd = Self::reserve_fd_from_locked(&mut free_fds, 0)?;
+        files.insert(fd, FdEntry::with_status(fl, status, cloexec));
         Ok(fd)
     }
 
@@ -617,7 +637,7 @@ impl Task {
         let mut saved = Vec::with_capacity(files.len());
         for (&fd, entry) in files.iter() {
             let kind = checkpoint_fd_kind(fd)?;
-            let handle = entry.regular_handle().ok_or("enotsup")?;
+            entry.regular_handle().ok_or("enotsup")?;
             let description_id = checkpoint_description_id(entry, &mut descriptions)?;
             saved.push(SavedFdEntry {
                 fd: u32::try_from(fd).map_err(|_| "einval")?,
@@ -625,7 +645,7 @@ impl Task {
                 cloexec: entry.is_cloexec(),
                 status_flags: u32::try_from(entry.status_flags_bits()).map_err(|_| "einval")?,
                 kind,
-                offset: handle.offset(),
+                offset: entry.offset(),
             });
         }
         Ok(saved)
@@ -644,9 +664,9 @@ impl Task {
             let entry = if let Some(template) = descriptions.get(&saved.description_id) {
                 template.dup(saved.cloexec)
             } else {
-                let mut handle = checkpoint_stdio_handle(saved.kind, saved.status_flags)?;
-                handle.seek(FSeek::Start(saved.offset))?;
-                let entry = FdEntry::with_cloexec(FLike::File(handle), saved.cloexec);
+                let (handle, status) = checkpoint_stdio_handle(saved.kind, saved.status_flags)?;
+                let entry = FdEntry::with_status(FLike::File(handle), status, saved.cloexec);
+                entry.seek(FSeek::Start(saved.offset))?;
                 descriptions.insert(saved.description_id, entry.clone());
                 entry
             };
