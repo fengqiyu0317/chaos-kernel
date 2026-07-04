@@ -124,6 +124,24 @@ impl OpenFileDescription {
         }
     }
 
+    // AGENT: directory iteration uses the shared open-file-description offset
+    // so dup/fork observe the same stream position.
+    pub fn read_entry(&self) -> Result<String, &'static str> {
+        match &self.file {
+            FLike::File(f) => {
+                let mut state = self.state.write().unwrap();
+                if !state.status.rd {
+                    return Err("ebadf");
+                }
+                let idx = usize::try_from(state.offset).map_err(|_| "eoverflow")?;
+                let entry = f.read_entry(idx)?;
+                state.offset = state.offset.checked_add(1).ok_or("eoverflow")?;
+                Ok(entry)
+            }
+            _ => Err("enotdir"),
+        }
+    }
+
     // AGENT: fd-level truncation checks the open-description write permission;
     // FHandle only performs the backing file mutation.
     pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
@@ -404,6 +422,12 @@ impl FdEntry {
 
     pub fn io_ctl(&self, req: usize, arg: usize) -> Result<usize, &'static str> {
         self.desc.io_ctl(req, arg)
+    }
+
+    // AGENT: expose directory iteration at the descriptor-entry layer while
+    // keeping the shared offset inside OpenFileDescription.
+    pub fn read_entry(&self) -> Result<String, &'static str> {
+        self.desc.read_entry()
     }
 
     pub fn set_len(&self, len: u64) -> Result<(), &'static str> {

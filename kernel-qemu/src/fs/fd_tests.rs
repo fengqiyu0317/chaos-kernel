@@ -7,7 +7,7 @@ pub fn run_all() {
     set_len_tracks_byte_length_and_block_capacity();
     truncate_releases_blocks_for_reuse_without_old_contents();
     fallocate_validates_and_only_grows_regular_files();
-    lookup_reports_node_local_errors();
+    read_entry_uses_open_description_offset();
     regular_file_poll_and_ioctl_are_explicit();
     splice_checks_permissions_before_moving_offsets();
     splice_uses_shared_append_status();
@@ -123,21 +123,45 @@ fn fallocate_validates_and_only_grows_regular_files() {
     assert_eq!(dir_entry.fallocate(0, 1), Err("enodev"));
 }
 
-// AGENT: moved node-local lookup regression out of fd.rs without changing behavior.
+// AGENT: directory entry reads advance the shared open-file-description offset,
+// while direct FHandle reads remain explicit-index helpers.
 #[cfg_attr(test, test)]
-fn lookup_reports_node_local_errors() {
-    let file = FHandle::with_data("/tmp/file", Vec::new());
-    assert_eq!(file.lookup(".", 0), Err("enotdir"));
-
+fn read_entry_uses_open_description_offset() {
     let dir = FHandle::with_node("/tmp", Arc::new(FileNode::directory()));
-    assert_eq!(dir.lookup(".", 0), Ok(()));
-    assert_eq!(dir.lookup("", 0), Ok(()));
-    dir.node.add_dir_entry(&dir.storage, "child").unwrap();
-    assert_eq!(dir.lookup("child", 0), Ok(()));
-    assert_eq!(dir.lookup("missing", 0), Err("enoent"));
-    assert_eq!(dir.lookup(".", 41), Err("eloop"));
-    assert_eq!(dir.lookup("bad\0name", 0), Err("einval"));
-    assert_eq!(dir.lookup("bad/name", 0), Err("einval"));
+    dir.node.add_dir_entry(&dir.storage, "alpha").unwrap();
+    dir.node.add_dir_entry(&dir.storage, "beta").unwrap();
+    dir.node.add_dir_entry(&dir.storage, "gamma").unwrap();
+
+    assert_eq!(dir.read_entry(1), Ok(String::from("beta")));
+
+    let entry = file_entry(&dir, FdOpt::default());
+    assert_eq!(entry.read_entry(), Ok(String::from("alpha")));
+    assert_eq!(entry.offset(), 1);
+
+    let dup = entry.dup(false);
+    assert_eq!(dup.read_entry(), Ok(String::from("beta")));
+    assert_eq!(entry.read_entry(), Ok(String::from("gamma")));
+    assert_eq!(entry.offset(), 3);
+    assert_eq!(dup.offset(), 3);
+
+    assert_eq!(entry.read_entry(), Err("enoent"));
+    assert_eq!(entry.offset(), 3);
+
+    let unreadable = file_entry(
+        &dir,
+        FdOpt {
+            rd: false,
+            wr: true,
+            ap: false,
+            nb: false,
+        },
+    );
+    assert_eq!(unreadable.read_entry(), Err("ebadf"));
+    assert_eq!(unreadable.offset(), 0);
+
+    let file = FHandle::with_data("/tmp/file", Vec::new());
+    let file_entry = file_entry(&file, FdOpt::default());
+    assert_eq!(file_entry.read_entry(), Err("enotdir"));
 }
 
 // AGENT: regular-file ioctl observes FileNode's byte-precise visible length.

@@ -308,20 +308,6 @@ impl FileNode {
             .ok_or("enoent")
     }
 
-    // AGENT: check one directory-local child name without claiming to resolve
-    // full paths; Kernel::lookup_path owns global path resolution.
-    pub fn has_dir_entry(&self, name: &str) -> Result<bool, &'static str> {
-        if self.kind != FileKind::Directory {
-            return Err("enotdir");
-        }
-        Ok(self
-            .dir_entries
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|entry| entry == name))
-    }
-
     // AGENT: expose the byte-precise regular-file EOF owned by this FileNode.
     pub fn len(&self) -> usize {
         self.storage.lock().unwrap().byte_len

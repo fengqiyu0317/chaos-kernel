@@ -193,7 +193,7 @@ impl FHandle {
             return Ok(Vec::new());
         }
         let mut data = vec![0; count];
-        let n = self.node.read_bytes(&self.storage, off, &mut data)?;
+        let n = self.copy_from_node_at(off, &mut data)?;
         data.truncate(n);
         Ok(data)
     }
@@ -205,33 +205,10 @@ impl FHandle {
         self.node.set_data_len(&self.storage, len)?;
         Ok(())
     }
-    // AGENT: keep node-local lookup honest; full path lookup belongs to Kernel.
-    pub fn lookup(&self, path: &str, depth: usize) -> Result<(), &'static str> {
-        if depth > 40 {
-            return Err("eloop");
-        }
-        if path.bytes().any(|b| b == 0) {
-            return Err("einval");
-        }
-        if self.node.kind != FileKind::Directory {
-            return Err("enotdir");
-        }
-        if path.is_empty() || path == "." {
-            return Ok(());
-        }
-        if path.contains('/') {
-            return Err("einval");
-        }
-        if self.node.has_dir_entry(path)? {
-            Ok(())
-        } else {
-            Err("enoent")
-        }
-    }
-    // AGENT: direct directory inspection stays stateless; descriptor-level
-    // directory iteration should advance offset in OpenFileDescription.
-    pub fn read_entry(&self) -> Result<String, &'static str> {
-        self.node.dir_entry_at(0)
+    // AGENT: direct directory inspection stays stateless and uses the caller's
+    // explicit entry index; fd-level iteration advances OpenFileDescription.
+    pub fn read_entry(&self, idx: usize) -> Result<String, &'static str> {
+        self.node.dir_entry_at(idx)
     }
     // AGENT: regular files do not carry pipe-style closed-peer state.
     pub fn poll_status(&self) -> PollStatus {
