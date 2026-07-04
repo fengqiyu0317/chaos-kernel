@@ -22,35 +22,38 @@ fn writable_opt() -> FdOpt {
     }
 }
 
-// AGENT: observe regular-file contents through the public read path now that
-// FileNode no longer stores a Vec of bytes.
-fn file_bytes(fh: &FHandle) -> Vec<u8> {
-    let mut data = vec![0; fh.node.len()];
-    fh.read_at(0, &mut data).unwrap();
+// AGENT: observe a regular-file byte range through the public read path while
+// keeping tests independent from block-rounded allocation length.
+fn file_bytes(fh: &FHandle, off: usize, len: usize) -> Vec<u8> {
+    let mut data = vec![0; len];
+    fh.read_at(off, &mut data).unwrap();
     data
 }
 
-// AGENT: regular-file dirty state now lives as a unified BlockCache dirty count.
+// AGENT: regular-file dirty state follows block-map changes now that FileNode
+// no longer stores a byte-precise length.
 #[cfg_attr(test, test)]
 fn set_len_and_sync_update_cache_dirty_state() {
     let fh = FHandle::with_data("/tmp/file", writable_opt(), vec![1, 2, 3]);
+    assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE);
     assert_eq!(fh.cached_dirty_blocks(), 0);
 
     fh.write_at(1, &[9]).unwrap();
-    assert_eq!(file_bytes(&fh).as_slice(), &[1, 9, 3]);
+    assert_eq!(file_bytes(&fh, 0, 3).as_slice(), &[1, 9, 3]);
     assert_eq!(fh.cached_dirty_blocks(), 1);
 
     fh.sync_data().unwrap();
     assert_eq!(fh.cached_dirty_blocks(), 0);
 
     fh.set_len(5).unwrap();
-    assert_eq!(file_bytes(&fh).as_slice(), &[1, 9, 3, 0, 0]);
-    assert_eq!(fh.cached_dirty_blocks(), 1);
+    assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE);
+    assert_eq!(fh.cached_dirty_blocks(), 0);
 
     fh.sync_data().unwrap();
     assert_eq!(fh.cached_dirty_blocks(), 0);
 
-    fh.set_len(6).unwrap();
+    fh.set_len((BLOCK_CACHE_BLOCK_SIZE + 1) as u64).unwrap();
+    assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE * 2);
     assert_eq!(fh.cached_dirty_blocks(), 1);
     fh.sync_all().unwrap();
     assert_eq!(fh.cached_dirty_blocks(), 0);
@@ -59,18 +62,19 @@ fn set_len_and_sync_update_cache_dirty_state() {
     assert_eq!(ro.set_len(0), Err("ebadf"));
 }
 
-// AGENT: moved fallocate regression out of fd.rs without changing behavior.
+// AGENT: moved fallocate regression to block-rounded FileNode length behavior.
 #[cfg_attr(test, test)]
 fn fallocate_validates_and_only_grows_regular_files() {
     let fh = FHandle::with_data("/tmp/file", writable_opt(), vec![1, 2, 3]);
 
-    fh.fallocate(5, 2).unwrap();
-    assert_eq!(file_bytes(&fh).as_slice(), &[1, 2, 3, 0, 0, 0, 0]);
+    fh.fallocate(BLOCK_CACHE_BLOCK_SIZE + 5, 2).unwrap();
+    assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE * 2);
+    assert_eq!(file_bytes(&fh, 0, 3).as_slice(), &[1, 2, 3]);
     assert_eq!(fh.cached_dirty_blocks(), 1);
 
     fh.sync_all().unwrap();
     fh.fallocate(1, 1).unwrap();
-    assert_eq!(fh.node.len(), 7);
+    assert_eq!(fh.node.len(), BLOCK_CACHE_BLOCK_SIZE * 2);
     assert_eq!(fh.cached_dirty_blocks(), 0);
 
     assert_eq!(fh.fallocate(0, 0), Err("einval"));
@@ -100,7 +104,7 @@ fn lookup_reports_node_local_errors() {
     assert_eq!(dir.lookup("bad/name", 0), Err("einval"));
 }
 
-// AGENT: moved regular-file poll/ioctl regression out of fd.rs unchanged.
+// AGENT: regular-file ioctl observes block-rounded FileNode length.
 #[cfg_attr(test, test)]
 fn regular_file_poll_and_ioctl_are_explicit() {
     let file = FHandle::with_data("", writable_opt(), vec![1, 2, 3, 4]);
@@ -109,10 +113,10 @@ fn regular_file_poll_and_ioctl_are_explicit() {
     assert!(poll.writable);
     assert!(!poll.error);
 
-    assert_eq!(file.io_ctl(FIONREAD, 0), Ok(4));
+    assert_eq!(file.io_ctl(FIONREAD, 0), Ok(BLOCK_CACHE_BLOCK_SIZE));
     let mut buf = [0; 2];
     assert_eq!(file.read(&mut buf), Ok(2));
-    assert_eq!(file.io_ctl(TIOCINQ, 0), Ok(2));
+    assert_eq!(file.io_ctl(TIOCINQ, 0), Ok(BLOCK_CACHE_BLOCK_SIZE - 2));
     assert_eq!(file.io_ctl(0xDEAD, 0), Err("enotty"));
 }
 
@@ -145,7 +149,7 @@ fn splice_checks_permissions_before_moving_offsets() {
     assert_eq!(dst.node.len(), 0);
 }
 
-// AGENT: moved shared append-status splice regression out of fd.rs unchanged.
+// AGENT: append-status splice appends at the block-rounded FileNode end.
 #[cfg_attr(test, test)]
 fn splice_uses_shared_append_status() {
     let src = FHandle::with_data("/src", FdOpt::default(), vec![1, 2, 3]);
@@ -157,6 +161,10 @@ fn splice_uses_shared_append_status() {
     dst_entry.set_status_flags(O_APPEND).unwrap();
     assert_eq!(src_entry.splice_to(&dst_entry, 2), Ok(2));
     assert_eq!(src.offset(), 2);
-    assert_eq!(dst.offset(), 4);
-    assert_eq!(file_bytes(&dst).as_slice(), &[9, 9, 1, 2]);
+    assert_eq!(dst.offset(), (BLOCK_CACHE_BLOCK_SIZE + 2) as u64);
+    assert_eq!(file_bytes(&dst, 0, 2).as_slice(), &[9, 9]);
+    assert_eq!(
+        file_bytes(&dst, BLOCK_CACHE_BLOCK_SIZE, 2).as_slice(),
+        &[1, 2]
+    );
 }

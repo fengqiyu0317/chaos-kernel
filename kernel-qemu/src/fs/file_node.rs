@@ -94,16 +94,12 @@ impl FileStorage {
 
 #[derive(Debug)]
 struct FileNodeBlocks {
-    len: usize,
-    blocks: Vec<Option<usize>>,
+    blocks: Vec<usize>,
 }
 
 impl FileNodeBlocks {
     fn empty() -> Self {
-        Self {
-            len: 0,
-            blocks: Vec::new(),
-        }
+        Self { blocks: Vec::new() }
     }
 }
 
@@ -195,25 +191,30 @@ impl FileNode {
             .any(|entry| entry == name))
     }
 
-    // AGENT: expose the visible byte length without exposing storage blocks.
+    // AGENT: expose block-backed byte capacity without storing a separate file
+    // length now that regular files use contiguous block allocation.
     pub fn len(&self) -> usize {
-        self.storage.lock().unwrap().len
+        self.storage
+            .lock()
+            .unwrap()
+            .blocks
+            .len()
+            .saturating_mul(BLOCK_CACHE_BLOCK_SIZE)
     }
 
+    // AGENT: allocate all missing logical file blocks up to file_block so the
+    // node no longer needs sparse holes or a separate visible-length field.
     fn ensure_block(
         storage: &mut FileNodeBlocks,
         backend: &FileStorage,
         file_block: usize,
     ) -> Result<(usize, bool), &'static str> {
+        let mut allocated = false;
         while storage.blocks.len() <= file_block {
-            storage.blocks.push(None);
+            storage.blocks.push(backend.allocate_block()?);
+            allocated = true;
         }
-        if let Some(block) = storage.blocks[file_block] {
-            return Ok((block, false));
-        }
-        let block = backend.allocate_block()?;
-        storage.blocks[file_block] = Some(block);
-        Ok((block, true))
+        Ok((storage.blocks[file_block], allocated))
     }
 
     fn blocks_for_len(len: usize) -> Result<usize, &'static str> {
@@ -258,13 +259,11 @@ impl FileNode {
             &mut cursor,
             &[self.executable.load(Ordering::Relaxed) as u8],
         );
-        Self::put_metadata_u64(&mut payload, &mut cursor, storage.len);
         Self::put_metadata_u64(&mut payload, &mut cursor, storage.blocks.len());
         Self::put_metadata_u64(&mut payload, &mut cursor, entries.len());
 
-        for block in storage.blocks.iter() {
-            let encoded = block.map(|nr| nr.saturating_add(1)).unwrap_or(0);
-            Self::put_metadata_u64(&mut payload, &mut cursor, encoded);
+        for &block in storage.blocks.iter() {
+            Self::put_metadata_u64(&mut payload, &mut cursor, block.saturating_add(1));
         }
         for entry in entries.iter() {
             Self::put_metadata_u64(&mut payload, &mut cursor, entry.len());
@@ -298,24 +297,14 @@ impl FileNode {
         len: usize,
     ) -> Result<bool, &'static str> {
         let end = start.checked_add(len).ok_or("efbig")?;
-        if end > storage.len {
-            return Ok(true);
-        }
         if len == 0 {
             return Ok(false);
         }
-        let first = start / BLOCK_CACHE_BLOCK_SIZE;
-        let last = (end - 1) / BLOCK_CACHE_BLOCK_SIZE;
-        for file_block in first..=last {
-            if !matches!(storage.blocks.get(file_block), Some(Some(_))) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(Self::blocks_for_len(end)? > storage.blocks.len())
     }
 
-    // AGENT: read bytes from the block backend through the node's block map,
-    // treating sparse or unallocated regions as zero-filled file holes.
+    // AGENT: read bytes from the contiguous block map; EOF is derived from the
+    // number of allocated file blocks rather than a stored byte length.
     pub(crate) fn read_bytes(
         &self,
         backend: &FileStorage,
@@ -326,22 +315,20 @@ impl FileNode {
             return Err("eisdir");
         }
         let storage = self.storage.lock().unwrap();
-        if off >= storage.len || buf.is_empty() {
+        let file_len = storage.blocks.len().saturating_mul(BLOCK_CACHE_BLOCK_SIZE);
+        if off >= file_len || buf.is_empty() {
             return Ok(0);
         }
-        let total = min(buf.len(), storage.len - off);
+        let total = min(buf.len(), file_len - off);
         let mut copied = 0usize;
         while copied < total {
             let abs = off.checked_add(copied).ok_or("efbig")?;
             let file_block = abs / BLOCK_CACHE_BLOCK_SIZE;
             let block_off = abs % BLOCK_CACHE_BLOCK_SIZE;
             let n = min(total - copied, BLOCK_CACHE_BLOCK_SIZE - block_off);
-            if let Some(Some(block)) = storage.blocks.get(file_block) {
-                let block_data = backend.read_block(*block)?;
-                buf[copied..copied + n].copy_from_slice(&block_data[block_off..block_off + n]);
-            } else {
-                buf[copied..copied + n].fill(0);
-            }
+            let block = storage.blocks[file_block];
+            let block_data = backend.read_block(block)?;
+            buf[copied..copied + n].copy_from_slice(&block_data[block_off..block_off + n]);
             copied += n;
         }
         Ok(copied)
@@ -368,17 +355,16 @@ impl FileNode {
         }
         {
             let storage = self.storage.lock().unwrap();
-            let start = offset.unwrap_or(storage.len);
+            let start = offset.unwrap_or(storage.blocks.len() * BLOCK_CACHE_BLOCK_SIZE);
             if Self::write_may_change_metadata(&storage, start, buf.len())? {
                 drop(storage);
                 self.ensure_metadata_block(backend)?;
             }
         }
         let mut storage = self.storage.lock().unwrap();
-        let start = offset.unwrap_or(storage.len);
+        let start = offset.unwrap_or(storage.blocks.len() * BLOCK_CACHE_BLOCK_SIZE);
         let end = start.checked_add(buf.len()).ok_or("efbig")?;
-        let grew = end > storage.len;
-        let mut metadata_changed = grew;
+        let mut metadata_changed = false;
 
         let mut copied = 0usize;
         while copied < buf.len() {
@@ -396,9 +382,6 @@ impl FileNode {
             block_data[block_off..block_off + n].copy_from_slice(&buf[copied..copied + n]);
             backend.write_block(block, &block_data)?;
             copied += n;
-        }
-        if grew {
-            storage.len = end;
         }
         drop(storage);
 
@@ -419,8 +402,8 @@ impl FileNode {
         Ok(())
     }
 
-    // AGENT: resize visible file length while keeping truncated stale blocks
-    // unreachable from later reads.
+    // AGENT: resize the contiguous block map; byte lengths round up to whole
+    // blocks because FileNode no longer stores a separate visible byte length.
     pub(crate) fn set_data_len(
         &self,
         backend: &FileStorage,
@@ -429,33 +412,26 @@ impl FileNode {
         if self.kind != FileKind::Regular {
             return Err("eisdir");
         }
+        let keep_blocks = Self::blocks_for_len(len)?;
         {
             let storage = self.storage.lock().unwrap();
-            if storage.len != len {
+            if storage.blocks.len() != keep_blocks {
                 drop(storage);
                 self.ensure_metadata_block(backend)?;
             }
         }
         let changed = {
             let mut storage = self.storage.lock().unwrap();
-            if storage.len == len {
+            if storage.blocks.len() == keep_blocks {
                 false
             } else {
-                if len < storage.len {
-                    let keep_blocks = Self::blocks_for_len(len)?;
-                    if keep_blocks > 0 {
-                        let tail_off = len % BLOCK_CACHE_BLOCK_SIZE;
-                        if tail_off != 0 {
-                            if let Some(Some(block)) = storage.blocks.get(keep_blocks - 1) {
-                                let mut block_data = backend.read_block(*block)?;
-                                block_data[tail_off..].fill(0);
-                                backend.write_block(*block, &block_data)?;
-                            }
-                        }
-                    }
+                if keep_blocks < storage.blocks.len() {
                     storage.blocks.truncate(keep_blocks);
+                } else {
+                    while storage.blocks.len() < keep_blocks {
+                        storage.blocks.push(backend.allocate_block()?);
+                    }
                 }
-                storage.len = len;
                 true
             }
         };
@@ -465,26 +441,29 @@ impl FileNode {
         Ok(())
     }
 
-    // AGENT: grow only the visible length; actual blocks are allocated lazily
-    // when a later write stores non-hole bytes.
+    // AGENT: grow the contiguous block map eagerly, replacing the old sparse
+    // visible-length-only behavior.
     pub(crate) fn ensure_data_len_at_least(
         &self,
         backend: &FileStorage,
         len: usize,
     ) -> Result<(), &'static str> {
+        let needed_blocks = Self::blocks_for_len(len)?;
         {
             let storage = self.storage.lock().unwrap();
-            if storage.len < len {
+            if storage.blocks.len() < needed_blocks {
                 drop(storage);
                 self.ensure_metadata_block(backend)?;
             }
         }
         let grew = {
             let mut storage = self.storage.lock().unwrap();
-            if storage.len >= len {
+            if storage.blocks.len() >= needed_blocks {
                 false
             } else {
-                storage.len = len;
+                while storage.blocks.len() < needed_blocks {
+                    storage.blocks.push(backend.allocate_block()?);
+                }
                 true
             }
         };
@@ -514,7 +493,6 @@ impl fmt::Debug for FileNode {
         f.debug_struct("FileNode")
             .field("kind", &self.kind)
             .field("executable", &self.executable.load(Ordering::Relaxed))
-            .field("len", &storage.len)
             .field("blocks", &storage.blocks.len())
             .field("metadata_block", &*self.metadata_block.lock().unwrap())
             .field("entries", &self.dir_entries.lock().unwrap().len())
