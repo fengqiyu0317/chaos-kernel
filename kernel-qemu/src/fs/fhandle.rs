@@ -237,16 +237,6 @@ impl FHandle {
         }
     }
 
-    // AGENT: validate readahead hints without claiming to prefetch through the
-    // current minimal RamBlockDevice backend.
-    pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> {
-        if self.node.kind != FileKind::Regular {
-            return Err("enodev");
-        }
-        offset.checked_add(len).ok_or("efbig")?;
-        Ok(())
-    }
-
     // AGENT: direct allocation validates regular-file semantics and grows the
     // node through the single-lock FileNode helper.
     pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> {
