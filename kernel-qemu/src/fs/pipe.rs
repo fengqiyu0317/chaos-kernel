@@ -5,6 +5,10 @@ use super::*;
 // buffer implementation instead of growing VecDeque without backpressure.
 const PIPE_BUF_CAPACITY: usize = 4 * 1024;
 
+// AGENT: EvBus stores the pipe-wide publication of endpoint readiness bits, so
+// refreshes should only touch pipe-related bits and leave unrelated event bits alone.
+const PIPE_READY_MASK: u32 = EvFlag::READABLE | EvFlag::WRITABLE | EvFlag::ERROR | EvFlag::CLOSED;
+
 // AGENT: pipe endpoint direction is internal to this module; Copy keeps
 // endpoint checks simple without exposing the enum outside pipe handling.
 #[derive(Clone, Copy, PartialEq)]
@@ -26,14 +30,14 @@ impl PipeBuf {
     // AGENT: centralize pipe-buffer construction so PipeNode no longer reaches
     // into CircBuf/EvBus fields when creating endpoint pairs.
     fn new() -> Self {
-        let mut bus = EvBus::default();
-        bus.set(EvFlag::WRITABLE);
-        Self {
+        let mut pipe = Self {
             buf: CircBuf::new(PIPE_BUF_CAPACITY),
-            bus,
+            bus: EvBus::default(),
             readers: 1,
             writers: 1,
-        }
+        };
+        pipe.publish_readiness();
+        pipe
     }
 
     // AGENT: keep endpoint reference accounting with the shared buffer state it
@@ -43,6 +47,7 @@ impl PipeBuf {
             PipeDir::Rd => self.readers += 1,
             PipeDir::Wr => self.writers += 1,
         }
+        self.publish_readiness();
     }
 
     // AGENT: publish peer-close readiness from the buffer owner whenever the
@@ -52,9 +57,7 @@ impl PipeBuf {
             PipeDir::Rd => self.readers -= 1,
             PipeDir::Wr => self.writers -= 1,
         }
-        if self.readers == 0 || self.writers == 0 {
-            self.bus.set(EvFlag::CLOSED);
-        }
+        self.publish_readiness();
     }
 
     // AGENT: compute endpoint-local readiness from the pipe buffer and peer
@@ -83,6 +86,23 @@ impl PipeBuf {
                 ready
             }
         }
+    }
+
+    // AGENT: publish the union of readiness visible to still-live endpoints so
+    // read/write mutations do not open-code partial EvBus bit updates.
+    fn publish_readiness(&mut self) {
+        let mut ready = 0;
+        if self.readers > 0 {
+            ready |= self.readiness(PipeDir::Rd);
+        }
+        if self.writers > 0 {
+            ready |= self.readiness(PipeDir::Wr);
+        }
+        if self.readers == 0 || self.writers == 0 {
+            ready |= EvFlag::CLOSED;
+        }
+
+        self.bus.change(PIPE_READY_MASK & !ready, ready);
     }
 
     // AGENT: attach epoll callbacks to the buffer's EvBus while using the same
@@ -129,15 +149,7 @@ impl PipeBuf {
         for dst in out.iter_mut().take(n) {
             *dst = self.buf.pop().unwrap();
         }
-        let mut clear = 0;
-        let mut set = 0;
-        if self.buf.empty() {
-            clear |= EvFlag::READABLE;
-        }
-        if self.writers > 0 && self.buf.remaining() > 0 {
-            set |= EvFlag::WRITABLE;
-        }
-        self.bus.change(clear, set);
+        self.publish_readiness();
         Ok(n)
     }
 
@@ -148,27 +160,14 @@ impl PipeBuf {
             return Ok(0);
         }
         if self.readers == 0 {
-            self.bus.set(EvFlag::CLOSED | EvFlag::ERROR);
             return Err("broken");
         }
         if self.buf.remaining() == 0 {
-            self.bus.clear(EvFlag::WRITABLE);
             return Err("again");
         }
 
         let written = self.buf.fill_from(input);
-        let clear = if self.buf.remaining() == 0 {
-            EvFlag::WRITABLE
-        } else {
-            0
-        };
-        let set = EvFlag::READABLE
-            | if self.buf.remaining() > 0 {
-                EvFlag::WRITABLE
-            } else {
-                0
-            };
-        self.bus.change(clear, set);
+        self.publish_readiness();
         Ok(written)
     }
 
