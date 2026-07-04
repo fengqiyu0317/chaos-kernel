@@ -1,6 +1,10 @@
 // AGENT
 use super::*;
 
+// AGENT: keep QEMU pipe buffering bounded while reusing the existing byte ring
+// buffer implementation instead of growing VecDeque without backpressure.
+const PIPE_BUF_CAPACITY: usize = 4 * 1024;
+
 // AGENT: pipe endpoint direction is internal to this module; Copy keeps
 // endpoint checks simple without exposing the enum outside pipe handling.
 #[derive(Clone, Copy, PartialEq)]
@@ -12,7 +16,7 @@ enum PipeDir {
 // AGENT: keep shared pipe state private while preserving explicit reader/writer
 // counts for clone/drop peer-close semantics.
 struct PipeBuf {
-    buf: VecDeque<u8>,
+    buf: CircBuf,
     bus: EvBus,
     readers: i32,
     writers: i32,
@@ -81,9 +85,11 @@ impl Drop for PipeNode {
 
 impl PipeNode {
     pub fn pair() -> (PipeNode, PipeNode) {
+        let mut bus = EvBus::default();
+        bus.set(EvFlag::WRITABLE);
         let inner = PipeBuf {
-            buf: VecDeque::new(),
-            bus: EvBus::default(),
+            buf: CircBuf::new(PIPE_BUF_CAPACITY),
+            bus,
             readers: 1,
             writers: 1,
         };
@@ -106,7 +112,7 @@ impl PipeNode {
             PipeDir::Rd => {
                 let eof = d.writers == 0;
                 let mut ready = 0;
-                if !d.buf.is_empty() || eof {
+                if !d.buf.empty() || eof {
                     ready |= EvFlag::READABLE;
                 }
                 if eof {
@@ -119,7 +125,7 @@ impl PipeNode {
                 let mut ready = 0;
                 if broken {
                     ready |= EvFlag::CLOSED | EvFlag::ERROR;
-                } else {
+                } else if d.buf.remaining() > 0 {
                     ready |= EvFlag::WRITABLE;
                 }
                 ready
@@ -174,21 +180,27 @@ impl PipeNode {
             return Ok(0);
         }
         let mut d = self.data.lock().unwrap();
-        if d.buf.is_empty() {
+        if d.buf.empty() {
             return if d.writers == 0 { Ok(0) } else { Err("again") };
         }
 
         let n = min(buf.len(), d.buf.len());
         for dst in buf.iter_mut().take(n) {
-            *dst = d.buf.pop_front().unwrap();
+            *dst = d.buf.pop().unwrap();
         }
-        if d.buf.is_empty() {
-            d.bus.clear(EvFlag::READABLE);
+        let mut clear = 0;
+        let mut set = 0;
+        if d.buf.empty() {
+            clear |= EvFlag::READABLE;
         }
+        if d.writers > 0 && d.buf.remaining() > 0 {
+            set |= EvFlag::WRITABLE;
+        }
+        d.bus.change(clear, set);
         Ok(n)
     }
-    // AGENT: writes publish READABLE and broken-pipe ERROR/CLOSED readiness to
-    // EvBus subscribers.
+    // AGENT: writes publish READABLE/WRITABLE transitions and broken-pipe
+    // ERROR/CLOSED readiness to EvBus subscribers.
     pub fn write_at(&self, buf: &[u8]) -> Result<usize, &'static str> {
         if buf.is_empty() {
             return Ok(0);
@@ -201,10 +213,25 @@ impl PipeNode {
             d.bus.set(EvFlag::CLOSED | EvFlag::ERROR);
             return Err("broken");
         }
+        if d.buf.remaining() == 0 {
+            d.bus.clear(EvFlag::WRITABLE);
+            return Err("again");
+        }
 
-        d.buf.extend(buf.iter().copied());
-        d.bus.set(EvFlag::READABLE);
-        Ok(buf.len())
+        let written = d.buf.fill_from(buf);
+        let clear = if d.buf.remaining() == 0 {
+            EvFlag::WRITABLE
+        } else {
+            0
+        };
+        let set = EvFlag::READABLE
+            | if d.buf.remaining() > 0 {
+                EvFlag::WRITABLE
+            } else {
+                0
+            };
+        d.bus.change(clear, set);
+        Ok(written)
     }
     // AGENT: poll reuses the same readiness bit calculation as epoll
     // registration, so pipe readiness has one local source of truth.

@@ -33,6 +33,7 @@ pub fn run_all() {
     futex_wait_timeout_removes_published_waiter();
     futex_cmp_requeue_propagates_word_read_fault();
     futex_requeue_skips_completed_waiters_when_moving();
+    pipe_uses_bounded_ring_buffer_and_reports_writable();
     pipe_epoll_closed_status_reports_hup_and_err();
     fd_close_detaches_epoll_subscription_before_reuse();
 }
@@ -504,6 +505,25 @@ fn fd_close_detaches_epoll_subscription_before_reuse() {
     let _ = task.close_fd(write_fd);
     let _ = task.close_fd(epfd);
     clear_wait_token_state();
+}
+
+// AGENT: pipe buffers use CircBuf capacity, report full pipes as not writable,
+// and become writable again when reads free ring slots.
+#[cfg_attr(test, test)]
+fn pipe_uses_bounded_ring_buffer_and_reports_writable() {
+    let (read_end, write_end) = PipeNode::pair();
+    let payload = vec![0xA5; 4 * 1024];
+
+    assert!(write_end.poll().writable);
+    assert_eq!(write_end.write_at(&payload), Ok(payload.len()));
+    assert!(!write_end.poll().writable);
+    assert_eq!(write_end.write_at(b"x"), Err("again"));
+    assert_eq!(read_end.readable_len(), payload.len());
+
+    let mut out = [0u8; 4];
+    assert_eq!(read_end.read_at(&mut out), Ok(out.len()));
+    assert_eq!(out, [0xA5; 4]);
+    assert!(write_end.poll().writable);
 }
 
 // AGENT: pipe peer-close state must wake epoll and also survive the level scan
