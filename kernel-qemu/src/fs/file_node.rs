@@ -4,9 +4,9 @@ use super::*;
 
 const FILE_NODE_METADATA_MAGIC: &[u8; 4] = b"FNMD";
 
-// AGENT: keep standalone/test file handles small; full-chain writeback now
-// preserves correctness when a single chain has to recycle slots.
-const STANDALONE_BLOCK_CACHE_CHAINS: usize = 10;
+// AGENT: keep standalone/test file handles within the 1 MiB QEMU early heap;
+// full-chain writeback preserves correctness when a single chain recycles slots.
+const STANDALONE_BLOCK_CACHE_CHAINS: usize = 1;
 
 // AGENT: distinguish regular path files from directory nodes for exec checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,38 +15,80 @@ pub enum FileKind {
     Directory,
 }
 
-// AGENT: allocate root RamBlockDevice blocks for FileNode-backed regular files.
+// AGENT: track root RamBlockDevice block ownership so truncated FileNode data
+// can return space to later files instead of only bumping a high-water mark.
 pub struct FileBlockAllocator {
-    next: AtomicUsize,
+    state: Mutex<FileBlockAllocatorState>,
+}
+
+// AGENT: keep allocator state together because free-list reuse and next-block
+// allocation must be updated atomically with respect to other file operations.
+struct FileBlockAllocatorState {
+    next: usize,
+    free: BTreeSet<usize>,
 }
 
 impl FileBlockAllocator {
+    // AGENT: start with an empty free list and allocate new blocks sequentially.
     pub fn new() -> Self {
         Self {
-            next: AtomicUsize::new(0),
+            state: Mutex::new(FileBlockAllocatorState {
+                next: 0,
+                free: BTreeSet::new(),
+            }),
         }
     }
 
-    fn allocate(&self, device: &RamBlockDevice) -> Result<usize, &'static str> {
-        let block = self.next.fetch_add(1, Ordering::Relaxed);
-        if block >= device.block_count() {
+    // AGENT: prefer cleared blocks returned by FileBlock RAII drops, falling
+    // back to the next never-used block inside the fixed RAM-device capacity.
+    fn allocate_id(&self, device: &RamBlockDevice) -> Result<usize, &'static str> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(block) = state.free.iter().next().copied() {
+            state.free.remove(&block);
+            return Ok(block);
+        }
+
+        if state.next >= device.block_count() {
             return Err("enospc");
         }
+        let block = state.next;
+        state.next += 1;
         Ok(block)
+    }
+
+    // AGENT: FileBlock::drop returns already-cleared blocks here; duplicate
+    // releases would mean block ownership escaped the FileNode map.
+    fn release_owned(&self, block: usize) {
+        let mut state = self.state.lock().unwrap();
+        if block < state.next {
+            let inserted = state.free.insert(block);
+            debug_assert!(inserted, "file block released twice");
+        } else {
+            debug_assert!(false, "file block released outside allocator range");
+        }
+    }
+
+    // AGENT: expose allocator reuse to focused fd/qemu-sync regressions without
+    // making the free-list shape part of the normal filesystem API.
+    #[cfg(any(test, feature = "qemu-sync-selftest"))]
+    fn stats(&self) -> (usize, usize) {
+        let state = self.state.lock().unwrap();
+        (state.next, state.free.len())
     }
 }
 
-// AGENT: share the live block backend between all handles opened from the same
-// Kernel while keeping tests able to build standalone in-memory devices.
-#[derive(Clone)]
-pub struct FileStorage {
+// AGENT: keep the shared block backend in one private object so FileStorage is
+// a cloneable handle while FileBlock only adds single-block ownership.
+struct FileStorageInner {
     cache: Arc<BlockCache>,
     device: Arc<RamBlockDevice>,
     allocator: Arc<FileBlockAllocator>,
 }
 
-impl FileStorage {
-    pub fn new(
+impl FileStorageInner {
+    // AGENT: centralize construction of the backend shared by handles and
+    // owned file blocks.
+    fn new(
         cache: Arc<BlockCache>,
         device: Arc<RamBlockDevice>,
         allocator: Arc<FileBlockAllocator>,
@@ -55,6 +97,76 @@ impl FileStorage {
             cache,
             device,
             allocator,
+        }
+    }
+}
+
+// AGENT: own one backend block and return it to FileBlockAllocator when the
+// FileNode block map drops it after truncation or node teardown.
+struct FileBlock {
+    id: usize,
+    storage: Arc<FileStorageInner>,
+}
+
+impl FileBlock {
+    // AGENT: bind block ownership to the backend used for cache-coherent zeroing
+    // before the allocator is allowed to hand this id to another file.
+    fn new(id: usize, storage: Arc<FileStorageInner>) -> Self {
+        Self { id, storage }
+    }
+
+    // AGENT: keep callers from copying raw ids while still allowing cache I/O
+    // to address the concrete block owned by this RAII wrapper.
+    fn id(&self) -> usize {
+        self.id
+    }
+
+    // AGENT: clear through BlockCache so reused blocks cannot expose stale file
+    // contents from either the RAM backend or a resident dirty cache slot.
+    fn clear_for_release(&self) -> Result<(), &'static str> {
+        let zero = [0u8; BLOCK_CACHE_BLOCK_SIZE];
+        self.storage.cache.write_block_cached(
+            self.storage.device.as_ref(),
+            ROOT_BLOCK_DEVICE,
+            self.id,
+            &zero,
+        )
+    }
+}
+
+impl Drop for FileBlock {
+    // AGENT: make block release RAII-based; if best-effort clearing fails during
+    // an implicit drop, leak the block instead of reusing stale contents.
+    fn drop(&mut self) {
+        if self.clear_for_release().is_ok() {
+            self.storage.allocator.release_owned(self.id);
+        }
+    }
+}
+
+impl fmt::Debug for FileBlock {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("FileBlock").field("id", &self.id).finish()
+    }
+}
+
+// AGENT: share the live block backend between all handles opened from the same
+// Kernel while keeping tests able to build standalone in-memory devices.
+#[derive(Clone)]
+pub struct FileStorage {
+    inner: Arc<FileStorageInner>,
+}
+
+impl FileStorage {
+    // AGENT: keep FileStorage as a cheap handle over the shared backend instead
+    // of duplicating the backend fields in every owned block.
+    pub fn new(
+        cache: Arc<BlockCache>,
+        device: Arc<RamBlockDevice>,
+        allocator: Arc<FileBlockAllocator>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(FileStorageInner::new(cache, device, allocator)),
         }
     }
 
@@ -66,30 +178,49 @@ impl FileStorage {
         )
     }
 
-    fn allocate_block(&self) -> Result<usize, &'static str> {
-        self.allocator.allocate(self.device.as_ref())
+    // AGENT: allocate an owned backend block tied to this storage's cache,
+    // device, and allocator so FileNode truncation can release it by dropping.
+    fn allocate_block(&self) -> Result<FileBlock, &'static str> {
+        let id = self
+            .inner
+            .allocator
+            .allocate_id(self.inner.device.as_ref())?;
+        Ok(FileBlock::new(id, self.inner.clone()))
     }
 
     fn read_block(&self, block: usize) -> Result<Vec<u8>, &'static str> {
-        self.cache
-            .read_block_cached(self.device.as_ref(), ROOT_BLOCK_DEVICE, block)
+        self.inner
+            .cache
+            .read_block_cached(self.inner.device.as_ref(), ROOT_BLOCK_DEVICE, block)
     }
 
     // AGENT: route file-block writes through BlockCache's write-back path.
     fn write_block(&self, block: usize, data: &[u8]) -> Result<(), &'static str> {
-        self.cache
-            .write_block_cached(self.device.as_ref(), ROOT_BLOCK_DEVICE, block, data)
+        self.inner.cache.write_block_cached(
+            self.inner.device.as_ref(),
+            ROOT_BLOCK_DEVICE,
+            block,
+            data,
+        )
     }
 
     // AGENT: sync writes dirty cache slots back to the shared RAM block device.
     fn flush(&self) -> Result<usize, &'static str> {
-        self.cache.flush_dirty(self.device.as_ref())
+        self.inner.cache.flush_dirty(self.inner.device.as_ref())
+    }
+
+    // AGENT: expose allocator reuse to fd regressions without leaking raw block
+    // ownership outside FileNode in normal builds.
+    #[cfg(any(test, feature = "qemu-sync-selftest"))]
+    pub(crate) fn allocator_stats(&self) -> (usize, usize) {
+        self.inner.allocator.stats()
     }
 }
 
+// AGENT: FileNodeBlocks owns the data-block RAII wrappers for one regular file.
 #[derive(Debug)]
 struct FileNodeBlocks {
-    blocks: Vec<usize>,
+    blocks: Vec<FileBlock>,
 }
 
 impl FileNodeBlocks {
@@ -104,7 +235,7 @@ pub struct FileNode {
     pub kind: FileKind,
     pub executable: AtomicBool,
     storage: Mutex<FileNodeBlocks>,
-    metadata_block: Mutex<Option<usize>>,
+    metadata_block: Mutex<Option<FileBlock>>,
     dir_entries: Arc<Mutex<Vec<String>>>,
 }
 
@@ -209,7 +340,7 @@ impl FileNode {
             storage.blocks.push(backend.allocate_block()?);
             allocated = true;
         }
-        Ok((storage.blocks[file_block], allocated))
+        Ok((storage.blocks[file_block].id(), allocated))
     }
 
     fn blocks_for_len(len: usize) -> Result<usize, &'static str> {
@@ -257,8 +388,8 @@ impl FileNode {
         Self::put_metadata_u64(&mut payload, &mut cursor, storage.blocks.len());
         Self::put_metadata_u64(&mut payload, &mut cursor, entries.len());
 
-        for &block in storage.blocks.iter() {
-            Self::put_metadata_u64(&mut payload, &mut cursor, block.saturating_add(1));
+        for block in storage.blocks.iter() {
+            Self::put_metadata_u64(&mut payload, &mut cursor, block.id().saturating_add(1));
         }
         for entry in entries.iter() {
             Self::put_metadata_u64(&mut payload, &mut cursor, entry.len());
@@ -270,12 +401,13 @@ impl FileNode {
 
     fn ensure_metadata_block(&self, backend: &FileStorage) -> Result<usize, &'static str> {
         let mut metadata_block = self.metadata_block.lock().unwrap();
-        if let Some(block) = *metadata_block {
-            return Ok(block);
+        if let Some(block) = metadata_block.as_ref() {
+            return Ok(block.id());
         }
         let block = backend.allocate_block()?;
+        let id = block.id();
         *metadata_block = Some(block);
-        Ok(block)
+        Ok(id)
     }
 
     // AGENT: encode FileNode-owned metadata through BlockCache so metadata
@@ -321,7 +453,7 @@ impl FileNode {
             let file_block = abs / BLOCK_CACHE_BLOCK_SIZE;
             let block_off = abs % BLOCK_CACHE_BLOCK_SIZE;
             let n = min(total - copied, BLOCK_CACHE_BLOCK_SIZE - block_off);
-            let block = storage.blocks[file_block];
+            let block = storage.blocks[file_block].id();
             let block_data = backend.read_block(block)?;
             buf[copied..copied + n].copy_from_slice(&block_data[block_off..block_off + n]);
             copied += n;
@@ -421,6 +553,9 @@ impl FileNode {
                 false
             } else {
                 if keep_blocks < storage.blocks.len() {
+                    for block in storage.blocks[keep_blocks..].iter() {
+                        block.clear_for_release()?;
+                    }
                     storage.blocks.truncate(keep_blocks);
                 } else {
                     while storage.blocks.len() < keep_blocks {

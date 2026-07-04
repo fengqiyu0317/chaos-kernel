@@ -5,6 +5,7 @@ use super::*;
 // AGENT: keep the QEMU boot selftest aggregator in the moved fd test module.
 pub fn run_all() {
     set_len_tracks_block_rounded_growth();
+    truncate_releases_blocks_for_reuse_without_old_contents();
     fallocate_validates_and_only_grows_regular_files();
     lookup_reports_node_local_errors();
     regular_file_poll_and_ioctl_are_explicit();
@@ -48,6 +49,37 @@ fn set_len_tracks_block_rounded_growth() {
 
     let ro = FHandle::with_data("/tmp/ro", FdOpt::default(), vec![1, 2, 3]);
     assert_eq!(ro.set_len(0), Err("ebadf"));
+}
+
+// AGENT: truncation must return cleared blocks to the shared FileStorage
+// allocator so later files can reuse space without observing stale contents.
+#[cfg_attr(test, test)]
+fn truncate_releases_blocks_for_reuse_without_old_contents() {
+    let storage = FileStorage::new(
+        Arc::new(BlockCache::new(1)),
+        Arc::new(RamBlockDevice::empty()),
+        Arc::new(FileBlockAllocator::new()),
+    );
+    let first_node = Arc::new(FileNode::regular(false));
+    let first =
+        FHandle::with_node_on_storage("/tmp/first", writable_opt(), first_node, storage.clone());
+    first
+        .write_at(0, &vec![0x5a; BLOCK_CACHE_BLOCK_SIZE * 2])
+        .unwrap();
+    assert_eq!(storage.allocator_stats(), (3, 0));
+
+    first.set_len(0).unwrap();
+    assert_eq!(first.node.len(), 0);
+    assert_eq!(storage.allocator_stats(), (3, 2));
+
+    let second_node = Arc::new(FileNode::regular(false));
+    let second =
+        FHandle::with_node_on_storage("/tmp/second", writable_opt(), second_node, storage.clone());
+    second.fallocate(0, BLOCK_CACHE_BLOCK_SIZE).unwrap();
+    assert_eq!(storage.allocator_stats(), (3, 0));
+
+    let reused = file_bytes(&second, 0, BLOCK_CACHE_BLOCK_SIZE);
+    assert!(reused.iter().all(|&byte| byte == 0));
 }
 
 // AGENT: moved fallocate regression to block-rounded FileNode length behavior.

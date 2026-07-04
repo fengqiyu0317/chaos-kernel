@@ -9,7 +9,6 @@ pub mod fd;
 pub mod file_node;
 pub mod fs_misc;
 pub mod mount_io_disk;
-pub mod page_cache;
 pub mod pipe;
 pub mod tty;
 
@@ -21,6 +20,5 @@ pub use self::fd::*;
 pub use self::file_node::*;
 pub use self::fs_misc::*;
 pub use self::mount_io_disk::*;
-pub use self::page_cache::*;
 pub use self::pipe::*;
 pub use self::tty::*;
