@@ -1,3 +1,5 @@
-// AGENT: chaos-tests now consumes the legacy-compatible root API from
-// kernel-sim instead of carrying a local compatibility patch.
-pub use kernel_sim::*;
+// AGENT: test the monolithic kernel/src/kernel.rs file directly.
+#[path = "../../kernel/src/kernel.rs"]
+pub mod kernel;
+
+pub use kernel::*;
