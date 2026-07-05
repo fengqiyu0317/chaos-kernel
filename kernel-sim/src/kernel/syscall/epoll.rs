@@ -1,7 +1,7 @@
 // AGENT
 use super::*;
 
-pub(super) fn sys_epoll_create(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_epoll_create(kernel: &RuntimeKernel, a0: usize) -> Result<usize, &'static str> {
     let size = a0;
     if size == 0 {
         return Err("einval");
@@ -24,7 +24,7 @@ pub(super) fn sys_epoll_create(kernel: &Kernel, a0: usize) -> Result<usize, &'st
 // AGENT: epoll_ctl mirrors source-backed registrations into cancellable EvBus
 // subscriptions after updating the epoll interest table.
 pub(super) fn sys_epoll_ctl(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     a0: usize,
     a1: usize,
     a2: usize,
@@ -99,7 +99,7 @@ pub(super) fn sys_epoll_ctl(
 // AGENT: epoll_wait now sleeps on EpInst.waiters and is woken by registered
 // source readiness callbacks instead of spinning with thread::yield_now().
 pub(super) fn sys_epoll_wait(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     a0: usize,
     a1: usize,
     a2: usize,

@@ -5,7 +5,7 @@ fn returning(result: Result<usize, &'static str>) -> Result<SyscallOutcome, &'st
     result.map(SyscallOutcome::Return)
 }
 
-impl Kernel {
+impl RuntimeKernel {
     pub fn dispatch_syscall(
         &self,
         nr: usize,
@@ -19,7 +19,7 @@ impl Kernel {
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
         let _ts_enter = CLK.load(Ordering::Relaxed);
         // AGENT: caller_token mirrors the current address-space token for syscall
-        // entry bookkeeping; user-memory access is routed through Task.addr_space.
+        // entry bookkeeping; user-memory access is routed through RuntimeTask.addr_space.
         let _caller_token = {
             let cpus = self.cpus.lock().unwrap();
             cpus.iter()

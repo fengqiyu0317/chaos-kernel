@@ -1,14 +1,14 @@
 // AGENT
 use super::*;
 
-pub(super) fn sys_fork(kernel: &Kernel, _caller_token: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_fork(kernel: &RuntimeKernel, _caller_token: usize) -> Result<usize, &'static str> {
     let parent_id = kernel.cur_task(0).map(|task| task.id()).ok_or("esrch")?;
     // AGENT: keep syscall fork as a thin wrapper around the real fork path.
     kernel.do_fork(parent_id)
 }
 
 pub(super) fn sys_exec(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     a0: usize,
     a1: usize,
     a2: usize,
@@ -80,13 +80,13 @@ fn read_user_string_array(
     Err("e2big")
 }
 
-pub(super) fn sys_exit(kernel: &Kernel, a0: usize) -> Result<SyscallOutcome, &'static str> {
+pub(super) fn sys_exit(kernel: &RuntimeKernel, a0: usize) -> Result<SyscallOutcome, &'static str> {
     kernel.do_exit_current(0, a0)?;
     Ok(SyscallOutcome::NoReturn)
 }
 
 pub(super) fn sys_wait4(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     a0: usize,
     a1: usize,
     a2: usize,
@@ -116,7 +116,7 @@ pub(super) fn sys_wait4(
     Ok(pid)
 }
 
-pub(super) fn sys_getpid(kernel: &Kernel) -> Result<usize, &'static str> {
+pub(super) fn sys_getpid(kernel: &RuntimeKernel) -> Result<usize, &'static str> {
     let cur = kernel.cur_task(0);
     match cur {
         Some(t) => Ok(t.process_pid()),
@@ -124,7 +124,7 @@ pub(super) fn sys_getpid(kernel: &Kernel) -> Result<usize, &'static str> {
     }
 }
 
-pub(super) fn sys_getppid(kernel: &Kernel) -> Result<usize, &'static str> {
+pub(super) fn sys_getppid(kernel: &RuntimeKernel) -> Result<usize, &'static str> {
     let cur = kernel.cur_task(0);
     match cur {
         Some(t) => {
@@ -138,7 +138,7 @@ pub(super) fn sys_getppid(kernel: &Kernel) -> Result<usize, &'static str> {
     }
 }
 
-pub(super) fn sys_setpgid(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_setpgid(kernel: &RuntimeKernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let pid = a0;
     let pgid = a1;
     let cur = kernel.cur_task(0);
@@ -168,7 +168,7 @@ pub(super) fn sys_setpgid(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize
     Ok(0)
 }
 
-pub(super) fn sys_getpgid(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_getpgid(kernel: &RuntimeKernel, a0: usize) -> Result<usize, &'static str> {
     let pid = a0;
     let cur = kernel.cur_task(0);
     let target = if pid == 0 {
@@ -185,7 +185,7 @@ pub(super) fn sys_getpgid(kernel: &Kernel, a0: usize) -> Result<usize, &'static 
     }
 }
 
-pub(super) fn sys_setsid(kernel: &Kernel) -> Result<usize, &'static str> {
+pub(super) fn sys_setsid(kernel: &RuntimeKernel) -> Result<usize, &'static str> {
     let cur = kernel.cur_task(0);
     if let Some(t) = cur {
         let pid = t.process_pid();

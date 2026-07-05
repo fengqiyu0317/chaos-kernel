@@ -7,7 +7,7 @@ struct PreparedExec {
     close_fds: Vec<usize>,
 }
 
-impl Kernel {
+impl RuntimeKernel {
     // AGENT: read a stable executable snapshot from the unified path file table.
     fn read_file_for_exec(&self, path: &str) -> Result<Vec<u8>, &'static str> {
         let node = self
@@ -30,7 +30,7 @@ impl Kernel {
     // AGENT: prepare exec from a path-backed executable file snapshot.
     fn prepare_exec_image(
         &self,
-        task: &Arc<Task>,
+        task: &Arc<RuntimeTask>,
         path: &str,
         args: Vec<String>,
         envs: Vec<String>,
@@ -125,7 +125,7 @@ impl Kernel {
         })
     }
 
-    fn commit_exec(&self, task: &Arc<Task>, prepared: PreparedExec) {
+    fn commit_exec(&self, task: &Arc<RuntimeTask>, prepared: PreparedExec) {
         {
             let mut files = task.process.files.lock().unwrap();
             for fd in prepared.close_fds {

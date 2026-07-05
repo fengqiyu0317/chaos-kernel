@@ -1,8 +1,8 @@
 use super::*;
 
-impl Kernel {
+impl RuntimeKernel {
     // AGENT: central signal enqueue path so sleeping tasks can be made runnable.
-    pub fn send_signal_to_task(&self, task: &Arc<Task>, signo: i32, sender_tid: isize) {
+    pub fn send_signal_to_task(&self, task: &Arc<RuntimeTask>, signo: i32, sender_tid: isize) {
         task.send_sig(signo, sender_tid);
         if task.done() {
             return;

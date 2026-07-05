@@ -17,7 +17,7 @@ pub struct SigFrame {
     pub sender_tid: isize,
 }
 
-// AGENT: signal selected from Task::sig_queue with its disposition snapshot.
+// AGENT: signal selected from RuntimeTask::sig_queue with its disposition snapshot.
 #[derive(Clone)]
 pub struct PendingSignal {
     pub signo: u32,

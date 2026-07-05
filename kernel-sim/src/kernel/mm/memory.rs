@@ -34,21 +34,21 @@ pub fn k_off(va: usize) -> usize {
     r
 }
 
-// AGENT: PgFrame is the RAII mapping handle for a physical frame; cloning it
+// AGENT: RuntimePgFrame is the RAII mapping handle for a physical frame; cloning it
 // represents another PTE sharing that frame.
 #[derive(Clone)]
-pub struct PgFrame {
+pub struct RuntimePgFrame {
     inner: Arc<PgFrameInner>,
 }
 
-// AGENT: return the frame to its pool when the final PgFrame mapping handle drops.
+// AGENT: return the frame to its pool when the final RuntimePgFrame mapping handle drops.
 struct PgFrameInner {
     id: usize,
     slots: Arc<Mutex<Vec<bool>>>,
     base_paddr: usize,
 }
 
-impl PgFrame {
+impl RuntimePgFrame {
     pub(crate) fn from_allocated(
         id: usize,
         slots: Arc<Mutex<Vec<bool>>>,
@@ -93,14 +93,14 @@ impl Drop for PgFrameInner {
     }
 }
 
-// AGENT: legacy standalone refcount frame used by chaos-tests, kept separate
-// from the simulator RAII PgFrame used by address spaces.
-pub struct LegacyPgFrame {
+// AGENT: standalone refcount frame used by chaos-tests; the full simulator
+// address-space frame handle is RuntimePgFrame.
+pub struct PgFrame {
     pub rc: AtomicUsize,
 }
 
 // AGENT: expose the old atomic refcount helpers expected by chaos-tests.
-impl LegacyPgFrame {
+impl PgFrame {
     pub fn new() -> Self {
         Self {
             rc: AtomicUsize::new(0),

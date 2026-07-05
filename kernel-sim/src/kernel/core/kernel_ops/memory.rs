@@ -1,6 +1,6 @@
 use super::*;
 
-impl Kernel {
+impl RuntimeKernel {
     // AGENT: keep the basic simulator page-fault probe with memory operations.
     pub fn handle_pgfault(&self, addr: usize) -> bool {
         let _page = addr & !(PAGE_SZ - 1);

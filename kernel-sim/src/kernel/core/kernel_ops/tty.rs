@@ -1,6 +1,6 @@
 use super::*;
 
-impl Kernel {
+impl RuntimeKernel {
     // AGENT: normalize terminal input and append it to the simulator TTY buffer.
     pub fn tty_push(&self, c: u8) {
         let byte = if c == b'\r' { b'\n' } else { c };

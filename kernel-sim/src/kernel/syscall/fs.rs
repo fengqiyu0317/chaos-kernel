@@ -4,7 +4,7 @@ use super::*;
 const MAX_RW_COUNT: usize = PAGE_SZ * 16;
 
 // AGENT: read a NUL-terminated path from the current user address space.
-fn read_user_path(task: &Task, addr: usize) -> Result<String, &'static str> {
+fn read_user_path(task: &RuntimeTask, addr: usize) -> Result<String, &'static str> {
     if addr == 0 {
         return Err("efault");
     }
@@ -38,7 +38,7 @@ fn fdopt_to_open_flags(opt: FdOpt) -> usize {
 }
 
 pub(super) fn sys_read(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     a0: usize,
     a1: usize,
     a2: usize,
@@ -72,7 +72,7 @@ pub(super) fn sys_read(
 }
 
 pub(super) fn sys_write(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     a0: usize,
     a1: usize,
     a2: usize,
@@ -105,7 +105,7 @@ pub(super) fn sys_write(
 }
 
 pub(super) fn sys_open(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     a0: usize,
     a1: usize,
     a2: usize,
@@ -174,7 +174,7 @@ pub(super) fn sys_open(
     Ok(fd)
 }
 
-pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_close(kernel: &RuntimeKernel, a0: usize) -> Result<usize, &'static str> {
     let fd = a0;
     // AGENT: use the fd limit instead of the process-count constant.
     if fd >= MAX_FD {
@@ -188,7 +188,7 @@ pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static st
 }
 
 pub(super) fn sys_stat(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     nr: usize,
     a0: usize,
     a1: usize,
@@ -216,7 +216,7 @@ pub(super) fn sys_stat(
 }
 
 pub(super) fn sys_ioctl(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     a0: usize,
     a1: usize,
     a2: usize,
@@ -267,7 +267,7 @@ pub(super) fn sys_ioctl(
     }
 }
 
-pub(super) fn sys_pipe(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_pipe(kernel: &RuntimeKernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let fds_addr = a0;
     let pipe_flags = a1;
     if fds_addr == 0 {
@@ -294,7 +294,7 @@ pub(super) fn sys_pipe(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
     }
 }
 
-pub(super) fn sys_dup(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_dup(kernel: &RuntimeKernel, a0: usize) -> Result<usize, &'static str> {
     // AGENT: fixed — was not checking old_fd existence, not duplicating file object, and searching from old_fd instead of 0
     let old_fd = a0;
     // AGENT: validate fd number against the fd limit, not N_PROC.
@@ -305,7 +305,7 @@ pub(super) fn sys_dup(kernel: &Kernel, a0: usize) -> Result<usize, &'static str>
     task.dup_fd(old_fd, false)
 }
 
-pub(super) fn sys_dup2(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_dup2(kernel: &RuntimeKernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let old_fd = a0;
     let new_fd = a1;
     // AGENT: validate both fd numbers against the fd limit, not N_PROC.
@@ -323,7 +323,7 @@ pub(super) fn sys_dup2(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
 }
 
 pub(super) fn sys_fcntl(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     a0: usize,
     a1: usize,
     a2: usize,

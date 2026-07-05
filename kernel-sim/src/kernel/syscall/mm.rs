@@ -3,7 +3,7 @@ use super::*;
 
 // AGENT: validate mmap flags/protections and route anonymous versus file-backed mappings.
 pub(super) fn sys_mmap(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     a0: usize,
     a1: usize,
     a2: usize,
@@ -114,7 +114,7 @@ pub(super) fn sys_mmap(
 
 // AGENT: reject invalid munmap parameters before mutating address-space state,
 // then propagate unmap/writeback failures from the address-space layer.
-pub(super) fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_munmap(kernel: &RuntimeKernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let addr = a0;
     let len = a1;
     if len == 0 || addr % PAGE_SZ != 0 {
@@ -138,7 +138,7 @@ pub(super) fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize,
 // program break separately from the mapped heap extent, preserve the intended
 // raw-syscall or libc-wrapper failure semantics, enforce start_brk/min_brk, and
 // move heap pages toward lazy allocation.
-pub(super) fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_brk(kernel: &RuntimeKernel, a0: usize) -> Result<usize, &'static str> {
     let new_brk = a0;
     if new_brk == 0 {
         return Ok(kernel

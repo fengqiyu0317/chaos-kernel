@@ -1,6 +1,6 @@
 use super::*;
 
-impl Kernel {
+impl RuntimeKernel {
     // AGENT: create the simulator init task and install it as CPU0's current task.
     pub fn proc_init(&self) {
         let root = self.tasks.spawn_root();
@@ -20,7 +20,7 @@ impl Kernel {
         Ok(())
     }
 
-    pub(crate) fn exit_task(&self, cpu: usize, task: &Arc<Task>, reason: ExitReason) {
+    pub(crate) fn exit_task(&self, cpu: usize, task: &Arc<RuntimeTask>, reason: ExitReason) {
         let thread_ids = task.process.threads.lock().unwrap().clone();
         if !task.exit_proc(reason) {
             return;
@@ -100,7 +100,7 @@ impl Kernel {
     ) -> Result<(usize, usize), &'static str> {
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let wnohang = (options & 1) != 0;
-        let children: Vec<Arc<Task>> = parent.process.subtasks.lock().unwrap().clone();
+        let children: Vec<Arc<RuntimeTask>> = parent.process.subtasks.lock().unwrap().clone();
         if children.is_empty() {
             return Err("echild");
         }

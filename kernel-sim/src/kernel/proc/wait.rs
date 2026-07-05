@@ -54,7 +54,7 @@ impl ProcessGroup {
         self.foreground.load(Ordering::Relaxed)
     }
 
-    pub fn broadcast_signal(&self, signo: i32, tasks: &TaskTable) {
+    pub fn broadcast_signal(&self, signo: i32, tasks: &RuntimeTaskTable) {
         let members = self.members.lock().unwrap();
         let member_ids = members.clone();
         drop(members);

@@ -48,7 +48,7 @@ impl PageBacking {
 // AGENT: page-table entries own a RAII frame handle plus backing metadata for
 // mmap writeback.
 pub struct PageTableEntry {
-    pub frame: PgFrame,
+    pub frame: RuntimePgFrame,
     pub data: Arc<Mutex<Vec<u8>>>,
     pub backing: PageBacking,
     pub flags: u32,
@@ -59,12 +59,12 @@ pub struct PageTableEntry {
 
 impl PageTableEntry {
     // AGENT: default page-table entries are anonymous zero-filled pages.
-    pub fn new(frame: PgFrame, flags: u32) -> Self {
+    pub fn new(frame: RuntimePgFrame, flags: u32) -> Self {
         Self::with_backing(frame, flags, PageBacking::Anonymous)
     }
 
     // AGENT: allow mmap to seed resident pages with file backing metadata.
-    pub fn with_backing(frame: PgFrame, flags: u32, backing: PageBacking) -> Self {
+    pub fn with_backing(frame: RuntimePgFrame, flags: u32, backing: PageBacking) -> Self {
         Self {
             frame,
             data: Arc::new(Mutex::new(vec![0; PAGE_SZ])),
@@ -81,7 +81,7 @@ impl PageTableEntry {
         self.cow = true;
     }
 
-    fn resolve_write(&mut self, frame: PgFrame, data: Vec<u8>) {
+    fn resolve_write(&mut self, frame: RuntimePgFrame, data: Vec<u8>) {
         self.frame = frame;
         self.data = Arc::new(Mutex::new(data));
         self.writable = self.flags & VM_WRITE != 0;

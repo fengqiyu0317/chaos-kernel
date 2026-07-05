@@ -17,7 +17,7 @@ fn ticks_to_timespec(ticks: usize) -> ClockTimeSpec {
 }
 
 pub(super) fn sys_clock_gettime(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     a0: usize,
     a1: usize,
 ) -> Result<usize, &'static str> {

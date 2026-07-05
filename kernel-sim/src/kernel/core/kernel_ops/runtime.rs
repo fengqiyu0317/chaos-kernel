@@ -19,8 +19,8 @@ pub struct KernelRuntimeTicker {
 }
 
 impl KernelRuntimeTicker {
-    // AGENT: start one 100Hz runtime ticker for an explicitly Arc-owned Kernel.
-    pub fn start(kernel: Arc<Kernel>) -> Result<Self, &'static str> {
+    // AGENT: start one 100Hz runtime ticker for an explicitly Arc-owned RuntimeKernel.
+    pub fn start(kernel: Arc<RuntimeKernel>) -> Result<Self, &'static str> {
         if RUNTIME_TICKER_ACTIVE
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -74,14 +74,14 @@ impl KernelRuntimeTicker {
 }
 
 impl Drop for KernelRuntimeTicker {
-    // AGENT: dropping the guard stops the ticker before the Kernel Arc can be released.
+    // AGENT: dropping the guard stops the ticker before the RuntimeKernel Arc can be released.
     fn drop(&mut self) {
         self.stop();
     }
 }
 
-impl Kernel {
-    // AGENT: keep simulator tick/GKL/cache maintenance out of the Kernel state
+impl RuntimeKernel {
+    // AGENT: keep simulator tick/GKL/cache maintenance out of the RuntimeKernel state
     // definition and use guard-based GKL release.
     pub fn tick(&self, id: usize) {
         // AGENT: route GKL through the guard so Drop performs owner-checked release.
@@ -108,7 +108,7 @@ impl Kernel {
     }
 
     // AGENT: expose the per-CPU current-task slot used by scheduling and syscalls.
-    pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
+    pub fn cur_task(&self, cpu: usize) -> Option<Arc<RuntimeTask>> {
         let cg = self.cpus.lock().unwrap();
         if cpu >= cg.len() {
             return None;
@@ -124,7 +124,7 @@ impl Kernel {
     }
 
     // AGENT: update the per-CPU current-task slot without keeping the old task alive.
-    pub fn set_cur(&self, cpu: usize, t: Option<Arc<Task>>) {
+    pub fn set_cur(&self, cpu: usize, t: Option<Arc<RuntimeTask>>) {
         let mut cg = self.cpus.lock().unwrap();
         if cpu < cg.len() {
             if cpu == 0 {

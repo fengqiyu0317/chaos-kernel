@@ -2,7 +2,7 @@
 use super::*;
 
 pub(super) fn sys_futex(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     a0: usize,
     a1: usize,
     a2: usize,

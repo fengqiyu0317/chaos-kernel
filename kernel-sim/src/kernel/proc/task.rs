@@ -22,7 +22,7 @@ impl fmt::Display for Pid {
 }
 
 #[derive(Clone, Debug)]
-pub struct TaskInfo {
+pub struct RuntimeTaskInfo {
     pub id: usize,
     pub tag: String,
 }
@@ -57,8 +57,8 @@ pub struct ProcessState {
     // AGENT: debug-only descriptor names used by smoke tests; real descriptors
     // live in ProcessState::files below.
     pub debug_fds: Mutex<Vec<String>>,
-    pub parent: Mutex<Option<Arc<Task>>>,
-    pub subtasks: Mutex<Vec<Arc<Task>>>,
+    pub parent: Mutex<Option<Arc<RuntimeTask>>>,
+    pub subtasks: Mutex<Vec<Arc<RuntimeTask>>>,
     pub files: Mutex<BTreeMap<usize, FdEntry>>,
     pub cwd: Mutex<String>,
     pub exec_path: Mutex<String>,
@@ -177,8 +177,8 @@ impl Default for ThdCtx {
     }
 }
 
-pub struct Task {
-    pub info: Mutex<TaskInfo>,
+pub struct RuntimeTask {
+    pub info: Mutex<RuntimeTaskInfo>,
     pub process: Arc<ProcessState>,
     pub sig_mask: Mutex<u64>,
     pub kstk: Mutex<Option<KStk>>,
@@ -186,7 +186,7 @@ pub struct Task {
     pub sched: Mutex<SchedEntity>,
 }
 
-impl Task {
+impl RuntimeTask {
     pub fn make(id: usize, tag: &str) -> Arc<Self> {
         Self::make_with_process(id, tag, ProcessState::new_shared())
     }
@@ -198,7 +198,7 @@ impl Task {
     fn make_with_process(id: usize, tag: &str, process: Arc<ProcessState>) -> Arc<Self> {
         let _kobj_stamp = CLK.load(Ordering::Relaxed);
         Arc::new(Self {
-            info: Mutex::new(TaskInfo {
+            info: Mutex::new(RuntimeTaskInfo {
                 id,
                 tag: tag.to_string(),
             }),
@@ -221,10 +221,10 @@ impl Task {
     pub fn process_pid(&self) -> usize {
         self.process.pid.lock().unwrap().get()
     }
-    pub fn link_parent(&self, p: &Arc<Task>) {
+    pub fn link_parent(&self, p: &Arc<RuntimeTask>) {
         *self.process.parent.lock().unwrap() = Some(p.clone());
     }
-    pub fn link_child(&self, c: &Arc<Task>) {
+    pub fn link_child(&self, c: &Arc<RuntimeTask>) {
         self.process.subtasks.lock().unwrap().push(c.clone());
     }
     pub fn done(&self) -> bool {
@@ -296,7 +296,7 @@ impl Task {
     pub fn get_futex(&self) -> Arc<FutexBucket> {
         self.process.futex.clone()
     }
-    // AGENT: record process death once; resource teardown is driven by Kernel::exit_task.
+    // AGENT: record process death once; resource teardown is driven by RuntimeKernel::exit_task.
     pub fn exit_proc(&self, reason: ExitReason) -> bool {
         {
             let mut exit_reason = self.process.exit_reason.lock().unwrap();
@@ -478,7 +478,7 @@ impl Task {
     }
 }
 
-impl fmt::Debug for Task {
+impl fmt::Debug for RuntimeTask {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let d = self.info.lock().unwrap();
         f.debug_struct("T")
@@ -488,15 +488,15 @@ impl fmt::Debug for Task {
     }
 }
 
-pub struct TaskTable {
-    pub map: RwLock<BTreeMap<usize, Arc<Task>>>,
+pub struct RuntimeTaskTable {
+    pub map: RwLock<BTreeMap<usize, Arc<RuntimeTask>>>,
     pub seq: AtomicUsize,
-    pub root: Mutex<Option<Arc<Task>>>,
+    pub root: Mutex<Option<Arc<RuntimeTask>>>,
     // AGENT: reserve capacity for forks in progress so concurrent fork callers
     // cannot all pass the process-table limit check before registration.
     fork_reservations: AtomicUsize,
 }
-impl TaskTable {
+impl RuntimeTaskTable {
     pub fn new() -> Self {
         Self {
             map: RwLock::new(BTreeMap::new()),
@@ -505,22 +505,22 @@ impl TaskTable {
             fork_reservations: AtomicUsize::new(0),
         }
     }
-    pub fn spawn(&self, tag: &str) -> Arc<Task> {
+    pub fn spawn(&self, tag: &str) -> Arc<RuntimeTask> {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
-        let t = Task::make(id, tag);
+        let t = RuntimeTask::make(id, tag);
         *t.process.pid.lock().unwrap() = Pid(id);
         self.map.write().unwrap().insert(id, t.clone());
         t
     }
-    pub fn spawn_root(&self) -> Arc<Task> {
+    pub fn spawn_root(&self) -> Arc<RuntimeTask> {
         let t = self.spawn("init");
         *self.root.lock().unwrap() = Some(t.clone());
         t
     }
-    pub fn find(&self, id: usize) -> Option<Arc<Task>> {
+    pub fn find(&self, id: usize) -> Option<Arc<RuntimeTask>> {
         self.map.read().unwrap().get(&id).cloned()
     }
-    pub fn find_by_tag(&self, tag: &str) -> Vec<Arc<Task>> {
+    pub fn find_by_tag(&self, tag: &str) -> Vec<Arc<RuntimeTask>> {
         self.map
             .read()
             .unwrap()
@@ -529,7 +529,7 @@ impl TaskTable {
             .cloned()
             .collect()
     }
-    pub fn process_of_tid(&self, tid: usize) -> Option<Arc<Task>> {
+    pub fn process_of_tid(&self, tid: usize) -> Option<Arc<RuntimeTask>> {
         self.map
             .read()
             .unwrap()
@@ -537,7 +537,7 @@ impl TaskTable {
             .find(|t| t.process.threads.lock().unwrap().contains(&tid))
             .cloned()
     }
-    pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> {
+    pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<RuntimeTask>> {
         let mut seen = BTreeSet::new();
         self.map
             .read()
@@ -548,7 +548,7 @@ impl TaskTable {
             .cloned()
             .collect()
     }
-    pub fn register(&self, task: &Arc<Task>, pid: Pid) {
+    pub fn register(&self, task: &Arc<RuntimeTask>, pid: Pid) {
         *task.process.pid.lock().unwrap() = pid.clone();
         self.map.write().unwrap().insert(pid.get(), task.clone());
     }
@@ -563,7 +563,7 @@ impl TaskTable {
                     .unwrap()
                     .retain(|child| child.id() != id);
             }
-            let ch: Vec<Arc<Task>> = t.process.subtasks.lock().unwrap().drain(..).collect();
+            let ch: Vec<Arc<RuntimeTask>> = t.process.subtasks.lock().unwrap().drain(..).collect();
             let rt = self.root.lock().unwrap().clone();
             if let Some(ref r) = rt {
                 for c in ch {
@@ -588,8 +588,8 @@ impl TaskTable {
             map.remove(&id);
         }
     }
-    pub fn reparent_children_to_init(&self, task: &Arc<Task>) {
-        let children: Vec<Arc<Task>> = task.process.subtasks.lock().unwrap().drain(..).collect();
+    pub fn reparent_children_to_init(&self, task: &Arc<RuntimeTask>) {
+        let children: Vec<Arc<RuntimeTask>> = task.process.subtasks.lock().unwrap().drain(..).collect();
         if children.is_empty() {
             return;
         }
@@ -630,7 +630,7 @@ impl TaskTable {
             }
         }
     }
-    pub fn fork_task(&self, src: &Arc<Task>) -> Result<Arc<Task>, &'static str> {
+    pub fn fork_task(&self, src: &Arc<RuntimeTask>) -> Result<Arc<RuntimeTask>, &'static str> {
         let fork_slot = self.reserve_fork_slot()?;
         let proc_src = self.process_of_tid(src.id()).unwrap_or_else(|| src.clone());
         let nid = self.seq.fetch_add(1, Ordering::SeqCst);
@@ -639,7 +639,7 @@ impl TaskTable {
             let src_addr_space = proc_src.process.addr_space.lock().unwrap();
             Arc::new(Mutex::new(AddrSpace::fork_from(&src_addr_space)))
         };
-        let tgt = Task::make_with_addr_space(nid, &ns, child_addr_space);
+        let tgt = RuntimeTask::make_with_addr_space(nid, &ns, child_addr_space);
         {
             let src_fds = proc_src.process.debug_fds.lock().unwrap();
             let mut tgt_fds = tgt.process.debug_fds.lock().unwrap();
@@ -705,14 +705,14 @@ impl TaskTable {
     }
     pub fn clone_thread(
         &self,
-        src: &Arc<Task>,
+        src: &Arc<RuntimeTask>,
         stack_top: u64,
         tls: u64,
         clear_tid: usize,
-    ) -> Arc<Task> {
+    ) -> Arc<RuntimeTask> {
         let proc_src = self.process_of_tid(src.id()).unwrap_or_else(|| src.clone());
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
-        let t = Task::make_with_process(id, &proc_src.tag(), proc_src.process.clone());
+        let t = RuntimeTask::make_with_process(id, &proc_src.tag(), proc_src.process.clone());
         let mut ctx = ThdCtx::default();
         ctx.uctx.set_ret(0);
         ctx.uctx.set_sp(stack_top);
@@ -732,7 +732,7 @@ impl TaskTable {
         args: Vec<String>,
         envs: Vec<String>,
         pool: &FramePool,
-    ) -> Arc<Task> {
+    ) -> Arc<RuntimeTask> {
         let t = self.spawn(path);
         *t.process.exec_path.lock().unwrap() = path.to_string();
         let _elf_entry = validate_elf_header(&[
@@ -838,7 +838,7 @@ impl TaskTable {
 }
 
 struct ForkSlotReservation<'a> {
-    table: &'a TaskTable,
+    table: &'a RuntimeTaskTable,
     active: bool,
 }
 
@@ -855,9 +855,9 @@ impl ForkSlotReservation<'_> {
     }
 }
 
-// AGENT: legacy chaos-tests task-info shape moved out of the crate root.
+// AGENT: legacy chaos-tests task-info shape now directly replaces the root TaskInfo.
 #[derive(Clone, Debug)]
-pub struct LegacyTaskInfo {
+pub struct TaskInfo {
     pub id: usize,
     pub tag: String,
     pub status: Option<usize>,
@@ -865,21 +865,21 @@ pub struct LegacyTaskInfo {
 
 // AGENT: compatibility wrapper that keeps the old public fields used by
 // chaos-tests while carrying the real kernel-sim task internally.
-pub struct LegacyTask {
-    inner: Arc<Task>,
-    pub info: Mutex<LegacyTaskInfo>,
-    pub parent: Mutex<Option<Arc<LegacyTask>>>,
+pub struct Task {
+    inner: Arc<RuntimeTask>,
+    pub info: Mutex<TaskInfo>,
+    pub parent: Mutex<Option<Arc<Task>>>,
 }
 
-// AGENT: bridge legacy Task methods to the real simulator task.
-impl LegacyTask {
+// AGENT: bridge legacy RuntimeTask methods to the real simulator task.
+impl Task {
     pub fn make(id: usize, tag: &str) -> Arc<Self> {
-        Self::wrap(Task::make(id, tag), None)
+        Self::wrap(RuntimeTask::make(id, tag), None)
     }
 
-    fn wrap(inner: Arc<Task>, parent: Option<Arc<LegacyTask>>) -> Arc<Self> {
+    fn wrap(inner: Arc<RuntimeTask>, parent: Option<Arc<Task>>) -> Arc<Self> {
         Arc::new(Self {
-            info: Mutex::new(LegacyTaskInfo {
+            info: Mutex::new(TaskInfo {
                 id: inner.id(),
                 tag: inner.tag(),
                 status: None,
@@ -900,47 +900,47 @@ impl LegacyTask {
 
 // AGENT: bridge the legacy infallible fork_task API to kernel-sim's fallible
 // fork implementation without changing the existing basic tests.
-pub struct LegacyTaskTable {
-    inner: TaskTable,
-    map: RwLock<BTreeMap<usize, Arc<LegacyTask>>>,
-    pub root: Mutex<Option<Arc<LegacyTask>>>,
+pub struct TaskTable {
+    inner: RuntimeTaskTable,
+    map: RwLock<BTreeMap<usize, Arc<Task>>>,
+    pub root: Mutex<Option<Arc<Task>>>,
 }
 
 // AGENT: expose the legacy task-table surface while delegating storage to the
 // real simulator task table.
-impl LegacyTaskTable {
+impl TaskTable {
     pub fn new() -> Self {
         Self {
-            inner: TaskTable::new(),
+            inner: RuntimeTaskTable::new(),
             map: RwLock::new(BTreeMap::new()),
             root: Mutex::new(None),
         }
     }
 
-    pub fn spawn(&self, tag: &str) -> Arc<LegacyTask> {
-        let task = LegacyTask::wrap(self.inner.spawn(tag), None);
+    pub fn spawn(&self, tag: &str) -> Arc<Task> {
+        let task = Task::wrap(self.inner.spawn(tag), None);
         self.map.write().unwrap().insert(task.id(), task.clone());
         task
     }
 
-    pub fn spawn_root(&self) -> Arc<LegacyTask> {
-        let task = LegacyTask::wrap(self.inner.spawn_root(), None);
+    pub fn spawn_root(&self) -> Arc<Task> {
+        let task = Task::wrap(self.inner.spawn_root(), None);
         self.map.write().unwrap().insert(task.id(), task.clone());
         *self.root.lock().unwrap() = Some(task.clone());
         task
     }
 
-    pub fn fork_task(&self, src: &Arc<LegacyTask>) -> Arc<LegacyTask> {
+    pub fn fork_task(&self, src: &Arc<Task>) -> Arc<Task> {
         let child_inner = self
             .inner
             .fork_task(&src.inner)
             .expect("kernel-sim fork_task should succeed for basic tests");
-        let child = LegacyTask::wrap(child_inner, Some(src.clone()));
+        let child = Task::wrap(child_inner, Some(src.clone()));
         self.map.write().unwrap().insert(child.id(), child.clone());
         child
     }
 
-    pub fn find(&self, id: usize) -> Option<Arc<LegacyTask>> {
+    pub fn find(&self, id: usize) -> Option<Arc<Task>> {
         self.map.read().unwrap().get(&id).cloned()
     }
 

@@ -1,6 +1,6 @@
 use super::*;
 
-impl Kernel {
+impl RuntimeKernel {
     // AGENT: route System V semaphore lookup through the kernel-owned IPC store.
     pub fn get_sem(
         &self,

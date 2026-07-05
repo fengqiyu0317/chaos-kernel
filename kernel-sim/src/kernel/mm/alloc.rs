@@ -1,14 +1,14 @@
 // AGENT
 use super::*;
 
-// AGENT: share the frame bitmap with PgFrame so RAII drops can return pages.
+// AGENT: share the frame bitmap with RuntimePgFrame so RAII drops can return pages.
 pub struct FramePool {
     pub(crate) slots: Arc<Mutex<Vec<bool>>>,
     pub(crate) cap: usize,
     pub(crate) base_paddr: usize,
 }
 impl FramePool {
-    // AGENT: initialize the simulator frame bitmap inside Arc for PgFrame RAII drops.
+    // AGENT: initialize the simulator frame bitmap inside Arc for RuntimePgFrame RAII drops.
     pub fn new(n: usize) -> Self {
         Self {
             slots: Arc::new(Mutex::new(vec![true; n])),
@@ -17,7 +17,7 @@ impl FramePool {
         }
     }
     // AGENT: allocate the requested frame id so tests and seeded mappings can
-    // build stable RAII PgFrame handles.
+    // build stable RAII RuntimePgFrame handles.
     pub fn get(&self, id: usize) -> Option<usize> {
         let mut s = self.slots.lock().unwrap();
         if id < s.len() && s[id] {
@@ -90,20 +90,20 @@ impl FramePool {
     }
 
     // AGENT: allocate a physical frame as a RAII page-frame handle.
-    pub fn alloc_pg_frame(&self) -> Option<PgFrame> {
+    pub fn alloc_pg_frame(&self) -> Option<RuntimePgFrame> {
         let id = self.get_inner()?;
         Some(self.pg_frame_from_allocated(id))
     }
 
     // AGENT: allocate a specific physical frame as a RAII page-frame handle.
-    pub fn get_pg_frame(&self, id: usize) -> Option<PgFrame> {
+    pub fn get_pg_frame(&self, id: usize) -> Option<RuntimePgFrame> {
         self.get(id)?;
         Some(self.pg_frame_from_allocated(id))
     }
 
     // AGENT: attach RAII ownership to a frame that is already marked allocated.
-    fn pg_frame_from_allocated(&self, id: usize) -> PgFrame {
-        PgFrame::from_allocated(id, self.slots.clone(), self.base_paddr)
+    fn pg_frame_from_allocated(&self, id: usize) -> RuntimePgFrame {
+        RuntimePgFrame::from_allocated(id, self.slots.clone(), self.base_paddr)
     }
 
     pub fn get_zone_aware(&self, zone: &ZoneInfo) -> Option<usize> {
@@ -271,12 +271,12 @@ pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<u
     None
 }
 
-pub struct SharedPage {
+pub struct RuntimeSharedPage {
     pub frame: AtomicUsize,
     pub w: AtomicBool,
     pub pending: AtomicBool,
 }
-impl SharedPage {
+impl RuntimeSharedPage {
     pub fn new(f: usize) -> Self {
         Self {
             frame: AtomicUsize::new(f),
@@ -284,9 +284,9 @@ impl SharedPage {
             pending: AtomicBool::new(true),
         }
     }
-    // AGENT: accept PgFrame as the COW source handle; PgFrame drop owns
+    // AGENT: accept RuntimePgFrame as the COW source handle; RuntimePgFrame drop owns
     // lifetime cleanup instead of manual refcount mutation here.
-    pub fn fault(&self, pool: &FramePool, _src: &PgFrame) -> Result<usize, &'static str> {
+    pub fn fault(&self, pool: &FramePool, _src: &RuntimePgFrame) -> Result<usize, &'static str> {
         let pend = self.pending.load(Ordering::Relaxed);
         let cur = self.frame.load(Ordering::Relaxed);
         if !pend {
@@ -313,14 +313,14 @@ impl SharedPage {
 
 // AGENT: legacy COW helper that accepts the old PgFrame refcount type while
 // still allocating through the real kernel-sim FramePool.
-pub struct LegacySharedPage {
+pub struct SharedPage {
     pub frame: AtomicUsize,
     pub w: AtomicBool,
     pub pending: AtomicBool,
 }
 
 // AGENT: preserve the old SharedPage behavior used by basic chaos-tests.
-impl LegacySharedPage {
+impl SharedPage {
     pub fn new(f: usize) -> Self {
         Self {
             frame: AtomicUsize::new(f),
@@ -329,7 +329,7 @@ impl LegacySharedPage {
         }
     }
 
-    pub fn fault(&self, pool: &FramePool, src: &LegacyPgFrame) -> Result<usize, &'static str> {
+    pub fn fault(&self, pool: &FramePool, src: &PgFrame) -> Result<usize, &'static str> {
         let pending = self.pending.load(Ordering::Relaxed);
         let current = self.frame.load(Ordering::Relaxed);
         if !pending {

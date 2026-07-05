@@ -1,6 +1,6 @@
 use super::*;
 
-impl Kernel {
+impl RuntimeKernel {
     pub fn do_pipe(&self, task_id: usize) -> Result<(usize, usize), &'static str> {
         let task = self.tasks.find(task_id).ok_or("esrch")?;
         let (rd, wr) = PipeNode::pair();

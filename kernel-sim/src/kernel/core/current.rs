@@ -10,9 +10,9 @@ std::thread_local! {
 }
 
 // AGENT: scheduler-owned current task marker. The value is a simulator
-// Task::id() installed by Kernel::set_cur() or focused tests; it is
+// RuntimeTask::id() installed by RuntimeKernel::set_cur() or focused tests; it is
 // intentionally separate from host std::thread identity and from the full
-// Kernel object.
+// RuntimeKernel object.
 pub fn set_current_task_id(task_id: Option<usize>) {
     let id = match task_id {
         Some(id) => {
@@ -35,11 +35,11 @@ pub fn current_task_id() -> Option<usize> {
 }
 
 // AGENT: shared assertion helper for low-level code that needs a current
-// simulator task but must not depend on Kernel.
+// simulator task but must not depend on RuntimeKernel.
 pub(crate) fn require_current_task_id(caller: &str) -> usize {
     match current_task_id() {
         Some(id) => id,
-        None => panic!("{caller} needs a current nonzero simulator Task::id()"),
+        None => panic!("{caller} needs a current nonzero simulator RuntimeTask::id()"),
     }
 }
 
@@ -48,6 +48,6 @@ pub(crate) fn require_current_task_id(caller: &str) -> usize {
 fn validate_current_task_id(id: usize) {
     assert_ne!(
         id, NO_CURRENT_TASK_ID,
-        "current task id must be a nonzero simulator Task::id()"
+        "current task id must be a nonzero simulator RuntimeTask::id()"
     );
 }

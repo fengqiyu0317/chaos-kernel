@@ -3,8 +3,8 @@ use kernel_sim::{
     check_access, compute_inet_checksum, parse_ipv4_header, set_current_task_id, wait_ev,
     AddrSpace, BlockCache, BlockDevice, Channel, CircBuf, EpData, EpEvent, EvBus, EvFlag,
     ExitReason, FHandle, FLike, FdOpt, KernLock, KernelRuntimeTicker, PageBacking, PageTableEntry,
-    SchedulePolicy, SemCtx, Sema, SimKernel as Kernel, SimTask as Task, SimTaskTable as TaskTable,
-    Spin, SpinLock, SyncQueue, TaskRunState, TimerEntry, VmMap, VmRegion, WaitOutcome, WaitToken,
+    RuntimeKernel, RuntimeTask, RuntimeTaskTable, SchedulePolicy, SemCtx, Sema, Spin, SpinLock,
+    SyncQueue, TaskRunState, TimerEntry, VmMap, VmRegion, WaitOutcome, WaitToken,
     AT_ENTRY, AT_PAGESZ, BLOCK_CACHE_BLOCK_SIZE, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED,
     N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK,
     SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT, SYS_FORK,
@@ -85,7 +85,7 @@ fn lock_current_task_tests() -> std::sync::MutexGuard<'static, ()> {
 // AGENT: helper for tests that still need current-task context for nearby
 // scheduler/syscall paths; Spin itself no longer depends on this context.
 fn set_test_current_task(id: usize) -> usize {
-    let task = Task::make(id, "spin-test");
+    let task = RuntimeTask::make(id, "spin-test");
     let id = task.id();
     set_current_task_id(Some(id));
     id
@@ -164,7 +164,7 @@ fn kern_lock_try_guard_respects_owner() {
 }
 
 // AGENT: Spin is again usable as a low-level host-thread lock without requiring
-// Kernel::set_cur() or a manually installed simulator Task::id().
+// RuntimeKernel::set_cur() or a manually installed simulator RuntimeTask::id().
 #[test]
 fn spin_host_threads_do_not_require_current_task() {
     let _current_task_guard = lock_current_task_tests();
@@ -476,7 +476,7 @@ fn semaphore_remove_and_set_val_keep_acquire_state_consistent() {
 // AGENT: accumulated SEM_UNDO releases should all be applied at process-context drop.
 #[test]
 fn sem_ctx_drop_applies_accumulated_undo() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     let sems = kernel
         .get_sem(0, 1, 0)
         .expect("private semaphore set should be created");
@@ -494,7 +494,7 @@ fn sem_ctx_drop_applies_accumulated_undo() {
 // AGENT: removing a process-local semaphore id must not leak undo into a reused id.
 #[test]
 fn sem_ctx_remove_clears_undo_for_reused_id() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     let first = kernel
         .get_sem(0, 1, 0)
         .expect("first private semaphore set should be created");
@@ -661,7 +661,7 @@ fn read_user_c_string(addr_space: &AddrSpace, addr: usize) -> String {
 }
 
 // AGENT: place a NUL-terminated path into user memory for syscall open/exec tests.
-fn write_user_c_string(kernel: &Kernel, task: &Arc<Task>, addr: usize, value: &str) {
+fn write_user_c_string(kernel: &RuntimeKernel, task: &Arc<RuntimeTask>, addr: usize, value: &str) {
     let mut bytes = value.as_bytes().to_vec();
     bytes.push(0);
     let page = addr & !(PAGE_SZ - 1);
@@ -684,7 +684,7 @@ fn write_user_c_string(kernel: &Kernel, task: &Arc<Task>, addr: usize, value: &s
 }
 
 // AGENT: create a user mapping for syscall copy-in/copy-out tests.
-fn map_user_region(kernel: &Kernel, task: &Arc<Task>, addr: usize, len: usize, flags: u32) {
+fn map_user_region(kernel: &RuntimeKernel, task: &Arc<RuntimeTask>, addr: usize, len: usize, flags: u32) {
     task.process
         .addr_space
         .lock()
@@ -720,7 +720,7 @@ fn vm_map_rejects_overflowing_ranges() {
 
 // AGENT: drive logical timers in tests that intentionally wait for timer-wheel
 // expiry instead of host-time timeout.
-fn drive_timers_until_idle(kernel: &Kernel) -> bool {
+fn drive_timers_until_idle(kernel: &RuntimeKernel) -> bool {
     for _ in 0..=TIMER_WHEEL_SIZE {
         if kernel.timers.lock().unwrap().active_count() == 0 {
             return true;
@@ -730,7 +730,7 @@ fn drive_timers_until_idle(kernel: &Kernel) -> bool {
     kernel.timers.lock().unwrap().active_count() == 0
 }
 
-fn install_test_exec(kernel: &Kernel, path: &str) {
+fn install_test_exec(kernel: &RuntimeKernel, path: &str) {
     kernel
         .install_exec_file(path, test_exec_elf())
         .expect("test exec file should install");
@@ -738,8 +738,8 @@ fn install_test_exec(kernel: &Kernel, path: &str) {
 
 // AGENT: seed live process state that must survive failed exec preparation.
 fn seed_failed_exec_state(
-    kernel: &Kernel,
-    task: &Arc<Task>,
+    kernel: &RuntimeKernel,
+    task: &Arc<RuntimeTask>,
     old_mapping: usize,
 ) -> (usize, usize, usize) {
     let path_addr = old_mapping + PAGE_SZ;
@@ -769,8 +769,8 @@ fn seed_failed_exec_state(
 
 // AGENT: verify failed exec left address space, context, fd table, and frames intact.
 fn assert_failed_exec_state_preserved(
-    kernel: &Kernel,
-    task: &Arc<Task>,
+    kernel: &RuntimeKernel,
+    task: &Arc<RuntimeTask>,
     close_fd: usize,
     old_token: usize,
     free_before: usize,
@@ -861,7 +861,7 @@ fn write_u64_le(data: &mut [u8], off: usize, value: u64) {
 
 #[test]
 fn boot_kernel_in_standalone_runtime() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
 
     assert_eq!(kernel.cur_task(0).expect("init should be current").id(), 1);
@@ -876,7 +876,7 @@ fn boot_kernel_in_standalone_runtime() {
 #[test]
 // AGENT
 fn syscall_fork_creates_child_task_and_enqueues_it() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
 
     let child = kernel
@@ -906,7 +906,7 @@ fn syscall_fork_creates_child_task_and_enqueues_it() {
 #[test]
 // AGENT
 fn fork_copies_context_address_space_cwd_and_kernel_stack() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let parent = kernel.cur_task(0).expect("init should be current");
     let parent_token = parent.vm_token();
@@ -1006,7 +1006,7 @@ fn fork_copies_context_address_space_cwd_and_kernel_stack() {
 #[test]
 // AGENT
 fn cow_write_fault_copies_child_page_and_keeps_parent_shared() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let parent = kernel.cur_task(0).expect("init should be current");
     let page = 0x5100_0000;
@@ -1063,7 +1063,7 @@ fn cow_write_fault_copies_child_page_and_keeps_parent_shared() {
 #[test]
 // AGENT: MAP_PRIVATE file mmap loads file bytes but does not write changes back.
 fn mmap_private_file_mapping_does_not_write_back() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     let handle = FHandle::with_data(
@@ -1112,7 +1112,7 @@ fn mmap_private_file_mapping_does_not_write_back() {
 #[test]
 // AGENT: MAP_SHARED file mmap writes through only the file-backed part of pages.
 fn mmap_shared_file_mapping_writes_back_without_extending_tail() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     let handle = FHandle::with_data(
@@ -1164,7 +1164,7 @@ fn mmap_shared_file_mapping_writes_back_without_extending_tail() {
 #[test]
 // AGENT: file mmap rejects unaligned offsets and shared writable mappings on read-only fds.
 fn mmap_file_mapping_validates_offset_and_shared_write_permissions() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     let handle = FHandle::with_data(
@@ -1201,7 +1201,7 @@ fn mmap_file_mapping_validates_offset_and_shared_write_permissions() {
 #[test]
 // AGENT: sys_read copies real file bytes into user memory and shares dup offset.
 fn sys_read_regular_file_copies_data_and_advances_shared_offset() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     kernel
         .install_file("/tmp/read-real", b"abcdef".to_vec(), false)
@@ -1252,7 +1252,7 @@ fn sys_read_regular_file_copies_data_and_advances_shared_offset() {
 #[test]
 // AGENT: sys_read reports real fd and user-buffer errors instead of synthetic lengths.
 fn sys_read_validates_fd_permissions_and_user_buffer() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     const PATH: usize = 0x2200_0000;
@@ -1286,7 +1286,7 @@ fn sys_read_validates_fd_permissions_and_user_buffer() {
 #[test]
 // AGENT: sys_write and sys_read move real bytes through pipe file objects.
 fn sys_read_and_write_use_pipe_file_objects() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     const SRC: usize = 0x2400_0000;
@@ -1328,7 +1328,7 @@ fn sys_read_and_write_use_pipe_file_objects() {
 // AGENT: pipe readiness changes should wake a blocked epoll_wait through the
 // EvBus -> EpInst wait queue path instead of relying on epoll polling/yielding.
 fn epoll_wait_wakes_when_pipe_becomes_readable() {
-    let kernel = Arc::new(Kernel::new(N_FRAMES));
+    let kernel = Arc::new(RuntimeKernel::new(N_FRAMES));
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     const SRC: usize = 0x2500_0000;
@@ -1392,7 +1392,7 @@ fn epoll_wait_wakes_when_pipe_becomes_readable() {
 #[test]
 // AGENT: munmap requires a current task after validating the syscall range.
 fn munmap_without_current_task_returns_esrch() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
 
     let err = kernel
         .dispatch_syscall(SYS_MUNMAP, 0x5600_0000, PAGE_SZ, 0, 0, 0, 0)
@@ -1404,7 +1404,7 @@ fn munmap_without_current_task_returns_esrch() {
 #[test]
 // AGENT: munmap validates syscall range parameters before removing mappings.
 fn munmap_rejects_invalid_ranges_before_unmapping() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     let base = 0x5400_0000;
@@ -1446,7 +1446,7 @@ fn munmap_rejects_invalid_ranges_before_unmapping() {
 #[test]
 // AGENT: munmap rounds non-zero lengths up to full pages on the syscall path.
 fn munmap_rounds_length_up_to_pages() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     let base = 0x5500_0000;
@@ -1472,7 +1472,7 @@ fn munmap_rounds_length_up_to_pages() {
 #[test]
 // AGENT: munmap releases last-reference resident pages back to the frame pool.
 fn munmap_returns_frames_to_pool() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     let free_before = kernel.pool.free_count();
@@ -1508,7 +1508,7 @@ fn munmap_returns_frames_to_pool() {
 #[test]
 // AGENT: failed MAP_SHARED writeback reports an error and leaves mappings intact.
 fn munmap_propagates_shared_writeback_error_without_unmapping() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     let base = 0x5600_0000;
@@ -1552,7 +1552,7 @@ fn munmap_propagates_shared_writeback_error_without_unmapping() {
 #[test]
 // AGENT: shrinking brk uses unmap_range and returns heap pages to FramePool.
 fn brk_shrink_returns_frames_to_pool() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     let initial_brk = task.process.addr_space.lock().unwrap().vm_map.brk;
@@ -1584,7 +1584,7 @@ fn brk_shrink_returns_frames_to_pool() {
 #[test]
 // AGENT
 fn unmap_range_returns_unmapped_page_count_and_splits_region() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     let base = 0x5300_0000;
@@ -1631,7 +1631,7 @@ fn unmap_range_returns_unmapped_page_count_and_splits_region() {
 #[test]
 // AGENT
 fn fork_keeps_shared_writable_mapping_without_cow() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let parent = kernel.cur_task(0).expect("init should be current");
     let page = 0x5200_0000;
@@ -1678,7 +1678,7 @@ fn fork_keeps_shared_writable_mapping_without_cow() {
 #[test]
 // AGENT
 fn fork_preserves_cloexec_and_epoll_state() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     write_user_c_string(&kernel, &task, 0x1000, "/tmp/fork-cloexec");
@@ -1746,7 +1746,7 @@ fn fork_preserves_cloexec_and_epoll_state() {
 #[test]
 // AGENT
 fn do_exec_commits_new_address_space_context_and_cloexec() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     install_test_exec(&kernel, "/bin/next");
     let task = kernel.cur_task(0).expect("init should be current");
@@ -1871,7 +1871,7 @@ fn do_exec_commits_new_address_space_context_and_cloexec() {
 #[test]
 // AGENT
 fn do_exec_loads_registered_elf_segment_bytes_and_zeroes_bss() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let payload = b"segment-bytes-cross-page";
     let vaddr = TEST_EXEC_ENTRY + PAGE_SZ - 8;
@@ -1928,7 +1928,7 @@ fn do_exec_loads_registered_elf_segment_bytes_and_zeroes_bss() {
 #[test]
 // AGENT
 fn do_exec_loads_updated_regular_file_contents() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let old_payload = b"old path-backed payload";
     let new_payload = b"updated path-backed payload";
@@ -1970,7 +1970,7 @@ fn do_exec_loads_updated_regular_file_contents() {
 #[test]
 // AGENT
 fn cloned_thread_observes_exec_token_from_shared_address_space() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     install_test_exec(&kernel, "/bin/next");
     let task = kernel.cur_task(0).expect("init should be current");
@@ -1997,7 +1997,7 @@ fn cloned_thread_observes_exec_token_from_shared_address_space() {
 #[test]
 // AGENT
 fn fork_from_cloned_thread_uses_shared_process_state_and_thread_context() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     let thread_task = kernel
@@ -2106,7 +2106,7 @@ fn fork_from_cloned_thread_uses_shared_process_state_and_thread_context() {
 #[test]
 // AGENT
 fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     install_test_exec(&kernel, "/bin/too-big");
     let task = kernel.cur_task(0).expect("init should be current");
@@ -2169,7 +2169,7 @@ fn do_exec_failure_preserves_old_image_and_cloexec_fds() {
 #[test]
 // AGENT
 fn do_exec_rejects_unregistered_exec_file_without_commit() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     let (close_fd, old_token, free_before) = seed_failed_exec_state(&kernel, &task, 0x5500_0000);
@@ -2192,7 +2192,7 @@ fn do_exec_rejects_unregistered_exec_file_without_commit() {
 #[test]
 // AGENT
 fn do_exec_rejects_non_executable_file_without_commit() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     kernel
         .install_file("/bin/plain", test_exec_elf(), false)
@@ -2218,7 +2218,7 @@ fn do_exec_rejects_non_executable_file_without_commit() {
 #[test]
 // AGENT
 fn do_exec_rejects_directory_without_commit() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     kernel
         .install_directory("/bin/dir")
@@ -2244,7 +2244,7 @@ fn do_exec_rejects_directory_without_commit() {
 #[test]
 // AGENT
 fn do_exec_rejects_invalid_elf_without_commit() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     kernel
         .install_file("/bin/bad", vec![0; 64], true)
@@ -2270,7 +2270,7 @@ fn do_exec_rejects_invalid_elf_without_commit() {
 #[test]
 // AGENT
 fn syscall_exec_reads_user_memory_and_commits_do_exec() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     install_test_exec(&kernel, "/bin/next");
     let task = kernel.cur_task(0).expect("init should be current");
@@ -2333,7 +2333,7 @@ fn syscall_exec_reads_user_memory_and_commits_do_exec() {
 #[test]
 // AGENT
 fn syscall_exec_faults_on_unmapped_user_path_without_commit() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     *task.process.exec_path.lock().unwrap() = String::from("/bin/old");
@@ -2351,7 +2351,7 @@ fn syscall_exec_faults_on_unmapped_user_path_without_commit() {
 #[test]
 // AGENT
 fn fork_returns_eagain_when_process_table_is_full() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     for _ in kernel.tasks.count()..N_PROC {
         kernel.tasks.spawn("filler");
@@ -2368,7 +2368,7 @@ fn fork_returns_eagain_when_process_table_is_full() {
 #[test]
 // AGENT
 fn concurrent_fork_respects_process_table_limit() {
-    let tasks = Arc::new(TaskTable::new());
+    let tasks = Arc::new(RuntimeTaskTable::new());
     let root = tasks.spawn_root();
     for _ in tasks.count()..(N_PROC - 1) {
         tasks.spawn("filler");
@@ -2406,7 +2406,7 @@ fn concurrent_fork_respects_process_table_limit() {
 #[test]
 // AGENT
 fn default_signal_action_terminates_current_task() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let child = kernel.do_fork(1).expect("fork should create child task");
 
@@ -2432,7 +2432,7 @@ fn default_signal_action_terminates_current_task() {
 #[test]
 // AGENT
 fn custom_signal_handler_updates_context_and_sigreturn_restores_it() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init should be current");
     {
@@ -2483,7 +2483,7 @@ fn custom_signal_handler_updates_context_and_sigreturn_restores_it() {
 #[test]
 fn forked_task_enters_run_queue_and_receives_cpu_after_slice() {
     let _timer_guard = lock_timer_tests();
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let child = kernel.do_fork(1).expect("fork should create child task");
 
@@ -2504,7 +2504,7 @@ fn forked_task_enters_run_queue_and_receives_cpu_after_slice() {
 #[test]
 fn single_current_task_keeps_running_across_ticks() {
     let _timer_guard = lock_timer_tests();
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
 
     for _ in 0..25 {
@@ -2521,7 +2521,7 @@ fn single_current_task_keeps_running_across_ticks() {
 #[test]
 fn cpu0_schedule_tick_advances_kernel_timer_wheel() {
     let _timer_guard = lock_timer_tests();
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     let deadline = {
         let mut timers = kernel.timers.lock().unwrap();
         let deadline = (timers.current_slot + 1) % TIMER_WHEEL_SIZE;
@@ -2541,7 +2541,7 @@ fn cpu0_schedule_tick_advances_kernel_timer_wheel() {
 #[test]
 fn timer_target_wakes_wait_token_as_timeout() {
     let _timer_guard = lock_timer_tests();
-    let kernel = Arc::new(Kernel::new(N_FRAMES));
+    let kernel = Arc::new(RuntimeKernel::new(N_FRAMES));
     let waiter = thread::spawn(move || {
         let token = WaitToken::current();
         token.wait_with_timer(Duration::from_millis(10))
@@ -2569,9 +2569,9 @@ fn timer_target_wakes_wait_token_as_timeout() {
 #[test]
 fn runtime_ticker_guard_drives_timer_waits_and_stops_cleanly() {
     let _timer_guard = lock_timer_tests();
-    let kernel = Arc::new(Kernel::new(N_FRAMES));
+    let kernel = Arc::new(RuntimeKernel::new(N_FRAMES));
     let mut ticker = KernelRuntimeTicker::start(Arc::clone(&kernel))
-        .expect("runtime ticker should start for Arc<Kernel>");
+        .expect("runtime ticker should start for Arc<RuntimeKernel>");
 
     assert!(
         KernelRuntimeTicker::start(Arc::clone(&kernel)).is_err(),
@@ -2614,7 +2614,7 @@ fn runtime_ticker_guard_drives_timer_waits_and_stops_cleanly() {
 
 #[test]
 fn exiting_current_task_switches_to_next_runnable_task() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let child = kernel.do_fork(1).expect("fork should create child task");
 
@@ -2632,7 +2632,7 @@ fn exiting_current_task_switches_to_next_runnable_task() {
 #[test]
 // AGENT
 fn exit_without_current_task_returns_esrch() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     kernel.set_cur(0, None);
     kernel.run_queue.clear_current();
@@ -2649,7 +2649,7 @@ fn exit_without_current_task_returns_esrch() {
 fn wait4_reaps_child_and_writes_exit_status() {
     const STATUS_ADDR: usize = 0x7000;
 
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let parent = kernel.cur_task(0).expect("init should be current");
     let child_id = kernel
@@ -2710,7 +2710,7 @@ fn exit_releases_process_resources_before_wait_reaps_zombie() {
     const STATUS_ADDR: usize = 0x8000;
     const CHILD_MAPPING: usize = 0x5900_0000;
 
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let parent = kernel.cur_task(0).expect("init should be current");
     let child_id = kernel
@@ -2849,7 +2849,7 @@ fn exit_releases_process_resources_before_wait_reaps_zombie() {
 #[test]
 // AGENT
 fn wait4_ignores_unrelated_zombies() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let orphan = kernel.tasks.spawn("orphan");
     orphan.exit_proc(ExitReason::Code(3));
@@ -2864,7 +2864,7 @@ fn wait4_ignores_unrelated_zombies() {
 
 #[test]
 fn futex_wait_returns_eagain_when_value_changed() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let futex_word = AtomicU32::new(0);
     let uaddr = &futex_word as *const AtomicU32 as usize;
@@ -2879,7 +2879,7 @@ fn futex_wait_returns_eagain_when_value_changed() {
 #[test]
 fn futex_wait_sleeps_until_wake() {
     let _timer_guard = lock_timer_tests();
-    let kernel = Arc::new(Kernel::new(N_FRAMES));
+    let kernel = Arc::new(RuntimeKernel::new(N_FRAMES));
     kernel.proc_init();
     let futex_word = Arc::new(AtomicU32::new(1));
     let timeout = Arc::new([1usize, 0usize]);
@@ -2907,7 +2907,7 @@ fn futex_wait_sleeps_until_wake() {
 
 #[test]
 fn futex_wake_zero_wakes_nobody() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let futex_word = AtomicU32::new(1);
     let uaddr = &futex_word as *const AtomicU32 as usize;
@@ -2922,7 +2922,7 @@ fn futex_wake_zero_wakes_nobody() {
 #[test]
 fn futex_requeue_wakes_and_moves_waiters() {
     let _timer_guard = lock_timer_tests();
-    let kernel = Arc::new(Kernel::new(N_FRAMES));
+    let kernel = Arc::new(RuntimeKernel::new(N_FRAMES));
     kernel.proc_init();
     let src = Arc::new(AtomicU32::new(1));
     let dst = Arc::new(AtomicU32::new(0));
@@ -2971,7 +2971,7 @@ fn futex_wake_op_updates_uaddr2_and_conditionally_wakes_both_queues() {
     const FUTEX_OP_ADD: usize = 1;
     const FUTEX_OP_CMP_EQ: usize = 0;
 
-    let kernel = Arc::new(Kernel::new(N_FRAMES));
+    let kernel = Arc::new(RuntimeKernel::new(N_FRAMES));
     kernel.proc_init();
     let src = Arc::new(AtomicU32::new(1));
     let dst = Arc::new(AtomicU32::new(0));
@@ -3015,7 +3015,7 @@ fn futex_wake_op_sign_extends_oparg_and_cmparg() {
     const FUTEX_OP_ADD: usize = 1;
     const FUTEX_OP_CMP_EQ: usize = 0;
 
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let src = AtomicU32::new(0);
     let dst = AtomicU32::new(u32::MAX);
@@ -3037,7 +3037,7 @@ fn futex_wake_op_invalid_cmp_does_not_wake_waiters() {
     const FUTEX_OP_ADD: usize = 1;
     const FUTEX_OP_CMP_INVALID: usize = 6;
 
-    let kernel = Arc::new(Kernel::new(N_FRAMES));
+    let kernel = Arc::new(RuntimeKernel::new(N_FRAMES));
     kernel.proc_init();
     let src = Arc::new(AtomicU32::new(1));
     let dst = AtomicU32::new(0);
@@ -3070,7 +3070,7 @@ fn futex_wake_op_invalid_cmp_does_not_wake_waiters() {
 
 #[test]
 fn futex_cmp_requeue_returns_eagain_when_source_value_changed() {
-    let kernel = Kernel::new(N_FRAMES);
+    let kernel = RuntimeKernel::new(N_FRAMES);
     kernel.proc_init();
     let src = AtomicU32::new(1);
     let dst = AtomicU32::new(0);
@@ -3087,7 +3087,7 @@ fn futex_cmp_requeue_returns_eagain_when_source_value_changed() {
 #[test]
 fn futex_cmp_requeue_wakes_and_moves_after_compare() {
     let _timer_guard = lock_timer_tests();
-    let kernel = Arc::new(Kernel::new(N_FRAMES));
+    let kernel = Arc::new(RuntimeKernel::new(N_FRAMES));
     kernel.proc_init();
     let src = Arc::new(AtomicU32::new(1));
     let dst = Arc::new(AtomicU32::new(0));

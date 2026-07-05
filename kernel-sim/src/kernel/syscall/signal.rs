@@ -11,7 +11,7 @@ struct UserSigAction {
     sa_flags: i32,
 }
 
-pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_kill(kernel: &RuntimeKernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let pid = a0 as isize;
     let sig = a1;
     if sig >= NSIG as usize {
@@ -20,7 +20,7 @@ pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
 
     let protected =
         |tid: usize| (sig == SIGKILL as usize || sig == SIGSTOP as usize) && tid <= Pid::INIT;
-    let send_one = |t: &Arc<Task>| -> bool {
+    let send_one = |t: &Arc<RuntimeTask>| -> bool {
         if protected(t.id()) {
             return false;
         }
@@ -29,7 +29,7 @@ pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
         }
         true
     };
-    let finish_many = |targets: Vec<Arc<Task>>| -> Result<usize, &'static str> {
+    let finish_many = |targets: Vec<Arc<RuntimeTask>>| -> Result<usize, &'static str> {
         if targets.is_empty() {
             return Err("esrch");
         }
@@ -84,7 +84,7 @@ pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
 }
 
 pub(super) fn sys_sigaction(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     a0: usize,
     a1: usize,
     a2: usize,
@@ -149,7 +149,7 @@ pub(super) fn sys_sigaction(
 }
 
 pub(super) fn sys_sigprocmask(
-    kernel: &Kernel,
+    kernel: &RuntimeKernel,
     a0: usize,
     a1: usize,
     a2: usize,
@@ -199,7 +199,7 @@ pub(super) fn sys_sigprocmask(
 }
 
 // AGENT: restore the last simulated signal frame.
-pub(super) fn sys_sigreturn(kernel: &Kernel) -> Result<usize, &'static str> {
+pub(super) fn sys_sigreturn(kernel: &RuntimeKernel) -> Result<usize, &'static str> {
     let t = kernel.cur_task(0).ok_or("esrch")?;
     let mut thd = t.thd_ctx.lock().unwrap();
     let ctx = thd.as_mut().ok_or("einval")?;

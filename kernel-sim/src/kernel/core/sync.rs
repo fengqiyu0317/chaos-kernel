@@ -4,7 +4,7 @@ use super::*;
 // AGENT: Usage map for this module in the current kernel-sim code.
 //
 // Active paths:
-// - GKL/KernLock backs Kernel::tick() and BlockCache::sync_all(); the public
+// - GKL/KernLock backs RuntimeKernel::tick() and BlockCache::sync_all(); the public
 //   leave() keeps the legacy chaos-tests API, while guards still use
 //   owner-checked release internally.
 // - Spin backs cache-chain locking and Channel through SpinGuard so release is
@@ -55,7 +55,7 @@ impl KernLock {
             depth: AtomicUsize::new(0),
         }
     }
-    // AGENT: KernLock owner ids are lock-owner tokens, not TaskTable indexes.
+    // AGENT: KernLock owner ids are lock-owner tokens, not RuntimeTaskTable indexes.
     pub fn enter(&self, id: usize) {
         assert_ne!(id, KERNLOCK_NO_OWNER, "KernLock owner id is reserved");
         if self.holder.load(Ordering::Relaxed) == id {
@@ -168,9 +168,6 @@ impl Drop for KernLockGuard<'_> {
     }
 }
 
-// AGENT: compatibility name formerly exported from kernel-sim/src/lib.rs.
-pub type LegacyGkl = KernLock;
-
 const SPIN_NO_OWNER: usize = 0;
 static NEXT_SPIN_OWNER: AtomicUsize = AtomicUsize::new(1);
 
@@ -187,7 +184,7 @@ fn allocate_spin_owner() -> usize {
 }
 
 // AGENT: Spin derives ownership from the host thread again so low-level
-// chaos-tests can use it without first installing a simulator Task::id().
+// chaos-tests can use it without first installing a simulator RuntimeTask::id().
 fn spin_owner() -> usize {
     SPIN_OWNER.with(|owner| *owner)
 }

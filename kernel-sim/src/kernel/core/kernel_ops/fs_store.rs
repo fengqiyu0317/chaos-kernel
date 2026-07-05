@@ -1,6 +1,6 @@
 use super::*;
 
-impl Kernel {
+impl RuntimeKernel {
     pub fn lookup_path(&self, path: &str) -> Result<String, &'static str> {
         if path.is_empty() {
             return Err("enoent");
