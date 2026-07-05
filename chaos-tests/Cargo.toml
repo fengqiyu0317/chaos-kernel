@@ -7,6 +7,10 @@ description = "Test suite for the Chaos Monolith Kernel debugging exercise"
 [dependencies]
 kernel-sim = { path = "../kernel" }
 
+[lib]
+name = "chaos_tests"
+path = "src/lib.rs"
+
 [dev-dependencies]
 
 [[test]]
