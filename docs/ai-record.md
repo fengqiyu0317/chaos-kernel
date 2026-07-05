@@ -1302,6 +1302,25 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
 
+## 2026-07-05：发布单文件 kernel.rs 回退分支
+
+目标：按用户要求保留 GitHub 上原来的 `origin/master` 到旁支，然后把当前本地版本发布为新的主分支内容。
+
+已完成修改：
+
+- `kernel/src/kernel.rs` 已被替换为从 `kernel-sim/src/kernel/` 递归内联生成的单文件 OS 代码。
+- 原远端主分支将保存为 `backup/origin-master-before-flatten-20260705`，再用当前本地 `master` 覆盖远端 `master`。
+
+测试结果：
+
+```bash
+git diff --check -- kernel/src/kernel.rs
+rustfmt --check kernel/src/kernel.rs
+rustc --edition=2021 --crate-type lib --emit=metadata -o /tmp/kernel_rs_flatten_check.rmeta <临时 wrapper>
+```
+
+结果：以上检查通过。未运行 `chaos-tests`，因为当前测试依赖仍指向 `../kernel-sim`，不会覆盖这次改动的 `kernel/src/kernel.rs`。
+
 ## 2026-06-30：M9 kernel-qemu MM/Sv39 地址空间第一批替换
 
 目标：修正 `kernel-qemu/src/mm/address_space.rs` 中 `PageTableEntry` 仍像 `kernel-sim` 一样保存模拟 resident page 内容的问题，把第一批匿名/文件 resident 页改为真实 `PgFrame` + Sv39 leaf PTE 承载，同时保留 `kernel-sim` 的 VMA、权限、映射生命周期和 usercopy 入口形状。
