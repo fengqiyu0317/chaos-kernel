@@ -1,4 +1,4 @@
-use chaos_tests::*;
+use kernel_sim::*;
 use std::sync::Arc;
 
 fn run_with_timeout<F: FnOnce() + Send + 'static>(f: F, ms: u64) -> bool {

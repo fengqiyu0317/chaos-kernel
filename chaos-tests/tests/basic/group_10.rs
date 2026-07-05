@@ -1,4 +1,4 @@
-use chaos_tests::*;
+use kernel_sim::*;
 
 #[test]
 fn basic_access_ok_valid_range() {

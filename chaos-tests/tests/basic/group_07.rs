@@ -1,4 +1,4 @@
-use chaos_tests::*;
+use kernel_sim::*;
 use std::sync::Arc;
 use std::thread;
 
