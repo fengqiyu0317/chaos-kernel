@@ -18,7 +18,7 @@ pub mod core {
 
     pub mod arch {
         pub mod clock {
-            use crate::kernel::core::prelude::*;
+            use crate::core::prelude::*;
 
             pub static CLK: AtomicUsize = AtomicUsize::new(0);
 
@@ -48,7 +48,7 @@ pub mod core {
             }
         }
         pub mod context {
-            use crate::kernel::core::prelude::*;
+            use crate::core::prelude::*;
 
             #[derive(Clone)]
             pub struct Context {
@@ -238,9 +238,9 @@ pub mod core {
             }
         }
         pub mod trap {
-            use crate::kernel::core::arch::clock::CLK;
-            use crate::kernel::core::arch::context::Context;
-            use crate::kernel::core::prelude::*;
+            use crate::core::arch::clock::CLK;
+            use crate::core::arch::context::Context;
+            use crate::core::prelude::*;
 
             pub struct TrapCtl {
                 pub active: AtomicBool,
