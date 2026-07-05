@@ -17,7 +17,7 @@ The purpose of this policy is to ensure you *understand* the bugs and the code y
 
 ## Overview
 
-This project is built on top of the [rCore](https://github.com/rcore-os/rCore) teaching operating system. The file `kernel/src/kernel.rs` contains a monolithic kernel simulation with **intentionally embedded bugs** across multiple subsystems -- locking, memory management, scheduling, file systems, IPC, signal handling, and more. Some bugs cause incorrect behavior at runtime; others prevent compilation entirely.
+This project is built on top of the [rCore](https://github.com/rcore-os/rCore) teaching operating system. The active host-side simulator now lives in `kernel/` (Cargo package name `kernel-sim`). The old monolithic rCore file is preserved under `kernel-legacy/src/kernel.rs`.
 
 A comprehensive test suite is provided under `chaos-tests/`.
 
@@ -25,7 +25,7 @@ A comprehensive test suite is provided under `chaos-tests/`.
 
 ### Task 1: Debug and Pass All Tests
 
-The kernel code in `kernel/src/kernel.rs` contains numerous bugs of varying difficulty.
+The active kernel simulator code in `kernel/` is the current debugging and rewriting target.
 
 Your goal is to **find and fix all bugs** so that the entire test suite passes:
 
@@ -44,12 +44,12 @@ All three test groups must pass for full credit.
 
 > **Clarifications (April 28)**
 >
-> `chaos-tests/src/lib.rs` is now a symbolic link pointing to `kernel/src/kernel.rs`.
-> Therefore, any changes made to the kernel source will automatically be reflected in the test suites.
+> `chaos-tests` now depends on the `kernel-sim` Cargo package through `path = "../kernel"`.
+> Therefore, changes made under `kernel/` are reflected in the test suites.
 
 ### Task 2: Rewrite the Code
 
-After debugging, **rewrite `kernel/src/kernel.rs`** to improve code quality:
+After debugging, **rewrite the relevant code under `kernel/`** to improve code quality:
 
 - Add clear, meaningful comments where appropriate
 - Rename cryptic variables and functions to descriptive names
@@ -63,10 +63,11 @@ The rewrite is graded on **readability, structure, and correctness**.
 
 ```
 chaos/
-├── kernel/
-│   └── src/
-│       └── kernel.rs      # The buggy monolithic kernel (YOUR TARGET)
-└── README.md                      # This file
+├── kernel/                 # Active host userspace simulator
+├── kernel-legacy/          # Old rCore source tree, normally not edited
+├── kernel-qemu/            # RISC-V QEMU no_std carrier and migration target
+├── chaos-tests/            # Test suite
+└── README.md               # This file
 ```
 
 ## Getting Started

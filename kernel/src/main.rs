@@ -1,6 +1,12 @@
-#![no_std] // don't link the Rust standard library
-#![cfg_attr(not(test), no_main)] // disable all Rust-level entry points
-#![cfg_attr(test, allow(dead_code, unused_macros, unused_imports))]
+// AGENT: use RuntimeKernel for the full simulator; root Kernel is the
+// chaos-tests-compatible facade.
+use kernel_sim::{RuntimeKernel, N_FRAMES, SYS_GETPID};
 
-#[allow(unused_imports)]
-use rcore;
+fn main() {
+    let kernel = RuntimeKernel::new(N_FRAMES);
+    kernel.proc_init();
+    let pid = kernel
+        .dispatch_syscall(SYS_GETPID, 0, 0, 0, 0, 0, 0)
+        .expect("kernel-sim getpid syscall failed");
+    println!("kernel-sim booted, root pid={pid}");
+}

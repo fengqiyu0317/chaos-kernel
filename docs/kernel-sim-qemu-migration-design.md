@@ -1,14 +1,14 @@
-# kernel-sim 到 QEMU 裸机内核的迁移设计
+# kernel/ 到 QEMU 裸机内核的迁移设计
 
-更新时间：2026-06-30
+更新时间：2026-07-05
 
 ## 目标
 
-本文档用于明确 M9 任务的迁移边界和第一阶段实现路线。核心目标是把 `kernel-sim` 已经稳定下来的内核语义迁移到 QEMU 裸机环境，而不是重新设计一套新内核。迁移策略采用 source-first：每个子系统先直接迁入 `kernel-sim` 的现有代码作为基线，保留结构体、函数名、控制流和错误语义，再在这个基线上替换 host `std`、host 线程、host 锁和模拟地址空间等裸机不可用依赖。`kernel-qemu` 的职责是提供 RISC-V/QEMU 必需的启动、trap、页表、时钟和设备适配层，让迁入的 `kernel-sim` 语义逐步落到真实裸机运行时上。
+本文档用于明确 M9 任务的迁移边界和第一阶段实现路线。核心目标是把 `kernel/`（Cargo 包名仍为 `kernel-sim`）已经稳定下来的内核语义迁移到 QEMU 裸机环境，而不是重新设计一套新内核。迁移策略采用 source-first：每个子系统先直接迁入 `kernel/` 的现有代码作为基线，保留结构体、函数名、控制流和错误语义，再在这个基线上替换 host `std`、host 线程、host 锁和模拟地址空间等裸机不可用依赖。`kernel-qemu` 的职责是提供 RISC-V/QEMU 必需的启动、trap、页表、时钟和设备适配层，让迁入的 host 模拟器语义逐步落到真实裸机运行时上。
 
 第一阶段成功标准：
 
-- `kernel-sim/` 仍可在宿主环境中通过 `cargo test` 和 `kernel-sim/tests/smoke.rs` 做语义回归。
+- `kernel/` 仍可在宿主环境中通过 `cargo test` 和 `kernel/tests/smoke.rs` 做语义回归。
 - 新的 QEMU 内核路径可以用 `riscv64gc-unknown-none-elf` 构建。
 - QEMU `virt` 启动后能通过 SBI/UART 输出启动日志。
 - 能处理 timer trap，并用真实中断推进内核逻辑 tick。
@@ -17,8 +17,8 @@
 
 ## 非目标
 
-- 不修改 `chaos/kernel/src/kernel.rs`。
-- 不删除或替换 `kernel-sim/`。
+- 不修改 `chaos/kernel-legacy/src/kernel.rs`。
+- 不删除或替换 `kernel/`。
 - 不把 `chaos-tests` 直接当作 QEMU 移植的判定标准，除非后续明确接入该测试体系。
 - 不要求第一阶段实现完整文件系统、网络、virtio-blk、TTY、完整 signal、完整 epoll 或真实 Linux 兼容 ABI。
 - 不以“从零写一个更像 rCore 的内核”为目标；新增裸机代码必须服务于承载和迁移 `kernel-sim` 语义。
@@ -27,7 +27,7 @@
 
 ## 当前边界
 
-`kernel-sim` 当前是 userspace 模拟器。它依赖：
+`kernel/` 当前是 userspace 模拟器，Cargo 包名仍为 `kernel-sim`。它依赖：
 
 - `std::sync::{Arc, Mutex, RwLock, Condvar}`。
 - `std::thread` 和 host thread 的 park/unpark。
@@ -37,40 +37,40 @@
 - `AddrSpace` 中的模拟用户页内容，例如以宿主堆内存保存页面数据。
 - `cargo test` 作为主要验证入口。
 
-这些能力在裸机 `no_std` 环境中不存在。因此迁移时需要保留 `kernel-sim` 作为语义源和回归基准，同时先把 `kernel-sim` 代码迁入 QEMU 侧形成可审查的移植基线，再逐步替换裸机不可用依赖。QEMU 底座不是新内核的业务语义来源，而是把真实 RISC-V trap、页表、timer、设备 I/O 映射到迁入的 `kernel-sim` 语义所需接口上的适配层。
+这些能力在裸机 `no_std` 环境中不存在。因此迁移时需要保留 `kernel/` 作为语义源和回归基准，同时先把 host 模拟器代码迁入 QEMU 侧形成可审查的移植基线，再逐步替换裸机不可用依赖。QEMU 底座不是新内核的业务语义来源，而是把真实 RISC-V trap、页表、timer、设备 I/O 映射到迁入的 host 模拟器语义所需接口上的适配层。
 
 ## 迁移策略
 
 迁移执行顺序以“先迁入、再替换”为准：
 
-1. 每个子系统先从 `kernel-sim/src/kernel/` 复制对应源码到 `kernel-qemu/src/` 的同名或明确标注的迁移模块中。复制后应尽量保留原有类型名、函数名、错误返回、TODO 和关键控制流，避免先写只有相似名字的新实现。
+1. 每个子系统先从 `kernel/src/kernel/` 复制对应源码到 `kernel-qemu/src/` 的同名或明确标注的迁移模块中。复制后应尽量保留原有类型名、函数名、错误返回、TODO 和关键控制流，避免先写只有相似名字的新实现。
 2. 复制完成后做 host 依赖清单，逐项标出哪些依赖必须替换，例如 `std::sync`、host thread、`thread_local!`、`Instant`、host 文件对象、模拟页面 `Arc<Mutex<Vec<u8>>>`。
 3. 先让迁入代码在 QEMU crate 中可审查，再分批接入编译。暂时不能编译或暂时不能从 `main.rs` 注册的批次可以先隔离在未注册模块或显式 `cfg` 下，但隔离不是废弃；这些已迁入文件就是后续修改的主要位置。
 4. 修改迁入代码时应尽可能在原有结构体、函数和控制流内部替换实现，不因为当前接不上裸机入口就另写一套“更干净”的 QEMU 空骨架。缺少 heap、sync、frame allocator、Sv39、usercopy 等承载时，先补窄适配层或 TODO，再回到已迁入代码中替换对应 host 依赖。
 5. 每个阶段允许出现“代码已迁入但尚未可编译 / 尚未接入运行路径”的中间状态；只要记录清楚未接入原因、缺失前置依赖和下一步替换点即可。目标是改完整后自然接上，而不是用并行新实现绕开迁入代码。
 6. QEMU 新写代码只承担硬件适配和 ABI 适配，例如启动、trap、CSR、SBI/UART、页表写入、timer 中断、用户指针翻译。不得在这些适配层重新定义 syscall、fd、进程、等待或地址空间业务语义。
-7. 每次迁移都要能回答：源文件来自 `kernel-sim` 哪里，迁入后改了哪些 host 依赖，对应的 host 回归测试或 smoke 语义是什么，QEMU 侧当前只验证到哪一步。
+7. 每次迁移都要能回答：源文件来自 `kernel/` 哪里，迁入后改了哪些 host 依赖，对应的 host 回归测试或 smoke 语义是什么，QEMU 侧当前只验证到哪一步。
 
 ### 功能代码块级迁移工作流
 
-后续实现改为按用户指定的 `kernel-sim` 功能代码块逐步推进。这里的“代码块”可以是一个结构体、函数、impl 方法组，或一个明确的 syscall / MM / fd 子路径。除非用户明确扩大范围，每次只处理当前指定代码块，不顺手重构相邻 TODO 或提前迁移整个子系统。
+后续实现改为按用户指定的 `kernel/` 功能代码块逐步推进。这里的“代码块”可以是一个结构体、函数、impl 方法组，或一个明确的 syscall / MM / fd 子路径。除非用户明确扩大范围，每次只处理当前指定代码块，不顺手重构相邻 TODO 或提前迁移整个子系统。
 
 每个代码块按下面顺序处理：
 
-1. 标出源代码块，例如 `kernel-sim/src/kernel/mm/alloc.rs::FramePool`、`AddrSpace::resize_brk()` 或 `sys_brk()`。
-2. 说明该块当前在 `kernel-sim` 中提供的语义、直接调用者和依赖的下游入口。
+1. 标出源代码块，例如 `kernel/src/kernel/mm/alloc.rs::FramePool`、`AddrSpace::resize_brk()` 或 `sys_brk()`。
+2. 说明该块当前在 `kernel/` 中提供的语义、直接调用者和依赖的下游入口。
 3. 列出该块不能直接进入 QEMU 的 host 依赖，例如 `std`、host lock、host thread、模拟页 `Arc<Mutex<Vec<u8>>>`、模拟地址偏移或测试 helper。
 4. 只在当前代码块或它必须接触的最小适配边界内修改；如果发现需要先补 `heap`、`sync`、`FramePool`、Sv39 或 usercopy 前置能力，先记录阻塞点和下一块建议，不临时写一套平行实现绕过。
-5. 修改后记录验证边界：至少说明 `kernel-qemu` 是否能 build / smoke；如果触及 `kernel-sim` 共享语义，再运行对应 host 回归。
+5. 修改后记录验证边界：至少说明 `kernel-qemu` 是否能 build / smoke；如果触及 `kernel/` 共享语义，再运行对应 host 回归。
 6. 交接记录要写清“本轮只处理了哪个代码块”和“明确未处理哪些相邻功能”，避免后续误以为整个子系统已经完成。
 
 ## 建议目录
 
-建议新增独立目录，避免混入既有 `kernel/` 和 `kernel-sim/`：
+当前目录结构：
 
 ```text
 chaos/
-├── kernel-sim/             # 保留：host userspace 模拟器和 cargo test
+├── kernel/             # 保留：host userspace 模拟器和 cargo test
 ├── kernel-qemu/            # 新增：RISC-V QEMU no_std 内核壳
 │   ├── Cargo.toml
 │   ├── .cargo/config.toml
@@ -80,10 +80,10 @@ chaos/
 │   │   ├── main.rs
 │   │   ├── arch/riscv64/
 │   │   ├── trap/
-│   │   ├── mm/             # 先迁入 kernel-sim/src/kernel/mm，再替换真实 frame/Sv39
-│   │   ├── proc/           # 先迁入 kernel-sim/src/kernel/proc，再替换 host task/thread 承载
-│   │   ├── syscall/        # 先迁入 kernel-sim/src/kernel/syscall，再接 RISC-V ABI 映射
-│   │   ├── fs/             # 先迁入 kernel-sim/src/kernel/fs，再替换 host fd 后端
+│   │   ├── mm/             # 先迁入 kernel/src/kernel/mm，再替换真实 frame/Sv39
+│   │   ├── proc/           # 先迁入 kernel/src/kernel/proc，再替换 host task/thread 承载
+│   │   ├── syscall/        # 先迁入 kernel/src/kernel/syscall，再接 RISC-V ABI 映射
+│   │   ├── fs/             # 先迁入 kernel/src/kernel/fs，再替换 host fd 后端
 │   │   └── drivers/
 │   └── tests/
 └── tools/
@@ -133,7 +133,7 @@ qemu-system-riscv64 \
 
 ### 2. trap/syscall ABI 适配层
 
-`kernel-sim` 的 syscall 当前由测试或模拟运行时直接进入 Rust 函数；QEMU 侧必须建立真实 trap 入口，但 syscall 的行为语义应尽量向 `kernel-sim/src/kernel/syscall/` 靠拢，而不是在 trap 层重新定义一套规则。
+`kernel-sim` 的 syscall 当前由测试或模拟运行时直接进入 Rust 函数；QEMU 侧必须建立真实 trap 入口，但 syscall 的行为语义应尽量向 `kernel/src/kernel/syscall/` 靠拢，而不是在 trap 层重新定义一套规则。
 
 - 设置 `stvec`。
 - 定义 RISC-V trap frame，保存和恢复通用寄存器。
@@ -191,7 +191,7 @@ RISC-V trap frame
 这一阶段的第一目标是把 `kernel-sim` 的地址空间实现迁入 `kernel-qemu`，然后在迁入代码上把“宿主堆模拟页面”替换为“真实物理页 + Sv39 页表”。不要先写一个只有同名接口的 QEMU 原生空骨架，也不要一开始迁移完整文件系统、file-backed `mmap` 或完整 COW。下面顺序是总体依赖路线；实际执行仍按用户指定的功能代码块逐块推进。每一步都应尽量保持可构建、可 smoke；确实暂时不能编译或不能接入 `main.rs` 的复制批次要明确隔离、继续在原迁入文件上替换依赖，并在前置 heap/sync/frame/Sv39/usercopy 补齐后再接入。
 
 1. 直接迁入 `kernel-sim` MM 源码：
-   - 以 `kernel-sim/src/kernel/mm/mod.rs`、`address_space.rs`、`alloc.rs`、`bits.rs`、`memory.rs` 为源。
+   - 以 `kernel/src/kernel/mm/mod.rs`、`address_space.rs`、`alloc.rs`、`bits.rs`、`memory.rs` 为源。
    - 迁入到 `kernel-qemu/src/mm/` 的对应文件中，必要时拆出 `sv39.rs`、`usercopy.rs` 作为裸机适配文件。
    - 保留 `AddrSpace`、`VmRegion`、`VmMap`、`PageTableEntry`、`FramePool`、`map_region()`、`unmap_range()`、`protect()`、`read_user_bytes()`、`write_user_bytes()` 等语义入口，后续在这些入口内部替换实现。
    - 在 `kernel-qemu/src/main.rs` 注册 `mod mm;` 的时机以可构建为准；不能立即构建的迁入文件必须有明确 TODO 和下一步替换清单，但仍优先在这些迁入文件里完成 `std`、host lock、模拟页面和 host frame 依赖替换。
@@ -250,12 +250,12 @@ RISC-V trap frame
    - `cd kernel-qemu && cargo fmt --check && cargo build --release`。
    - `bash tools/qemu-smoke.sh`。
    - `git diff --check -- kernel-qemu tools/qemu-smoke.sh docs/kernel-sim-qemu-migration-design.md TASK.md docs/ai-record.md`。
-   - 如本阶段改动影响共享语义说明，还要运行 `cd kernel-sim && cargo test`，确保 host 端语义基准未被破坏。
+   - 如本阶段改动影响共享语义说明，还要运行 `cd kernel && cargo test`，确保 host 端语义基准未被破坏。
    - 每完成一个小闭环，把“已迁移的 kernel-sim 语义、仍停留在 host 模拟器的语义、QEMU smoke 结果”记录到 `TASK.md` 或 `docs/ai-record.md`。
 
 ### 4. 调度、同步和等待语义迁移层
 
-这一层先迁入 `kernel-sim/src/kernel/proc/`、`kernel-sim/src/kernel/core/sync.rs` 以及相关等待/唤醒代码，再替换 host thread 承载。要保留 `TaskRunState`、wait token、timer target、futex、pipe/epoll 唤醒等可观察语义；QEMU 侧替换的是运行方式，而不是重新发明等待规则。`kernel-sim` 的等待模型建立在 host thread 上，而 QEMU 裸机路径需要 task 调度模型：
+这一层先迁入 `kernel/src/kernel/proc/`、`kernel/src/kernel/core/sync.rs` 以及相关等待/唤醒代码，再替换 host thread 承载。要保留 `TaskRunState`、wait token、timer target、futex、pipe/epoll 唤醒等可观察语义；QEMU 侧替换的是运行方式，而不是重新发明等待规则。`kernel-sim` 的等待模型建立在 host thread 上，而 QEMU 裸机路径需要 task 调度模型：
 
 - `std::thread::park()` / `unpark()` 替换为修改 `TaskRunState` 和 run queue。
 - `Condvar` 替换为内核 wait queue。
@@ -268,7 +268,7 @@ RISC-V trap frame
 
 ### 5. 进程模型迁移层
 
-这一层先直接迁入 `kernel-sim/src/kernel/proc/` 的进程、task、wait、resource、signal 相关代码，再在迁入代码上替换 host runtime。第一阶段只需要把最小 task 路径跑通：
+这一层先直接迁入 `kernel/src/kernel/proc/` 的进程、task、wait、resource、signal 相关代码，再在迁入代码上替换 host runtime。第一阶段只需要把最小 task 路径跑通：
 
 - idle task。
 - init user task。
@@ -290,7 +290,7 @@ RISC-V trap frame
 
 ### 6. fd、文件和设备语义迁移层
 
-这一层先迁入 `kernel-sim/src/kernel/fs/` 中已有的 fd table、open-file-description、pipe 和 epoll ready/wait 语义，再把 host 文件对象和等待后端替换为 QEMU 可用承载。第一阶段建议只实现最小字符设备作为 fd 后端：
+这一层先迁入 `kernel/src/kernel/fs/` 中已有的 fd table、open-file-description、pipe 和 epoll ready/wait 语义，再把 host 文件对象和等待后端替换为 QEMU 可用承载。第一阶段建议只实现最小字符设备作为 fd 后端：
 
 - fd `1` / `2` 写到 SBI console 或 UART。
 - fd `0` 可以先返回 EOF 或阻塞占位，按测试需求决定。
@@ -359,7 +359,7 @@ RISC-V trap frame
 验证：
 
 ```bash
-cd kernel-sim
+cd kernel
 cargo test
 ```
 
@@ -403,7 +403,7 @@ cargo test
 
 产物：
 
-- 直接迁入的 `kernel-sim/src/kernel/mm/` 代码。
+- 直接迁入的 `kernel/src/kernel/mm/` 代码。
 - 在迁入 `FramePool` / `AddrSpace` 基础上改造出的 frame allocator。
 - 在迁入页表入口基础上改造出的 Sv39 kernel page table。
 - 内核地址空间映射。
@@ -438,7 +438,7 @@ cargo test
 产物：
 
 - RISC-V syscall number 映射层。
-- 直接迁入 `kernel-sim/src/kernel/syscall/` 中对应 syscall 的语义入口。
+- 直接迁入 `kernel/src/kernel/syscall/` 中对应 syscall 的语义入口。
 - 在迁入入口基础上把 `write` 接到 SBI/UART。
 - 在迁入入口基础上把 `exit` 接到 init task 退出或关机路径。
 - 在迁入入口基础上让 `getpid` 返回固定或真实 pid。
@@ -515,7 +515,7 @@ cargo test
 host 端继续运行：
 
 ```bash
-cd kernel-sim
+cd kernel
 cargo test
 ```
 
@@ -538,10 +538,10 @@ QEMU 端新增 smoke，初始检查：
 
 ## 禁止修改范围
 
-- 不修改 `chaos/kernel/src/kernel.rs`。
-- 不删除 `kernel-sim/` 的现有测试。
+- 不修改 `chaos/kernel-legacy/src/kernel.rs`。
+- 不删除 `kernel/` 的现有测试。
 - 不把 `kernel-sim` 的 host 测试路径改成依赖 QEMU。
-- 不把旧 `kernel/` 当作 M9 迁移的直接修改目标，除非后续任务明确改变边界。
+- 不把旧 `kernel-legacy/` 当作 M9 迁移的直接修改目标，除非后续任务明确改变边界。
 
 ## 交接记录要求
 

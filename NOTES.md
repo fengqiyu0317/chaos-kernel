@@ -45,7 +45,7 @@ upstream https://github.com/peterzheng98/chaos.git
 - 长任务或上下文即将不足时，先更新 `TASK.md` 或 `NOTES.md`。
 - 交接摘要至少记录目标、已完成修改、关键文件、测试结果、未解决问题、禁止修改位置。
 - 代码改动需要区分 `// HUMAN` 和 `// AGENT`。
-- 修改 `kernel-sim` 时不要触碰 `kernel/src/kernel.rs`。
+- 修改 host 模拟器 `kernel/` 时不要触碰 `kernel-legacy/src/kernel.rs`。
 
 ## 当前状态
 

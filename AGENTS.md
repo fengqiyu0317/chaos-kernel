@@ -6,13 +6,13 @@
 
 ### 概述
 - **仓库**: `chaos/` — 基于 rCore 的内核调试与重写作业
-- **当前目标目录**: `kernel-sim/`
+- **当前目标目录**: `kernel/`
 - **任务**: 修 bug → 通过全部测试 → 重写提升代码质量
-- **kernel-sim 当前验收目标**: 以通过 `chaos-tests` 测试为目标定位与阶段性完成标准
-- **M9 迁移目标**: 以 `docs/kernel-sim-qemu-migration-design.md` 为准，把 `kernel-sim` 已稳定的内核语义迁移到 QEMU 裸机环境，而不是重新设计一套新内核
+- **host 模拟器当前验收目标**: 以通过 `chaos-tests` 测试为目标定位与阶段性完成标准
+- **M9 迁移目标**: 以 `docs/kernel-sim-qemu-migration-design.md` 为准，把 `kernel/`（Cargo 包名仍为 `kernel-sim`）已稳定的内核语义迁移到 QEMU 裸机环境，而不是重新设计一套新内核
 
 ### 测试
-- 当前 `kernel-sim` 的实现与重写优先围绕 `chaos-tests` 的 basic 测试收敛；除非任务明确改变边界，不把目标转回旧 `kernel/src/kernel.rs`。注意在修改 `kernel-sim` 时也要修改 `kernel-qemu` 相应部分的代码以对齐，但修改  `kernel-qemu` 时不需要同步修改 `kernel-sim`，因为 `kernel-qemu` 不以通过 basic 测试为目标。
+- 当前 `kernel/` 的实现与重写优先围绕 `chaos-tests` 的 basic 测试收敛；除非任务明确改变边界，不把目标转回旧 `kernel-legacy/src/kernel.rs`。注意在修改 `kernel/` 时也要修改 `kernel-qemu` 相应部分的代码以对齐，但修改 `kernel-qemu` 时不需要同步修改 `kernel/`，因为 `kernel-qemu` 不以通过 basic 测试为目标。
 
 ```bash
 cargo test --test basic     # 基础测试
@@ -22,15 +22,15 @@ cargo test --test basic -- group_01  # 按组运行
 ```
 
 ### 内核结构
-- `kernel/src/kernel.rs` — 含故意植入的 bug，覆盖锁、内存管理、调度、文件系统、IPC、信号等
+- `kernel-legacy/src/kernel.rs` — 含故意植入的 bug，覆盖锁、内存管理、调度、文件系统、IPC、信号等
 - 使用 `std::` 而非 `no_std`，编译为 userspace 模拟
 - 常数定义：`PAGE_SZ=4096`, `N_PROC=256`, `N_FRAMES=65536` 等
 
 ### 目录结构
 ```
 chaos/
-├── kernel/src/kernel.rs  # 待调试/重写的内核
-├── kernel-sim/           # 当前主要修改目标：host userspace 内核模拟器
+├── kernel/                  # 当前主要修改目标：host userspace 内核模拟器
+├── kernel-legacy/src/kernel.rs  # 旧 rCore 单文件内核，除非明确要求否则不改
 ├── kernel-qemu/          # M9 新增目标：RISC-V QEMU no_std 承载层
 ├── kernel-common/        # 可选共享 crate：仅放 no_std/alloc 纯逻辑
 ├── docs/                 # 设计文档、AI 记录和交接材料
@@ -43,8 +43,8 @@ chaos/
 ```
 
 ### 注意
-- 一定不要修改 `chaos/kernel/src/kernel.rs`
-- 对 `kernel-sim` 相关问题，修改目标是 `chaos/kernel-sim/`，不要改 `chaos/kernel/`
+- 一定不要修改 `chaos/kernel-legacy/src/kernel.rs`
+- 对 host 模拟器相关问题，修改目标是 `chaos/kernel/`，不要改 `chaos/kernel-legacy/`
 - 修改后要保留 AI 对话日志作为提交材料
 - 代码中需要标注 `// HUMAN` 和 `// AGENT` 区分人写/AI 生成，注意 `// AGENT` 不能只写在一个文件开头，而是在每个修改的函数或结构体等块结构前写上 `// AGENT` 以及修改的内容
 
@@ -54,9 +54,9 @@ chaos/
 - 核心目标是迁移 `kernel-sim` 的现有语义：进程、地址空间、ELF/exec、fd/open-file-description、exit/wait、timer、pipe/epoll、同步等待等。
 - `kernel-qemu/` 只负责提供 QEMU/RISC-V 必需的启动、trap、页表、timer、SBI/UART、设备 I/O 和调度承载层；不要把它当作新的业务语义来源。
 - 不要以“从零写一个更像 rCore 的内核”为目标。新增裸机代码必须能说明服务于哪个 `kernel-sim` 语义迁移点。
-- 不删除或替换 `kernel-sim/`；host 端 `cargo test` 和 `kernel-sim/tests/smoke.rs` 仍是语义回归基准。
+- 不删除或替换 `kernel/`；host 端 `cargo test` 和 `kernel/tests/smoke.rs` 仍是语义回归基准。
 - 不把 `chaos-tests` 直接当作 QEMU 迁移判定标准，除非任务明确要求接入该测试体系。
-- 不把旧 `kernel/` 当作 M9 迁移的直接修改目标，除非用户明确改变边界。
+- 不把旧 `kernel-legacy/` 当作 M9 迁移的直接修改目标，除非用户明确改变边界。
 - 每一层迁移前先标清：
   - `kernel-sim` 中的语义源文件或现有测试。
   - QEMU 侧必须替换的 host 依赖。
@@ -79,7 +79,7 @@ chaos/
   - 关键文件：涉及的源码、测试、配置、文档路径
   - 测试结果：已运行命令、通过/失败情况、关键失败日志
   - 未解决问题：剩余 bug、风险、下一步排查方向
-  - 不要改的部分：例如 `chaos/kernel/src/kernel.rs` 等明确禁止修改的位置
+  - 不要改的部分：例如 `chaos/kernel-legacy/src/kernel.rs` 等明确禁止修改的位置
 - 写完总结后，应把当前 `git diff` / `git diff --stat`、最新测试命令与结果一起交给新对话继续，不要在一个超长对话里无期限追加。
 
 ---

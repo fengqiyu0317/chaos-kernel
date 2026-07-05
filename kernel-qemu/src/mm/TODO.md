@@ -4,11 +4,11 @@
 
 This directory currently contains a direct source-first copy of:
 
-- `kernel-sim/src/kernel/mm/mod.rs`
-- `kernel-sim/src/kernel/mm/address_space.rs`
-- `kernel-sim/src/kernel/mm/alloc.rs`
-- `kernel-sim/src/kernel/mm/bits.rs`
-- `kernel-sim/src/kernel/mm/memory.rs`
+- `kernel/src/kernel/mm/mod.rs`
+- `kernel/src/kernel/mm/address_space.rs`
+- `kernel/src/kernel/mm/alloc.rs`
+- `kernel/src/kernel/mm/bits.rs`
+- `kernel/src/kernel/mm/memory.rs`
 
 The files are now registered through the migrated `kernel-qemu/src/mod.rs` tree
 and compile in the `#![no_std]` QEMU crate. The current MM work is no longer a
