@@ -855,6 +855,107 @@ impl ForkSlotReservation<'_> {
     }
 }
 
+// AGENT: legacy chaos-tests task-info shape moved out of the crate root.
+#[derive(Clone, Debug)]
+pub struct LegacyTaskInfo {
+    pub id: usize,
+    pub tag: String,
+    pub status: Option<usize>,
+}
+
+// AGENT: compatibility wrapper that keeps the old public fields used by
+// chaos-tests while carrying the real kernel-sim task internally.
+pub struct LegacyTask {
+    inner: Arc<Task>,
+    pub info: Mutex<LegacyTaskInfo>,
+    pub parent: Mutex<Option<Arc<LegacyTask>>>,
+}
+
+// AGENT: bridge legacy Task methods to the real simulator task.
+impl LegacyTask {
+    pub fn make(id: usize, tag: &str) -> Arc<Self> {
+        Self::wrap(Task::make(id, tag), None)
+    }
+
+    fn wrap(inner: Arc<Task>, parent: Option<Arc<LegacyTask>>) -> Arc<Self> {
+        Arc::new(Self {
+            info: Mutex::new(LegacyTaskInfo {
+                id: inner.id(),
+                tag: inner.tag(),
+                status: None,
+            }),
+            inner,
+            parent: Mutex::new(parent),
+        })
+    }
+
+    pub fn id(&self) -> usize {
+        self.info.lock().unwrap().id
+    }
+
+    fn mark_reaped(&self) {
+        self.info.lock().unwrap().status = Some(0);
+    }
+}
+
+// AGENT: bridge the legacy infallible fork_task API to kernel-sim's fallible
+// fork implementation without changing the existing basic tests.
+pub struct LegacyTaskTable {
+    inner: TaskTable,
+    map: RwLock<BTreeMap<usize, Arc<LegacyTask>>>,
+    pub root: Mutex<Option<Arc<LegacyTask>>>,
+}
+
+// AGENT: expose the legacy task-table surface while delegating storage to the
+// real simulator task table.
+impl LegacyTaskTable {
+    pub fn new() -> Self {
+        Self {
+            inner: TaskTable::new(),
+            map: RwLock::new(BTreeMap::new()),
+            root: Mutex::new(None),
+        }
+    }
+
+    pub fn spawn(&self, tag: &str) -> Arc<LegacyTask> {
+        let task = LegacyTask::wrap(self.inner.spawn(tag), None);
+        self.map.write().unwrap().insert(task.id(), task.clone());
+        task
+    }
+
+    pub fn spawn_root(&self) -> Arc<LegacyTask> {
+        let task = LegacyTask::wrap(self.inner.spawn_root(), None);
+        self.map.write().unwrap().insert(task.id(), task.clone());
+        *self.root.lock().unwrap() = Some(task.clone());
+        task
+    }
+
+    pub fn fork_task(&self, src: &Arc<LegacyTask>) -> Arc<LegacyTask> {
+        let child_inner = self
+            .inner
+            .fork_task(&src.inner)
+            .expect("kernel-sim fork_task should succeed for basic tests");
+        let child = LegacyTask::wrap(child_inner, Some(src.clone()));
+        self.map.write().unwrap().insert(child.id(), child.clone());
+        child
+    }
+
+    pub fn find(&self, id: usize) -> Option<Arc<LegacyTask>> {
+        self.map.read().unwrap().get(&id).cloned()
+    }
+
+    pub fn reap(&self, id: usize) {
+        if let Some(task) = self.map.write().unwrap().remove(&id) {
+            task.mark_reaped();
+        }
+        self.inner.reap(id);
+    }
+
+    pub fn count(&self) -> usize {
+        self.map.read().unwrap().len()
+    }
+}
+
 impl Drop for ForkSlotReservation<'_> {
     fn drop(&mut self) {
         self.release_inner();

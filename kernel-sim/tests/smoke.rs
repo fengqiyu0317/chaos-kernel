@@ -2,15 +2,15 @@
 use kernel_sim::{
     check_access, compute_inet_checksum, parse_ipv4_header, set_current_task_id, wait_ev,
     AddrSpace, BlockCache, BlockDevice, Channel, CircBuf, EpData, EpEvent, EvBus, EvFlag,
-    ExitReason, FHandle, FLike, FdOpt, KernLock, Kernel, KernelRuntimeTicker, PageBacking,
-    PageTableEntry, SchedulePolicy, SemCtx, Sema, Spin, SpinLock, SyncQueue, Task, TaskRunState,
-    TaskTable, TimerEntry, VmMap, VmRegion, WaitOutcome, WaitToken, AT_ENTRY, AT_PAGESZ,
-    BLOCK_CACHE_BLOCK_SIZE, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, N_FRAMES, N_PROC,
-    N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK, SYS_DUP,
-    SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FUTEX,
-    SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION, SYS_SIGRETURN,
-    SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC, VM_READ, VM_SHARED,
-    VM_WRITE,
+    ExitReason, FHandle, FLike, FdOpt, KernLock, KernelRuntimeTicker, PageBacking, PageTableEntry,
+    SchedulePolicy, SemCtx, Sema, SimKernel as Kernel, SimTask as Task, SimTaskTable as TaskTable,
+    Spin, SpinLock, SyncQueue, TaskRunState, TimerEntry, VmMap, VmRegion, WaitOutcome, WaitToken,
+    AT_ENTRY, AT_PAGESZ, BLOCK_CACHE_BLOCK_SIZE, KERN_BASE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED,
+    N_FRAMES, N_PROC, N_REGS, O_CLOEXEC, O_CREAT, PAGE_SZ, PROT_READ, PROT_WRITE, SIGUSR1, SYS_BRK,
+    SYS_DUP, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EXEC, SYS_EXIT, SYS_FORK,
+    SYS_FUTEX, SYS_GETPID, SYS_KILL, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ, SYS_SIGACTION,
+    SYS_SIGRETURN, SYS_WAIT4, SYS_WRITE, TIMER_WHEEL_SIZE, USR_STK_OFF, USR_STK_SZ, VM_EXEC,
+    VM_READ, VM_SHARED, VM_WRITE,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
@@ -119,31 +119,34 @@ fn kern_lock_guard_releases_reentrant_lock_by_depth() {
     assert_eq!(lock.level(), 0);
 }
 
-// AGENT: non-owner release must panic without corrupting lock state.
+// AGENT: guard-only release must reject non-owners without corrupting lock state.
 #[test]
-fn kern_lock_rejects_non_owner_leave() {
+fn kern_lock_checked_release_rejects_non_owner() {
     let lock = KernLock::new();
     lock.enter(3);
 
-    let result = std::panic::catch_unwind(|| lock.leave(4));
+    let result = std::panic::catch_unwind(|| lock.leave_checked(4));
     assert!(result.is_err());
     assert!(lock.held());
     assert_eq!(lock.owner(), 3);
     assert_eq!(lock.level(), 1);
 
-    lock.leave(3);
+    lock.leave_checked(3);
     assert!(!lock.held());
 }
 
-// AGENT: releasing an unlocked KernLock is a detected bug.
+// AGENT: public leave() keeps the legacy no-owner API used by chaos-tests.
 #[test]
-fn kern_lock_rejects_unheld_leave() {
+fn kern_lock_legacy_leave_does_not_require_owner() {
     let lock = KernLock::new();
 
-    let result = std::panic::catch_unwind(|| lock.leave(1));
-    assert!(result.is_err());
+    lock.leave();
     assert!(!lock.held());
     assert_eq!(lock.level(), 0);
+
+    lock.enter(1);
+    lock.leave();
+    assert!(!lock.held());
 }
 
 // AGENT: try_guard must fail for non-owners and preserve recursive entry for owners.

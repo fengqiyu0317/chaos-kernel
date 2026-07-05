@@ -1,5 +1,6 @@
-// AGENT
-use kernel_sim::{Kernel, N_FRAMES, SYS_GETPID};
+// AGENT: use the real simulator Kernel; the root Kernel name is reserved for
+// chaos-tests legacy compatibility.
+use kernel_sim::{SimKernel as Kernel, N_FRAMES, SYS_GETPID};
 
 fn main() {
     let kernel = Kernel::new(N_FRAMES);

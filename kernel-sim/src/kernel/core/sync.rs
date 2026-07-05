@@ -4,8 +4,9 @@ use super::*;
 // AGENT: Usage map for this module in the current kernel-sim code.
 //
 // Active paths:
-// - GKL/KernLock backs Kernel::tick() and BlockCache::sync_all() through
-//   KernLockGuard so release stays caller-checked and panic-safe.
+// - GKL/KernLock backs Kernel::tick() and BlockCache::sync_all(); the public
+//   leave() keeps the legacy chaos-tests API, while guards still use
+//   owner-checked release internally.
 // - Spin backs cache-chain locking and Channel through SpinGuard so release is
 //   panic-safe and callers cannot touch the atomic state directly; ownership is
 //   keyed by host-thread tokens so legacy chaos-tests can exercise it outside
@@ -34,7 +35,8 @@ use super::*;
 // AGENT TODO: KernLock is still a simulator recursive spin lock, not full
 // real-kernel locking: it lacks fairness, blocking wait, preemption control,
 // and interrupt masking semantics.
-// AGENT: fields are private so callers must use owner-checked enter/leave or guard APIs.
+// AGENT: fields are private so callers must use the legacy enter/leave facade
+// or the owner-checked guard APIs.
 pub struct KernLock {
     flag: AtomicBool,
     holder: AtomicUsize,
@@ -70,9 +72,21 @@ impl KernLock {
         self.holder.store(id, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
     }
-    // AGENT: release requires the caller id so incorrect owner/depth state is
-    // caught at the lock boundary instead of silently unlocking GKL.
-    pub fn leave(&self, id: usize) {
+    // AGENT: legacy chaos-tests release API; it intentionally does not require
+    // an owner token, matching the old single-file kernel surface.
+    pub fn leave(&self) {
+        let depth = self.depth.load(Ordering::Relaxed);
+        if depth > 1 {
+            self.depth.store(depth - 1, Ordering::Relaxed);
+        } else {
+            self.holder.store(KERNLOCK_NO_OWNER, Ordering::Relaxed);
+            self.depth.store(0, Ordering::Relaxed);
+            self.flag.store(false, Ordering::Release);
+        }
+    }
+    // AGENT: guard-only release keeps internal callers protected against
+    // dropping another owner's GKL depth.
+    pub fn leave_checked(&self, id: usize) {
         assert_ne!(id, KERNLOCK_NO_OWNER, "KernLock owner id is reserved");
         let owner = self.holder.load(Ordering::Relaxed);
         let depth = self.depth.load(Ordering::Relaxed);
@@ -150,9 +164,12 @@ pub struct KernLockGuard<'a> {
 // AGENT: make guard drop the only release step needed by normal callers.
 impl Drop for KernLockGuard<'_> {
     fn drop(&mut self) {
-        self.lock.leave(self.id);
+        self.lock.leave_checked(self.id);
     }
 }
+
+// AGENT: compatibility name formerly exported from kernel-sim/src/lib.rs.
+pub type LegacyGkl = KernLock;
 
 const SPIN_NO_OWNER: usize = 0;
 static NEXT_SPIN_OWNER: AtomicUsize = AtomicUsize::new(1);

@@ -93,6 +93,65 @@ impl Drop for PgFrameInner {
     }
 }
 
+// AGENT: legacy standalone refcount frame used by chaos-tests, kept separate
+// from the simulator RAII PgFrame used by address spaces.
+pub struct LegacyPgFrame {
+    pub rc: AtomicUsize,
+}
+
+// AGENT: expose the old atomic refcount helpers expected by chaos-tests.
+impl LegacyPgFrame {
+    pub fn new() -> Self {
+        Self {
+            rc: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn with_rc(n: usize) -> Self {
+        Self {
+            rc: AtomicUsize::new(n),
+        }
+    }
+
+    pub fn up(&self) -> usize {
+        self.rc.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn down(&self) -> usize {
+        self.rc.fetch_sub(1, Ordering::Relaxed)
+    }
+
+    pub fn count(&self) -> usize {
+        self.rc.load(Ordering::Relaxed)
+    }
+
+    pub fn set(&self, n: usize) {
+        self.rc.store(n, Ordering::Relaxed);
+    }
+
+    pub fn cas(&self, expected: usize, desired: usize) -> bool {
+        self.rc
+            .compare_exchange(expected, desired, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    pub fn inc_if_nonzero(&self) -> bool {
+        loop {
+            let cur = self.rc.load(Ordering::Relaxed);
+            if cur == 0 {
+                return false;
+            }
+            if self
+                .rc
+                .compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+}
+
 pub struct VmRegion {
     pub base: usize,
     pub len: usize,

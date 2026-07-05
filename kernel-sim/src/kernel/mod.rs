@@ -3,6 +3,7 @@
 #![allow(
     unused,
     dead_code,
+    ambiguous_glob_reexports,
     non_upper_case_globals,
     non_camel_case_types,
     unused_assignments,

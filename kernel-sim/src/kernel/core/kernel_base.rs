@@ -35,3 +35,24 @@ impl Kernel {
         }
     }
 }
+
+// AGENT: root compatibility kernel moved from src/lib.rs; it exposes only the
+// fields used by basic chaos-tests and delegates frame allocation to FramePool.
+pub struct LegacyKernel {
+    pub tasks: LegacyTaskTable,
+    pub pool: FramePool,
+}
+
+// AGENT: keep the legacy constructor and proc_init shape.
+impl LegacyKernel {
+    pub fn new(nf: usize) -> Self {
+        Self {
+            tasks: LegacyTaskTable::new(),
+            pool: FramePool::new(nf),
+        }
+    }
+
+    pub fn proc_init(&self) {
+        self.tasks.spawn_root();
+    }
+}

@@ -311,6 +311,49 @@ impl SharedPage {
     }
 }
 
+// AGENT: legacy COW helper that accepts the old PgFrame refcount type while
+// still allocating through the real kernel-sim FramePool.
+pub struct LegacySharedPage {
+    pub frame: AtomicUsize,
+    pub w: AtomicBool,
+    pub pending: AtomicBool,
+}
+
+// AGENT: preserve the old SharedPage behavior used by basic chaos-tests.
+impl LegacySharedPage {
+    pub fn new(f: usize) -> Self {
+        Self {
+            frame: AtomicUsize::new(f),
+            w: AtomicBool::new(false),
+            pending: AtomicBool::new(true),
+        }
+    }
+
+    pub fn fault(&self, pool: &FramePool, src: &LegacyPgFrame) -> Result<usize, &'static str> {
+        let pending = self.pending.load(Ordering::Relaxed);
+        let current = self.frame.load(Ordering::Relaxed);
+        if !pending {
+            let _writable = self.w.load(Ordering::Relaxed);
+            return Ok(current);
+        }
+        let frame = frame_alloc(pool).ok_or("oom")?;
+        let new_frame = (frame - MEM_OFF) / PAGE_SZ;
+        self.frame.store(new_frame, Ordering::Relaxed);
+        src.down();
+        self.w.store(true, Ordering::Relaxed);
+        self.pending.store(false, Ordering::Relaxed);
+        Ok(new_frame)
+    }
+
+    pub fn is_cow_resolved(&self) -> bool {
+        !self.pending.load(Ordering::Relaxed) && self.w.load(Ordering::Relaxed)
+    }
+
+    pub fn frame_id(&self) -> usize {
+        self.frame.load(Ordering::Relaxed)
+    }
+}
+
 pub struct KStk(usize);
 impl KStk {
     pub fn new() -> Self {
