@@ -313,7 +313,3 @@ impl PipeNode {
         self.data.lock().unwrap().readable_len()
     }
 }
-
-pub fn read_as_vec(data: &[u8]) -> Vec<u8> {
-    data.to_vec()
-}
