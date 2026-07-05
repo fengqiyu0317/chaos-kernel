@@ -3,6 +3,7 @@
 use super::*;
 
 const FILE_NODE_METADATA_MAGIC: &[u8; 4] = b"FNMD";
+const FILE_NODE_METADATA_HEADER_LEN: usize = 4 + 1 + 1 + 8 + 8 + 8;
 
 // AGENT: keep standalone/test file handles within the 1 MiB QEMU early heap;
 // full-chain writeback preserves correctness when a single chain recycles slots.
@@ -217,18 +218,51 @@ impl FileStorage {
     }
 }
 
-// AGENT: FileNodeBlocks owns one regular file's byte length and data-block RAII
-// wrappers so visible EOF and allocated capacity cannot drift apart.
+// AGENT: FileNodeBlocks owns backend block RAII wrappers without encoding
+// whether those blocks hold user data or FileNode metadata.
 #[derive(Debug)]
 struct FileNodeBlocks {
     blocks: Vec<FileBlock>,
-    byte_len: usize,
 }
 
 impl FileNodeBlocks {
     fn empty() -> Self {
+        Self { blocks: Vec::new() }
+    }
+
+    fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    fn push(&mut self, block: FileBlock) {
+        self.blocks.push(block);
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.blocks.truncate(len);
+    }
+
+    fn split_off(&mut self, at: usize) -> Vec<FileBlock> {
+        self.blocks.split_off(at)
+    }
+
+    fn ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.blocks.iter().map(FileBlock::id)
+    }
+}
+
+// AGENT: keep the visible regular-file EOF under the same lock as its data
+// blocks so readers never observe a length before the backing blocks exist.
+#[derive(Debug)]
+struct FileNodeData {
+    blocks: FileNodeBlocks,
+    byte_len: usize,
+}
+
+impl FileNodeData {
+    fn empty() -> Self {
         Self {
-            blocks: Vec::new(),
+            blocks: FileNodeBlocks::empty(),
             byte_len: 0,
         }
     }
@@ -239,8 +273,8 @@ impl FileNodeBlocks {
 pub struct FileNode {
     pub kind: FileKind,
     pub executable: AtomicBool,
-    storage: Mutex<FileNodeBlocks>,
-    metadata_block: Mutex<Option<FileBlock>>,
+    storage: Mutex<FileNodeData>,
+    metadata_blocks: Mutex<FileNodeBlocks>,
     dir_entries: Arc<Mutex<Vec<String>>>,
 }
 
@@ -251,8 +285,8 @@ impl FileNode {
         Self {
             kind: FileKind::Regular,
             executable: AtomicBool::new(executable),
-            storage: Mutex::new(FileNodeBlocks::empty()),
-            metadata_block: Mutex::new(None),
+            storage: Mutex::new(FileNodeData::empty()),
+            metadata_blocks: Mutex::new(FileNodeBlocks::empty()),
             dir_entries: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -262,8 +296,8 @@ impl FileNode {
         Self {
             kind: FileKind::Directory,
             executable: AtomicBool::new(false),
-            storage: Mutex::new(FileNodeBlocks::empty()),
-            metadata_block: Mutex::new(None),
+            storage: Mutex::new(FileNodeData::empty()),
+            metadata_blocks: Mutex::new(FileNodeBlocks::empty()),
             dir_entries: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -274,12 +308,20 @@ impl FileNode {
             return Err("enotdir");
         }
         {
+            let data_blocks = self.storage.lock().unwrap().blocks.len();
             let entries = self.dir_entries.lock().unwrap();
             if entries.iter().any(|entry| entry == name) {
                 return Ok(());
             }
+            let entry_name_bytes = Self::entry_name_bytes(&entries)?
+                .checked_add(name.len())
+                .ok_or("efbig")?;
+            let entry_count = entries.len().checked_add(1).ok_or("efbig")?;
+            let payload_len =
+                Self::metadata_payload_len(data_blocks, entry_count, entry_name_bytes)?;
+            drop(entries);
+            self.ensure_metadata_capacity(backend, payload_len)?;
         }
-        self.ensure_metadata_block(backend)?;
         let inserted = {
             let mut entries = self.dir_entries.lock().unwrap();
             if entries.iter().any(|entry| entry == name) {
@@ -324,6 +366,13 @@ impl FileNode {
             .saturating_mul(BLOCK_CACHE_BLOCK_SIZE)
     }
 
+    // AGENT: expose metadata block growth to focused qemu-sync regressions
+    // without leaking backend block ids into normal filesystem code.
+    #[cfg(any(test, feature = "qemu-sync-selftest"))]
+    pub(crate) fn metadata_block_count(&self) -> usize {
+        self.metadata_blocks.lock().unwrap().len()
+    }
+
     fn blocks_for_len(len: usize) -> Result<usize, &'static str> {
         if len == 0 {
             return Ok(0);
@@ -334,7 +383,7 @@ impl FileNode {
     }
 
     fn zero_range_locked(
-        storage: &FileNodeBlocks,
+        storage: &FileNodeData,
         backend: &FileStorage,
         start: usize,
         end: usize,
@@ -349,7 +398,7 @@ impl FileNode {
             let file_block = copied / BLOCK_CACHE_BLOCK_SIZE;
             let block_off = copied % BLOCK_CACHE_BLOCK_SIZE;
             let n = min(end - copied, BLOCK_CACHE_BLOCK_SIZE - block_off);
-            let block = storage.blocks[file_block].id();
+            let block = storage.blocks.blocks[file_block].id();
             if block_off == 0 && n == BLOCK_CACHE_BLOCK_SIZE {
                 backend.write_block(block, &zero)?;
             } else {
@@ -362,29 +411,51 @@ impl FileNode {
         Ok(())
     }
 
-    fn put_metadata_bytes(payload: &mut [u8], cursor: &mut usize, bytes: &[u8]) {
-        if *cursor < payload.len() {
-            let n = min(bytes.len(), payload.len() - *cursor);
-            payload[*cursor..*cursor + n].copy_from_slice(&bytes[..n]);
+    fn checked_metadata_add(lhs: usize, rhs: usize) -> Result<usize, &'static str> {
+        lhs.checked_add(rhs).ok_or("efbig")
+    }
+
+    fn entry_name_bytes(entries: &[String]) -> Result<usize, &'static str> {
+        let mut total = 0usize;
+        for entry in entries.iter() {
+            total = Self::checked_metadata_add(total, entry.len())?;
         }
-        *cursor = (*cursor).saturating_add(bytes.len());
+        Ok(total)
     }
 
-    fn put_metadata_u64(payload: &mut [u8], cursor: &mut usize, value: usize) {
-        let value = u64::try_from(value).unwrap_or(u64::MAX);
-        Self::put_metadata_bytes(payload, cursor, &value.to_le_bytes());
+    fn metadata_payload_len(
+        data_blocks: usize,
+        entry_count: usize,
+        entry_name_bytes: usize,
+    ) -> Result<usize, &'static str> {
+        let data_block_bytes = data_blocks.checked_mul(8).ok_or("efbig")?;
+        let entry_len_bytes = entry_count.checked_mul(8).ok_or("efbig")?;
+        let len = Self::checked_metadata_add(FILE_NODE_METADATA_HEADER_LEN, data_block_bytes)?;
+        let len = Self::checked_metadata_add(len, entry_len_bytes)?;
+        Self::checked_metadata_add(len, entry_name_bytes)
     }
 
-    fn metadata_payload(&self) -> Vec<u8> {
+    fn put_metadata_bytes(payload: &mut Vec<u8>, bytes: &[u8]) {
+        payload.extend_from_slice(bytes);
+    }
+
+    fn put_metadata_u64(payload: &mut Vec<u8>, value: usize) -> Result<(), &'static str> {
+        let value = u64::try_from(value).map_err(|_| "efbig")?;
+        Self::put_metadata_bytes(payload, &value.to_le_bytes());
+        Ok(())
+    }
+
+    fn metadata_payload(&self) -> Result<Vec<u8>, &'static str> {
         let storage = self.storage.lock().unwrap();
         let entries = self.dir_entries.lock().unwrap();
-        let mut payload = vec![0; BLOCK_CACHE_BLOCK_SIZE];
-        let mut cursor = 0usize;
+        let entry_name_bytes = Self::entry_name_bytes(&entries)?;
+        let payload_len =
+            Self::metadata_payload_len(storage.blocks.len(), entries.len(), entry_name_bytes)?;
+        let mut payload = Vec::with_capacity(payload_len);
 
-        Self::put_metadata_bytes(&mut payload, &mut cursor, FILE_NODE_METADATA_MAGIC);
+        Self::put_metadata_bytes(&mut payload, FILE_NODE_METADATA_MAGIC);
         Self::put_metadata_bytes(
             &mut payload,
-            &mut cursor,
             &[match self.kind {
                 FileKind::Regular => 1,
                 FileKind::Directory => 2,
@@ -392,45 +463,85 @@ impl FileNode {
         );
         Self::put_metadata_bytes(
             &mut payload,
-            &mut cursor,
             &[self.executable.load(Ordering::Relaxed) as u8],
         );
-        Self::put_metadata_u64(&mut payload, &mut cursor, storage.byte_len);
-        Self::put_metadata_u64(&mut payload, &mut cursor, storage.blocks.len());
-        Self::put_metadata_u64(&mut payload, &mut cursor, entries.len());
+        Self::put_metadata_u64(&mut payload, storage.byte_len)?;
+        Self::put_metadata_u64(&mut payload, storage.blocks.len())?;
+        Self::put_metadata_u64(&mut payload, entries.len())?;
 
-        for block in storage.blocks.iter() {
-            Self::put_metadata_u64(&mut payload, &mut cursor, block.id().saturating_add(1));
+        for block in storage.blocks.ids() {
+            let stored_id = block.checked_add(1).ok_or("efbig")?;
+            Self::put_metadata_u64(&mut payload, stored_id)?;
         }
         for entry in entries.iter() {
-            Self::put_metadata_u64(&mut payload, &mut cursor, entry.len());
-            Self::put_metadata_bytes(&mut payload, &mut cursor, entry.as_bytes());
+            Self::put_metadata_u64(&mut payload, entry.len())?;
+            Self::put_metadata_bytes(&mut payload, entry.as_bytes());
         }
+        debug_assert_eq!(payload.len(), payload_len);
 
-        payload
+        Ok(payload)
     }
 
-    fn ensure_metadata_block(&self, backend: &FileStorage) -> Result<usize, &'static str> {
-        let mut metadata_block = self.metadata_block.lock().unwrap();
-        if let Some(block) = metadata_block.as_ref() {
-            return Ok(block.id());
+    fn ensure_metadata_capacity(
+        &self,
+        backend: &FileStorage,
+        payload_len: usize,
+    ) -> Result<usize, &'static str> {
+        let needed_blocks = Self::blocks_for_len(payload_len.max(1))?;
+        let mut metadata_blocks = self.metadata_blocks.lock().unwrap();
+        if metadata_blocks.len() >= needed_blocks {
+            return Ok(needed_blocks);
         }
-        let block = backend.allocate_block()?;
-        let id = block.id();
-        *metadata_block = Some(block);
-        Ok(id)
+        let mut allocated = Vec::new();
+        while metadata_blocks.len() + allocated.len() < needed_blocks {
+            allocated.push(backend.allocate_block()?);
+        }
+        metadata_blocks.blocks.append(&mut allocated);
+        Ok(needed_blocks)
+    }
+
+    fn ensure_metadata_capacity_for_data_blocks(
+        &self,
+        backend: &FileStorage,
+        data_blocks: usize,
+    ) -> Result<(), &'static str> {
+        let entries = self.dir_entries.lock().unwrap();
+        let entry_name_bytes = Self::entry_name_bytes(&entries)?;
+        let payload_len = Self::metadata_payload_len(data_blocks, entries.len(), entry_name_bytes)?;
+        drop(entries);
+        self.ensure_metadata_capacity(backend, payload_len)?;
+        Ok(())
     }
 
     // AGENT: encode FileNode-owned metadata through BlockCache so metadata
-    // changes use the same dirty state as regular file-block writes.
+    // changes use the same dirty state as regular file-block writes, spanning
+    // as many backend blocks as the serialized metadata needs.
     fn mark_metadata_dirty(&self, backend: &FileStorage) -> Result<(), &'static str> {
-        let block = self.ensure_metadata_block(backend)?;
-        let payload = self.metadata_payload();
-        backend.write_block(block, &payload)
+        let payload = self.metadata_payload()?;
+        let needed_blocks = self.ensure_metadata_capacity(backend, payload.len())?;
+        let extra_blocks = {
+            let mut metadata_blocks = self.metadata_blocks.lock().unwrap();
+            for idx in 0..needed_blocks {
+                let start = idx * BLOCK_CACHE_BLOCK_SIZE;
+                let end = min(start + BLOCK_CACHE_BLOCK_SIZE, payload.len());
+                let mut block_payload = [0u8; BLOCK_CACHE_BLOCK_SIZE];
+                if start < end {
+                    block_payload[..end - start].copy_from_slice(&payload[start..end]);
+                }
+                backend.write_block(metadata_blocks.blocks[idx].id(), &block_payload)?;
+            }
+            if metadata_blocks.len() > needed_blocks {
+                metadata_blocks.split_off(needed_blocks)
+            } else {
+                Vec::new()
+            }
+        };
+        drop(extra_blocks);
+        Ok(())
     }
 
     fn write_may_change_metadata(
-        storage: &FileNodeBlocks,
+        storage: &FileNodeData,
         start: usize,
         len: usize,
     ) -> Result<bool, &'static str> {
@@ -464,7 +575,7 @@ impl FileNode {
             let file_block = abs / BLOCK_CACHE_BLOCK_SIZE;
             let block_off = abs % BLOCK_CACHE_BLOCK_SIZE;
             let n = min(total - copied, BLOCK_CACHE_BLOCK_SIZE - block_off);
-            let block = storage.blocks[file_block].id();
+            let block = storage.blocks.blocks[file_block].id();
             let block_data = backend.read_block(block)?;
             buf[copied..copied + n].copy_from_slice(&block_data[block_off..block_off + n]);
             copied += n;
@@ -496,8 +607,10 @@ impl FileNode {
             let storage = self.storage.lock().unwrap();
             let start = offset.unwrap_or(storage.byte_len);
             if Self::write_may_change_metadata(&storage, start, buf.len())? {
+                let end = start.checked_add(buf.len()).ok_or("efbig")?;
+                let needed_blocks = Self::blocks_for_len(end)?;
                 drop(storage);
-                self.ensure_metadata_block(backend)?;
+                self.ensure_metadata_capacity_for_data_blocks(backend, needed_blocks)?;
             }
         }
         let mut storage = self.storage.lock().unwrap();
@@ -524,7 +637,7 @@ impl FileNode {
             let file_block = abs / BLOCK_CACHE_BLOCK_SIZE;
             let block_off = abs % BLOCK_CACHE_BLOCK_SIZE;
             let n = min(buf.len() - copied, BLOCK_CACHE_BLOCK_SIZE - block_off);
-            let block = storage.blocks[file_block].id();
+            let block = storage.blocks.blocks[file_block].id();
             let mut block_data = if block_off == 0 && n == BLOCK_CACHE_BLOCK_SIZE {
                 vec![0; BLOCK_CACHE_BLOCK_SIZE]
             } else {
@@ -572,7 +685,7 @@ impl FileNode {
             let storage = self.storage.lock().unwrap();
             if storage.blocks.len() != keep_blocks || storage.byte_len != len {
                 drop(storage);
-                self.ensure_metadata_block(backend)?;
+                self.ensure_metadata_capacity_for_data_blocks(backend, keep_blocks)?;
             }
         }
         let changed = {
@@ -584,7 +697,7 @@ impl FileNode {
                 // the same final block.
             } else {
                 if keep_blocks < storage.blocks.len() {
-                    for block in storage.blocks[keep_blocks..].iter() {
+                    for block in storage.blocks.blocks[keep_blocks..].iter() {
                         block.clear_for_release()?;
                     }
                     storage.blocks.truncate(keep_blocks);
@@ -628,7 +741,7 @@ impl FileNode {
             }
             if storage.blocks.len() < needed_blocks || storage.byte_len < len {
                 drop(storage);
-                self.ensure_metadata_block(backend)?;
+                self.ensure_metadata_capacity_for_data_blocks(backend, needed_blocks)?;
             }
         }
         let grew = {
@@ -662,7 +775,10 @@ impl fmt::Debug for FileNode {
             .field("executable", &self.executable.load(Ordering::Relaxed))
             .field("byte_len", &storage.byte_len)
             .field("blocks", &storage.blocks.len())
-            .field("metadata_block", &*self.metadata_block.lock().unwrap())
+            .field(
+                "metadata_blocks",
+                &self.metadata_blocks.lock().unwrap().len(),
+            )
             .field("entries", &self.dir_entries.lock().unwrap().len())
             .finish()
     }

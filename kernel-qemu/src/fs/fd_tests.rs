@@ -5,6 +5,8 @@ use super::*;
 // AGENT: keep the QEMU boot selftest aggregator in the moved fd test module.
 pub fn run_all() {
     set_len_tracks_byte_length_and_block_capacity();
+    metadata_blocks_expand_for_large_regular_file();
+    metadata_blocks_expand_for_large_directory_entry();
     truncate_releases_blocks_for_reuse_without_old_contents();
     fallocate_validates_and_only_grows_regular_files();
     read_entry_uses_open_description_offset();
@@ -61,6 +63,36 @@ fn set_len_tracks_byte_length_and_block_capacity() {
     let ro = FHandle::with_data("/tmp/ro", vec![1, 2, 3]);
     let ro_entry = file_entry(&ro, FdOpt::default());
     assert_eq!(ro_entry.set_len(0), Err("ebadf"));
+}
+
+// AGENT: regular-file metadata must grow past one backend block when the data
+// block id list no longer fits in the first metadata payload block.
+#[cfg_attr(test, test)]
+fn metadata_blocks_expand_for_large_regular_file() {
+    let fh = FHandle::with_data("/tmp/large", Vec::new());
+    let data = vec![0x7a; BLOCK_CACHE_BLOCK_SIZE * 61];
+
+    fh.write_at(0, &data).unwrap();
+
+    assert_eq!(fh.len(), data.len());
+    assert_eq!(fh.node.allocated_len(), data.len());
+    assert_eq!(fh.node.metadata_block_count(), 2);
+}
+
+// AGENT: directory metadata uses the same multi-block payload path as regular
+// files, with entry names contributing to metadata size.
+#[cfg_attr(test, test)]
+fn metadata_blocks_expand_for_large_directory_entry() {
+    let dir = FHandle::with_node("/tmp", Arc::new(FileNode::directory()));
+    let mut name = String::new();
+    for _ in 0..BLOCK_CACHE_BLOCK_SIZE {
+        name.push('x');
+    }
+
+    dir.node.add_dir_entry(&dir.storage, &name).unwrap();
+
+    assert_eq!(dir.node.metadata_block_count(), 2);
+    assert_eq!(dir.read_entry(0), Ok(name));
 }
 
 // AGENT: truncation must return cleared blocks to the shared FileStorage
