@@ -41,124 +41,174 @@ impl EpCtlOp {
     pub const MOD: i32 = 3;
 }
 
-// AGENT: epoll instances now own both the interest table and a wait queue that
-// source readiness callbacks can wake.
+// AGENT: one watched fd inside an epoll instance. queued mirrors Linux epitem
+// membership in the ready list so repeated source callbacks do not duplicate fd
+// entries before epoll_wait consumes them.
+struct EpItem {
+    event: EpEvent,
+    source_sub: Option<usize>,
+    queued: bool,
+}
+
+#[derive(Default)]
+struct EpInstInner {
+    interests: BTreeMap<usize, EpItem>,
+    ready_list: VecDeque<usize>,
+}
+
+impl EpInstInner {
+    fn queue_ready(&mut self, fd: usize) -> bool {
+        let Some(item) = self.interests.get_mut(&fd) else {
+            return false;
+        };
+        if item.queued {
+            return false;
+        }
+        item.queued = true;
+        self.ready_list.push_back(fd);
+        true
+    }
+
+    fn remove_ready(&mut self, fd: usize) {
+        if let Some(item) = self.interests.get_mut(&fd) {
+            item.queued = false;
+        }
+        self.ready_list.retain(|queued_fd| *queued_fd != fd);
+    }
+}
+
+// AGENT: epoll instances now hold an interest table plus a Linux-style ready
+// list. epoll_wait consumes ready_list entries instead of scanning every
+// registered fd on each wake.
 #[derive(Clone)]
 pub struct EpInst {
-    pub events: Arc<Mutex<BTreeMap<usize, EpEvent>>>,
-    pub ready: Arc<Mutex<BTreeSet<usize>>>,
+    inner: Arc<Mutex<EpInstInner>>,
     // AGENT: epoll_wait sleeps on this queue and source readiness callbacks
     // wake it when a registered fd becomes ready.
-    pub waiters: Arc<Mutex<VecDeque<WaitToken>>>,
-    // AGENT: fd -> EvBus subscription id for registrations backed by a
-    // cancellable readiness source such as PipeNode.
-    source_subs: Arc<Mutex<BTreeMap<usize, usize>>>,
+    waiters: Arc<WaitQueue>,
 }
 impl EpInst {
     pub fn new() -> Self {
         EpInst {
-            events: Arc::new(Mutex::new(BTreeMap::new())),
-            ready: Arc::new(Mutex::new(BTreeSet::new())),
-            waiters: Arc::new(Mutex::new(VecDeque::new())),
-            source_subs: Arc::new(Mutex::new(BTreeMap::new())),
+            inner: Arc::new(Mutex::new(EpInstInner::default())),
+            waiters: Arc::new(WaitQueue::new()),
         }
     }
-    // AGENT: notify epoll_wait waiters that one watched fd has reached a
-    // readiness state. Stale callbacks are ignored if the fd is no longer
-    // registered in this epoll instance.
+    // AGENT: source callbacks queue one watched fd onto the ready list. Stale
+    // callbacks are ignored if the fd is no longer registered in this instance.
     pub fn mark_ready(&self, fd: usize) {
-        if !self.events.lock().unwrap().contains_key(&fd) {
-            return;
+        let queued = self.inner.lock().unwrap().queue_ready(fd);
+        if queued {
+            self.wake_all_waiters();
         }
-        self.ready.lock().unwrap().insert(fd);
-        self.wake_all_waiters();
     }
-    // AGENT: clear cached readiness before a level-triggered rescan; new
-    // callbacks racing after this point repopulate the cache and wake waiters.
-    pub fn clear_ready(&self) {
-        self.ready.lock().unwrap().clear();
+
+    // AGENT: level-triggered epoll_wait puts still-ready items back on the
+    // ready list so later waits can observe them without rescanning all fds.
+    pub fn requeue_ready(&self, fd: usize) {
+        self.inner.lock().unwrap().queue_ready(fd);
     }
-    // AGENT: preserve the compatibility ready cache for FLike::Ep::poll().
-    pub fn replace_ready(&self, ready_fds: BTreeSet<usize>) {
-        *self.ready.lock().unwrap() = ready_fds;
+
+    // AGENT: pop the next possibly-ready watched fd. The caller must poll the
+    // current fd state before returning it to userspace because readiness can
+    // become stale between callback delivery and epoll_wait.
+    pub fn pop_ready(&self) -> Option<(usize, EpEvent)> {
+        let mut inner = self.inner.lock().unwrap();
+        while let Some(fd) = inner.ready_list.pop_front() {
+            let Some(item) = inner.interests.get_mut(&fd) else {
+                continue;
+            };
+            item.queued = false;
+            return Some((fd, item.event.clone()));
+        }
+        None
     }
+
+    pub fn has_interest(&self, fd: usize) -> bool {
+        self.inner.lock().unwrap().interests.contains_key(&fd)
+    }
+
+    pub fn ready_len(&self) -> usize {
+        self.inner.lock().unwrap().ready_list.len()
+    }
+
     // AGENT: expose epoll-fd readiness without making FLike inspect EpInst
     // internals directly.
     pub fn poll_status(&self) -> PollStatus {
-        let ready = self.ready.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
         PollStatus {
-            readable: !ready.is_empty(),
+            readable: !inner.ready_list.is_empty(),
             ..PollStatus::default()
         }
     }
-    // AGENT: enqueue an epoll_wait token only if no readiness callback has
-    // populated the cache since the last scan.
+
+    // AGENT: enqueue an epoll_wait token only while the ready list is still
+    // empty. Holding inner while enqueueing closes the check-then-sleep race
+    // against mark_ready().
     pub fn prepare_wait(&self) -> Option<WaitToken> {
-        let ready = self.ready.lock().unwrap();
-        if !ready.is_empty() {
+        let inner = self.inner.lock().unwrap();
+        if !inner.ready_list.is_empty() {
             return None;
         }
-        let token = WaitToken::current();
-        self.waiters.lock().unwrap().push_back(token.clone());
+        let token = self.waiters.enqueue_current_locked();
         Some(token)
     }
     // AGENT: remove a timed-out epoll_wait token from the instance queue.
     pub fn remove_waiter(&self, token: &WaitToken) {
-        self.waiters
-            .lock()
-            .unwrap()
-            .retain(|queued| !queued.same(token));
+        self.waiters.remove_waiter(token);
     }
     // AGENT: remember which EvBus callback backs a watched fd.
     pub fn set_source_sub(&self, fd: usize, sub_id: usize) {
-        self.source_subs.lock().unwrap().insert(fd, sub_id);
+        if let Some(item) = self.inner.lock().unwrap().interests.get_mut(&fd) {
+            item.source_sub = Some(sub_id);
+        }
     }
     // AGENT: take the callback id so the caller can unregister it from the
     // concrete source while processing epoll_ctl(DEL/MOD).
     pub fn take_source_sub(&self, fd: usize) -> Option<usize> {
-        self.source_subs.lock().unwrap().remove(&fd)
+        self.inner
+            .lock()
+            .unwrap()
+            .interests
+            .get_mut(&fd)
+            .and_then(|item| item.source_sub.take())
     }
 
     // AGENT: closing a watched fd removes its registration and returns the
     // source subscription id that must be cancelled on the watched file object.
     pub fn remove_closed_fd(&self, fd: usize) -> Option<usize> {
-        self.remove_interest(fd);
-        self.source_subs.lock().unwrap().remove(&fd)
+        self.remove_interest(fd).and_then(|item| item.source_sub)
     }
 
     // AGENT: closing the last descriptor for an epoll instance detaches every
     // source callback and wakes waiters so they can observe the closed fd.
     pub fn drain_source_subs_on_close(&self) -> Vec<(usize, usize)> {
         let subs = {
-            let mut source_subs = self.source_subs.lock().unwrap();
-            let drained = source_subs
+            let mut inner = self.inner.lock().unwrap();
+            let drained = inner
+                .interests
                 .iter()
-                .map(|(&fd, &sub_id)| (fd, sub_id))
+                .filter_map(|(&fd, item)| item.source_sub.map(|sub_id| (fd, sub_id)))
                 .collect();
-            source_subs.clear();
+            inner.interests.clear();
+            inner.ready_list.clear();
             drained
         };
-
-        self.events.lock().unwrap().clear();
-        self.ready.lock().unwrap().clear();
         self.wake_all_waiters();
 
         subs
     }
 
     // AGENT: remove the epoll-visible part of one watched fd registration.
-    fn remove_interest(&self, fd: usize) -> bool {
-        let existed = self.events.lock().unwrap().remove(&fd).is_some();
-        self.ready.lock().unwrap().remove(&fd);
-        existed
+    fn remove_interest(&self, fd: usize) -> Option<EpItem> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.remove_ready(fd);
+        inner.interests.remove(&fd)
     }
 
     // AGENT: finish all waiters that are sleeping on this epoll instance.
     fn wake_all_waiters(&self) {
-        let waiters: Vec<WaitToken> = self.waiters.lock().unwrap().drain(..).collect();
-        for token in waiters {
-            token.wake();
-        }
+        self.waiters.broadcast();
     }
 
     // AGENT: EpInst clones share their tables through Arc<Mutex<_>>, so control
@@ -166,23 +216,33 @@ impl EpInst {
     pub fn control(&self, op: i32, fd: usize, ev: &EpEvent) -> Result<(), &'static str> {
         match op {
             EpCtlOp::ADD => {
-                let mut events = self.events.lock().unwrap();
-                if events.contains_key(&fd) {
+                let mut inner = self.inner.lock().unwrap();
+                if inner.interests.contains_key(&fd) {
                     return Err("eexist");
                 }
-                events.insert(fd, ev.clone());
+                inner.interests.insert(
+                    fd,
+                    EpItem {
+                        event: ev.clone(),
+                        source_sub: None,
+                        queued: false,
+                    },
+                );
                 Ok(())
             }
             EpCtlOp::MOD => {
-                let mut events = self.events.lock().unwrap();
-                if !events.contains_key(&fd) {
-                    return Err("enoent");
+                let mut inner = self.inner.lock().unwrap();
+                inner.remove_ready(fd);
+                match inner.interests.get_mut(&fd) {
+                    Some(item) => {
+                        item.event = ev.clone();
+                        Ok(())
+                    }
+                    None => Err("enoent"),
                 }
-                events.insert(fd, ev.clone());
-                Ok(())
             }
             EpCtlOp::DEL => {
-                if !self.remove_interest(fd) {
+                if self.remove_interest(fd).is_none() {
                     return Err("enoent");
                 }
                 Ok(())

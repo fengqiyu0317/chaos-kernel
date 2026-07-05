@@ -77,11 +77,18 @@ pub(super) fn sys_epoll_ctl(
     // AGENT: mutate the registered epoll instance first, then mirror ADD/MOD/DEL
     // into the source object's cancellable readiness subscription when present.
     let inst = epoll_instance(&task, epfd)?;
+    let del_sub_id = if op == EpCtlOp::DEL && inst.has_interest(fd) {
+        inst.take_source_sub(fd)
+    } else {
+        None
+    };
     inst.control(op, fd, &ev)?;
     match op {
         EpCtlOp::ADD => {
             if let Some(sub_id) = file.register_epoll(fd, inst.clone(), &ev) {
                 inst.set_source_sub(fd, sub_id);
+            } else {
+                mark_if_currently_ready(&task, &inst, fd, ev.events);
             }
         }
         EpCtlOp::MOD => {
@@ -90,10 +97,12 @@ pub(super) fn sys_epoll_ctl(
             }
             if let Some(sub_id) = file.register_epoll(fd, inst.clone(), &ev) {
                 inst.set_source_sub(fd, sub_id);
+            } else {
+                mark_if_currently_ready(&task, &inst, fd, ev.events);
             }
         }
         EpCtlOp::DEL => {
-            if let Some(sub_id) = inst.take_source_sub(fd) {
+            if let Some(sub_id) = del_sub_id {
                 file.unregister_epoll(sub_id);
             }
         }
@@ -122,9 +131,19 @@ pub(crate) fn epoll_ready_events(status: PollStatus, interest: u32) -> u32 {
     ready
 }
 
-// AGENT: epoll_wait now sleeps on EpInst.waiters and is woken by registered
-// source readiness callbacks. QEMU timeouts use the logical timer wheel instead
-// of host Instant/park_timeout.
+// AGENT: non-source-backed files do not install EvBus callbacks, so epoll_ctl
+// seeds the ready list once from their current level-triggered poll state.
+fn mark_if_currently_ready(task: &Task, inst: &EpInst, fd: usize, interest: u32) {
+    if let Some(entry) = task.get_fd_entry(fd) {
+        if epoll_ready_events(entry.poll(), interest) != 0 {
+            inst.mark_ready(fd);
+        }
+    }
+}
+
+// AGENT: epoll_wait consumes EpInst's ready list and only polls fd entries that
+// were delivered by source callbacks or initial level-triggered registration.
+// QEMU timeouts use the logical timer wheel instead of host Instant/park_timeout.
 pub(super) fn sys_epoll_wait(
     kernel: &Kernel,
     a0: usize,
@@ -156,22 +175,11 @@ pub(super) fn sys_epoll_wait(
 
     loop {
         let inst = epoll_instance(&task, epfd)?;
-        inst.clear_ready();
-        let registrations: Vec<(usize, EpEvent)> = {
-            inst.events
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(&fd, ev)| (fd, ev.clone()))
-                .collect()
-        };
-
         let mut nready = 0usize;
-        let mut ready_fds = BTreeSet::new();
-        for (fd, ev) in registrations {
-            if nready >= max_events {
+        while nready < max_events {
+            let Some((fd, ev)) = inst.pop_ready() else {
                 break;
-            }
+            };
             let Some(entry) = task.get_fd_entry(fd) else {
                 continue;
             };
@@ -180,7 +188,6 @@ pub(super) fn sys_epoll_wait(
                 continue;
             }
 
-            ready_fds.insert(fd);
             let out = EpEvent {
                 events: ready,
                 data: ev.data,
@@ -191,10 +198,12 @@ pub(super) fn sys_epoll_wait(
                 ::core::ptr::write_unaligned(dst, out);
             }
             nready += 1;
+            if !ev.has(EpEvent::ET) {
+                inst.requeue_ready(fd);
+            }
         }
 
         if nready > 0 {
-            inst.replace_ready(ready_fds);
             return Ok(nready);
         }
         if timeout == 0 {

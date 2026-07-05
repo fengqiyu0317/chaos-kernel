@@ -39,6 +39,7 @@ pub fn run_all() {
     pipe_uses_bounded_ring_buffer_and_reports_writable();
     pipe_epoll_closed_status_reports_hup_and_err();
     fd_close_detaches_epoll_subscription_before_reuse();
+    epoll_ready_list_deduplicates_and_requeues();
 }
 
 // AGENT: reset simulator-global wait state so QEMU boot selftests are
@@ -463,8 +464,8 @@ fn fd_close_detaches_epoll_subscription_before_reuse() {
 
     task.close_fd(read_fd)
         .expect("closing watched fd should succeed");
-    assert!(!epoll.events.lock().unwrap().contains_key(&read_fd));
-    assert!(epoll.ready.lock().unwrap().is_empty());
+    assert!(!epoll.has_interest(read_fd));
+    assert_eq!(epoll.ready_len(), 0);
 
     let (new_read, new_write) = PipeNode::pair();
     let (new_read_fd, new_write_fd) = task
@@ -498,8 +499,9 @@ fn fd_close_detaches_epoll_subscription_before_reuse() {
             .expect_err("old pipe should be broken"),
         "broken"
     );
-    assert!(
-        epoll.ready.lock().unwrap().is_empty(),
+    assert_eq!(
+        epoll.ready_len(),
+        0,
         "stale source callback marked the reused fd ready"
     );
 
@@ -507,6 +509,42 @@ fn fd_close_detaches_epoll_subscription_before_reuse() {
     let _ = task.close_fd(new_write_fd);
     let _ = task.close_fd(write_fd);
     let _ = task.close_fd(epfd);
+    clear_wait_token_state();
+}
+
+// AGENT: EpInst's ready list models Linux epitem queueing: source callbacks
+// deduplicate a watched fd until epoll_wait consumes it, and LT delivery can
+// requeue the same still-ready fd.
+#[cfg_attr(test, test)]
+fn epoll_ready_list_deduplicates_and_requeues() {
+    reset_wait_token_state(24);
+
+    let epoll = EpInst::new();
+    let event = EpEvent {
+        events: EpEvent::IN,
+        data: EpData { ptr: 7 },
+    };
+    epoll
+        .control(EpCtlOp::ADD, 3, &event)
+        .expect("epoll add should succeed");
+
+    epoll.mark_ready(3);
+    epoll.mark_ready(3);
+    assert_eq!(epoll.ready_len(), 1);
+
+    let (fd, queued) = epoll.pop_ready().expect("ready fd should be queued");
+    assert_eq!(fd, 3);
+    assert_eq!(queued.data.ptr, 7);
+    assert_eq!(epoll.ready_len(), 0);
+
+    epoll.requeue_ready(3);
+    assert_eq!(epoll.ready_len(), 1);
+
+    epoll
+        .control(EpCtlOp::DEL, 3, &event)
+        .expect("epoll delete should succeed");
+    assert_eq!(epoll.ready_len(), 0);
+    assert!(epoll.pop_ready().is_none());
     clear_wait_token_state();
 }
 
