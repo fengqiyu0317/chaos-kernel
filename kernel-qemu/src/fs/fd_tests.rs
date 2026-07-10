@@ -25,10 +25,10 @@ fn writable_opt() -> FdOpt {
     }
 }
 
-// AGENT: build a fd entry around a regular-file object with explicit
-// open-description state; FInstance no longer carries fd status or offset.
+// AGENT: build a fd entry around a regular-file handle with explicit
+// open-description status; FInstance remains only the backing object.
 fn file_entry(instance: &FInstance, opt: FdOpt) -> FdEntry {
-    FdEntry::with_status(FLike::File(instance.clone()), opt, false)
+    FdEntry::with_status(FLike::File(FHandle::new(instance.clone())), opt, false)
 }
 
 // AGENT: observe a regular-file byte range through the public read path while
@@ -155,8 +155,8 @@ fn fallocate_validates_and_only_grows_regular_files() {
     assert_eq!(dir_entry.fallocate(0, 1), Err("enodev"));
 }
 
-// AGENT: directory entry reads advance the shared open-file-description offset,
-// while direct FInstance reads remain explicit-index helpers.
+// AGENT: directory entry reads advance the shared FHandle offset, while direct
+// FInstance reads remain explicit-index helpers.
 #[cfg_attr(test, test)]
 fn read_entry_uses_open_description_offset() {
     let dir = FInstance::with_node("/tmp", Arc::new(FileNode::directory()));

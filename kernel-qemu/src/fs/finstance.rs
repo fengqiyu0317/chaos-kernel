@@ -2,7 +2,7 @@
 use super::*;
 
 // AGENT: regular file instances only identify the backing file object. Per-open
-// access flags, status flags, and current offset live in OpenFileDesc.
+// offset lives in FHandle, while access/status flags live in OpenFileDesc.
 #[derive(Clone)]
 pub struct FInstance {
     pub path: String,
@@ -10,17 +10,7 @@ pub struct FInstance {
     pub(super) storage: FileStorage,
 }
 
-#[derive(Debug)]
-pub enum FSeek {
-    Start(u64),
-    End(i64),
-    Cur(i64),
-}
-
 impl FInstance {
-    pub(super) const TRANSFER_WRITE: u8 = 0;
-    pub(super) const TRANSFER_READ: u8 = 1;
-
     // AGENT: create a fresh standalone regular node for device-like instances.
     pub fn new(path: &str) -> Self {
         let storage = FileStorage::standalone();
@@ -77,79 +67,10 @@ impl FInstance {
         self.node.read_bytes(&self.storage, off, buf)
     }
 
-    // AGENT: read using state supplied by the owning OpenFileDesc.
-    pub(super) fn read_with_state(
-        &self,
-        status: FdOpt,
-        offset: &mut u64,
-        buf: &mut [u8],
-    ) -> Result<usize, &'static str> {
-        if !status.rd {
-            return Err("ebadf");
-        }
-        let off = match usize::try_from(*offset) {
-            Ok(off) => off,
-            Err(_) => return Ok(0),
-        };
-        let n = self.copy_from_node_at(off, buf)?;
-        let moved = u64::try_from(n).map_err(|_| "efbig")?;
-        *offset = offset.checked_add(moved).ok_or("efbig")?;
-        Ok(n)
-    }
-
-    // AGENT: positioned reads use the supplied status and do not advance the
-    // shared descriptor offset.
-    fn read_at_with_status(
-        &self,
-        status: FdOpt,
-        off: usize,
-        buf: &mut [u8],
-    ) -> Result<usize, &'static str> {
-        if !status.rd {
-            return Err("ebadf");
-        }
-        self.copy_from_node_at(off, buf)
-    }
-
     // AGENT: direct positioned reads are pure file-object reads; fd permission
     // checks belong to OpenFileDesc.
     pub fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
         self.copy_from_node_at(off, buf)
-    }
-
-    // AGENT: write using state supplied by the owning OpenFileDesc.
-    pub(super) fn write_with_state(
-        &self,
-        status: FdOpt,
-        offset: &mut u64,
-        buf: &[u8],
-    ) -> Result<usize, &'static str> {
-        if !status.wr {
-            return Err("ebadf");
-        }
-        let off = if status.ap {
-            None
-        } else {
-            Some(usize::try_from(*offset).map_err(|_| "efbig")?)
-        };
-        let end = self.node.write_bytes(&self.storage, off, buf)?;
-        *offset = u64::try_from(end).map_err(|_| "efbig")?;
-        Ok(buf.len())
-    }
-
-    // AGENT: explicit-offset writes use the supplied status and do not advance
-    // the shared file offset.
-    fn write_at_with_status(
-        &self,
-        status: FdOpt,
-        off: usize,
-        buf: &[u8],
-    ) -> Result<usize, &'static str> {
-        if !status.wr {
-            return Err("ebadf");
-        }
-        self.node.write_bytes(&self.storage, Some(off), buf)?;
-        Ok(buf.len())
     }
 
     // AGENT: direct positioned writes are pure file-object writes; fd permission
@@ -157,34 +78,6 @@ impl FInstance {
     pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
         self.node.write_bytes(&self.storage, Some(off), buf)?;
         Ok(buf.len())
-    }
-
-    // AGENT: validate the legacy transfer-shaped API explicitly instead of
-    // accepting arbitrary odd/even direction values or extra buffers.
-    pub(super) fn transfer_with_state(
-        &self,
-        status: FdOpt,
-        offset: &mut u64,
-        dir: u8,
-        positioned_offset: Option<usize>,
-        buf_rd: Option<&mut [u8]>,
-        buf_wr: Option<&[u8]>,
-    ) -> Result<usize, &'static str> {
-        match (dir, positioned_offset, buf_rd, buf_wr) {
-            (Self::TRANSFER_READ, Some(off), Some(buf), None) => {
-                self.read_at_with_status(status, off, buf)
-            }
-            (Self::TRANSFER_READ, None, Some(buf), None) => {
-                self.read_with_state(status, offset, buf)
-            }
-            (Self::TRANSFER_WRITE, Some(off), None, Some(buf)) => {
-                self.write_at_with_status(status, off, buf)
-            }
-            (Self::TRANSFER_WRITE, None, None, Some(buf)) => {
-                self.write_with_state(status, offset, buf)
-            }
-            _ => Err("einval"),
-        }
     }
 
     // AGENT: copy a regular-file byte range without changing descriptor state.

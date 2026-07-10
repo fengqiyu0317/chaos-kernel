@@ -408,9 +408,11 @@ fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str> {
     let stdin_instance = FInstance::new("/dev/tty");
     let stdout_instance = FInstance::new("/dev/tty");
     let stderr_instance = stdout_instance.dup();
-    let stdin = task.add_file_with_status(FLike::File(stdin_instance), stdin_opt)?;
-    let stdout = task.add_file_with_status(FLike::File(stdout_instance), stdout_opt)?;
-    let stderr = task.add_file_with_status(FLike::File(stderr_instance), stdout_opt)?;
+    let stdin = task.add_file_with_status(FLike::File(FHandle::new(stdin_instance)), stdin_opt)?;
+    let stdout =
+        task.add_file_with_status(FLike::File(FHandle::new(stdout_instance)), stdout_opt)?;
+    let stderr =
+        task.add_file_with_status(FLike::File(FHandle::new(stderr_instance)), stdout_opt)?;
     if (stdin, stdout, stderr) != (0, 1, 2) {
         return Err("ebadf");
     }
@@ -665,7 +667,11 @@ impl Task {
                 template.dup(saved.cloexec)
             } else {
                 let (instance, status) = checkpoint_stdio_instance(saved.kind, saved.status_flags)?;
-                let entry = FdEntry::with_status(FLike::File(instance), status, saved.cloexec);
+                let entry = FdEntry::with_status(
+                    FLike::File(FHandle::new(instance)),
+                    status,
+                    saved.cloexec,
+                );
                 entry.seek(FSeek::Start(saved.offset))?;
                 descriptions.insert(saved.description_id, entry.clone());
                 entry

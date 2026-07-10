@@ -135,7 +135,8 @@ pub(super) fn sys_open(
     if _truncate && wr {
         instance.set_len(0)?;
     }
-    let fd = task.add_file_with_cloexec_and_status(FLike::File(instance), opt, _cloexec)?;
+    let fd =
+        task.add_file_with_cloexec_and_status(FLike::File(FHandle::new(instance)), opt, _cloexec)?;
     let _perm_check = {
         let owner_r = (mode >> 8) & 0x4;
         let owner_w = (mode >> 8) & 0x2;

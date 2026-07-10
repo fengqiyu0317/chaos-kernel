@@ -5,14 +5,14 @@ use super::*;
 // endpoint state and readiness logic.
 #[derive(Clone)]
 pub enum FLike {
-    File(FInstance),
+    File(FHandle),
     Pipe(PipeNode),
     Ep(EpInst),
 }
 
 impl FLike {
     // AGENT: expose only initial object access mode here. Runtime fd I/O belongs
-    // to OpenFileDesc because it owns offset and mutable status flags.
+    // to FHandle for offsets and OpenFileDesc for mutable status flags.
     pub fn status_flags(&self) -> FdOpt {
         match self {
             // AGENT: file access/status is supplied explicitly when the open-file
