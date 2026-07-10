@@ -73,6 +73,9 @@ impl OpenFileDescription {
     // AGENT: enforce open-file-description access flags before dispatching to
     // the concrete file-like object.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         match &self.file {
             FLike::File(f) => {
                 let mut state = self.state.write().unwrap();
@@ -91,6 +94,9 @@ impl OpenFileDescription {
     // AGENT: keep append/write permission checks in the shared open-file
     // description instead of duplicating mutable status in FHandle.
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         match &self.file {
             FLike::File(f) => {
                 let mut state = self.state.write().unwrap();
@@ -121,7 +127,11 @@ impl OpenFileDescription {
                 let state = self.state.read().unwrap();
                 f.io_ctl_with_offset(req, arg, state.offset)
             }
-            _ => self.file.io_ctl(req, arg),
+            FLike::Pipe(p) => match req {
+                FIONREAD => Ok(p.readable_len()),
+                _ => Err("enotty"),
+            },
+            FLike::Ep(_) => Err("enosys"),
         }
     }
 

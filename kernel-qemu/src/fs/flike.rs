@@ -11,32 +11,8 @@ pub enum FLike {
 }
 
 impl FLike {
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        match self {
-            // AGENT: regular-file reads need open-description offset/status, so
-            // fd-table I/O must dispatch through FdEntry/OpenFileDescription.
-            FLike::File(_) => Err("enosys"),
-            FLike::Pipe(p) => p.read_at(buf),
-            FLike::Ep(_) => Err("enosys"),
-        }
-    }
-
-    pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        match self {
-            // AGENT: regular-file writes need open-description offset/status, so
-            // fd-table I/O must dispatch through FdEntry/OpenFileDescription.
-            FLike::File(_) => Err("enosys"),
-            FLike::Pipe(p) => p.write_at(buf),
-            FLike::Ep(_) => Err("enosys"),
-        }
-    }
-
+    // AGENT: expose only initial object access mode here. Runtime fd I/O belongs
+    // to OpenFileDescription because it owns offset and mutable status flags.
     pub fn status_flags(&self) -> FdOpt {
         match self {
             // AGENT: file access/status is supplied explicitly when the open-file
@@ -49,21 +25,6 @@ impl FLike {
                 ap: false,
                 nb: false,
             },
-        }
-    }
-
-    // AGENT: handle object-specific ioctl requests; fd-wide requests such as
-    // FIONBIO are applied by sys_ioctl because they mutate descriptor status.
-    pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
-        match self {
-            // AGENT: regular-file ioctl needs open-description offset, so
-            // fd-table ioctl must dispatch through OpenFileDescription.
-            FLike::File(_) => Err("enosys"),
-            FLike::Pipe(p) => match req {
-                FIONREAD => Ok(p.readable_len()),
-                _ => Err("enotty"),
-            },
-            FLike::Ep(_) => Err("enosys"),
         }
     }
 
