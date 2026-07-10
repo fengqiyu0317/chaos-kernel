@@ -28,17 +28,11 @@ impl FdOpt {
     }
 }
 
-// AGENT: shared mutable status produced by one open. Regular-file offsets now
-// live in FHandle; dup/fork share both through OpenFileDesc.
-struct OpenFileState {
-    status: FdOpt,
-}
-
 // AGENT: shared open-file description; dup/fork clone FdEntry while sharing
-// this object, so status state, file handles, and pipe endpoint lifetime remain shared.
+// this object, so status flags, file handles, and pipe endpoint lifetime remain shared.
 pub struct OpenFileDesc {
     file: FLike,
-    state: RwLock<OpenFileState>,
+    status: RwLock<FdOpt>,
 }
 
 impl OpenFileDesc {
@@ -53,7 +47,7 @@ impl OpenFileDesc {
     pub fn new_with_status(file: FLike, status: FdOpt) -> Self {
         Self {
             file,
-            state: RwLock::new(OpenFileState { status }),
+            status: RwLock::new(status),
         }
     }
 
@@ -162,7 +156,7 @@ impl OpenFileDesc {
     }
 
     pub fn status_flags(&self) -> FdOpt {
-        self.state.read().unwrap().status
+        *self.status.read().unwrap()
     }
 
     pub fn offset(&self) -> u64 {
@@ -189,8 +183,8 @@ impl OpenFileDesc {
     // AGENT: update only the mutable open-file status bits; access mode remains
     // fixed from open/pipe creation.
     pub fn set_status_flags(&self, flags: usize) -> Result<(), &'static str> {
-        let mut state = self.state.write().unwrap();
-        state.status.apply_status_flags(flags);
+        let mut status = self.status.write().unwrap();
+        status.apply_status_flags(flags);
         Ok(())
     }
 
