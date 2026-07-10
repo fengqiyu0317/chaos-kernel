@@ -261,12 +261,12 @@ fn checkpoint_description_id(
     Ok(id)
 }
 
-// AGENT: rebuild the stdio-like handles supported by the first checkpoint
+// AGENT: rebuild the stdio-like instances supported by the first checkpoint
 // restore pass; regular path files need a later file-object section.
-fn checkpoint_stdio_handle(
+fn checkpoint_stdio_instance(
     kind: SavedFdKind,
     status_flags: u32,
-) -> Result<(FHandle, FdOpt), &'static str> {
+) -> Result<(FInstance, FdOpt), &'static str> {
     let mut opt = match kind {
         SavedFdKind::Stdin => FdOpt {
             rd: true,
@@ -293,7 +293,7 @@ fn checkpoint_stdio_handle(
         SavedFdKind::Stderr => "/dev/stderr",
         _ => return Err("enotsup"),
     };
-    Ok((FHandle::new(path), opt))
+    Ok((FInstance::new(path), opt))
 }
 
 struct InitialUserImage {
@@ -405,12 +405,12 @@ fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str> {
         ap: false,
         nb: false,
     };
-    let fd0 = FHandle::new("/dev/tty");
-    let fd1 = FHandle::new("/dev/tty");
-    let fd2 = fd1.dup();
-    let stdin = task.add_file_with_status(FLike::File(fd0), stdin_opt)?;
-    let stdout = task.add_file_with_status(FLike::File(fd1), stdout_opt)?;
-    let stderr = task.add_file_with_status(FLike::File(fd2), stdout_opt)?;
+    let stdin_instance = FInstance::new("/dev/tty");
+    let stdout_instance = FInstance::new("/dev/tty");
+    let stderr_instance = stdout_instance.dup();
+    let stdin = task.add_file_with_status(FLike::File(stdin_instance), stdin_opt)?;
+    let stdout = task.add_file_with_status(FLike::File(stdout_instance), stdout_opt)?;
+    let stderr = task.add_file_with_status(FLike::File(stderr_instance), stdout_opt)?;
     if (stdin, stdout, stderr) != (0, 1, 2) {
         return Err("ebadf");
     }
@@ -561,7 +561,7 @@ impl Task {
     }
 
     // AGENT: install a new fd entry with explicit open-file-description state for
-    // regular files whose FHandle only stores the backing object.
+    // regular files whose FInstance only stores the backing object.
     pub fn add_file_with_status(&self, fl: FLike, status: FdOpt) -> Result<usize, &'static str> {
         self.add_file_with_cloexec_and_status(fl, status, false)
     }
@@ -637,7 +637,7 @@ impl Task {
         let mut saved = Vec::with_capacity(files.len());
         for (&fd, entry) in files.iter() {
             let kind = checkpoint_fd_kind(fd)?;
-            entry.regular_handle().ok_or("enotsup")?;
+            entry.regular_instance().ok_or("enotsup")?;
             let description_id = checkpoint_description_id(entry, &mut descriptions)?;
             saved.push(SavedFdEntry {
                 fd: u32::try_from(fd).map_err(|_| "einval")?,
@@ -652,7 +652,7 @@ impl Task {
     }
 
     // AGENT: restore the first checkpoint fd subset by rebuilding stdio-like
-    // memory handles and sharing duplicated open-file-descriptions by id.
+    // memory instances and sharing duplicated open-file-descriptions by id.
     pub fn restore_checkpoint_fds(&self, fds: &[SavedFdEntry]) -> Result<(), &'static str> {
         let mut restored = BTreeMap::new();
         let mut descriptions: BTreeMap<u32, FdEntry> = BTreeMap::new();
@@ -664,8 +664,8 @@ impl Task {
             let entry = if let Some(template) = descriptions.get(&saved.description_id) {
                 template.dup(saved.cloexec)
             } else {
-                let (handle, status) = checkpoint_stdio_handle(saved.kind, saved.status_flags)?;
-                let entry = FdEntry::with_status(FLike::File(handle), status, saved.cloexec);
+                let (instance, status) = checkpoint_stdio_instance(saved.kind, saved.status_flags)?;
+                let entry = FdEntry::with_status(FLike::File(instance), status, saved.cloexec);
                 entry.seek(FSeek::Start(saved.offset))?;
                 descriptions.insert(saved.description_id, entry.clone());
                 entry

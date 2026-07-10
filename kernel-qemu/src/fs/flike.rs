@@ -5,7 +5,7 @@ use super::*;
 // endpoint state and readiness logic.
 #[derive(Clone)]
 pub enum FLike {
-    File(FHandle),
+    File(FInstance),
     Pipe(PipeNode),
     Ep(EpInst),
 }

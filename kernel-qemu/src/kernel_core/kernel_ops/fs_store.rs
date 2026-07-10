@@ -47,7 +47,7 @@ impl Kernel {
     }
 
     // AGENT: if a real parent directory node exists, expose this path through
-    // its directory-entry list used by FHandle::read_entry().
+    // its directory-entry list used by FInstance::read_entry().
     pub(crate) fn note_path_in_parent_dir(&self, resolved_path: &str) -> Result<(), &'static str> {
         let Some((parent, name)) = Self::parent_dir_entry(resolved_path) else {
             return Ok(());
@@ -61,7 +61,7 @@ impl Kernel {
         Ok(())
     }
 
-    // AGENT: install a regular path-backed file used by both file handles and exec.
+    // AGENT: install a regular path-backed file used by both file instances and exec.
     pub fn install_file(
         &self,
         path: &str,

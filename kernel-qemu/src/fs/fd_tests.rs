@@ -26,16 +26,16 @@ fn writable_opt() -> FdOpt {
 }
 
 // AGENT: build a fd entry around a regular-file object with explicit
-// open-description state; FHandle no longer carries fd status or offset.
-fn file_entry(fh: &FHandle, opt: FdOpt) -> FdEntry {
-    FdEntry::with_status(FLike::File(fh.clone()), opt, false)
+// open-description state; FInstance no longer carries fd status or offset.
+fn file_entry(instance: &FInstance, opt: FdOpt) -> FdEntry {
+    FdEntry::with_status(FLike::File(instance.clone()), opt, false)
 }
 
 // AGENT: observe a regular-file byte range through the public read path while
 // keeping tests independent from block-rounded allocation length.
-fn file_bytes(fh: &FHandle, off: usize, len: usize) -> Vec<u8> {
+fn file_bytes(instance: &FInstance, off: usize, len: usize) -> Vec<u8> {
     let mut data = vec![0; len];
-    fh.read_at(off, &mut data).unwrap();
+    instance.read_at(off, &mut data).unwrap();
     data
 }
 
@@ -43,24 +43,24 @@ fn file_bytes(fh: &FHandle, off: usize, len: usize) -> Vec<u8> {
 // whole backend blocks.
 #[cfg_attr(test, test)]
 fn set_len_tracks_byte_length_and_block_capacity() {
-    let fh = FHandle::with_data("/tmp/file", vec![1, 2, 3]);
-    let entry = file_entry(&fh, writable_opt());
-    assert_eq!(fh.len(), 3);
-    assert_eq!(fh.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE);
+    let instance = FInstance::with_data("/tmp/file", vec![1, 2, 3]);
+    let entry = file_entry(&instance, writable_opt());
+    assert_eq!(instance.len(), 3);
+    assert_eq!(instance.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE);
 
-    fh.write_at(1, &[9]).unwrap();
-    assert_eq!(file_bytes(&fh, 0, 3).as_slice(), &[1, 9, 3]);
-    assert_eq!(fh.len(), 3);
+    instance.write_at(1, &[9]).unwrap();
+    assert_eq!(file_bytes(&instance, 0, 3).as_slice(), &[1, 9, 3]);
+    assert_eq!(instance.len(), 3);
 
     entry.set_len(5).unwrap();
-    assert_eq!(fh.len(), 5);
-    assert_eq!(fh.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE);
+    assert_eq!(instance.len(), 5);
+    assert_eq!(instance.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE);
 
     entry.set_len((BLOCK_CACHE_BLOCK_SIZE + 1) as u64).unwrap();
-    assert_eq!(fh.len(), BLOCK_CACHE_BLOCK_SIZE + 1);
-    assert_eq!(fh.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
+    assert_eq!(instance.len(), BLOCK_CACHE_BLOCK_SIZE + 1);
+    assert_eq!(instance.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
 
-    let ro = FHandle::with_data("/tmp/ro", vec![1, 2, 3]);
+    let ro = FInstance::with_data("/tmp/ro", vec![1, 2, 3]);
     let ro_entry = file_entry(&ro, FdOpt::default());
     assert_eq!(ro_entry.set_len(0), Err("ebadf"));
 }
@@ -69,21 +69,21 @@ fn set_len_tracks_byte_length_and_block_capacity() {
 // block id list no longer fits in the first metadata payload block.
 #[cfg_attr(test, test)]
 fn metadata_blocks_expand_for_large_regular_file() {
-    let fh = FHandle::with_data("/tmp/large", Vec::new());
+    let instance = FInstance::with_data("/tmp/large", Vec::new());
     let data = vec![0x7a; BLOCK_CACHE_BLOCK_SIZE * 61];
 
-    fh.write_at(0, &data).unwrap();
+    instance.write_at(0, &data).unwrap();
 
-    assert_eq!(fh.len(), data.len());
-    assert_eq!(fh.node.allocated_len(), data.len());
-    assert_eq!(fh.node.metadata_block_count(), 2);
+    assert_eq!(instance.len(), data.len());
+    assert_eq!(instance.node.allocated_len(), data.len());
+    assert_eq!(instance.node.metadata_block_count(), 2);
 }
 
 // AGENT: directory metadata uses the same multi-block payload path as regular
 // files, with entry names contributing to metadata size.
 #[cfg_attr(test, test)]
 fn metadata_blocks_expand_for_large_directory_entry() {
-    let dir = FHandle::with_node("/tmp", Arc::new(FileNode::directory()));
+    let dir = FInstance::with_node("/tmp", Arc::new(FileNode::directory()));
     let mut name = String::new();
     for _ in 0..BLOCK_CACHE_BLOCK_SIZE {
         name.push('x');
@@ -105,7 +105,7 @@ fn truncate_releases_blocks_for_reuse_without_old_contents() {
         Arc::new(FileBlockAllocator::new()),
     );
     let first_node = Arc::new(FileNode::regular(false));
-    let first = FHandle::with_node_on_storage("/tmp/first", first_node, storage.clone());
+    let first = FInstance::with_node_on_storage("/tmp/first", first_node, storage.clone());
     let first_entry = file_entry(&first, writable_opt());
     first
         .write_at(0, &vec![0x5a; BLOCK_CACHE_BLOCK_SIZE * 2])
@@ -118,7 +118,7 @@ fn truncate_releases_blocks_for_reuse_without_old_contents() {
     assert_eq!(storage.allocator_stats(), (3, 2));
 
     let second_node = Arc::new(FileNode::regular(false));
-    let second = FHandle::with_node_on_storage("/tmp/second", second_node, storage.clone());
+    let second = FInstance::with_node_on_storage("/tmp/second", second_node, storage.clone());
     let second_entry = file_entry(&second, writable_opt());
     second_entry.fallocate(0, BLOCK_CACHE_BLOCK_SIZE).unwrap();
     assert_eq!(storage.allocator_stats(), (3, 0));
@@ -130,36 +130,36 @@ fn truncate_releases_blocks_for_reuse_without_old_contents() {
 // AGENT: fallocate grows visible EOF exactly while allocation stays block-rounded.
 #[cfg_attr(test, test)]
 fn fallocate_validates_and_only_grows_regular_files() {
-    let fh = FHandle::with_data("/tmp/file", vec![1, 2, 3]);
-    let entry = file_entry(&fh, writable_opt());
+    let instance = FInstance::with_data("/tmp/file", vec![1, 2, 3]);
+    let entry = file_entry(&instance, writable_opt());
 
     entry.fallocate(BLOCK_CACHE_BLOCK_SIZE + 5, 2).unwrap();
-    assert_eq!(fh.len(), BLOCK_CACHE_BLOCK_SIZE + 7);
-    assert_eq!(fh.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
-    assert_eq!(file_bytes(&fh, 0, 3).as_slice(), &[1, 2, 3]);
+    assert_eq!(instance.len(), BLOCK_CACHE_BLOCK_SIZE + 7);
+    assert_eq!(instance.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
+    assert_eq!(file_bytes(&instance, 0, 3).as_slice(), &[1, 2, 3]);
 
     entry.fallocate(1, 1).unwrap();
-    assert_eq!(fh.len(), BLOCK_CACHE_BLOCK_SIZE + 7);
-    assert_eq!(fh.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
-    assert_eq!(file_bytes(&fh, 0, 3).as_slice(), &[1, 2, 3]);
+    assert_eq!(instance.len(), BLOCK_CACHE_BLOCK_SIZE + 7);
+    assert_eq!(instance.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
+    assert_eq!(file_bytes(&instance, 0, 3).as_slice(), &[1, 2, 3]);
 
     assert_eq!(entry.fallocate(0, 0), Err("einval"));
     assert_eq!(entry.fallocate(usize::MAX, 1), Err("efbig"));
 
-    let ro = FHandle::with_data("/tmp/ro", vec![1, 2, 3]);
+    let ro = FInstance::with_data("/tmp/ro", vec![1, 2, 3]);
     let ro_entry = file_entry(&ro, FdOpt::default());
     assert_eq!(ro_entry.fallocate(0, 1), Err("ebadf"));
 
-    let dir = FHandle::with_node("/tmp", Arc::new(FileNode::directory()));
+    let dir = FInstance::with_node("/tmp", Arc::new(FileNode::directory()));
     let dir_entry = file_entry(&dir, writable_opt());
     assert_eq!(dir_entry.fallocate(0, 1), Err("enodev"));
 }
 
 // AGENT: directory entry reads advance the shared open-file-description offset,
-// while direct FHandle reads remain explicit-index helpers.
+// while direct FInstance reads remain explicit-index helpers.
 #[cfg_attr(test, test)]
 fn read_entry_uses_open_description_offset() {
-    let dir = FHandle::with_node("/tmp", Arc::new(FileNode::directory()));
+    let dir = FInstance::with_node("/tmp", Arc::new(FileNode::directory()));
     dir.node.add_dir_entry(&dir.storage, "alpha").unwrap();
     dir.node.add_dir_entry(&dir.storage, "beta").unwrap();
     dir.node.add_dir_entry(&dir.storage, "gamma").unwrap();
@@ -191,7 +191,7 @@ fn read_entry_uses_open_description_offset() {
     assert_eq!(unreadable.read_entry(), Err("ebadf"));
     assert_eq!(unreadable.offset(), 0);
 
-    let file = FHandle::with_data("/tmp/file", Vec::new());
+    let file = FInstance::with_data("/tmp/file", Vec::new());
     let file_entry = file_entry(&file, FdOpt::default());
     assert_eq!(file_entry.read_entry(), Err("enotdir"));
 }
@@ -200,7 +200,7 @@ fn read_entry_uses_open_description_offset() {
 // observes FileNode's byte-precise visible length.
 #[cfg_attr(test, test)]
 fn regular_file_poll_and_ioctl_are_explicit() {
-    let file = FHandle::with_data("", vec![1, 2, 3, 4]);
+    let file = FInstance::with_data("", vec![1, 2, 3, 4]);
     let entry = file_entry(&file, writable_opt());
     let poll = entry.poll();
     assert!(poll.readable);
@@ -235,8 +235,8 @@ fn regular_file_poll_and_ioctl_are_explicit() {
 // AGENT: moved splice permission regression out of fd.rs unchanged.
 #[cfg_attr(test, test)]
 fn splice_checks_permissions_before_moving_offsets() {
-    let src = FHandle::with_data("/src", vec![1, 2, 3]);
-    let dst = FHandle::with_data("/dst", Vec::new());
+    let src = FInstance::with_data("/src", vec![1, 2, 3]);
+    let dst = FInstance::with_data("/dst", Vec::new());
     let src_entry = file_entry(&src, FdOpt::default());
     let dst_entry = file_entry(&dst, FdOpt::default());
 
@@ -251,8 +251,8 @@ fn splice_checks_permissions_before_moving_offsets() {
         ap: false,
         nb: false,
     };
-    let src = FHandle::with_data("/src", vec![1, 2, 3]);
-    let dst = FHandle::with_data("/dst", Vec::new());
+    let src = FInstance::with_data("/src", vec![1, 2, 3]);
+    let dst = FInstance::with_data("/dst", Vec::new());
     let src_entry = file_entry(&src, unreadable);
     let dst_entry = file_entry(&dst, writable_opt());
 
@@ -264,8 +264,8 @@ fn splice_checks_permissions_before_moving_offsets() {
 // AGENT: append-status splice appends at the byte-precise FileNode EOF.
 #[cfg_attr(test, test)]
 fn splice_uses_shared_append_status() {
-    let src = FHandle::with_data("/src", vec![1, 2, 3]);
-    let dst = FHandle::with_data("/dst", vec![9, 9]);
+    let src = FInstance::with_data("/src", vec![1, 2, 3]);
+    let dst = FInstance::with_data("/dst", vec![9, 9]);
     let src_entry = file_entry(&src, FdOpt::default());
     let dst_entry = file_entry(&dst, writable_opt());
     dst_entry.seek(FSeek::Start(1)).unwrap();

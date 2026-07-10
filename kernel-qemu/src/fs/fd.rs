@@ -29,7 +29,7 @@ impl FdOpt {
 }
 
 // AGENT: shared state produced by one open. dup/fork share this through
-// OpenFileDesc instead of storing fd semantics on FHandle.
+// OpenFileDesc instead of storing fd semantics on FInstance.
 struct OpenFileState {
     offset: u64,
     status: FdOpt,
@@ -50,7 +50,7 @@ impl OpenFileDesc {
     }
 
     // AGENT: build an open-file description with explicit open-time access and
-    // initial status flags, used when FHandle carries only the file object.
+    // initial status flags, used when FInstance carries only the file object.
     pub fn new_with_status(file: FLike, status: FdOpt) -> Self {
         Self {
             file,
@@ -84,7 +84,7 @@ impl OpenFileDesc {
     }
 
     // AGENT: keep append/write permission checks in the shared open-file
-    // description instead of duplicating mutable status in FHandle.
+    // description instead of duplicating mutable status in FInstance.
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
         if buf.is_empty() {
             return Ok(0);
@@ -146,7 +146,7 @@ impl OpenFileDesc {
     }
 
     // AGENT: fd-level truncation checks the open-description write permission;
-    // FHandle only performs the backing file mutation.
+    // FInstance only performs the backing file mutation.
     pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
         let status = self.status_flags();
         if !status.wr {
@@ -159,7 +159,7 @@ impl OpenFileDesc {
     }
 
     // AGENT: allocation is a regular-file operation gated by the shared open
-    // access mode, not by state stored on FHandle.
+    // access mode, not by state stored on FInstance.
     pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> {
         let status = self.status_flags();
         if !status.wr {
@@ -180,7 +180,7 @@ impl OpenFileDesc {
     }
 
     // AGENT: lseek mutates the shared open-file-description offset. The backing
-    // FHandle only supplies regular-file length for SEEK_END.
+    // FInstance only supplies regular-file length for SEEK_END.
     pub fn seek(&self, pos: FSeek) -> Result<u64, &'static str> {
         let FLike::File(file) = &self.file else {
             return Err("espipe");
@@ -212,7 +212,7 @@ impl OpenFileDesc {
         Ok(())
     }
 
-    pub fn regular_handle(&self) -> Option<FHandle> {
+    pub fn regular_instance(&self) -> Option<FInstance> {
         match &self.file {
             FLike::File(f) => Some(f.clone()),
             _ => None,
@@ -234,9 +234,11 @@ impl OpenFileDesc {
                 f.transfer_with_state(state.status, &mut state.offset, dir, offset, buf_rd, buf_wr)
             }
             _ => match (dir, offset, buf_rd, buf_wr) {
-                (FHandle::TRANSFER_READ, None, Some(buf), None) => self.read(buf),
-                (FHandle::TRANSFER_WRITE, None, None, Some(buf)) => self.write(buf),
-                (FHandle::TRANSFER_READ | FHandle::TRANSFER_WRITE, Some(_), _, _) => Err("espipe"),
+                (FInstance::TRANSFER_READ, None, Some(buf), None) => self.read(buf),
+                (FInstance::TRANSFER_WRITE, None, None, Some(buf)) => self.write(buf),
+                (FInstance::TRANSFER_READ | FInstance::TRANSFER_WRITE, Some(_), _, _) => {
+                    Err("espipe")
+                }
                 _ => Err("einval"),
             },
         }
@@ -244,11 +246,7 @@ impl OpenFileDesc {
 
     // AGENT: keep splice on the shared open-file-description path so mutable
     // status flags such as O_APPEND are honored for both ends.
-    pub fn splice_to(
-        &self,
-        dst: &OpenFileDesc,
-        count: usize,
-    ) -> Result<usize, &'static str> {
+    pub fn splice_to(&self, dst: &OpenFileDesc, count: usize) -> Result<usize, &'static str> {
         match (&self.file, &dst.file) {
             (FLike::File(src), FLike::File(dst_file)) => {
                 if ::core::ptr::eq(self, dst) {
@@ -275,8 +273,8 @@ impl OpenFileDesc {
     // AGENT: self-splice observes one shared open-file-description offset instead
     // of trying to borrow the same state lock twice.
     fn splice_same_description(
-        src: &FHandle,
-        dst: &FHandle,
+        src: &FInstance,
+        dst: &FInstance,
         state: &mut OpenFileState,
         count: usize,
     ) -> Result<usize, &'static str> {
@@ -310,9 +308,9 @@ impl OpenFileDesc {
     // AGENT: copy regular-file bytes and commit both open-description offsets only
     // after the destination write succeeds.
     fn splice_locked(
-        src: &FHandle,
+        src: &FInstance,
         src_state: &mut OpenFileState,
-        dst: &FHandle,
+        dst: &FInstance,
         dst_state: &mut OpenFileState,
         count: usize,
     ) -> Result<usize, &'static str> {
@@ -369,7 +367,7 @@ impl FdEntry {
     }
 
     // AGENT: create a descriptor entry with explicit open-file-description state
-    // for regular files whose FHandle no longer stores fd status.
+    // for regular files whose FInstance no longer stores fd status.
     pub fn with_status(file: FLike, status: FdOpt, cloexec: bool) -> Self {
         Self {
             desc: Arc::new(OpenFileDesc::new_with_status(file, status)),
@@ -470,8 +468,8 @@ impl FdEntry {
         self.desc.set_status_flags(flags)
     }
 
-    pub fn regular_handle(&self) -> Option<FHandle> {
-        self.desc.regular_handle()
+    pub fn regular_instance(&self) -> Option<FInstance> {
+        self.desc.regular_instance()
     }
 
     // AGENT: expose the transfer helper at the fd-entry layer so callers do not
@@ -487,7 +485,7 @@ impl FdEntry {
     }
 
     // AGENT: fd-table callers splice through descriptor entries rather than
-    // raw handles, preserving shared status and offset semantics.
+    // raw instances, preserving shared status and offset semantics.
     pub fn splice_to(&self, dst: &FdEntry, count: usize) -> Result<usize, &'static str> {
         self.desc.splice_to(dst.desc.as_ref(), count)
     }

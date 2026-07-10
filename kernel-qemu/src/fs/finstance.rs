@@ -1,10 +1,10 @@
 // AGENT
 use super::*;
 
-// AGENT: regular file handles only identify the backing file object. Per-open
+// AGENT: regular file instances only identify the backing file object. Per-open
 // access flags, status flags, and current offset live in OpenFileDesc.
 #[derive(Clone)]
-pub struct FHandle {
+pub struct FInstance {
     pub path: String,
     pub node: Arc<FileNode>,
     pub(super) storage: FileStorage,
@@ -17,11 +17,11 @@ pub enum FSeek {
     Cur(i64),
 }
 
-impl FHandle {
+impl FInstance {
     pub(super) const TRANSFER_WRITE: u8 = 0;
     pub(super) const TRANSFER_READ: u8 = 1;
 
-    // AGENT: create a fresh standalone regular node for device-like handles.
+    // AGENT: create a fresh standalone regular node for device-like instances.
     pub fn new(path: &str) -> Self {
         let storage = FileStorage::standalone();
         Self {
@@ -30,7 +30,7 @@ impl FHandle {
             storage,
         }
     }
-    // AGENT: create a handle over a fresh regular file node.
+    // AGENT: create an instance over a fresh regular file node.
     pub fn with_data(path: &str, d: Vec<u8>) -> Self {
         let storage = FileStorage::standalone();
         let node = Arc::new(FileNode::regular(false));
@@ -57,16 +57,16 @@ impl FHandle {
         }
     }
     // AGENT: duplicate only the file object reference; open-description state is
-    // intentionally not part of FHandle.
+    // intentionally not part of FInstance.
     pub fn dup(&self) -> Self {
-        FHandle {
+        FInstance {
             path: self.path.clone(),
             node: self.node.clone(),
             storage: self.storage.clone(),
         }
     }
 
-    // AGENT: expose the FileNode-owned byte-precise EOF through regular handles.
+    // AGENT: expose the FileNode-owned byte-precise EOF through regular instances.
     pub fn len(&self) -> usize {
         self.node.len()
     }
@@ -252,8 +252,8 @@ impl FHandle {
     }
 }
 
-impl fmt::Debug for FHandle {
+impl fmt::Debug for FInstance {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("FH").field("path", &self.path).finish()
+        f.debug_struct("FI").field("path", &self.path).finish()
     }
 }
