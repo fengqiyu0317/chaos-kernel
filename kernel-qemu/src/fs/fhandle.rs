@@ -27,9 +27,6 @@ impl Clone for FHandle {
 }
 
 impl FHandle {
-    pub(super) const TRANSFER_WRITE: u8 = 0;
-    pub(super) const TRANSFER_READ: u8 = 1;
-
     // AGENT: create the regular-file per-open layer around a backing instance.
     pub fn new(instance: FInstance) -> Self {
         Self {
@@ -40,10 +37,6 @@ impl FHandle {
 
     pub fn instance(&self) -> &FInstance {
         &self.instance
-    }
-
-    pub fn clone_instance(&self) -> FInstance {
-        self.instance.clone()
     }
 
     pub fn len(&self) -> usize {
@@ -140,35 +133,6 @@ impl FHandle {
         };
         *offset = next;
         Ok(next)
-    }
-
-    // AGENT: validate the legacy transfer-shaped API while keeping implicit
-    // offset movement on this handle instead of on OpenFileDesc.
-    pub(super) fn transfer_with_status(
-        &self,
-        status: FdOpt,
-        dir: u8,
-        positioned_offset: Option<usize>,
-        buf_rd: Option<&mut [u8]>,
-        buf_wr: Option<&[u8]>,
-    ) -> Result<usize, &'static str> {
-        match (dir, positioned_offset, buf_rd, buf_wr) {
-            (Self::TRANSFER_READ, Some(off), Some(buf), None) => {
-                if !status.rd {
-                    return Err("ebadf");
-                }
-                self.instance.read_at(off, buf)
-            }
-            (Self::TRANSFER_READ, None, Some(buf), None) => self.read_with_status(status, buf),
-            (Self::TRANSFER_WRITE, Some(off), None, Some(buf)) => {
-                if !status.wr {
-                    return Err("ebadf");
-                }
-                self.instance.write_at(off, buf)
-            }
-            (Self::TRANSFER_WRITE, None, None, Some(buf)) => self.write_with_status(status, buf),
-            _ => Err("einval"),
-        }
     }
 
     // AGENT: copy regular-file bytes and commit handle offsets only after the

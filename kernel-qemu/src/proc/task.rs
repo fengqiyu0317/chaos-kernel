@@ -639,7 +639,9 @@ impl Task {
         let mut saved = Vec::with_capacity(files.len());
         for (&fd, entry) in files.iter() {
             let kind = checkpoint_fd_kind(fd)?;
-            entry.regular_instance().ok_or("enotsup")?;
+            if !entry.is_regular_file() {
+                return Err("enotsup");
+            }
             let description_id = checkpoint_description_id(entry, &mut descriptions)?;
             saved.push(SavedFdEntry {
                 fd: u32::try_from(fd).map_err(|_| "einval")?,

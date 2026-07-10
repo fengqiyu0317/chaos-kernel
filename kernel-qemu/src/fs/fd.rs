@@ -188,34 +188,10 @@ impl OpenFileDesc {
         Ok(())
     }
 
-    pub fn regular_instance(&self) -> Option<FInstance> {
-        match &self.file {
-            FLike::File(f) => Some(f.clone_instance()),
-            _ => None,
-        }
-    }
-
-    // AGENT: keep transfer-shaped callers on the shared open-file description
-    // path so fd status changes such as O_APPEND remain visible.
-    pub fn transfer(
-        &self,
-        dir: u8,
-        offset: Option<usize>,
-        buf_rd: Option<&mut [u8]>,
-        buf_wr: Option<&[u8]>,
-    ) -> Result<usize, &'static str> {
-        match &self.file {
-            FLike::File(f) => {
-                let status = self.status_flags();
-                f.transfer_with_status(status, dir, offset, buf_rd, buf_wr)
-            }
-            _ => match (dir, offset, buf_rd, buf_wr) {
-                (FHandle::TRANSFER_READ, None, Some(buf), None) => self.read(buf),
-                (FHandle::TRANSFER_WRITE, None, None, Some(buf)) => self.write(buf),
-                (FHandle::TRANSFER_READ | FHandle::TRANSFER_WRITE, Some(_), _, _) => Err("espipe"),
-                _ => Err("einval"),
-            },
-        }
+    // AGENT: checkpoint only needs to reject non-regular fd objects here; avoid
+    // cloning the backing file instance when the offset/status live elsewhere.
+    pub fn is_regular_file(&self) -> bool {
+        matches!(self.file, FLike::File(_))
     }
 
     // AGENT: keep splice on the shared open-file-description path so mutable
@@ -356,20 +332,10 @@ impl FdEntry {
         self.desc.set_status_flags(flags)
     }
 
-    pub fn regular_instance(&self) -> Option<FInstance> {
-        self.desc.regular_instance()
-    }
-
-    // AGENT: expose the transfer helper at the fd-entry layer so callers do not
-    // bypass shared open-file-description status.
-    pub fn transfer(
-        &self,
-        dir: u8,
-        offset: Option<usize>,
-        buf_rd: Option<&mut [u8]>,
-        buf_wr: Option<&[u8]>,
-    ) -> Result<usize, &'static str> {
-        self.desc.transfer(dir, offset, buf_rd, buf_wr)
+    // AGENT: expose regular-file object classification without cloning the
+    // underlying FInstance or implying fd-dup semantics.
+    pub fn is_regular_file(&self) -> bool {
+        self.desc.is_regular_file()
     }
 
     // AGENT: fd-table callers splice through descriptor entries rather than
