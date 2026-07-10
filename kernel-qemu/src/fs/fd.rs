@@ -106,9 +106,9 @@ impl OpenFileDesc {
         }
     }
 
-    pub fn io_ctl(&self, req: usize, arg: usize) -> Result<usize, &'static str> {
+    pub fn io_ctl(&self, req: usize) -> Result<usize, &'static str> {
         match &self.file {
-            FLike::File(f) => f.io_ctl(req, arg),
+            FLike::File(f) => f.io_ctl(req),
             FLike::Pipe(p) => match req {
                 FIONREAD => Ok(p.readable_len()),
                 _ => Err("enotty"),
@@ -317,8 +317,8 @@ impl FdEntry {
         self.desc.poll()
     }
 
-    pub fn io_ctl(&self, req: usize, arg: usize) -> Result<usize, &'static str> {
-        self.desc.io_ctl(req, arg)
+    pub fn io_ctl(&self, req: usize) -> Result<usize, &'static str> {
+        self.desc.io_ctl(req)
     }
 
     // AGENT: expose directory iteration at the descriptor-entry layer while

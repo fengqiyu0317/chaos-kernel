@@ -225,11 +225,11 @@ fn regular_file_poll_and_ioctl_are_explicit() {
     assert!(!write_only_poll.readable);
     assert!(write_only_poll.writable);
 
-    assert_eq!(entry.io_ctl(FIONREAD, 0), Ok(4));
+    assert_eq!(entry.io_ctl(FIONREAD), Ok(4));
     let mut buf = [0; 2];
     assert_eq!(entry.read(&mut buf), Ok(2));
-    assert_eq!(entry.io_ctl(TIOCINQ, 0), Ok(2));
-    assert_eq!(entry.io_ctl(0xDEAD, 0), Err("enotty"));
+    assert_eq!(entry.io_ctl(TIOCINQ), Ok(2));
+    assert_eq!(entry.io_ctl(0xDEAD), Err("enotty"));
 }
 
 // AGENT: moved splice permission regression out of fd.rs unchanged.

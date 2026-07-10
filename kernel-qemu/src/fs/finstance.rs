@@ -118,7 +118,6 @@ impl FInstance {
     pub(super) fn io_ctl_with_offset(
         &self,
         cmd: usize,
-        _arg: usize,
         offset: u64,
     ) -> Result<usize, &'static str> {
         match cmd {

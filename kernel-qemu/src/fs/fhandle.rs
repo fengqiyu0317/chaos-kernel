@@ -123,8 +123,8 @@ impl FHandle {
         self.instance.poll_status_with_status(status)
     }
 
-    pub(super) fn io_ctl(&self, cmd: usize, arg: usize) -> Result<usize, &'static str> {
-        self.instance.io_ctl_with_offset(cmd, arg, self.offset())
+    pub(super) fn io_ctl(&self, cmd: usize) -> Result<usize, &'static str> {
+        self.instance.io_ctl_with_offset(cmd, self.offset())
     }
 
     // AGENT: lseek mutates only this regular-file handle's per-open offset.

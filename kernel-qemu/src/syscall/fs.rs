@@ -255,7 +255,7 @@ pub(super) fn sys_ioctl(
             Ok(0)
         }
         FIONREAD | TIOCINQ => {
-            let readable = entry.io_ctl(cmd, arg)?;
+            let readable = entry.io_ctl(cmd)?;
             let readable = i32::try_from(readable).map_err(|_| "eoverflow")?;
             write_user_i32(kernel, &task, arg, readable)?;
             Ok(0)
