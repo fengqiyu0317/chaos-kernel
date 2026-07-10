@@ -37,6 +37,7 @@ pub fn run_all() {
     futex_cmp_requeue_propagates_word_read_fault();
     futex_requeue_skips_completed_waiters_when_moving();
     pipe_uses_bounded_ring_buffer_and_reports_writable();
+    pipe_rejects_wrong_direction_direct_io();
     pipe_epoll_closed_status_reports_hup_and_err();
     fd_close_detaches_epoll_subscription_before_reuse();
     epoll_ready_list_deduplicates_and_requeues();
@@ -565,6 +566,17 @@ fn pipe_uses_bounded_ring_buffer_and_reports_writable() {
     assert_eq!(read_end.read_at(&mut out), Ok(out.len()));
     assert_eq!(out, [0xA5; 4]);
     assert!(write_end.poll().writable);
+}
+
+// AGENT: pipe endpoints reject wrong-direction direct I/O even when a caller
+// bypasses the OpenFileDesc permission check.
+#[cfg_attr(test, test)]
+fn pipe_rejects_wrong_direction_direct_io() {
+    let (read_end, write_end) = PipeNode::pair();
+    let mut out = [0u8; 1];
+
+    assert_eq!(write_end.read_at(&mut out), Err("ebadf"));
+    assert_eq!(read_end.write_at(b"x"), Err("ebadf"));
 }
 
 // AGENT: pipe peer-close state must wake epoll and also survive the level scan

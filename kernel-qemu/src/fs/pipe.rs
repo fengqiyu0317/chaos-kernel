@@ -275,20 +275,20 @@ impl PipeNode {
     pub fn unregister_epoll(&self, sub_id: usize) -> bool {
         self.data.lock().unwrap().unsubscribe_epoll(sub_id)
     }
-    // AGENT: empty reads are a no-op; an empty pipe returns AGAIN while writers
-    // exist and EOF once the last writer is gone.
+    // AGENT: reject reads on write endpoints at the pipe layer too; empty reads
+    // are a no-op, while an empty read endpoint reports AGAIN or EOF.
     pub fn read_at(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
         if self.dir != PipeDir::Rd {
-            return Ok(0);
+            return Err("ebadf");
         }
         let mut d = self.data.lock().unwrap();
         d.read_into(buf)
     }
-    // AGENT: writes publish READABLE/WRITABLE transitions and broken-pipe
-    // ERROR/CLOSED readiness to EvBus subscribers.
+    // AGENT: reject writes on read endpoints at the pipe layer too; valid writes
+    // publish READABLE/WRITABLE and broken-pipe readiness transitions.
     pub fn write_at(&self, buf: &[u8]) -> Result<usize, &'static str> {
         if self.dir != PipeDir::Wr {
-            return Ok(0);
+            return Err("ebadf");
         }
         let mut d = self.data.lock().unwrap();
         d.write_from(buf)
