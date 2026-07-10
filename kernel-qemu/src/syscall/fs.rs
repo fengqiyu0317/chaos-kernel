@@ -316,6 +316,43 @@ pub(super) fn sys_dup2(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
     task.dup2_fd(old_fd, new_fd)
 }
 
+// AGENT: TODO(M9-splice): implement Linux splice(2) through real pipe buffers,
+// user off_t pointer copy-in/copy-out, blocking/nonblocking waits, and pipe/file
+// direction checks. This stub only reserves the syscall surface and rejects
+// unsupported nonzero transfers instead of reusing the old file-to-file helper.
+pub(super) fn sys_splice(
+    kernel: &Kernel,
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+) -> Result<usize, &'static str> {
+    let fd_in = a0;
+    let _off_in_addr = a1;
+    let fd_out = a2;
+    let _off_out_addr = a3;
+    let size = a4;
+    let flags = a5;
+
+    if fd_in >= MAX_FD || fd_out >= MAX_FD {
+        return Err("ebadf");
+    }
+    if flags & !SPLICE_KNOWN_FLAGS != 0 {
+        return Err("einval");
+    }
+
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    let _in_entry = task.get_fd_entry(fd_in).ok_or("ebadf")?;
+    let _out_entry = task.get_fd_entry(fd_out).ok_or("ebadf")?;
+    if size == 0 {
+        return Ok(0);
+    }
+
+    Err("enosys")
+}
+
 // AGENT: fcntl mutates fd entries while keeping access mode fixed in the
 // shared open-file description.
 pub(super) fn sys_fcntl(

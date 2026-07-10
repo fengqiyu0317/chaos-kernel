@@ -57,6 +57,7 @@ impl Kernel {
             SYS_EPOLL_CTL => returning(sys_epoll_ctl(self, a0, a1, a2, a3)),
             SYS_EPOLL_WAIT => returning(sys_epoll_wait(self, a0, a1, a2, a3)),
             SYS_CLOCK_GETTIME => returning(sys_clock_gettime(self, a0, a1)),
+            SYS_SPLICE => returning(sys_splice(self, a0, a1, a2, a3, a4, a5)),
             SYS_SIGACTION => returning(sys_sigaction(self, a0, a1, a2, a3, a4)),
             SYS_SIGPROCMASK => returning(sys_sigprocmask(self, a0, a1, a2)),
             SYS_SIGRETURN => returning(sys_sigreturn(self)),

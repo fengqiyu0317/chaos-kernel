@@ -61,6 +61,15 @@ pub const O_APPEND: usize = 0o2000;
 pub const O_CLOEXEC: usize = 0o2000000;
 pub const AT_NOFOLLOW: usize = 0x100;
 
+// AGENT: Linux splice(2) flag bits; the syscall entry is currently a TODO stub
+// until pipe-buffer-backed movement is migrated.
+pub const SPLICE_F_MOVE: usize = 0x01;
+pub const SPLICE_F_NONBLOCK: usize = 0x02;
+pub const SPLICE_F_MORE: usize = 0x04;
+pub const SPLICE_F_GIFT: usize = 0x08;
+pub const SPLICE_KNOWN_FLAGS: usize =
+    SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
+
 pub const TCGETS: usize = 0x5401;
 pub const TCSETS: usize = 0x5402;
 pub const TIOCGPGRP: usize = 0x540F;
@@ -188,6 +197,7 @@ pub const SYS_EPOLL_CREATE: usize = 213;
 pub const SYS_EPOLL_CTL: usize = 233;
 pub const SYS_EPOLL_WAIT: usize = 232;
 pub const SYS_CLOCK_GETTIME: usize = 228;
+pub const SYS_SPLICE: usize = 275;
 pub const SYS_SIGACTION: usize = 13;
 pub const SYS_SIGPROCMASK: usize = 14;
 pub const SYS_FUTEX: usize = 202;
