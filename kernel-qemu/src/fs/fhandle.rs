@@ -2,7 +2,7 @@
 use super::*;
 
 // AGENT: regular file handles only identify the backing file object. Per-open
-// access flags, status flags, and current offset live in OpenFileDescription.
+// access flags, status flags, and current offset live in OpenFileDesc.
 #[derive(Clone)]
 pub struct FHandle {
     pub path: String,
@@ -77,7 +77,7 @@ impl FHandle {
         self.node.read_bytes(&self.storage, off, buf)
     }
 
-    // AGENT: read using state supplied by the owning OpenFileDescription.
+    // AGENT: read using state supplied by the owning OpenFileDesc.
     pub(super) fn read_with_state(
         &self,
         status: FdOpt,
@@ -112,12 +112,12 @@ impl FHandle {
     }
 
     // AGENT: direct positioned reads are pure file-object reads; fd permission
-    // checks belong to OpenFileDescription.
+    // checks belong to OpenFileDesc.
     pub fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
         self.copy_from_node_at(off, buf)
     }
 
-    // AGENT: write using state supplied by the owning OpenFileDescription.
+    // AGENT: write using state supplied by the owning OpenFileDesc.
     pub(super) fn write_with_state(
         &self,
         status: FdOpt,
@@ -153,7 +153,7 @@ impl FHandle {
     }
 
     // AGENT: direct positioned writes are pure file-object writes; fd permission
-    // checks belong to OpenFileDescription.
+    // checks belong to OpenFileDesc.
     pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
         self.node.write_bytes(&self.storage, Some(off), buf)?;
         Ok(buf.len())
@@ -199,18 +199,18 @@ impl FHandle {
     }
 
     // AGENT: direct truncation mutates only the backing file object; write
-    // permission checks belong to OpenFileDescription.
+    // permission checks belong to OpenFileDesc.
     pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
         let len = usize::try_from(len).map_err(|_| "efbig")?;
         self.node.set_data_len(&self.storage, len)?;
         Ok(())
     }
     // AGENT: direct directory inspection stays stateless and uses the caller's
-    // explicit entry index; fd-level iteration advances OpenFileDescription.
+    // explicit entry index; fd-level iteration advances OpenFileDesc.
     pub fn read_entry(&self, idx: usize) -> Result<String, &'static str> {
         self.node.dir_entry_at(idx)
     }
-    // AGENT: let OpenFileDescription provide the visible access mode when fd
+    // AGENT: let OpenFileDesc provide the visible access mode when fd
     // polling goes through the fd table.
     pub(super) fn poll_status_with_status(&self, status: FdOpt) -> PollStatus {
         PollStatus {

@@ -38,18 +38,18 @@ impl FdState {
 // file description.
 #[derive(Clone)]
 pub struct FdEntry {
-    desc: Arc<OpenFileDescription>,
+    desc: Arc<OpenFileDesc>,
     cloexec: bool,
 }
 
 // AGENT: shared open-file description; dup/fork clone FdEntry while sharing
 // this object, so offset/status state and pipe endpoint lifetime remain shared.
-pub struct OpenFileDescription {
+pub struct OpenFileDesc {
     file: FLike,
     status: RwLock<FdOpt>,
 }
 
-impl OpenFileDescription {
+impl OpenFileDesc {
     // AGENT: build an open-file description around a concrete file object.
     pub fn new(file: FLike) -> Self {
         let status = file.status_flags();
@@ -115,7 +115,7 @@ impl FdEntry {
     // AGENT: create a descriptor entry with per-fd close-on-exec state.
     pub fn with_cloexec(file: FLike, cloexec: bool) -> Self {
         Self {
-            desc: Arc::new(OpenFileDescription::new(file)),
+            desc: Arc::new(OpenFileDesc::new(file)),
             cloexec,
         }
     }

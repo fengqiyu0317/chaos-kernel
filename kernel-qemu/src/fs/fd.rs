@@ -28,29 +28,21 @@ impl FdOpt {
     }
 }
 
-// AGENT: fd flags that belong to one descriptor entry, not to the shared open
-// file description.
-#[derive(Clone)]
-pub struct FdEntry {
-    desc: Arc<OpenFileDescription>,
-    cloexec: bool,
-}
-
 // AGENT: shared state produced by one open. dup/fork share this through
-// OpenFileDescription instead of storing fd semantics on FHandle.
-struct OpenFileDescriptionState {
+// OpenFileDesc instead of storing fd semantics on FHandle.
+struct OpenFileState {
     offset: u64,
     status: FdOpt,
 }
 
 // AGENT: shared open-file description; dup/fork clone FdEntry while sharing
 // this object, so offset/status state and pipe endpoint lifetime remain shared.
-pub struct OpenFileDescription {
+pub struct OpenFileDesc {
     file: FLike,
-    state: RwLock<OpenFileDescriptionState>,
+    state: RwLock<OpenFileState>,
 }
 
-impl OpenFileDescription {
+impl OpenFileDesc {
     // AGENT: build an open-file description around a concrete file object.
     pub fn new(file: FLike) -> Self {
         let status = file.status_flags();
@@ -62,7 +54,7 @@ impl OpenFileDescription {
     pub fn new_with_status(file: FLike, status: FdOpt) -> Self {
         Self {
             file,
-            state: RwLock::new(OpenFileDescriptionState { offset: 0, status }),
+            state: RwLock::new(OpenFileState { offset: 0, status }),
         }
     }
 
@@ -254,7 +246,7 @@ impl OpenFileDescription {
     // status flags such as O_APPEND are honored for both ends.
     pub fn splice_to(
         &self,
-        dst: &OpenFileDescription,
+        dst: &OpenFileDesc,
         count: usize,
     ) -> Result<usize, &'static str> {
         match (&self.file, &dst.file) {
@@ -263,8 +255,8 @@ impl OpenFileDescription {
                     let mut state = self.state.write().unwrap();
                     Self::splice_same_description(src, dst_file, &mut state, count)
                 } else {
-                    let self_key = self as *const OpenFileDescription as usize;
-                    let dst_key = dst as *const OpenFileDescription as usize;
+                    let self_key = self as *const OpenFileDesc as usize;
+                    let dst_key = dst as *const OpenFileDesc as usize;
                     if self_key < dst_key {
                         let mut src_state = self.state.write().unwrap();
                         let mut dst_state = dst.state.write().unwrap();
@@ -285,7 +277,7 @@ impl OpenFileDescription {
     fn splice_same_description(
         src: &FHandle,
         dst: &FHandle,
-        state: &mut OpenFileDescriptionState,
+        state: &mut OpenFileState,
         count: usize,
     ) -> Result<usize, &'static str> {
         if !state.status.rd || !state.status.wr {
@@ -319,9 +311,9 @@ impl OpenFileDescription {
     // after the destination write succeeds.
     fn splice_locked(
         src: &FHandle,
-        src_state: &mut OpenFileDescriptionState,
+        src_state: &mut OpenFileState,
         dst: &FHandle,
-        dst_state: &mut OpenFileDescriptionState,
+        dst_state: &mut OpenFileState,
         count: usize,
     ) -> Result<usize, &'static str> {
         if !src_state.status.rd || !dst_state.status.wr {
@@ -354,6 +346,14 @@ impl OpenFileDescription {
     }
 }
 
+// AGENT: fd flags that belong to one descriptor entry, not to the shared open
+// file description.
+#[derive(Clone)]
+pub struct FdEntry {
+    desc: Arc<OpenFileDesc>,
+    cloexec: bool,
+}
+
 impl FdEntry {
     // AGENT: create a descriptor entry over a fresh open-file description.
     pub fn new(file: FLike) -> Self {
@@ -363,7 +363,7 @@ impl FdEntry {
     // AGENT: create a descriptor entry with per-fd close-on-exec state.
     pub fn with_cloexec(file: FLike, cloexec: bool) -> Self {
         Self {
-            desc: Arc::new(OpenFileDescription::new(file)),
+            desc: Arc::new(OpenFileDesc::new(file)),
             cloexec,
         }
     }
@@ -372,7 +372,7 @@ impl FdEntry {
     // for regular files whose FHandle no longer stores fd status.
     pub fn with_status(file: FLike, status: FdOpt, cloexec: bool) -> Self {
         Self {
-            desc: Arc::new(OpenFileDescription::new_with_status(file, status)),
+            desc: Arc::new(OpenFileDesc::new_with_status(file, status)),
             cloexec,
         }
     }
@@ -436,7 +436,7 @@ impl FdEntry {
     }
 
     // AGENT: expose directory iteration at the descriptor-entry layer while
-    // keeping the shared offset inside OpenFileDescription.
+    // keeping the shared offset inside OpenFileDesc.
     pub fn read_entry(&self) -> Result<String, &'static str> {
         self.desc.read_entry()
     }
