@@ -1,9 +1,5 @@
 // AGENT: keep this module focused on physical-frame pool allocation.
-use alloc::{
-    sync::Arc,
-    vec,
-    vec::Vec,
-};
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::cmp::{max, min};
 
 use super::{Mutex, PgFrame, PAGE_SZ};
