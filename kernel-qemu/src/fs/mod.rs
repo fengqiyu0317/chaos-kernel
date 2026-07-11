@@ -8,7 +8,6 @@ pub mod circ_buf;
 // AGENT: Keep the fault-injectable simulated disk separate from block-device
 // backends, mount resolution, and request scheduling.
 pub mod disk;
-pub mod elf_loader;
 pub mod epoll;
 pub mod fd;
 pub mod fhandle;
@@ -28,7 +27,6 @@ pub use self::block_device::*;
 pub use self::channel::*;
 pub use self::circ_buf::*;
 pub use self::disk::*;
-pub use self::elf_loader::*;
 pub use self::epoll::*;
 pub use self::fd::*;
 pub use self::fhandle::*;

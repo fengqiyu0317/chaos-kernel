@@ -296,100 +296,6 @@ fn checkpoint_stdio_instance(
     Ok((FInstance::new(path), opt))
 }
 
-struct InitialUserImage {
-    addr_space: AddrSpace,
-    thd_ctx: ThdCtx,
-}
-
-// AGENT: build the first user image from explicit ELF bytes so task creation
-// does not depend on a fake hard-coded header or hidden filesystem state.
-fn prepare_initial_user_image(
-    elf_data: &[u8],
-    args: Vec<String>,
-    envs: Vec<String>,
-    pool: &FramePool,
-) -> Result<InitialUserImage, &'static str> {
-    let (entry, load_segments) = parse_elf_load_segments(elf_data)?;
-    let mut addr_space = AddrSpace::new();
-    match populate_initial_user_image(
-        &mut addr_space,
-        elf_data,
-        load_segments,
-        entry,
-        args,
-        envs,
-        pool,
-    ) {
-        Ok(thd_ctx) => Ok(InitialUserImage {
-            addr_space,
-            thd_ctx,
-        }),
-        Err(err) => {
-            addr_space.release_all_pages(pool);
-            Err(err)
-        }
-    }
-}
-
-fn populate_initial_user_image(
-    addr_space: &mut AddrSpace,
-    elf_data: &[u8],
-    load_segments: Vec<ElfLoadSegment>,
-    entry: usize,
-    args: Vec<String>,
-    envs: Vec<String>,
-    pool: &FramePool,
-) -> Result<ThdCtx, &'static str> {
-    let mut image_end = 0usize;
-    for segment in load_segments {
-        let region = segment.vm_region()?;
-        let region_base = region.base;
-        let region_len = region.len;
-        let region_flags = region.flags;
-        let region_end = region.end();
-        addr_space.map_region(
-            VmRegion {
-                flags: region_flags | VM_WRITE,
-                ..region
-            },
-            pool,
-        )?;
-
-        let file_end = segment
-            .offset
-            .checked_add(segment.file_size)
-            .ok_or("ph_overflow")?;
-        if file_end > elf_data.len() {
-            return Err("ph_overflow");
-        }
-        addr_space.write_user_bytes(segment.vaddr, &elf_data[segment.offset..file_end], pool)?;
-        addr_space.protect(region_base, region_len, region_flags)?;
-        image_end = max(image_end, region_end);
-    }
-
-    let init = ProcInit {
-        args,
-        envs,
-        auxv: BTreeMap::from([(AT_PAGESZ, PAGE_SZ), (AT_ENTRY, entry)]),
-    };
-    if init.checked_total_size()? > USR_STK_SZ {
-        return Err("e2big");
-    }
-
-    let stack = VmRegion::new(USR_STK_OFF, USR_STK_SZ, VM_READ | VM_WRITE | VM_GROWSDOWN);
-    addr_space.map_region(stack, pool)?;
-    let sp = init.push_at(addr_space, pool, USR_STK_OFF + USR_STK_SZ)?;
-    if sp < USR_STK_OFF || sp > USR_STK_OFF + USR_STK_SZ {
-        return Err("e2big");
-    }
-
-    addr_space.vm_map.brk = (image_end + PAGE_SZ - 1) & !(PAGE_SZ - 1);
-    let mut thd_ctx = ThdCtx::default();
-    thd_ctx.uctx.set_sp(sp as u64);
-    thd_ctx.uctx.set_ip(entry as u64);
-    Ok(thd_ctx)
-}
-
 // AGENT: seed stdio through the normal fd allocator so the descriptor table and
 // free-fd set stay consistent with every later open/dup/close path.
 fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str> {
@@ -1384,6 +1290,9 @@ impl TaskTable {
         task_slot.release();
         Ok(t)
     }
+
+    // AGENT: build initial user tasks through the same ELF/address-space
+    // preparation path used by exec so their image semantics cannot drift.
     pub fn new_user_task(
         &self,
         path: &str,
@@ -1392,7 +1301,7 @@ impl TaskTable {
         envs: Vec<String>,
         pool: &FramePool,
     ) -> Result<Arc<Task>, &'static str> {
-        let mut image = prepare_initial_user_image(elf_data, args, envs, pool)?;
+        let mut image = prepare_user_image(elf_data, args, envs, pool)?;
         let t = match self.spawn(path) {
             Ok(task) => task,
             Err(err) => {

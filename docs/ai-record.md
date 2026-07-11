@@ -1302,6 +1302,48 @@ cargo test
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - 不删除或替换 `kernel-sim/`；host 端 `cargo test` 仍是语义回归基准。
 
+## 2026-07-11：kernel-qemu ELF 与用户映像装载边界收拢
+
+目标：消除 ELF 解析被放在文件系统层的职责割裂，并让初始用户任务与 `exec` 共用同一套用户映像构造逻辑。
+
+已完成修改：
+
+- 删除 `kernel-qemu/src/fs/elf_loader.rs`，将纯 ELF64 header / program-header 解析迁入 `kernel-qemu/src/proc/elf.rs`。
+- 新增 `ParsedElf`，将 entry point 和 `ElfLoadSegment` 列表收拢为具名解析结果；`validate_elf_header()` 继续保留。
+- 新增 `kernel-qemu/src/proc/user_image.rs`，统一处理 ELF 段的页对齐映射、临时可写装载、文件字节复制、BSS 零填充、最终 R/W/X 权限恢复、用户栈和 `brk` 初始化。
+- `TaskTable::new_user_task()` 和 `Kernel::prepare_exec_image()` 共用 `prepare_user_image()`；`exec` 调用方只保留可执行文件读取、signal mask / `FD_CLOEXEC` 准备和事务提交职责。
+- `qemu-proc-selftest` 新增合成 ELF 回归，验证段字节、BSS、最终不可写权限、`argv` 和 `brk`。
+
+关键文件：
+
+- `kernel-qemu/src/proc/elf.rs`
+- `kernel-qemu/src/proc/user_image.rs`
+- `kernel-qemu/src/proc/task.rs`
+- `kernel-qemu/src/kernel_core/kernel_ops/exec.rs`
+- `kernel-qemu/src/proc/process_tests.rs`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo fmt --all
+cargo check --target riscv64gc-unknown-none-elf
+cargo check --target riscv64gc-unknown-none-elf --features qemu-proc-selftest
+cargo build --release --features qemu-proc-selftest
+timeout 15s qemu-system-riscv64 -machine virt -m 128M -nographic -bios default \
+  -kernel target/riscv64gc-unknown-none-elf/release/kernel-qemu
+
+cd ..
+bash tools/qemu-smoke.sh
+```
+
+结果：两次 `cargo check` 和 feature-enabled release build 通过；QEMU 输出 `[kernel-qemu] proc selftest passed`、timer tick / timer wheel 通过并正常 shutdown；标准 `tools/qemu-smoke.sh` 也通过。本轮只重构 `kernel-qemu`，未修改 `kernel-sim`，因此没有重跑 host `kernel-sim` 回归。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- 不删除或替换 `kernel-sim/`。
+
 ## 2026-07-05：发布单文件 kernel.rs 回退分支
 
 目标：按用户要求保留 GitHub 上原来的 `origin/master` 到旁支，然后把当前本地版本发布为新的主分支内容。

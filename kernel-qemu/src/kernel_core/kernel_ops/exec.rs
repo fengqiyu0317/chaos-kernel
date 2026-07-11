@@ -36,85 +36,10 @@ impl Kernel {
     ) -> Result<PreparedExec, &'static str> {
         let exec_path = self.lookup_path(path)?;
         let elf_data = self.read_file_for_exec(&exec_path)?;
-        let (entry, load_segments) = parse_elf_load_segments(&elf_data)?;
-        let mut addr_space = AddrSpace::new();
-        let mut image_end = 0usize;
-        for segment in load_segments {
-            let region = segment.vm_region()?;
-            let region_base = region.base;
-            let region_len = region.len;
-            let region_flags = region.flags;
-            let region_end = region.end();
-            let load_region = VmRegion {
-                flags: region_flags | VM_WRITE,
-                ..region
-            };
-            image_end = max(image_end, region_end);
-            if let Err(err) = addr_space.map_region(load_region, &self.pool) {
-                addr_space.release_all_pages(&self.pool);
-                return Err(err);
-            }
-            let file_end = match segment.offset.checked_add(segment.file_size) {
-                Some(end) => end,
-                None => {
-                    addr_space.release_all_pages(&self.pool);
-                    return Err("ph_overflow");
-                }
-            };
-            if file_end > elf_data.len() {
-                addr_space.release_all_pages(&self.pool);
-                return Err("ph_overflow");
-            }
-            if let Err(err) = addr_space.write_user_bytes(
-                segment.vaddr,
-                &elf_data[segment.offset..file_end],
-                &self.pool,
-            ) {
-                addr_space.release_all_pages(&self.pool);
-                return Err(err);
-            }
-            if let Err(err) = addr_space.protect(region_base, region_len, region_flags) {
-                addr_space.release_all_pages(&self.pool);
-                return Err(err);
-            }
-        }
-        let init = ProcInit {
-            args,
-            envs,
-            auxv: BTreeMap::from([(AT_PAGESZ, PAGE_SZ), (AT_ENTRY, entry)]),
-        };
-        let init_size = match init.checked_total_size() {
-            Ok(size) => size,
-            Err(err) => {
-                addr_space.release_all_pages(&self.pool);
-                return Err(err);
-            }
-        };
-        if init_size > USR_STK_SZ {
-            addr_space.release_all_pages(&self.pool);
-            return Err("e2big");
-        }
-        let stack = VmRegion::new(USR_STK_OFF, USR_STK_SZ, VM_READ | VM_WRITE | VM_GROWSDOWN);
-        if let Err(err) = addr_space.map_region(stack, &self.pool) {
-            addr_space.release_all_pages(&self.pool);
-            return Err(err);
-        }
-        let sp = match init.push_at(&mut addr_space, &self.pool, USR_STK_OFF + USR_STK_SZ) {
-            Ok(sp) => sp,
-            Err(err) => {
-                addr_space.release_all_pages(&self.pool);
-                return Err(err);
-            }
-        };
-        if sp < USR_STK_OFF || sp > USR_STK_OFF + USR_STK_SZ {
-            addr_space.release_all_pages(&self.pool);
-            return Err("e2big");
-        }
-        addr_space.vm_map.brk = (image_end + PAGE_SZ - 1) & !(PAGE_SZ - 1);
-        let mut ctx = ThdCtx::default();
-        ctx.uctx.set_sp(sp as u64);
-        ctx.uctx.set_ip(entry as u64);
-        ctx.smask = *task.sig_mask.lock().unwrap();
+        // AGENT: delegate ELF mapping and stack construction to the common
+        // user-image builder; exec retains only file and commit semantics.
+        let mut image = prepare_user_image(&elf_data, args, envs, &self.pool)?;
+        image.thd_ctx.smask = *task.sig_mask.lock().unwrap();
         let close_fds = task
             .process
             .files
@@ -125,8 +50,8 @@ impl Kernel {
             .collect();
         Ok(PreparedExec {
             exec_path,
-            addr_space,
-            thd_ctx: ctx,
+            addr_space: image.addr_space,
+            thd_ctx: image.thd_ctx,
             close_fds,
         })
     }

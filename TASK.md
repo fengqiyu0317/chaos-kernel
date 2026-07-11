@@ -1,6 +1,6 @@
 # Chaos 项目交接状态
 
-更新日期：2026-06-28
+更新日期：2026-07-11
 
 ## 目标
 
@@ -53,6 +53,7 @@
 - 2026-06-28：完成 M9 trap 第 6 点早期异常失败路径：`kernel-qemu/src/trap.rs` 将 page fault 细分为 instruction/load/store fault，非法指令独立记录，失败日志统一输出 origin、cause/access、`sepc`、`stval`、`sstatus` 和 `sp`；当前没有 task exit / Sv39 recovery 时仍通过明确 fallback action 后 shutdown。
 - 2026-06-28：完成 M9 早期全局堆承载：`kernel-qemu` 启用 `extern crate alloc`，新增 linker 预留 early heap 和 `kernel-qemu/src/heap.rs` bump allocator，并在 QEMU 启动路径实际构造 `Vec`、`Box`、`BTreeMap`、`Arc`；该堆只承载早期 `alloc` 类型和迁移元数据，不作为最终用户页或页表页 frame allocator。
 - 2026-06-30：`kernel-qemu` 的迁入地址空间已新增最小 Sv39 helper：`PageTableEntry` 不再保存 `SharedPage` / resident `Vec<u8>` 页面内容，而是保存真实 `PgFrame` metadata；`map_region()` / `map_file_region()` 会建立 Sv39 leaf PTE，`read_user_bytes()` / `write_user_bytes()` 通过页表翻译和物理页 copy 访问用户页。当前仍未开启全局分页，也未完成 trap 级 COW/page fault recovery。
+- 2026-07-11：`kernel-qemu` 已将 ELF 解析从 `fs/elf_loader.rs` 移入 `proc/elf.rs`，并新增 `proc/user_image.rs` 统一承担 `PT_LOAD` 映射、文件段复制、BSS 零填充、最终权限、用户栈和 `brk` 初始化；`new_user_task()` 与 `exec` 现在共用 `prepare_user_image()`，并新增 QEMU proc selftest 覆盖该公共路径。
 
 ## 关键文件
 

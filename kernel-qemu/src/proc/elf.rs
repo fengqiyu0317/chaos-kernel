@@ -1,8 +1,8 @@
 // AGENT
 use super::*;
 
-// AGENT: describe one validated ELF PT_LOAD segment before address-space setup
-// maps it into the user process image.
+// AGENT: retain the validated subset of one ELF PT_LOAD program header for
+// later process-image construction.
 #[derive(Clone, Debug)]
 pub struct ElfLoadSegment {
     pub offset: usize,
@@ -12,54 +12,23 @@ pub struct ElfLoadSegment {
     pub flags: u32,
 }
 
-// AGENT: keep ELF-to-VM translation with the parsed segment metadata.
-impl ElfLoadSegment {
-    // AGENT: translate ELF program-header permission bits to VmRegion flags.
-    pub fn vm_flags(&self) -> u32 {
-        let mut flags = 0;
-        if self.flags & 0x4 != 0 {
-            flags |= VM_READ;
-        }
-        if self.flags & 0x2 != 0 {
-            flags |= VM_WRITE;
-        }
-        if self.flags & 0x1 != 0 {
-            flags |= VM_EXEC;
-        }
-        if flags == 0 {
-            VM_READ
-        } else {
-            flags
-        }
-    }
-
-    // AGENT: compute the page-aligned virtual range covered by this load segment.
-    pub fn vm_region(&self) -> Result<VmRegion, &'static str> {
-        let page_base = self.vaddr & !(PAGE_SZ - 1);
-        let page_off = self.vaddr - page_base;
-        let file_page_offset = self.offset.checked_sub(page_off).ok_or("bad_phdr")?;
-        if file_page_offset % PAGE_SZ != 0 {
-            return Err("bad_phdr");
-        }
-        let mapped_len = page_off
-            .checked_add(self.mem_size)
-            .and_then(|len| len.checked_add(PAGE_SZ - 1))
-            .map(|len| len & !(PAGE_SZ - 1))
-            .ok_or("ph_overflow")?;
-        if mapped_len == 0 || page_base.checked_add(mapped_len).is_none() {
-            return Err("ph_overflow");
-        }
-        Ok(VmRegion::new(page_base, mapped_len, self.vm_flags()))
-    }
+// AGENT: give callers a named parsed image instead of passing an entry point
+// and load-segment vector as an anonymous tuple.
+#[derive(Clone, Debug)]
+pub struct ParsedElf {
+    pub entry: usize,
+    pub load_segments: Vec<ElfLoadSegment>,
 }
 
-// AGENT: preserve the old header-only validation API by returning just entry.
+// AGENT: preserve the header-validation API while routing all validation
+// through the complete ELF parser used by process image construction.
 pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {
-    parse_elf_load_segments(data).map(|(entry, _)| entry)
+    parse_elf(data).map(|elf| elf.entry)
 }
 
-// AGENT: parse and validate the ELF header plus PT_LOAD table used by exec.
-pub fn parse_elf_load_segments(data: &[u8]) -> Result<(usize, Vec<ElfLoadSegment>), &'static str> {
+// AGENT: parse and validate the ELF header and PT_LOAD metadata without
+// performing filesystem I/O or mutating an address space.
+pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, &'static str> {
     if data.len() < 64 {
         return Err("too_short");
     }
@@ -144,10 +113,14 @@ pub fn parse_elf_load_segments(data: &[u8]) -> Result<(usize, Vec<ElfLoadSegment
     if load_segments.is_empty() {
         return Err("no_load");
     }
-    Ok((e_entry, load_segments))
+    Ok(ParsedElf {
+        entry: e_entry,
+        load_segments,
+    })
 }
 
-// AGENT: validate PT_LOAD alignment before exec maps file pages into memory.
+// AGENT: validate PT_LOAD alignment before process image construction maps
+// file pages into user memory.
 fn validate_load_segment_alignment(
     offset: usize,
     vaddr: usize,

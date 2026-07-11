@@ -2,8 +2,8 @@
 // page-table walker, and physical user-copy path to be initialized.
 use super::*;
 
-// AGENT: expose ProcInit stack construction checks to the optional QEMU boot
-// selftest path.
+// AGENT: expose process, initial-stack, and shared ELF image regressions to the
+// optional QEMU boot selftest path.
 pub fn run_all(pool: &FramePool) {
     capset_inherit_keeps_only_allowed_bits();
     capset_raise_ambient_requires_owned_inheritable_cap();
@@ -16,6 +16,7 @@ pub fn run_all(pool: &FramePool) {
     clone_thread_copies_caller_context_and_shares_process();
     reap_zombie_process_removes_thread_group_once();
     proc_init_push_at_writes_user_stack(pool);
+    prepared_user_image_loads_elf_segment_and_stack(pool);
     shm_segment_maps_shared_physical_page(pool);
 }
 
@@ -259,6 +260,102 @@ fn proc_init_push_at_writes_user_stack(pool: &FramePool) {
     assert_eq!(addr_space.read_user_usize(auxv + word * 3).unwrap(), entry);
     assert_eq!(addr_space.read_user_usize(auxv + word * 4).unwrap(), 0);
     assert_eq!(addr_space.read_user_usize(auxv + word * 5).unwrap(), 0);
+}
+
+// AGENT: exercise the shared ELF image builder used by both new_user_task and
+// exec, including file bytes, zero-filled bss, final permissions, and argv.
+fn prepared_user_image_loads_elf_segment_and_stack(pool: &FramePool) {
+    let segment_offset = PAGE_SZ + 0x234;
+    let segment_vaddr = 0x0040_1234;
+    let payload = b"init";
+    let elf = test_elf_with_load_segment(segment_offset, segment_vaddr, payload, 16);
+    let mut image = prepare_user_image(
+        &elf,
+        vec!["init".to_string()],
+        vec!["A=B".to_string()],
+        pool,
+    )
+    .expect("shared ELF image builder should succeed");
+
+    assert_eq!(image.thd_ctx.uctx.ip, segment_vaddr as u64);
+    let mut loaded = [0u8; 4];
+    image
+        .addr_space
+        .read_user_bytes(segment_vaddr, &mut loaded)
+        .expect("ELF payload should be readable");
+    assert_eq!(&loaded, payload);
+    let mut bss = [0xffu8; 12];
+    image
+        .addr_space
+        .read_user_bytes(segment_vaddr + payload.len(), &mut bss)
+        .expect("ELF bss should be readable");
+    assert_eq!(bss, [0u8; 12]);
+    assert!(image
+        .addr_space
+        .write_user_bytes(segment_vaddr, b"x", pool)
+        .is_err());
+
+    let sp = image.thd_ctx.uctx.r[N_REGS - 1] as usize;
+    assert_eq!(image.addr_space.read_user_usize(sp).unwrap(), 1);
+    let argv0 = image
+        .addr_space
+        .read_user_usize(sp + mem::size_of::<usize>())
+        .unwrap();
+    assert_user_cstr(&image.addr_space, argv0, "init");
+    assert_eq!(image.addr_space.vm_map.brk, 0x0040_2000);
+
+    image.addr_space.release_all_pages(pool);
+}
+
+// AGENT: build a compact ELF64 fixture with one PT_LOAD segment for the QEMU
+// process-image selftest without depending on host-side ELF tooling.
+fn test_elf_with_load_segment(
+    offset: usize,
+    vaddr: usize,
+    payload: &[u8],
+    mem_size: usize,
+) -> Vec<u8> {
+    const PH_OFF: usize = 64;
+    const PH_SIZE: usize = 56;
+    let mut data = vec![0u8; (PH_OFF + PH_SIZE).max(offset + payload.len())];
+    data[0..4].copy_from_slice(b"\x7fELF");
+    data[4] = 2;
+    data[5] = 1;
+    data[6] = 1;
+    write_test_u16(&mut data, 16, 2);
+    write_test_u16(&mut data, 18, 0xF3);
+    write_test_u32(&mut data, 20, 1);
+    write_test_u64(&mut data, 24, vaddr as u64);
+    write_test_u64(&mut data, 32, PH_OFF as u64);
+    write_test_u16(&mut data, 52, 64);
+    write_test_u16(&mut data, 54, PH_SIZE as u16);
+    write_test_u16(&mut data, 56, 1);
+
+    write_test_u32(&mut data, PH_OFF, 1);
+    write_test_u32(&mut data, PH_OFF + 4, 0x5);
+    write_test_u64(&mut data, PH_OFF + 8, offset as u64);
+    write_test_u64(&mut data, PH_OFF + 16, vaddr as u64);
+    write_test_u64(&mut data, PH_OFF + 24, vaddr as u64);
+    write_test_u64(&mut data, PH_OFF + 32, payload.len() as u64);
+    write_test_u64(&mut data, PH_OFF + 40, mem_size as u64);
+    write_test_u64(&mut data, PH_OFF + 48, PAGE_SZ as u64);
+    data[offset..offset + payload.len()].copy_from_slice(payload);
+    data
+}
+
+// AGENT: encode one little-endian u16 in the synthetic ELF fixture.
+fn write_test_u16(data: &mut [u8], offset: usize, value: u16) {
+    data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+// AGENT: encode one little-endian u32 in the synthetic ELF fixture.
+fn write_test_u32(data: &mut [u8], offset: usize, value: u32) {
+    data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+// AGENT: encode one little-endian u64 in the synthetic ELF fixture.
+fn write_test_u64(data: &mut [u8], offset: usize, value: u64) {
+    data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 // AGENT: shared-memory segments should map the same physical page into
