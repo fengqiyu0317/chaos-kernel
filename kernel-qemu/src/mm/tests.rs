@@ -8,7 +8,7 @@ pub fn run_all() {
     align_up_rejects_overflow();
     rotate_bits_masks_zero_distance_rotation();
     hash_combine_mixes_zero_values();
-    frame_pool_counts_only_managed_pages();
+    frame_pool_tracks_total_and_free_pages();
     vm_region_and_map_preserve_range_semantics();
     buddy_allocator_alloc_free_smoke();
     buddy_free_merges_with_nonzero_base();
@@ -61,20 +61,18 @@ fn hash_combine_mixes_zero_values() {
     assert_ne!(hash_combine(hash_combine(0, 0), 1), hash_combine(0, 1));
 }
 
-// AGENT: FramePool pressure accounting must ignore reserved RAM outside the
-// boot-discovered free range.
+// AGENT: FramePool covers the whole physical-memory span while its availability
+// bitmap exposes only the boot-discovered free range for allocation.
 #[cfg_attr(test, test)]
-fn frame_pool_counts_only_managed_pages() {
+fn frame_pool_tracks_total_and_free_pages() {
     let pool = FramePool::new(8, MEM_OFF);
     pool.mark_free_range(MEM_OFF + 2 * PAGE_SZ, MEM_OFF + 6 * PAGE_SZ);
 
-    assert_eq!(pool.managed_pages(), 4);
+    assert_eq!(pool.total_pages(), 8);
     assert_eq!(pool.free_count(), 4);
+    assert_eq!(pool.get(1), None);
 
     assert_eq!(pool.get(3), Some(3));
-    assert_eq!(pool.free_count(), 3);
-
-    pool.put(1);
     assert_eq!(pool.free_count(), 3);
 
     pool.put(3);

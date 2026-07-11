@@ -1,10 +1,10 @@
 // AGENT
 use super::*;
 
-// AGENT: share the frame bitmap with PgFrame so RAII drops can return pages.
+// AGENT: track the availability of every physical frame managed by the kernel;
+// PgFrame shares this bitmap so RAII drops can return allocated pages.
 pub struct FramePool {
     pub(crate) slots: Arc<Mutex<Vec<bool>>>,
-    managed: Arc<Mutex<Vec<bool>>>,
     pub(crate) cap: usize,
     pub(crate) base_paddr: usize,
 }
@@ -14,7 +14,6 @@ impl FramePool {
     pub fn new(n: usize, base_paddr: usize) -> Self {
         Self {
             slots: Arc::new(Mutex::new(vec![false; n])),
-            managed: Arc::new(Mutex::new(vec![false; n])),
             cap: n,
             base_paddr,
         }
@@ -34,13 +33,9 @@ impl FramePool {
 
         let first = (start - self.base_paddr) / PAGE_SZ;
         let last = min((end - self.base_paddr) / PAGE_SZ, self.cap);
-        let mut managed = self.managed.lock().unwrap();
         let mut slots = self.slots.lock().unwrap();
         for idx in first..last {
-            if !managed[idx] {
-                managed[idx] = true;
-                slots[idx] = true;
-            }
+            slots[idx] = true;
         }
     }
 
@@ -114,12 +109,11 @@ impl FramePool {
         }
         None
     }
-    // AGENT: return an allocated frame id to the bitmap once and ignore
-    // duplicate/out-of-range releases.
+    // AGENT: return a caller-owned frame id to the availability bitmap and
+    // ignore duplicate/out-of-range releases.
     pub fn put(&self, idx: usize) {
-        let managed = self.managed.lock().unwrap();
         let mut s = self.slots.lock().unwrap();
-        if idx < s.len() && managed[idx] && !s[idx] {
+        if idx < s.len() && !s[idx] {
             s[idx] = true;
         }
     }
@@ -131,14 +125,9 @@ impl FramePool {
         self.slots.lock().unwrap().iter().filter(|&&f| f).count()
     }
 
-    // AGENT: count only frames that boot-time discovery actually made allocatable.
-    pub fn managed_pages(&self) -> usize {
-        self.managed
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|&&managed| managed)
-            .count()
+    // AGENT: report the complete physical-frame span represented by this pool.
+    pub fn total_pages(&self) -> usize {
+        self.cap
     }
 
     // AGENT: allocate a physical frame as a RAII page-frame handle.
@@ -185,40 +174,6 @@ impl FramePool {
             }
         }
         result
-    }
-}
-
-// AGENT: keep the legacy physical-address API as a thin wrapper over FramePool.
-pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
-    let frame_id = pool.get_inner()?;
-    match pool.frame_id_to_paddr(frame_id) {
-        Some(paddr) => Some(paddr),
-        None => {
-            pool.put(frame_id);
-            None
-        }
-    }
-}
-
-// AGENT: return a physical frame through the FramePool release path.
-pub fn frame_dealloc(pool: &FramePool, target: usize) {
-    let Some(idx) = pool.paddr_to_frame_id(target) else {
-        return;
-    };
-    pool.put(idx);
-}
-
-// AGENT: keep contiguous physical allocation behind FramePool's aligned scanner.
-pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<usize> {
-    let frame_id = pool.get_contig(sz, align)?;
-    match pool.frame_id_to_paddr(frame_id) {
-        Some(paddr) => Some(paddr),
-        None => {
-            for id in frame_id..frame_id + sz {
-                pool.put(id);
-            }
-            None
-        }
     }
 }
 

@@ -46,9 +46,10 @@ impl Kernel {
         }
     }
 
-    // AGENT: report allocator pressure over managed frames, not the whole RAM span.
+    // AGENT: report pressure over the complete physical-memory span represented
+    // by FramePool, including frames occupied before runtime allocation begins.
     pub fn memory_pressure(&self) -> usize {
-        let total = self.pool.managed_pages();
+        let total = self.pool.total_pages();
         let free = self.pool.free_count();
         if total == 0 {
             return 100;
