@@ -16,7 +16,6 @@ pub mod finstance;
 pub mod flike;
 // AGENT: Isolate the block-I/O request queue from mount and disk behavior.
 pub mod io_queue;
-pub mod memory_misc;
 // AGENT: Isolate mount-table path resolution from I/O scheduling and devices.
 pub mod mount;
 pub mod pipe;
@@ -34,7 +33,6 @@ pub use self::file_node::*;
 pub use self::finstance::*;
 pub use self::flike::*;
 pub use self::io_queue::*;
-pub use self::memory_misc::*;
 pub use self::mount::*;
 pub use self::pipe::*;
 pub use self::tty::*;
