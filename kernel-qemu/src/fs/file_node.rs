@@ -1,6 +1,7 @@
 // AGENT: keep shared path-file metadata in FileNode while storing file bytes
 // in the QEMU block backend instead of duplicating contents in the node.
 use super::*;
+use crate::kernel::allocator::AllocatorState;
 
 const FILE_NODE_METADATA_MAGIC: &[u8; 4] = b"FNMD";
 const FILE_NODE_METADATA_HEADER_LEN: usize = 4 + 1 + 1 + 8 + 8 + 8;
@@ -19,62 +20,39 @@ pub enum FileKind {
 // AGENT: track root RamBlockDevice block ownership so truncated FileNode data
 // can return space to later files instead of only bumping a high-water mark.
 pub struct FileBlockAllocator {
-    state: Mutex<FileBlockAllocatorState>,
-}
-
-// AGENT: keep allocator state together because free-list reuse and next-block
-// allocation must be updated atomically with respect to other file operations.
-struct FileBlockAllocatorState {
-    next: usize,
-    free: BTreeSet<usize>,
+    state: Mutex<AllocatorState>,
 }
 
 impl FileBlockAllocator {
-    // AGENT: start with an empty free list and allocate new blocks sequentially.
-    pub fn new() -> Self {
+    // AGENT: bind the sequential block allocator to its device capacity once.
+    pub fn new(limit: usize) -> Self {
         Self {
-            state: Mutex::new(FileBlockAllocatorState {
-                next: 0,
-                free: BTreeSet::new(),
-            }),
+            state: Mutex::new(AllocatorState::new(0, limit)),
         }
     }
 
     // AGENT: prefer cleared blocks returned by FileBlock RAII drops, falling
     // back to the next never-used block inside the fixed RAM-device capacity.
-    fn allocate_id(&self, device: &RamBlockDevice) -> Result<usize, &'static str> {
-        let mut state = self.state.lock().unwrap();
-        if let Some(block) = state.free.iter().next().copied() {
-            state.free.remove(&block);
-            return Ok(block);
-        }
-
-        if state.next >= device.block_count() {
-            return Err("enospc");
-        }
-        let block = state.next;
-        state.next += 1;
-        Ok(block)
+    fn allocate_id(&self) -> Result<usize, &'static str> {
+        self.state.lock().unwrap().allocate().ok_or("enospc")
     }
 
     // AGENT: FileBlock::drop returns already-cleared blocks here; duplicate
     // releases would mean block ownership escaped the FileNode map.
     fn release_owned(&self, block: usize) {
         let mut state = self.state.lock().unwrap();
-        if block < state.next {
-            let inserted = state.free.insert(block);
-            debug_assert!(inserted, "file block released twice");
-        } else {
-            debug_assert!(false, "file block released outside allocator range");
-        }
+        let released = state.release(block);
+        debug_assert!(
+            released,
+            "file block released twice or outside allocator range"
+        );
     }
 
     // AGENT: expose allocator reuse to focused fd/qemu-sync regressions without
     // making the free-list shape part of the normal filesystem API.
     #[cfg(any(test, feature = "qemu-sync-selftest"))]
     fn stats(&self) -> (usize, usize) {
-        let state = self.state.lock().unwrap();
-        (state.next, state.free.len())
+        self.state.lock().unwrap().stats()
     }
 }
 
@@ -172,20 +150,19 @@ impl FileStorage {
     }
 
     pub fn standalone() -> Self {
+        let device = Arc::new(RamBlockDevice::empty());
+        let allocator = Arc::new(FileBlockAllocator::new(device.block_count()));
         Self::new(
             Arc::new(BlockCache::new(STANDALONE_BLOCK_CACHE_CHAINS)),
-            Arc::new(RamBlockDevice::empty()),
-            Arc::new(FileBlockAllocator::new()),
+            device,
+            allocator,
         )
     }
 
     // AGENT: allocate an owned backend block tied to this storage's cache,
     // device, and allocator so FileNode truncation can release it by dropping.
     fn allocate_block(&self) -> Result<FileBlock, &'static str> {
-        let id = self
-            .inner
-            .allocator
-            .allocate_id(self.inner.device.as_ref())?;
+        let id = self.inner.allocator.allocate_id()?;
         Ok(FileBlock::new(id, self.inner.clone()))
     }
 

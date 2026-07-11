@@ -99,10 +99,11 @@ fn metadata_blocks_expand_for_large_directory_entry() {
 // allocator so later files can reuse space without observing stale contents.
 #[cfg_attr(test, test)]
 fn truncate_releases_blocks_for_reuse_without_old_contents() {
+    let device = Arc::new(RamBlockDevice::empty());
     let storage = FileStorage::new(
         Arc::new(BlockCache::new(1)),
-        Arc::new(RamBlockDevice::empty()),
-        Arc::new(FileBlockAllocator::new()),
+        device.clone(),
+        Arc::new(FileBlockAllocator::new(device.block_count())),
     );
     let first_node = Arc::new(FileNode::regular(false));
     let first = FInstance::with_node_on_storage("/tmp/first", first_node, storage.clone());

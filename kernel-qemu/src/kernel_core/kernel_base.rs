@@ -81,12 +81,13 @@ impl Kernel {
         block_device: Arc<RamBlockDevice>,
         cache_chains: usize,
     ) -> Self {
+        let file_blocks = Arc::new(FileBlockAllocator::new(block_device.block_count()));
         Self {
             tasks: TaskTable::new(),
             run_queue: RunQueue::new(),
             cache: Arc::new(BlockCache::new(cache_chains)),
             block_device,
-            file_blocks: Arc::new(FileBlockAllocator::new()),
+            file_blocks,
             pool,
             cpus: Mutex::new([None, None, None, None, None, None, None, None]),
             mnt: MountTable::new(),

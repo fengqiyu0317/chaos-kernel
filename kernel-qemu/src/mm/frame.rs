@@ -1,8 +1,8 @@
 // AGENT: isolate physical-frame ownership from direct-map conversion and VMA
 // metadata management.
-use alloc::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
 
-use super::{copy_page, FramePool, Mutex, PAGE_SZ};
+use super::{copy_page, AllocatorState, FramePool, Mutex, PAGE_SZ};
 
 // AGENT: PgFrame is the RAII mapping handle for a physical frame; cloning it
 // represents another PTE sharing that frame.
@@ -14,7 +14,7 @@ pub struct PgFrame {
 // AGENT: return the frame to its pool when the final PgFrame mapping handle drops.
 struct PgFrameInner {
     id: usize,
-    slots: Arc<Mutex<Vec<bool>>>,
+    allocator: Arc<Mutex<AllocatorState>>,
     base_paddr: usize,
 }
 
@@ -23,13 +23,13 @@ impl PgFrame {
     // AGENT: construct a frame handle only for a slot already reserved by FramePool.
     pub(crate) fn from_allocated(
         id: usize,
-        slots: Arc<Mutex<Vec<bool>>>,
+        allocator: Arc<Mutex<AllocatorState>>,
         base_paddr: usize,
     ) -> Self {
         Self {
             inner: Arc::new(PgFrameInner {
                 id,
-                slots,
+                allocator,
                 base_paddr,
             }),
         }
@@ -60,13 +60,16 @@ impl PgFrame {
     }
 }
 
-// AGENT: implement final-owner reclamation at the frame ownership boundary.
+// AGENT: reclaim the final owner's frame and surface allocator invariant
+// violations instead of silently accepting invalid or duplicate releases.
 impl Drop for PgFrameInner {
     fn drop(&mut self) {
-        let mut slots = self.slots.lock().unwrap();
-        if self.id < slots.len() && !slots[self.id] {
-            slots[self.id] = true;
-        }
+        let released = self.allocator.lock().unwrap().release(self.id);
+        assert!(
+            released,
+            "PgFrame {} was released twice or was never allocated",
+            self.id
+        );
     }
 }
 

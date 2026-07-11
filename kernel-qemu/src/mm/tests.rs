@@ -61,8 +61,8 @@ fn hash_combine_mixes_zero_values() {
     assert_ne!(hash_combine(hash_combine(0, 0), 1), hash_combine(0, 1));
 }
 
-// AGENT: FramePool covers the whole physical-memory span while its availability
-// bitmap exposes only the boot-discovered free range for allocation.
+// AGENT: FramePool covers the whole physical-memory span while its shared
+// allocator state exposes only the boot-discovered free range for allocation.
 #[cfg_attr(test, test)]
 fn frame_pool_tracks_total_and_free_pages() {
     let pool = FramePool::new(8, MEM_OFF);
