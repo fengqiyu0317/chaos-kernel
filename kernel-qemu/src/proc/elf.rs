@@ -48,15 +48,16 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, &'static str> {
         return Err("bad_version");
     }
     let e_type = read_u16_le(data, 16)?;
-    if e_type != 2 && e_type != 3 {
+    // AGENT: accept only fixed-address executables until load-bias,
+    // interpreter, and relocation handling exist for ET_DYN images.
+    if e_type != 2 {
         return Err("not_exec");
     }
     let e_machine = read_u16_le(data, 18)?;
-    const EM_X86_64: u16 = 0x3E;
     const EM_RISCV: u16 = 0xF3;
-    // AGENT: QEMU executes RISC-V user images, while existing migration
-    // fixtures still use x86_64-shaped synthetic ELF bytes.
-    if e_machine != EM_RISCV && e_machine != EM_X86_64 {
+    // AGENT: reject foreign instruction sets before their bytes can reach the
+    // RISC-V user execution path.
+    if e_machine != EM_RISCV {
         return Err("bad_machine");
     }
     let e_entry = read_u64_le(data, 24)? as usize;
@@ -112,6 +113,18 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, &'static str> {
     }
     if load_segments.is_empty() {
         return Err("no_load");
+    }
+    // AGENT: the initial PC must name an instruction inside a mapped,
+    // executable PT_LOAD segment rather than an arbitrary ELF-provided address.
+    let entry_is_executable = load_segments.iter().any(|segment| {
+        segment.flags & 0x1 != 0
+            && segment
+                .vaddr
+                .checked_add(segment.mem_size)
+                .is_some_and(|end| segment.vaddr <= e_entry && e_entry < end)
+    });
+    if !entry_is_executable {
+        return Err("bad_entry");
     }
     Ok(ParsedElf {
         entry: e_entry,

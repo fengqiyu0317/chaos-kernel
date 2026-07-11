@@ -16,6 +16,7 @@ pub fn run_all(pool: &FramePool) {
     clone_thread_copies_caller_context_and_shares_process();
     reap_zombie_process_removes_thread_group_once();
     proc_init_push_at_writes_user_stack(pool);
+    parse_elf_rejects_unsupported_or_invalid_entry();
     prepared_user_image_loads_elf_segment_and_stack(pool);
     shm_segment_maps_shared_physical_page(pool);
 }
@@ -305,6 +306,39 @@ fn prepared_user_image_loads_elf_segment_and_stack(pool: &FramePool) {
     assert_eq!(image.addr_space.vm_map.brk, 0x0040_2000);
 
     image.addr_space.release_all_pages(pool);
+}
+
+// AGENT: keep foreign-machine, unsupported ET_DYN, and invalid-entry ELF
+// images from reaching the RISC-V address-space construction path.
+fn parse_elf_rejects_unsupported_or_invalid_entry() {
+    const PH_OFF: usize = 64;
+    let segment_offset = PAGE_SZ;
+    let segment_vaddr = 0x0040_0000;
+    let payload = b"code";
+
+    let mut foreign_machine =
+        test_elf_with_load_segment(segment_offset, segment_vaddr, payload, payload.len());
+    write_test_u16(&mut foreign_machine, 18, 0x3E);
+    assert_eq!(parse_elf(&foreign_machine).unwrap_err(), "bad_machine");
+
+    let mut dynamic =
+        test_elf_with_load_segment(segment_offset, segment_vaddr, payload, payload.len());
+    write_test_u16(&mut dynamic, 16, 3);
+    assert_eq!(parse_elf(&dynamic).unwrap_err(), "not_exec");
+
+    let mut unmapped_entry =
+        test_elf_with_load_segment(segment_offset, segment_vaddr, payload, payload.len());
+    write_test_u64(
+        &mut unmapped_entry,
+        24,
+        (segment_vaddr + payload.len()) as u64,
+    );
+    assert_eq!(parse_elf(&unmapped_entry).unwrap_err(), "bad_entry");
+
+    let mut non_executable =
+        test_elf_with_load_segment(segment_offset, segment_vaddr, payload, payload.len());
+    write_test_u32(&mut non_executable, PH_OFF + 4, 0x4);
+    assert_eq!(parse_elf(&non_executable).unwrap_err(), "bad_entry");
 }
 
 // AGENT: build a compact ELF64 fixture with one PT_LOAD segment for the QEMU
