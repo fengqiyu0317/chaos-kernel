@@ -1,80 +1,8 @@
-// AGENT
-use super::*;
+// AGENT: keep individual VMA metadata and address-space-wide VMA collection
+// operations together, separate from physical frame ownership.
+use alloc::vec::Vec;
 
-// AGENT: translate a physical address through the current high-half direct map.
-pub fn p2v(pa: usize) -> usize {
-    PHYS_OFF.checked_add(pa).expect("p2v overflow")
-}
-
-// AGENT: reverse p2v() and reject addresses outside the high-half direct map.
-pub fn v2p(va: usize) -> usize {
-    va.checked_sub(PHYS_OFF).expect("v2p below direct map")
-}
-
-// AGENT: compute an offset from the kernel virtual base without wrapping.
-pub fn k_off(va: usize) -> usize {
-    va.checked_sub(KERN_BASE)
-        .expect("kernel address below KERN_BASE")
-}
-
-// AGENT: PgFrame is the RAII mapping handle for a physical frame; cloning it
-// represents another PTE sharing that frame.
-#[derive(Clone)]
-pub struct PgFrame {
-    inner: Arc<PgFrameInner>,
-}
-
-// AGENT: return the frame to its pool when the final PgFrame mapping handle drops.
-struct PgFrameInner {
-    id: usize,
-    slots: Arc<Mutex<Vec<bool>>>,
-    base_paddr: usize,
-}
-
-impl PgFrame {
-    pub(crate) fn from_allocated(
-        id: usize,
-        slots: Arc<Mutex<Vec<bool>>>,
-        base_paddr: usize,
-    ) -> Self {
-        Self {
-            inner: Arc::new(PgFrameInner {
-                id,
-                slots,
-                base_paddr,
-            }),
-        }
-    }
-
-    pub fn id(&self) -> usize {
-        self.inner.id
-    }
-
-    pub fn paddr(&self) -> usize {
-        self.inner
-            .id
-            .checked_mul(PAGE_SZ)
-            .and_then(|offset| self.inner.base_paddr.checked_add(offset))
-            .unwrap_or(usize::MAX)
-    }
-
-    pub fn count(&self) -> usize {
-        Arc::strong_count(&self.inner)
-    }
-
-    pub fn is_unique(&self) -> bool {
-        self.count() == 1
-    }
-}
-
-impl Drop for PgFrameInner {
-    fn drop(&mut self) {
-        let mut slots = self.slots.lock().unwrap();
-        if self.id < slots.len() && !slots[self.id] {
-            slots[self.id] = true;
-        }
-    }
-}
+use super::{align_up, KERN_BASE, PAGE_SZ};
 
 // AGENT: keep VmRegion to the VMA metadata that is currently used by the
 // QEMU address-space code; unused region tag/offset fields were removed.
@@ -84,7 +12,10 @@ pub struct VmRegion {
     pub flags: u32,
 }
 
+// AGENT: keep range-local validation, comparison, split, and merge operations
+// on the VMA value itself.
 impl VmRegion {
+    // AGENT: construct one VMA metadata value without mutating a VmMap.
     pub fn new(base: usize, len: usize, flags: u32) -> Self {
         Self { base, len, flags }
     }
@@ -171,6 +102,7 @@ pub struct VmMap {
 
 const MMAP_BASE: usize = 0x7000_0000;
 
+// AGENT: keep sorted-region mutation and free-gap queries at the collection boundary.
 impl VmMap {
     // AGENT: initialize only the VM metadata that can differ by address space.
     pub fn new() -> Self {
@@ -316,6 +248,7 @@ impl VmMap {
         s
     }
 
+    // AGENT: copy VMA metadata without exposing mutable access to the source map.
     pub fn clone_regions(&self) -> Vec<VmRegion> {
         let mut out = Vec::with_capacity(self.regions.len());
         for r in self.regions.iter() {
@@ -329,6 +262,7 @@ impl VmMap {
         out
     }
 
+    // AGENT: measure the unmapped interval after one sorted VMA without underflow.
     pub fn gap_after(&self, idx: usize) -> usize {
         if idx >= self.regions.len() {
             return 0;

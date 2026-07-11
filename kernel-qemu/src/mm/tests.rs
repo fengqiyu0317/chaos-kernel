@@ -1,16 +1,42 @@
 // AGENT: keep bit-helper regressions next to the QEMU MM helper module and
 // expose the same checks to the optional QEMU boot self-test path.
 use super::*;
-use crate::kernel::{FramePool, MEM_OFF, PAGE_SZ};
+use crate::kernel::{FramePool, VmMap, VmRegion, MEM_OFF, PAGE_SZ, VM_READ, VM_WRITE};
 
+// AGENT: run the new VMA boundary regression with the existing QEMU MM checks.
 pub fn run_all() {
     align_up_rejects_overflow();
     rotate_bits_masks_zero_distance_rotation();
     hash_combine_mixes_zero_values();
     frame_pool_counts_only_managed_pages();
+    vm_region_and_map_preserve_range_semantics();
     buddy_allocator_alloc_free_smoke();
     buddy_free_merges_with_nonzero_base();
     buddy_free_rejects_duplicate_and_bad_ranges();
+}
+
+// AGENT: keep a boot-time regression at the new VmRegion/VmMap module boundary
+// so the source split cannot silently change coalescing or range removal.
+#[cfg_attr(test, test)]
+fn vm_region_and_map_preserve_range_semantics() {
+    let base = 0x1000_0000;
+    let mut map = VmMap::new();
+
+    map.insert(VmRegion::new(base, PAGE_SZ, VM_READ | VM_WRITE))
+        .unwrap();
+    map.insert(VmRegion::new(
+        base + PAGE_SZ,
+        2 * PAGE_SZ,
+        VM_READ | VM_WRITE,
+    ))
+    .unwrap();
+
+    assert_eq!(map.regions.len(), 1);
+    assert!(map.find(base + PAGE_SZ).is_some());
+    map.remove_range(base + PAGE_SZ, PAGE_SZ);
+    assert_eq!(map.regions.len(), 2);
+    assert_eq!(map.regions[0].checked_end(), Some(base + PAGE_SZ));
+    assert_eq!(map.regions[1].base, base + 2 * PAGE_SZ);
 }
 
 #[cfg_attr(test, test)]
