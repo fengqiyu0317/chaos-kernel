@@ -19,7 +19,9 @@ pub fn run_all() {
     #[cfg(feature = "qemu-sync-selftest")]
     crate::kernel::fs::block_cache::tests::run_all();
     crate::kernel::fs::fd::tests::run_all();
-    crate::kernel::fs::mount_io_disk::tests::run_all();
+    // AGENT: Follow the mount-table selftests to their dedicated module after
+    // splitting mount_io_disk into separate responsibilities.
+    crate::kernel::fs::mount::tests::run_all();
     wait_token_captures_current_task();
     wait_token_event_wake_wins_once();
     wait_token_timeout_wake_wins_once();

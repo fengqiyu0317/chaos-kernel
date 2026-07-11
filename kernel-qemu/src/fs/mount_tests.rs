@@ -1,8 +1,8 @@
-// AGENT: mount-table regressions split out from mount_io_disk.rs while
-// retaining the same module path for Rust tests and qemu-sync-selftest.
-use super::*;
+// AGENT: Keep mount-table regressions next to mount.rs after splitting the
+// former mixed mount_io_disk module.
+use super::MountTable;
 
-// AGENT: keep the QEMU boot selftest aggregator in the moved mount I/O test module.
+// AGENT: Keep the QEMU boot selftest aggregator in the mount test module.
 pub fn run_all() {
     bind_updates_existing_prefix_and_normalizes();
     bind_ignores_invalid_mount_points();
