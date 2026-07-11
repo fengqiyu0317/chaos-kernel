@@ -15,12 +15,21 @@ pub struct ElfLoadSegment {
     pub flags: u32,
 }
 
+// AGENT: retain one page-granular PT_LOAD mapping with the union of every
+// segment permission that covers it, so shared boundary pages are mapped once.
+#[derive(Clone, Debug)]
+pub struct ElfLoadPage {
+    pub vaddr: usize,
+    pub flags: u32,
+}
+
 // AGENT: give callers a named parsed image instead of passing an entry point
 // and load-segment vector as an anonymous tuple.
 #[derive(Clone, Debug)]
 pub struct ParsedElf {
     pub entry: usize,
     pub load_segments: Vec<ElfLoadSegment>,
+    pub load_pages: Vec<ElfLoadPage>,
 }
 
 // AGENT: preserve the header-validation API while routing all validation
@@ -81,7 +90,7 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, &'static str> {
         return Err("ph_overflow");
     }
     let mut load_segments = Vec::new();
-    let mut load_page_ranges = Vec::new();
+    let mut load_pages = BTreeMap::<usize, u32>::new();
     for idx in 0..e_phnum as usize {
         // AGENT: derive every table entry with checked arithmetic and reject a
         // malformed table instead of silently returning a partial parse.
@@ -121,16 +130,15 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, &'static str> {
             continue;
         }
 
-        let page_range = load_segment_page_range(vaddr, mem_size)?;
-        // AGENT: the current AddrSpace loader owns one mapping and one final
-        // permission set per page, so reject page-sharing PT_LOAD layouts here.
-        if load_page_ranges
-            .iter()
-            .any(|&(start, end)| page_range.0 < end && start < page_range.1)
-        {
-            return Err("overlap");
+        let (page_start, page_end) = load_segment_page_range(vaddr, mem_size)?;
+        // AGENT: aggregate page ownership and permissions during parsing;
+        // multiple PT_LOAD segments may legally share a boundary page.
+        for page_vaddr in (page_start..page_end).step_by(PAGE_SZ) {
+            load_pages
+                .entry(page_vaddr)
+                .and_modify(|page_flags| *page_flags |= flags)
+                .or_insert(flags);
         }
-        load_page_ranges.push(page_range);
         load_segments.push(ElfLoadSegment {
             offset,
             vaddr,
@@ -157,6 +165,10 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, &'static str> {
     Ok(ParsedElf {
         entry: e_entry,
         load_segments,
+        load_pages: load_pages
+            .into_iter()
+            .map(|(vaddr, flags)| ElfLoadPage { vaddr, flags })
+            .collect(),
     })
 }
 

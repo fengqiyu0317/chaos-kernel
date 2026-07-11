@@ -54,6 +54,7 @@
 - 2026-06-28：完成 M9 早期全局堆承载：`kernel-qemu` 启用 `extern crate alloc`，新增 linker 预留 early heap 和 `kernel-qemu/src/heap.rs` bump allocator，并在 QEMU 启动路径实际构造 `Vec`、`Box`、`BTreeMap`、`Arc`；该堆只承载早期 `alloc` 类型和迁移元数据，不作为最终用户页或页表页 frame allocator。
 - 2026-06-30：`kernel-qemu` 的迁入地址空间已新增最小 Sv39 helper：`PageTableEntry` 不再保存 `SharedPage` / resident `Vec<u8>` 页面内容，而是保存真实 `PgFrame` metadata；`map_region()` / `map_file_region()` 会建立 Sv39 leaf PTE，`read_user_bytes()` / `write_user_bytes()` 通过页表翻译和物理页 copy 访问用户页。当前仍未开启全局分页，也未完成 trap 级 COW/page fault recovery。
 - 2026-07-11：`kernel-qemu` 已将 ELF 解析从 `fs/elf_loader.rs` 移入 `proc/elf.rs`，并新增 `proc/user_image.rs` 统一承担 `PT_LOAD` 映射、文件段复制、BSS 零填充、最终权限、用户栈和 `brk` 初始化；`new_user_task()` 与 `exec` 现在共用 `prepare_user_image()`，并新增 QEMU proc selftest 覆盖该公共路径。
+- 2026-07-11：`kernel-qemu` ELF loader 已支持多个 `PT_LOAD` 共享同一虚拟页；`parse_elf()` 按页聚合覆盖范围和权限，`prepare_user_image()` 每页只映射一次，再逐段复制文件内容、清零 BSS，最后按覆盖段权限并集统一 `protect()`。
 
 ## 关键文件
 

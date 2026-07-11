@@ -1344,6 +1344,44 @@ bash tools/qemu-smoke.sh
 - 不要修改 `chaos/kernel/src/kernel.rs`。
 - 不删除或替换 `kernel-sim/`。
 
+## 2026-07-11：kernel-qemu ELF PT_LOAD 共享页装载
+
+目标：修复 `parse_elf()` 拒绝多个 `PT_LOAD` 共享边界页的限制，并让用户映像构造路径完整支持共享页。
+
+已完成修改：
+
+- `ParsedElf` 新增按虚拟页排序的 `load_pages`；`parse_elf()` 汇总全部 `PT_LOAD` 页，对共享页合并 `PF_R/PF_W/PF_X` 权限，不再因页级相交返回 `overlap`。
+- `prepare_user_image()` 先按 `load_pages` 将每页临时可写映射一次，再按 program-header 顺序复制每段文件字节并显式清零 BSS，最后逐页恢复合并后的最终权限。
+- QEMU proc selftest 新增两个合成 `PT_LOAD` 共享一页的回归，覆盖解析页数、权限并集、两段文件字节、两段 BSS 和最终页权限。
+
+关键文件：
+
+- `kernel-qemu/src/proc/elf.rs`
+- `kernel-qemu/src/proc/user_image.rs`
+- `kernel-qemu/src/proc/process_tests.rs`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo fmt --all
+cargo check --target riscv64gc-unknown-none-elf
+cargo check --target riscv64gc-unknown-none-elf --features qemu-proc-selftest
+cargo build --release --features qemu-proc-selftest
+timeout 15s qemu-system-riscv64 -machine virt -m 128M -nographic -bios default \
+  -kernel target/riscv64gc-unknown-none-elf/release/kernel-qemu
+
+cd ..
+bash tools/qemu-smoke.sh
+```
+
+结果：两次 `cargo check` 和 feature-enabled release build 通过；QEMU 输出 `[kernel-qemu] proc selftest passed` 并正常 shutdown；标准 `tools/qemu-smoke.sh` 通过。本轮只修改 `kernel-qemu` 及记录文档，未修改 `kernel-sim` 语义，因此没有重跑 host 回归。
+
+不要改的部分：
+
+- 不要修改 `chaos/kernel/src/kernel.rs`。
+- 不删除或替换 `kernel-sim/`。
+
 ## 2026-07-05：发布单文件 kernel.rs 回退分支
 
 目标：按用户要求保留 GitHub 上原来的 `origin/master` 到旁支，然后把当前本地版本发布为新的主分支内容。

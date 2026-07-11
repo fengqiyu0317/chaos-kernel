@@ -30,16 +30,17 @@ pub(crate) fn prepare_user_image(
     }
 }
 
-// AGENT: translate ELF permission bits into the VM flags used by AddrSpace.
-fn segment_vm_flags(segment: &ElfLoadSegment) -> u32 {
+// AGENT: translate aggregated ELF permission bits into the VM flags used by
+// one page-granular AddrSpace mapping.
+fn elf_vm_flags(elf_flags: u32) -> u32 {
     let mut flags = 0;
-    if segment.flags & 0x4 != 0 {
+    if elf_flags & 0x4 != 0 {
         flags |= VM_READ;
     }
-    if segment.flags & 0x2 != 0 {
+    if elf_flags & 0x2 != 0 {
         flags |= VM_WRITE;
     }
-    if segment.flags & 0x1 != 0 {
+    if elf_flags & 0x1 != 0 {
         flags |= VM_EXEC;
     }
     if flags == 0 {
@@ -47,30 +48,6 @@ fn segment_vm_flags(segment: &ElfLoadSegment) -> u32 {
     } else {
         flags
     }
-}
-
-// AGENT: derive the page-aligned virtual mapping covered by one PT_LOAD
-// segment while keeping address-space policy out of the pure ELF parser.
-fn segment_vm_region(segment: &ElfLoadSegment) -> Result<VmRegion, &'static str> {
-    let page_base = segment.vaddr & !(PAGE_SZ - 1);
-    let page_off = segment.vaddr - page_base;
-    let file_page_offset = segment.offset.checked_sub(page_off).ok_or("bad_phdr")?;
-    if file_page_offset % PAGE_SZ != 0 {
-        return Err("bad_phdr");
-    }
-    let mapped_len = page_off
-        .checked_add(segment.mem_size)
-        .and_then(|len| len.checked_add(PAGE_SZ - 1))
-        .map(|len| len & !(PAGE_SZ - 1))
-        .ok_or("ph_overflow")?;
-    if mapped_len == 0 || page_base.checked_add(mapped_len).is_none() {
-        return Err("ph_overflow");
-    }
-    Ok(VmRegion::new(
-        page_base,
-        mapped_len,
-        segment_vm_flags(segment),
-    ))
 }
 
 // AGENT: populate a fresh address space from parsed ELF segments, then build
@@ -83,21 +60,22 @@ fn populate_user_image(
     envs: Vec<String>,
     pool: &FramePool,
 ) -> Result<ThdCtx, &'static str> {
-    let mut image_end = 0usize;
-    for segment in elf.load_segments {
-        let region = segment_vm_region(&segment)?;
-        let region_base = region.base;
-        let region_len = region.len;
-        let region_flags = region.flags;
-        let region_end = region.end();
-        addr_space.map_region(
-            VmRegion {
-                flags: region_flags | VM_WRITE,
-                ..region
-            },
-            pool,
-        )?;
+    let ParsedElf {
+        entry,
+        load_segments,
+        load_pages,
+    } = elf;
 
+    // AGENT: map the union of all PT_LOAD pages exactly once with temporary
+    // write permission; final per-page permissions are installed after copying.
+    for page in &load_pages {
+        addr_space.map_region(VmRegion::new(page.vaddr, PAGE_SZ, VM_READ | VM_WRITE), pool)?;
+    }
+
+    let zeroes = vec![0u8; PAGE_SZ];
+    // AGENT: after every page exists, populate each segment in program-header
+    // order and explicitly clear its BSS range, including shared boundary pages.
+    for segment in &load_segments {
         let file_end = segment
             .offset
             .checked_add(segment.file_size)
@@ -106,14 +84,37 @@ fn populate_user_image(
             return Err("ph_overflow");
         }
         addr_space.write_user_bytes(segment.vaddr, &elf_data[segment.offset..file_end], pool)?;
-        addr_space.protect(region_base, region_len, region_flags)?;
-        image_end = max(image_end, region_end);
+
+        let bss_start = segment
+            .vaddr
+            .checked_add(segment.file_size)
+            .ok_or("ph_overflow")?;
+        let bss_end = segment
+            .vaddr
+            .checked_add(segment.mem_size)
+            .ok_or("ph_overflow")?;
+        let mut cursor = bss_start;
+        while cursor < bss_end {
+            let len = min(PAGE_SZ, bss_end - cursor);
+            addr_space.write_user_bytes(cursor, &zeroes[..len], pool)?;
+            cursor += len;
+        }
     }
+
+    // AGENT: shared pages receive the union of all covering segment flags;
+    // protect only after file and BSS writes no longer need temporary access.
+    for page in &load_pages {
+        addr_space.protect(page.vaddr, PAGE_SZ, elf_vm_flags(page.flags))?;
+    }
+    let image_end = load_pages
+        .last()
+        .and_then(|page| page.vaddr.checked_add(PAGE_SZ))
+        .ok_or("ph_overflow")?;
 
     let init = ProcInit {
         args,
         envs,
-        auxv: BTreeMap::from([(AT_PAGESZ, PAGE_SZ), (AT_ENTRY, elf.entry)]),
+        auxv: BTreeMap::from([(AT_PAGESZ, PAGE_SZ), (AT_ENTRY, entry)]),
     };
     if init.checked_total_size()? > USR_STK_SZ {
         return Err("e2big");
@@ -129,6 +130,6 @@ fn populate_user_image(
     addr_space.vm_map.brk = (image_end + PAGE_SZ - 1) & !(PAGE_SZ - 1);
     let mut thd_ctx = ThdCtx::default();
     thd_ctx.uctx.set_sp(sp as u64);
-    thd_ctx.uctx.set_ip(elf.entry as u64);
+    thd_ctx.uctx.set_ip(entry as u64);
     Ok(thd_ctx)
 }

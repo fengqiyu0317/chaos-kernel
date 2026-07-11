@@ -19,6 +19,7 @@ pub fn run_all(pool: &FramePool) {
     parse_elf_rejects_unsupported_or_invalid_entry();
     parse_elf_validates_program_header_layouts();
     prepared_user_image_loads_elf_segment_and_stack(pool);
+    prepared_user_image_loads_segments_sharing_a_page(pool);
     prepared_user_image_loads_out_of_order_segments(pool);
     shm_segment_maps_shared_physical_page(pool);
 }
@@ -343,8 +344,8 @@ fn parse_elf_rejects_unsupported_or_invalid_entry() {
     assert_eq!(parse_elf(&non_executable).unwrap_err(), "bad_entry");
 }
 
-// AGENT: exercise checked program-header traversal and the explicitly supported
-// static, nonoverlapping Sv39 PT_LOAD layout contract.
+// AGENT: exercise checked program-header traversal for the supported static
+// Sv39 PT_LOAD layout contract.
 fn parse_elf_validates_program_header_layouts() {
     const PH_OFF: usize = 64;
 
@@ -360,17 +361,65 @@ fn parse_elf_validates_program_header_layouts() {
     let mut truncated_table = test_elf_with_load_segment(PAGE_SZ, 0x0040_0000, b"code", 4);
     write_test_u64(&mut truncated_table, 32, u64::MAX);
     assert_eq!(parse_elf(&truncated_table).unwrap_err(), "ph_overflow");
+}
 
-    let mut overlapping = test_elf_with_load_segment(PAGE_SZ + 0x100, 0x0040_0100, b"left", 0x100);
+// AGENT: allow two PT_LOAD segments to share one virtual page, load both byte
+// ranges, keep BSS zeroed, and union RX/RW into the page's final permissions.
+fn prepared_user_image_loads_segments_sharing_a_page(pool: &FramePool) {
+    let page_vaddr = 0x0040_0000;
+    let left_vaddr = page_vaddr + 0x100;
+    let right_vaddr = page_vaddr + 0x900;
+    let mut elf = test_elf_with_load_segment(PAGE_SZ + 0x100, left_vaddr, b"left", 0x180);
     append_test_load_segment(
-        &mut overlapping,
+        &mut elf,
         PAGE_SZ * 2 + 0x900,
-        0x0040_0900,
+        right_vaddr,
         b"right",
-        0x100,
-        0x5,
+        0x180,
+        0x6,
     );
-    assert_eq!(parse_elf(&overlapping).unwrap_err(), "overlap");
+
+    let parsed = parse_elf(&elf).expect("shared-page PT_LOAD segments should parse");
+    assert_eq!(parsed.load_segments.len(), 2);
+    assert_eq!(parsed.load_pages.len(), 1);
+    assert_eq!(parsed.load_pages[0].vaddr, page_vaddr);
+    assert_eq!(parsed.load_pages[0].flags, 0x7);
+
+    let mut image = prepare_user_image(&elf, Vec::new(), Vec::new(), pool)
+        .expect("shared-page PT_LOAD segments should load");
+    let mut left = [0u8; 4];
+    let mut right = [0u8; 5];
+    let mut left_bss = [0xffu8; 8];
+    let mut right_bss = [0xffu8; 8];
+    image
+        .addr_space
+        .read_user_bytes(left_vaddr, &mut left)
+        .unwrap();
+    image
+        .addr_space
+        .read_user_bytes(right_vaddr, &mut right)
+        .unwrap();
+    image
+        .addr_space
+        .read_user_bytes(left_vaddr + left.len(), &mut left_bss)
+        .unwrap();
+    image
+        .addr_space
+        .read_user_bytes(right_vaddr + right.len(), &mut right_bss)
+        .unwrap();
+    assert_eq!(&left, b"left");
+    assert_eq!(&right, b"right");
+    assert_eq!(left_bss, [0u8; 8]);
+    assert_eq!(right_bss, [0u8; 8]);
+    image
+        .addr_space
+        .write_user_bytes(right_vaddr, b"R", pool)
+        .expect("RW segment should make the shared page writable");
+    assert_eq!(
+        image.addr_space.vm_map.find(page_vaddr).unwrap().flags,
+        VM_READ | VM_WRITE | VM_EXEC
+    );
+    image.addr_space.release_all_pages(pool);
 }
 
 // AGENT: prove that program-header order does not control virtual-address order
