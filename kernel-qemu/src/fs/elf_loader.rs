@@ -1,96 +1,8 @@
 // AGENT
 use super::*;
 
-// AGENT: keep ring-buffer cursors private so rd/wr/n invariants stay local.
-pub struct CircBuf {
-    data: Vec<u8>,
-    rd: usize,
-    wr: usize,
-    cap: usize,
-    n: usize,
-}
-
-// AGENT: rd is the next byte to read, wr is the next slot to write.
-impl CircBuf {
-    // AGENT: initialize an empty ring without exposing cursor details.
-    pub fn new(c: usize) -> Self {
-        Self {
-            data: vec![0u8; c],
-            rd: 0,
-            wr: 0,
-            cap: c,
-            n: 0,
-        }
-    }
-
-    // AGENT: write at wr before advancing so slot 0 is usable and semantics are FIFO.
-    pub fn push(&mut self, v: u8) -> bool {
-        if self.full() {
-            return false;
-        }
-        self.data[self.wr] = v;
-        self.wr = (self.wr + 1) % self.cap;
-        self.n += 1;
-        true
-    }
-
-    // AGENT: read from rd before advancing to mirror push's cursor semantics.
-    pub fn pop(&mut self) -> Option<u8> {
-        if self.empty() {
-            return None;
-        }
-        let v = self.data[self.rd];
-        self.rd = (self.rd + 1) % self.cap;
-        self.n -= 1;
-        Some(v)
-    }
-
-    // AGENT: expose the buffered byte count without exposing raw cursors.
-    pub fn len(&self) -> usize {
-        self.n
-    }
-
-    // AGENT: keep the legacy empty() API while routing through the invariant field.
-    pub fn empty(&self) -> bool {
-        self.n == 0
-    }
-
-    // AGENT: full rings reject writes before any modulo arithmetic.
-    pub fn full(&self) -> bool {
-        self.n >= self.cap
-    }
-
-    // AGENT: report the actual number moved instead of assuming all pops succeed.
-    pub fn drain_to(&mut self, dst: &mut Vec<u8>, max: usize) -> usize {
-        let mut moved = 0;
-        while moved < max {
-            let Some(b) = self.pop() else {
-                break;
-            };
-            dst.push(b);
-            moved += 1;
-        }
-        moved
-    }
-
-    // AGENT: fill through push so capacity handling stays in one place.
-    pub fn fill_from(&mut self, src: &[u8]) -> usize {
-        let mut written = 0;
-        for &b in src {
-            if !self.push(b) {
-                break;
-            }
-            written += 1;
-        }
-        written
-    }
-
-    // AGENT: remaining capacity is exact because n is kept within cap.
-    pub fn remaining(&self) -> usize {
-        self.cap - self.n
-    }
-}
-
+// AGENT: describe one validated ELF PT_LOAD segment before address-space setup
+// maps it into the user process image.
 #[derive(Clone, Debug)]
 pub struct ElfLoadSegment {
     pub offset: usize,
@@ -100,7 +12,9 @@ pub struct ElfLoadSegment {
     pub flags: u32,
 }
 
+// AGENT: keep ELF-to-VM translation with the parsed segment metadata.
 impl ElfLoadSegment {
+    // AGENT: translate ELF program-header permission bits to VmRegion flags.
     pub fn vm_flags(&self) -> u32 {
         let mut flags = 0;
         if self.flags & 0x4 != 0 {
@@ -119,6 +33,7 @@ impl ElfLoadSegment {
         }
     }
 
+    // AGENT: compute the page-aligned virtual range covered by this load segment.
     pub fn vm_region(&self) -> Result<VmRegion, &'static str> {
         let page_base = self.vaddr & !(PAGE_SZ - 1);
         let page_off = self.vaddr - page_base;
@@ -138,10 +53,12 @@ impl ElfLoadSegment {
     }
 }
 
+// AGENT: preserve the old header-only validation API by returning just entry.
 pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {
     parse_elf_load_segments(data).map(|(entry, _)| entry)
 }
 
+// AGENT: parse and validate the ELF header plus PT_LOAD table used by exec.
 pub fn parse_elf_load_segments(data: &[u8]) -> Result<(usize, Vec<ElfLoadSegment>), &'static str> {
     if data.len() < 64 {
         return Err("too_short");
@@ -230,6 +147,7 @@ pub fn parse_elf_load_segments(data: &[u8]) -> Result<(usize, Vec<ElfLoadSegment
     Ok((e_entry, load_segments))
 }
 
+// AGENT: validate PT_LOAD alignment before exec maps file pages into memory.
 fn validate_load_segment_alignment(
     offset: usize,
     vaddr: usize,
@@ -250,6 +168,7 @@ fn validate_load_segment_alignment(
     Ok(())
 }
 
+// AGENT: read a checked little-endian u16 field from an ELF byte slice.
 fn read_u16_le(data: &[u8], off: usize) -> Result<u16, &'static str> {
     if off + 2 > data.len() {
         return Err("too_short");
@@ -257,6 +176,7 @@ fn read_u16_le(data: &[u8], off: usize) -> Result<u16, &'static str> {
     Ok(u16::from_le_bytes([data[off], data[off + 1]]))
 }
 
+// AGENT: read a checked little-endian u32 field from an ELF byte slice.
 fn read_u32_le(data: &[u8], off: usize) -> Result<u32, &'static str> {
     if off + 4 > data.len() {
         return Err("too_short");
@@ -269,6 +189,7 @@ fn read_u32_le(data: &[u8], off: usize) -> Result<u32, &'static str> {
     ]))
 }
 
+// AGENT: read a checked little-endian u64 field from an ELF byte slice.
 fn read_u64_le(data: &[u8], off: usize) -> Result<u64, &'static str> {
     if off + 8 > data.len() {
         return Err("too_short");
@@ -283,85 +204,4 @@ fn read_u64_le(data: &[u8], off: usize) -> Result<u64, &'static str> {
         data[off + 6],
         data[off + 7],
     ]))
-}
-
-// AGENT: audit only invariants visible from the occupied fd table; free fd
-// gaps are valid because ProcessState::free_fds owns allocator state.
-pub fn audit_fd_table(files: &BTreeMap<usize, FdEntry>) -> Vec<usize> {
-    files.keys().copied().filter(|&fd| fd >= MAX_FD).collect()
-}
-
-pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
-    let mut free_count = 0;
-    let mut last_used = 0;
-    let mut first_free = slots.len();
-    for i in 0..slots.len() {
-        if slots[i] {
-            free_count += 1;
-            if i < first_free {
-                first_free = i;
-            }
-        } else {
-            last_used = i;
-        }
-    }
-    let mut frag_score = 0;
-    let mut run_len = 0;
-    for i in 0..slots.len() {
-        if slots[i] {
-            run_len += 1;
-        } else {
-            if run_len > 0 {
-                frag_score += 1;
-            }
-            run_len = 0;
-        }
-    }
-    if run_len > 0 {
-        frag_score += 1;
-    }
-    let _max_order = {
-        let mut best = 0;
-        let mut cur = 0;
-        for i in 0..slots.len() {
-            if slots[i] {
-                cur += 1;
-                if cur > best {
-                    best = cur;
-                }
-            } else {
-                cur = 0;
-            }
-        }
-        let mut order: i32 = 0;
-        while (1 << order) <= best {
-            order += 1;
-        }
-        order.saturating_sub(1)
-    };
-    free_count
-}
-
-// AGENT: reject invalid orders before shifting, then keep all range math checked.
-pub fn verify_page_alignment(addr: usize, order: usize) -> bool {
-    if order >= 12 {
-        return false;
-    }
-    let Some(align) = PAGE_SZ.checked_shl(order as u32) else {
-        return false;
-    };
-    let mask = align - 1;
-    (addr & mask) == 0
-        && addr < KERN_BASE
-        && addr.checked_add(align).is_some_and(|end| end <= KERN_BASE)
-}
-
-// AGENT: estimate the resident-page watermark from mapped VMA length only;
-// true live RSS must be counted from AddrSpace resident page metadata.
-pub fn compute_rss_watermark(regions: &[VmRegion], pool_cap: usize) -> usize {
-    let mapped_pages = regions.iter().fold(0usize, |total, region| {
-        let pages = region.len / PAGE_SZ + usize::from(region.len % PAGE_SZ != 0);
-        total.saturating_add(pages)
-    });
-    mapped_pages.min(pool_cap)
 }
