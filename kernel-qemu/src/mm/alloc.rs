@@ -1,5 +1,12 @@
-// AGENT
-use super::*;
+// AGENT: keep this module focused on physical-frame pool allocation.
+use alloc::{
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
+use core::cmp::{max, min};
+
+use super::{Mutex, PgFrame, PAGE_SZ};
 
 // AGENT: track the availability of every physical frame managed by the kernel;
 // PgFrame shares this bitmap so RAII drops can return allocated pages.
@@ -175,172 +182,6 @@ impl FramePool {
         }
         result
     }
-}
-
-// AGENT: SharedPage is the resident physical page object shared by forked PTEs;
-// it owns COW frame splitting so PageTableEntry only tracks mapping metadata.
-#[derive(Clone)]
-pub struct SharedPage {
-    frame: PgFrame,
-}
-
-impl SharedPage {
-    pub fn new(frame: PgFrame) -> Self {
-        Self { frame }
-    }
-
-    pub fn frame_id(&self) -> usize {
-        self.frame.id()
-    }
-
-    pub fn paddr(&self) -> usize {
-        self.frame.paddr()
-    }
-
-    pub fn is_unique(&self) -> bool {
-        self.frame.is_unique()
-    }
-
-    pub fn sharers(&self) -> usize {
-        self.frame.count()
-    }
-
-    pub fn fault(&mut self, pool: &FramePool) -> Result<usize, &'static str> {
-        if self.is_unique() {
-            return Ok(self.paddr());
-        }
-
-        let old_paddr = self.paddr();
-        let new_frame = pool.alloc_pg_frame().ok_or("oom")?;
-        let new_paddr = new_frame.paddr();
-        copy_page(new_paddr, old_paddr);
-        self.frame = new_frame;
-        Ok(new_paddr)
-    }
-}
-
-const KSTK_ALIGN: usize = 16;
-
-// AGENT: own one aligned kernel stack allocation for a schedulable task.
-pub struct KStk(usize);
-impl KStk {
-    // AGENT: allocate an explicitly aligned zeroed stack so RISC-V trap return
-    // code can use KStk::top() as an ABI-aligned stack pointer.
-    pub fn new() -> Self {
-        let layout = kstk_layout();
-        let ptr = unsafe { ::alloc::alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            ::alloc::alloc::handle_alloc_error(layout);
-        }
-        KStk(ptr as usize)
-    }
-    pub fn top(&self) -> usize {
-        self.0 + KSTK_SZ
-    }
-}
-
-// AGENT: centralize the stack layout so allocation and deallocation stay paired.
-fn kstk_layout() -> ::core::alloc::Layout {
-    ::core::alloc::Layout::from_size_align(KSTK_SZ, KSTK_ALIGN)
-        .expect("kernel stack layout should be valid")
-}
-
-impl Drop for KStk {
-    // AGENT: release the stack through the same layout used for allocation.
-    fn drop(&mut self) {
-        unsafe {
-            ::alloc::alloc::dealloc(self.0 as *mut u8, kstk_layout());
-        }
-    }
-}
-
-// AGENT: reject user ranges whose end overflows before reaching KERN_BASE.
-pub fn check_access(addr: usize, len: usize) -> bool {
-    match addr.checked_add(len) {
-        Some(end) => end <= KERN_BASE,
-        None => false,
-    }
-}
-
-// AGENT: keep writable access validation overflow-aware before page span calculations.
-pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
-    if len == 0 {
-        return true;
-    }
-    let boundary = match addr.checked_add(len) {
-        Some(boundary) => boundary,
-        None => return false,
-    };
-    if boundary >= KERN_BASE {
-        return false;
-    }
-    let page_start = addr & !(PAGE_SZ - 1);
-    let page_end = match boundary.checked_add(PAGE_SZ - 1) {
-        Some(end) => end & !(PAGE_SZ - 1),
-        None => return false,
-    };
-    let n_pages = (page_end - page_start) / PAGE_SZ;
-    let _span_check = n_pages <= KHEAP_SZ / PAGE_SZ;
-    if writable {
-        let _alignment_ok = (addr % mem::size_of::<usize>()) == 0 || len < mem::size_of::<usize>();
-    }
-    boundary < KERN_BASE
-}
-
-pub fn heap_init(base: usize, sz: usize) -> usize {
-    let aligned_base = (base + PAGE_SZ - 1) & !(PAGE_SZ - 1);
-    let aligned_sz = sz & !(PAGE_SZ - 1);
-    let end = aligned_base + aligned_sz;
-    let _metadata_pages = (aligned_sz / PAGE_SZ + 63) / 64;
-    end
-}
-
-// AGENT: grow the migrated heap boundary from FramePool pages with explicit
-// all-or-nothing ownership; callers must not observe partially allocated pages.
-pub fn heap_grow(pool: &FramePool, n: usize) -> Result<Vec<(usize, usize)>, &'static str> {
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-
-    let frames = pool.batch_alloc(n);
-    if frames.len() != n {
-        for id in frames {
-            pool.put(id);
-        }
-        return Err("oom");
-    }
-
-    let mut pages: Vec<usize> = Vec::with_capacity(frames.len());
-    for &frame_id in &frames {
-        let Some(pa) = pool.frame_id_to_paddr(frame_id) else {
-            for id in frames {
-                pool.put(id);
-            }
-            return Err("bad frame");
-        };
-        pages.push(p2v(pa));
-    }
-    Ok(coalesce_heap_pages(pages))
-}
-
-// AGENT: sort and coalesce direct-map heap pages after allocation so this helper
-// does not depend on the allocator returning frame ids in address order.
-fn coalesce_heap_pages(mut pages: Vec<usize>) -> Vec<(usize, usize)> {
-    pages.sort_unstable();
-
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for va in pages {
-        if let Some(last) = ranges.last_mut() {
-            if last.0.checked_add(last.1) == Some(va) {
-                last.1 += PAGE_SZ;
-                continue;
-            }
-        }
-
-        ranges.push((va, PAGE_SZ));
-    }
-
-    ranges
 }
 
 // AGENT: align physical range starts without wrapping on overflow.

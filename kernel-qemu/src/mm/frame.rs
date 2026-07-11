@@ -2,7 +2,7 @@
 // metadata management.
 use alloc::{sync::Arc, vec::Vec};
 
-use super::{Mutex, PAGE_SZ};
+use super::{copy_page, FramePool, Mutex, PAGE_SZ};
 
 // AGENT: PgFrame is the RAII mapping handle for a physical frame; cloning it
 // represents another PTE sharing that frame.
@@ -67,5 +67,49 @@ impl Drop for PgFrameInner {
         if self.id < slots.len() && !slots[self.id] {
             slots[self.id] = true;
         }
+    }
+}
+
+// AGENT: SharedPage is the resident physical page object shared by forked PTEs;
+// keep COW frame splitting beside the PgFrame ownership it wraps.
+#[derive(Clone)]
+pub struct SharedPage {
+    frame: PgFrame,
+}
+
+// AGENT: expose shared-frame identity and perform COW replacement as one
+// ownership operation.
+impl SharedPage {
+    pub fn new(frame: PgFrame) -> Self {
+        Self { frame }
+    }
+
+    pub fn frame_id(&self) -> usize {
+        self.frame.id()
+    }
+
+    pub fn paddr(&self) -> usize {
+        self.frame.paddr()
+    }
+
+    pub fn is_unique(&self) -> bool {
+        self.frame.is_unique()
+    }
+
+    pub fn sharers(&self) -> usize {
+        self.frame.count()
+    }
+
+    pub fn fault(&mut self, pool: &FramePool) -> Result<usize, &'static str> {
+        if self.is_unique() {
+            return Ok(self.paddr());
+        }
+
+        let old_paddr = self.paddr();
+        let new_frame = pool.alloc_pg_frame().ok_or("oom")?;
+        let new_paddr = new_frame.paddr();
+        copy_page(new_paddr, old_paddr);
+        self.frame = new_frame;
+        Ok(new_paddr)
     }
 }
