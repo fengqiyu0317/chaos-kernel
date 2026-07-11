@@ -20,6 +20,49 @@ fn read_user_path(task: &Task, addr: usize) -> Result<String, &'static str> {
     Err("enametoolong")
 }
 
+// AGENT: Mount the current first-stage string-backed source at an absolute
+// target path; filesystem type is validated as user input but not interpreted
+// until real filesystem instances exist.
+pub(super) fn sys_mount(
+    kernel: &Kernel,
+    source_addr: usize,
+    target_addr: usize,
+    filesystem_type_addr: usize,
+    mount_flags: usize,
+    data_addr: usize,
+) -> Result<usize, &'static str> {
+    if mount_flags != 0 || data_addr != 0 {
+        return Err("enotsup");
+    }
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    let source = read_user_path(&task, source_addr)?;
+    let target = read_user_path(&task, target_addr)?;
+    if filesystem_type_addr != 0 {
+        let filesystem_type = read_user_path(&task, filesystem_type_addr)?;
+        if filesystem_type.is_empty() {
+            return Err("einval");
+        }
+    }
+    kernel.mnt.mount(&target, &source)?;
+    Ok(0)
+}
+
+// AGENT: Remove an exact first-stage mount binding; nonzero umount2 flags are
+// rejected until force, detach, expire, and no-follow semantics are modeled.
+pub(super) fn sys_umount2(
+    kernel: &Kernel,
+    target_addr: usize,
+    flags: usize,
+) -> Result<usize, &'static str> {
+    if flags != 0 {
+        return Err("enotsup");
+    }
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    let target = read_user_path(&task, target_addr)?;
+    kernel.mnt.umount(&target)?;
+    Ok(0)
+}
+
 // AGENT: ioctl integer arguments live in user memory; copy them through the
 // active address space instead of trusting the raw pointer.
 fn read_user_i32(task: &Task, addr: usize) -> Result<i32, &'static str> {

@@ -33,6 +33,8 @@ impl Kernel {
             SYS_READ => returning(sys_read(self, a0, a1, a2)),
             SYS_WRITE => returning(sys_write(self, a0, a1, a2)),
             SYS_OPEN => returning(sys_open(self, a0, a1, a2)),
+            SYS_MOUNT => returning(sys_mount(self, a0, a1, a2, a3, a4)),
+            SYS_UMOUNT2 => returning(sys_umount2(self, a0, a1)),
             SYS_CLOSE => returning(sys_close(self, a0)),
             SYS_STAT | SYS_FSTAT => returning(sys_stat(self, nr, a0, a1)),
             SYS_MMAP => returning(sys_mmap(self, a0, a1, a2, a3, a4, a5)),

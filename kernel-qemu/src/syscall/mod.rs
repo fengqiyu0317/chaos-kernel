@@ -8,6 +8,11 @@ mod mm;
 mod proc;
 mod signal;
 mod sync;
+// AGENT: Expose usercopy-backed filesystem syscall regressions to a focused
+// post-frame-pool QEMU boot selftest.
+#[cfg(any(test, feature = "qemu-fs-selftest"))]
+#[path = "fs_tests.rs"]
+pub mod tests;
 mod time;
 
 pub use self::dispatch::*;

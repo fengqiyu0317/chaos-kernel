@@ -93,6 +93,14 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         kernel::proc::process_tests::run_all(&kernel.pool);
         println!("[kernel-qemu] proc selftest passed");
     }
+    // AGENT: filesystem syscall selftests need the installed Kernel, current
+    // task, frame pool, Sv39 mappings, and usercopy path.
+    #[cfg(feature = "qemu-fs-selftest")]
+    {
+        println!("[kernel-qemu] fs syscall selftest start");
+        kernel::syscall::tests::run_all(kernel);
+        println!("[kernel-qemu] fs syscall selftest passed");
+    }
     // AGENT: checkpoint selftests run after Kernel/FramePool setup because the
     // snapshot path copies real resident pages and restores them into a task.
     #[cfg(feature = "qemu-checkpoint-selftest")]

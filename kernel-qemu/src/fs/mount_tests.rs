@@ -6,6 +6,7 @@ use super::MountTable;
 pub fn run_all() {
     bind_updates_existing_prefix_and_normalizes();
     bind_ignores_invalid_mount_points();
+    mount_and_umount_report_invalid_requests();
     prefix_match_respects_directory_boundary();
     resolve_does_not_remap_the_matched_suffix();
 }
@@ -41,6 +42,22 @@ fn bind_ignores_invalid_mount_points() {
     assert_eq!(mt.mount_count(), 0);
     assert!(!mt.has_prefix("/"));
     assert!(!mt.has_prefix("mnt"));
+}
+
+// AGENT: syscall-facing mount helpers must distinguish invalid or absent
+// requests from successful table mutation.
+#[cfg_attr(test, test)]
+fn mount_and_umount_report_invalid_requests() {
+    let mt = MountTable::new();
+
+    assert_eq!(mt.mount("/", "dev0"), Err("einval"));
+    assert_eq!(mt.mount("relative", "dev0"), Err("einval"));
+    assert_eq!(mt.mount("/mnt", ""), Err("einval"));
+    assert_eq!(mt.umount("/mnt"), Err("einval"));
+
+    assert_eq!(mt.mount("/mnt/", "dev0"), Ok(()));
+    assert_eq!(mt.umount("/mnt"), Ok(()));
+    assert_eq!(mt.umount("/mnt"), Err("einval"));
 }
 
 // AGENT: mount resolution must only match complete path components.

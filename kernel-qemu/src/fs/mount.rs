@@ -82,19 +82,17 @@ impl MountTable {
         path.len() == prefix.len() || path.as_bytes().get(prefix.len()) == Some(&b'/')
     }
 
-    // AGENT: canonicalize mount bindings, keep one target per prefix, and
-    // preserve longest-prefix-first order for lookup.
-    pub fn bind(&self, pfx: &str, tgt: &str) {
-        let Some(prefix) = Self::normalize_prefix(pfx) else {
-            return;
-        };
+    // AGENT: canonicalize mount bindings, keep one target per prefix, preserve
+    // longest-prefix-first lookup, and report invalid syscall-facing inputs.
+    pub fn mount(&self, pfx: &str, tgt: &str) -> Result<(), &'static str> {
+        let prefix = Self::normalize_prefix(pfx).ok_or("einval")?;
         if tgt.is_empty() {
-            return;
+            return Err("einval");
         }
         let mut e = self.entries.write().unwrap();
         if let Some(existing) = e.iter_mut().find(|m| m.prefix == prefix) {
             existing.target = tgt.to_string();
-            return;
+            return Ok(());
         }
         let insert_at = e
             .iter()
@@ -107,6 +105,13 @@ impl MountTable {
                 target: tgt.to_string(),
             },
         );
+        Ok(())
+    }
+
+    // AGENT: retain the original compatibility helper for in-kernel callers
+    // that intentionally ignore invalid mount requests.
+    pub fn bind(&self, pfx: &str, tgt: &str) {
+        let _ = self.mount(pfx, tgt);
     }
 
     // AGENT: Resolve one longest mount prefix without recursively remapping the
@@ -138,22 +143,31 @@ impl MountTable {
         })
     }
 
-    // AGENT: normalize the requested mount point before removing it.
-    pub fn unmount(&self, pfx: &str) -> bool {
-        let Some(prefix) = Self::normalize_prefix(pfx) else {
-            return false;
-        };
+    // AGENT: normalize and remove exactly one syscall-facing mount point,
+    // reporting invalid or absent bindings instead of silently succeeding.
+    pub fn umount(&self, pfx: &str) -> Result<(), &'static str> {
+        let prefix = Self::normalize_prefix(pfx).ok_or("einval")?;
         let mut e = self.entries.write().unwrap();
         let before = e.len();
-        let mut i = 0;
-        while i < e.len() {
-            if e[i].prefix == prefix {
-                e.remove(i);
+        let mut index = 0;
+        while index < e.len() {
+            if e[index].prefix == prefix {
+                e.remove(index);
             } else {
-                i += 1;
+                index += 1;
             }
         }
-        e.len() < before
+        if e.len() == before {
+            Err("einval")
+        } else {
+            Ok(())
+        }
+    }
+
+    // AGENT: retain the original boolean compatibility helper on top of the
+    // syscall-facing exact unmount operation.
+    pub fn unmount(&self, pfx: &str) -> bool {
+        self.umount(pfx).is_ok()
     }
 
     // AGENT: Return a detached snapshot of the current mount bindings.

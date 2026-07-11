@@ -193,6 +193,10 @@ pub const SYS_GETPPID: usize = 110;
 pub const SYS_SETPGID: usize = 109;
 pub const SYS_GETPGID: usize = 121;
 pub const SYS_SETSID: usize = 112;
+// AGENT: Keep migrated semantic syscall ids in the existing x86_64-style
+// internal namespace; syscall_abi maps RISC-V numbers onto these values.
+pub const SYS_MOUNT: usize = 165;
+pub const SYS_UMOUNT2: usize = 166;
 pub const SYS_EPOLL_CREATE: usize = 213;
 pub const SYS_EPOLL_CTL: usize = 233;
 pub const SYS_EPOLL_WAIT: usize = 232;

@@ -436,6 +436,8 @@ cargo test --test pressure
 - `[M5][普通] TODO`: `kernel-sim` 的 file lock 模型尚未区分 POSIX process-associated record locks、open-file-description locks 和 `flock` locks；真实 fork 中这些锁的继承/不继承规则不同。
 - `[M5][普通] TODO`: `kernel-sim` 尚未建模 directory streams、POSIX message queue descriptors、AIO contexts、io_uring 等对象，因此也没有对应的 fork 继承或清空规则。
 - `[M5][重要] TODO`: `kernel-sim` 的 syscall 文件 I/O 已有 fd entry / open-file description 基础模型，但仍未实现 `readv`/`writev`、`pread`/`pwrite`、`lseek` syscall、目录 fd 语义、权限/credential 检查、真实设备/tty 行规程等更完整文件系统行为。
+- `[M5][M9][重要] DONE`: `kernel-qemu` 已增加 RISC-V `mount(40)` / `umount2(39)` 到内部 syscall 的 ABI 映射和分发，通过当前 task 的 `AddrSpace` 搬运 `source` / `target` / `filesystemtype` 字符串，并接入 `MountTable::{mount,umount}`。第一阶段仅接受零 flags 和空 data，已用 `qemu-fs-selftest` 覆盖 syscall 号映射、Sv39 usercopy、重复挂载替换、非法指针/flag、精确卸载和重复卸载错误。
+- `[M5][M9][重要] TODO`: 继续将当前字符串前缀映射升级为完整 VFS mount 语义：引入文件系统实例/superblock、根挂载、mount flags、busy/reference 检查、namespace 和逐路径分量遍历；本次 syscall 接线不表示这些 VFS 能力已完成。
 - `[M5][重要] TODO`: `kernel-sim/src/kernel/syscall/fs.rs` 的 `sys_open()` 已从用户地址空间读取路径并接入 `FileNode` 表，但路径解析仍是简化绝对路径模型；后续应补齐 cwd 相对路径、目录遍历、符号链接、mode/umask、真实 `EISDIR`/`ENOTDIR`/`ELOOP` 等错误边界。
 - `[M5][重要] TODO`: `kernel-sim` 的 pipe read/write 已走真实 `PipeNode` 队列，但空 pipe 目前直接返回 `again`，尚未实现阻塞等待、`O_NONBLOCK` 差异、关闭写端后的 EOF 唤醒、`SIGPIPE`/`EPIPE` 等完整 pipe 语义。
 - `[M5][重要] TODO`: `kernel-sim` 的 syscall 用户缓冲区复制目前用 contiguous readable/writable prefix 产生 short I/O；后续若实现 lazy page fault，应让 copy-in/copy-out 能触发缺页装入并精确区分 fault 前后已搬运字节。

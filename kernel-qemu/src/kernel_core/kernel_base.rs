@@ -11,6 +11,7 @@ fn boot_kernel_block_cache_chains() -> usize {
     #[cfg(any(
         test,
         feature = "qemu-mm-selftest",
+        feature = "qemu-fs-selftest",
         feature = "qemu-sync-selftest",
         feature = "qemu-sched-selftest",
         feature = "qemu-proc-selftest",
@@ -22,6 +23,7 @@ fn boot_kernel_block_cache_chains() -> usize {
     #[cfg(not(any(
         test,
         feature = "qemu-mm-selftest",
+        feature = "qemu-fs-selftest",
         feature = "qemu-sync-selftest",
         feature = "qemu-sched-selftest",
         feature = "qemu-proc-selftest",

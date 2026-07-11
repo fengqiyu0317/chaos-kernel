@@ -4,6 +4,9 @@ use crate::trap::TrapFrame;
 
 pub const ENOSYS_RET: usize = (-38isize) as usize;
 
+// AGENT: Linux asm-generic syscall numbers used by the RISC-V ABI.
+pub const RISCV_SYS_UMOUNT2: usize = 39;
+pub const RISCV_SYS_MOUNT: usize = 40;
 pub const RISCV_SYS_READ: usize = 63;
 pub const RISCV_SYS_WRITE: usize = 64;
 pub const RISCV_SYS_BRK: usize = 214;
@@ -15,6 +18,8 @@ pub const INTERNAL_SYS_WRITE: usize = 1;
 pub const INTERNAL_SYS_BRK: usize = 12;
 pub const INTERNAL_SYS_EXIT: usize = 60;
 pub const INTERNAL_SYS_GETPID: usize = 39;
+pub const INTERNAL_SYS_MOUNT: usize = 165;
+pub const INTERNAL_SYS_UMOUNT2: usize = 166;
 
 // AGENT: Decoded RISC-V syscall request before it reaches migrated kernel-sim semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +32,8 @@ pub struct SyscallRequest {
 // AGENT: Convert the small first-stage RISC-V syscall set to kernel-sim-style ids.
 pub fn map_riscv_nr(nr: usize) -> Option<usize> {
     match nr {
+        RISCV_SYS_UMOUNT2 => Some(INTERNAL_SYS_UMOUNT2),
+        RISCV_SYS_MOUNT => Some(INTERNAL_SYS_MOUNT),
         RISCV_SYS_READ => Some(INTERNAL_SYS_READ),
         RISCV_SYS_WRITE => Some(INTERNAL_SYS_WRITE),
         RISCV_SYS_BRK => Some(INTERNAL_SYS_BRK),
