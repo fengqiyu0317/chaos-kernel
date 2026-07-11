@@ -1,6 +1,9 @@
 // AGENT
 use super::*;
 
+// AGENT: Sv39 lower-half canonical user addresses occupy [0, 2^38).
+const SV39_USER_TOP: usize = 1usize << 38;
+
 // AGENT: retain the validated subset of one ELF PT_LOAD program header for
 // later process-image construction.
 #[derive(Clone, Debug)]
@@ -70,46 +73,71 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, &'static str> {
     if e_phentsize < 56 {
         return Err("bad_phent");
     }
-    let ph_end = e_phoff
-        .checked_add((e_phentsize as usize).saturating_mul(e_phnum as usize))
+    let ph_table_size = (e_phentsize as usize)
+        .checked_mul(e_phnum as usize)
         .ok_or("ph_overflow")?;
+    let ph_end = e_phoff.checked_add(ph_table_size).ok_or("ph_overflow")?;
     if ph_end > data.len() {
         return Err("ph_overflow");
     }
     let mut load_segments = Vec::new();
+    let mut load_page_ranges = Vec::new();
     for idx in 0..e_phnum as usize {
-        let base = e_phoff + idx * e_phentsize as usize;
-        if base + 56 > data.len() {
-            break;
+        // AGENT: derive every table entry with checked arithmetic and reject a
+        // malformed table instead of silently returning a partial parse.
+        let base = idx
+            .checked_mul(e_phentsize as usize)
+            .and_then(|offset| e_phoff.checked_add(offset))
+            .ok_or("ph_overflow")?;
+        if base.checked_add(56).ok_or("ph_overflow")? > data.len() {
+            return Err("ph_overflow");
         }
         let p_type = read_u32_le(data, base)?;
-        if p_type == 1 {
-            let flags = read_u32_le(data, base + 4)?;
-            let offset = read_u64_le(data, base + 8)? as usize;
-            let vaddr = read_u64_le(data, base + 16)? as usize;
-            let file_size = read_u64_le(data, base + 32)? as usize;
-            let mem_size = read_u64_le(data, base + 40)? as usize;
-            let align = read_u64_le(data, base + 48)? as usize;
-            if file_size > mem_size {
-                return Err("bad_phdr");
-            }
-            validate_load_segment_alignment(offset, vaddr, align)?;
-            if vaddr >= KERN_BASE || vaddr.checked_add(mem_size).is_none() {
-                return Err("bad_phdr");
-            }
-            if offset.checked_add(file_size).ok_or("ph_overflow")? > data.len() {
-                return Err("ph_overflow");
-            }
-            if mem_size > 0 {
-                load_segments.push(ElfLoadSegment {
-                    offset,
-                    vaddr,
-                    file_size,
-                    mem_size,
-                    flags,
-                });
-            }
+        const PT_LOAD: u32 = 1;
+        const PT_INTERP: u32 = 3;
+        if p_type == PT_INTERP {
+            // AGENT: dynamically interpreted executables are not runnable until
+            // the QEMU exec path can load an interpreter and apply relocations.
+            return Err("enotsup");
         }
+        if p_type != PT_LOAD {
+            continue;
+        }
+
+        let flags = read_u32_le(data, base + 4)?;
+        let offset = read_u64_le(data, base + 8)? as usize;
+        let vaddr = read_u64_le(data, base + 16)? as usize;
+        let file_size = read_u64_le(data, base + 32)? as usize;
+        let mem_size = read_u64_le(data, base + 40)? as usize;
+        let align = read_u64_le(data, base + 48)? as usize;
+        if file_size > mem_size {
+            return Err("bad_phdr");
+        }
+        validate_load_segment_alignment(offset, vaddr, align)?;
+        if offset.checked_add(file_size).ok_or("ph_overflow")? > data.len() {
+            return Err("ph_overflow");
+        }
+        if mem_size == 0 {
+            continue;
+        }
+
+        let page_range = load_segment_page_range(vaddr, mem_size)?;
+        // AGENT: the current AddrSpace loader owns one mapping and one final
+        // permission set per page, so reject page-sharing PT_LOAD layouts here.
+        if load_page_ranges
+            .iter()
+            .any(|&(start, end)| page_range.0 < end && start < page_range.1)
+        {
+            return Err("overlap");
+        }
+        load_page_ranges.push(page_range);
+        load_segments.push(ElfLoadSegment {
+            offset,
+            vaddr,
+            file_size,
+            mem_size,
+            flags,
+        });
     }
     if load_segments.is_empty() {
         return Err("no_load");
@@ -130,6 +158,24 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, &'static str> {
         entry: e_entry,
         load_segments,
     })
+}
+
+// AGENT: validate one nonempty load segment against the canonical Sv39 user
+// range and return the exact page interval consumed by AddrSpace::map_region.
+fn load_segment_page_range(vaddr: usize, mem_size: usize) -> Result<(usize, usize), &'static str> {
+    let mem_end = vaddr.checked_add(mem_size).ok_or("bad_phdr")?;
+    if vaddr >= SV39_USER_TOP || mem_end > SV39_USER_TOP {
+        return Err("bad_phdr");
+    }
+    let page_start = vaddr & !(PAGE_SZ - 1);
+    let page_end = mem_end
+        .checked_add(PAGE_SZ - 1)
+        .map(|end| end & !(PAGE_SZ - 1))
+        .ok_or("bad_phdr")?;
+    if page_start >= page_end {
+        return Err("bad_phdr");
+    }
+    Ok((page_start, page_end))
 }
 
 // AGENT: validate PT_LOAD alignment before process image construction maps

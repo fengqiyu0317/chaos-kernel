@@ -17,7 +17,9 @@ pub fn run_all(pool: &FramePool) {
     reap_zombie_process_removes_thread_group_once();
     proc_init_push_at_writes_user_stack(pool);
     parse_elf_rejects_unsupported_or_invalid_entry();
+    parse_elf_validates_program_header_layouts();
     prepared_user_image_loads_elf_segment_and_stack(pool);
+    prepared_user_image_loads_out_of_order_segments(pool);
     shm_segment_maps_shared_physical_page(pool);
 }
 
@@ -341,6 +343,67 @@ fn parse_elf_rejects_unsupported_or_invalid_entry() {
     assert_eq!(parse_elf(&non_executable).unwrap_err(), "bad_entry");
 }
 
+// AGENT: exercise checked program-header traversal and the explicitly supported
+// static, nonoverlapping Sv39 PT_LOAD layout contract.
+fn parse_elf_validates_program_header_layouts() {
+    const PH_OFF: usize = 64;
+
+    let mut interpreted = test_elf_with_load_segment(PAGE_SZ, 0x0040_0000, b"code", 4);
+    write_test_u32(&mut interpreted, PH_OFF, 3);
+    assert_eq!(parse_elf(&interpreted).unwrap_err(), "enotsup");
+
+    let noncanonical_vaddr = (1usize << 38) - PAGE_SZ;
+    let outside_user =
+        test_elf_with_load_segment(PAGE_SZ, noncanonical_vaddr, b"code", PAGE_SZ * 2);
+    assert_eq!(parse_elf(&outside_user).unwrap_err(), "bad_phdr");
+
+    let mut truncated_table = test_elf_with_load_segment(PAGE_SZ, 0x0040_0000, b"code", 4);
+    write_test_u64(&mut truncated_table, 32, u64::MAX);
+    assert_eq!(parse_elf(&truncated_table).unwrap_err(), "ph_overflow");
+
+    let mut overlapping = test_elf_with_load_segment(PAGE_SZ + 0x100, 0x0040_0100, b"left", 0x100);
+    append_test_load_segment(
+        &mut overlapping,
+        PAGE_SZ * 2 + 0x900,
+        0x0040_0900,
+        b"right",
+        0x100,
+        0x5,
+    );
+    assert_eq!(parse_elf(&overlapping).unwrap_err(), "overlap");
+}
+
+// AGENT: prove that program-header order does not control virtual-address order
+// and that both nonoverlapping PT_LOAD segments reach the real image builder.
+fn prepared_user_image_loads_out_of_order_segments(pool: &FramePool) {
+    let high_vaddr = 0x0060_0000;
+    let low_vaddr = 0x0040_0000;
+    let mut elf = test_elf_with_load_segment(PAGE_SZ, high_vaddr, b"high", 8);
+    append_test_load_segment(&mut elf, PAGE_SZ * 2, low_vaddr, b"low", PAGE_SZ, 0x6);
+
+    let parsed = parse_elf(&elf).expect("out-of-order nonoverlapping segments should parse");
+    assert_eq!(parsed.load_segments.len(), 2);
+    assert_eq!(parsed.load_segments[0].vaddr, high_vaddr);
+    assert_eq!(parsed.load_segments[1].vaddr, low_vaddr);
+
+    let mut image = prepare_user_image(&elf, Vec::new(), Vec::new(), pool)
+        .expect("out-of-order nonoverlapping segments should load");
+    let mut high = [0u8; 4];
+    let mut low = [0u8; 3];
+    image
+        .addr_space
+        .read_user_bytes(high_vaddr, &mut high)
+        .unwrap();
+    image
+        .addr_space
+        .read_user_bytes(low_vaddr, &mut low)
+        .unwrap();
+    assert_eq!(&high, b"high");
+    assert_eq!(&low, b"low");
+    assert_eq!(image.thd_ctx.uctx.ip, high_vaddr as u64);
+    image.addr_space.release_all_pages(pool);
+}
+
 // AGENT: build a compact ELF64 fixture with one PT_LOAD segment for the QEMU
 // process-image selftest without depending on host-side ELF tooling.
 fn test_elf_with_load_segment(
@@ -351,7 +414,7 @@ fn test_elf_with_load_segment(
 ) -> Vec<u8> {
     const PH_OFF: usize = 64;
     const PH_SIZE: usize = 56;
-    let mut data = vec![0u8; (PH_OFF + PH_SIZE).max(offset + payload.len())];
+    let mut data = vec![0u8; PH_OFF];
     data[0..4].copy_from_slice(b"\x7fELF");
     data[4] = 2;
     data[5] = 1;
@@ -363,18 +426,38 @@ fn test_elf_with_load_segment(
     write_test_u64(&mut data, 32, PH_OFF as u64);
     write_test_u16(&mut data, 52, 64);
     write_test_u16(&mut data, 54, PH_SIZE as u16);
-    write_test_u16(&mut data, 56, 1);
-
-    write_test_u32(&mut data, PH_OFF, 1);
-    write_test_u32(&mut data, PH_OFF + 4, 0x5);
-    write_test_u64(&mut data, PH_OFF + 8, offset as u64);
-    write_test_u64(&mut data, PH_OFF + 16, vaddr as u64);
-    write_test_u64(&mut data, PH_OFF + 24, vaddr as u64);
-    write_test_u64(&mut data, PH_OFF + 32, payload.len() as u64);
-    write_test_u64(&mut data, PH_OFF + 40, mem_size as u64);
-    write_test_u64(&mut data, PH_OFF + 48, PAGE_SZ as u64);
-    data[offset..offset + payload.len()].copy_from_slice(payload);
+    write_test_u16(&mut data, 56, 0);
+    append_test_load_segment(&mut data, offset, vaddr, payload, mem_size, 0x5);
     data
+}
+
+// AGENT: append one ELF64 PT_LOAD entry and its payload to a synthetic image so
+// process selftests can cover multi-segment ordering and overlap behavior.
+fn append_test_load_segment(
+    data: &mut Vec<u8>,
+    offset: usize,
+    vaddr: usize,
+    payload: &[u8],
+    mem_size: usize,
+    flags: u32,
+) {
+    const PH_OFF: usize = 64;
+    const PH_SIZE: usize = 56;
+    let ph_num = u16::from_le_bytes([data[56], data[57]]) as usize;
+    let base = PH_OFF + ph_num * PH_SIZE;
+    let required_len = (base + PH_SIZE).max(offset + payload.len());
+    data.resize(required_len, 0);
+
+    write_test_u32(data, base, 1);
+    write_test_u32(data, base + 4, flags);
+    write_test_u64(data, base + 8, offset as u64);
+    write_test_u64(data, base + 16, vaddr as u64);
+    write_test_u64(data, base + 24, vaddr as u64);
+    write_test_u64(data, base + 32, payload.len() as u64);
+    write_test_u64(data, base + 40, mem_size as u64);
+    write_test_u64(data, base + 48, PAGE_SZ as u64);
+    data[offset..offset + payload.len()].copy_from_slice(payload);
+    write_test_u16(data, 56, (ph_num + 1) as u16);
 }
 
 // AGENT: encode one little-endian u16 in the synthetic ELF fixture.
