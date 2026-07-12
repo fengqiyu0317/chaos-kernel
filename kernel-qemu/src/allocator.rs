@@ -23,14 +23,6 @@ impl AllocatorState {
         }
     }
 
-    // AGENT: reset an allocator before its owning resource range becomes live.
-    pub(crate) fn reset(&mut self, next: usize, limit: usize) {
-        debug_assert!(next <= limit);
-        self.next = next;
-        self.limit = limit;
-        self.free.clear();
-    }
-
     // AGENT: prefer the lowest recycled id, then advance into never-used ids.
     pub(crate) fn allocate(&mut self) -> Option<usize> {
         let recycled = self.free.iter().next().copied();

@@ -9,6 +9,7 @@ pub fn run_all() {
     rotate_bits_masks_zero_distance_rotation();
     hash_combine_mixes_zero_values();
     frame_pool_tracks_total_and_free_pages();
+    frame_pool_reserves_kernel_heap_pages();
     vm_region_and_map_preserve_range_semantics();
     buddy_allocator_alloc_free_smoke();
     buddy_free_merges_with_nonzero_base();
@@ -61,32 +62,48 @@ fn hash_combine_mixes_zero_values() {
     assert_ne!(hash_combine(hash_combine(0, 0), 1), hash_combine(0, 1));
 }
 
-// AGENT: FramePool exposes only RAII frame ownership and rolls incomplete
-// batches back when the boot-discovered free range cannot satisfy a request.
+// AGENT: FramePool permanently claims boot pages through the shared allocator,
+// exposes only RAII frame ownership, and rolls incomplete batches back.
 #[cfg_attr(test, test)]
 fn frame_pool_tracks_total_and_free_pages() {
     let pool = FramePool::new(8, MEM_OFF);
-    pool.mark_free_range(MEM_OFF + 2 * PAGE_SZ, MEM_OFF + 6 * PAGE_SZ);
+    assert_eq!(pool.reserve_contiguous_pages(2, 1), Some(MEM_OFF));
 
     assert_eq!(pool.total_pages(), 8);
-    assert_eq!(pool.free_count(), 4);
+    assert_eq!(pool.free_count(), 6);
     assert!(pool.get_pg_frame(1).is_none());
 
     let frame = pool.get_pg_frame(3).unwrap();
     assert_eq!(frame.id(), 3);
-    assert_eq!(pool.free_count(), 3);
+    assert_eq!(pool.free_count(), 5);
     drop(frame);
-    assert_eq!(pool.free_count(), 4);
+    assert_eq!(pool.free_count(), 6);
 
-    assert!(pool.alloc_pg_frames(5).is_none());
-    assert_eq!(pool.free_count(), 4);
+    assert!(pool.alloc_pg_frames(7).is_none());
+    assert_eq!(pool.free_count(), 6);
 
     let frames = pool.alloc_pg_frames(3).unwrap();
     let frame_ids = frames.iter().map(|frame| frame.id()).collect::<Vec<_>>();
     assert_eq!(frame_ids.as_slice(), &[2, 3, 4]);
-    assert_eq!(pool.free_count(), 1);
+    assert_eq!(pool.free_count(), 3);
     drop(frames);
-    assert_eq!(pool.free_count(), 4);
+    assert_eq!(pool.free_count(), 6);
+}
+
+// AGENT: permanent kernel arenas must claim usable physical pages through the
+// same FramePool and must never become constructible as PgFrame handles.
+#[cfg_attr(test, test)]
+fn frame_pool_reserves_kernel_heap_pages() {
+    let pool = FramePool::new(8, MEM_OFF);
+    let heap = pool.reserve_contiguous_pages(2, 2).unwrap();
+    assert_eq!(heap, MEM_OFF);
+    assert_eq!(pool.free_count(), 6);
+    assert!(pool.get_pg_frame(0).is_none());
+    assert!(pool.get_pg_frame(1).is_none());
+    let frame = pool.get_pg_frame(2).unwrap();
+    assert_eq!(pool.free_count(), 5);
+    drop(frame);
+    assert_eq!(pool.free_count(), 6);
 }
 
 // AGENT: keep the buddy smoke check in the MM helper tests and call it from

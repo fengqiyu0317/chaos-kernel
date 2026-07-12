@@ -24,6 +24,7 @@ struct EarlyHeap {
     next: AtomicUsize,
     end: AtomicUsize,
     ready: AtomicBool,
+    promoted: AtomicBool,
 }
 
 impl EarlyHeap {
@@ -33,10 +34,15 @@ impl EarlyHeap {
             next: AtomicUsize::new(0),
             end: AtomicUsize::new(0),
             ready: AtomicBool::new(false),
+            promoted: AtomicBool::new(false),
         }
     }
 
     fn init(&self, base: usize, size: usize) -> usize {
+        assert!(
+            !self.ready.swap(true, Ordering::AcqRel),
+            "early heap initialized more than once"
+        );
         let start = align_up(base, HEAP_ALIGN);
         let raw_end = base.checked_add(size).expect("early heap range overflow");
         let end = align_down(raw_end, HEAP_ALIGN);
@@ -45,7 +51,31 @@ impl EarlyHeap {
         self.start.store(start, Ordering::Relaxed);
         self.next.store(start, Ordering::Relaxed);
         self.end.store(end, Ordering::Relaxed);
-        self.ready.store(true, Ordering::Release);
+        end
+    }
+
+    // AGENT: switch future allocations to a FramePool-reserved arena after the
+    // physical-frame map is live; bootstrap pointers remain valid because this
+    // monotonic allocator intentionally ignores deallocation.
+    fn promote(&self, base: usize, size: usize) -> usize {
+        assert!(
+            self.ready.load(Ordering::Acquire),
+            "cannot promote an uninitialized heap"
+        );
+        assert!(
+            !self.promoted.swap(true, Ordering::AcqRel),
+            "kernel heap promoted more than once"
+        );
+        let start = align_up(base, HEAP_ALIGN);
+        let raw_end = base.checked_add(size).expect("kernel heap range overflow");
+        let end = align_down(raw_end, HEAP_ALIGN);
+        assert!(start < end, "kernel heap range is empty");
+
+        // No interrupts or secondary harts allocate during this boot-only
+        // transition, so publish the complete new arena before boot continues.
+        self.start.store(start, Ordering::Relaxed);
+        self.next.store(start, Ordering::Relaxed);
+        self.end.store(end, Ordering::Release);
         end
     }
 
@@ -122,6 +152,18 @@ pub fn init() {
         "[kernel-qemu] heap ready base={:#x} end={:#x} bytes={}",
         base, heap_end, size
     );
+}
+
+// AGENT: make all post-bootstrap alloc users consume an arena whose physical
+// pages were explicitly claimed from FramePool.
+pub fn promote(base: usize, size: usize) -> usize {
+    let bootstrap_used = HEAP.used();
+    let heap_end = HEAP.promote(base, size);
+    println!(
+        "[kernel-qemu] heap promoted base={:#x} end={:#x} bytes={} bootstrap_used={}",
+        base, heap_end, size, bootstrap_used
+    );
+    heap_end
 }
 
 // AGENT: exercise alloc::Vec, Box, BTreeMap and Arc so QEMU smoke proves the

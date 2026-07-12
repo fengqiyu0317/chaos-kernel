@@ -59,6 +59,7 @@ const ROOT_INIT_ELF: &[u8] = &[];
 pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     clear_bss();
     heap::init();
+    let frame_pool = init_qemu_frame_pool();
     kernel::kernel_core::init_timer_wheel();
 
     println!("[kernel-qemu] boot hart={} dtb={:#x}", hartid, dtb_pa);
@@ -84,7 +85,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         kernel::proc::sched::tests::run_all();
         println!("[kernel-qemu] sched selftest passed");
     }
-    let kernel = init_qemu_kernel_backend();
+    let kernel = init_qemu_kernel_backend(frame_pool);
     // AGENT: run ProcInit stack-writing checks only after the real QEMU frame
     // pool and direct map are installed.
     #[cfg(feature = "qemu-proc-selftest")]
@@ -130,8 +131,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
 
 // AGENT: Install a leaked Kernel as the QEMU scheduler/timer backend so real
 // timer interrupts can drive migrated Kernel::schedule_tick() state.
-fn init_qemu_kernel_backend() -> &'static kernel::Kernel {
-    let frame_pool = init_qemu_frame_pool();
+fn init_qemu_kernel_backend(frame_pool: kernel::FramePool) -> &'static kernel::Kernel {
     install_kernel_page_table(&frame_pool);
     let root_block = Arc::new(kernel::RamBlockDevice::empty());
     let kernel = Box::leak(Box::new(kernel::Kernel::new_with_block_device(
@@ -185,19 +185,34 @@ fn install_kernel_page_table(frame_pool: &kernel::FramePool) {
     );
 }
 
-// AGENT: seed the migrated FramePool from the QEMU virt RAM range while
-// reserving the linked kernel image, boot stack, and early heap up to ekernel.
+// AGENT: account for the complete QEMU RAM span in FramePool, keep firmware and
+// linked boot memory reserved, then claim the post-bootstrap heap from free
+// physical frames before ordinary alloc users run.
 fn init_qemu_frame_pool() -> kernel::FramePool {
     let total_pages = (QEMU_VIRT_RAM_END - QEMU_VIRT_RAM_START) / kernel::PAGE_SZ;
     let pool = kernel::FramePool::new(total_pages, QEMU_VIRT_RAM_START);
     let kernel_end = align_up_page(core::ptr::addr_of!(ekernel) as usize);
-    pool.mark_free_range(kernel_end, QEMU_VIRT_RAM_END);
+    let boot_reserved_pages = (kernel_end - QEMU_VIRT_RAM_START) / kernel::PAGE_SZ;
+    let boot_reserved_start = pool
+        .reserve_contiguous_pages(boot_reserved_pages, 1)
+        .expect("QEMU RAM should contain the firmware and linked kernel");
+    assert_eq!(boot_reserved_start, QEMU_VIRT_RAM_START);
+    assert_eq!(kernel::KHEAP_SZ % kernel::PAGE_SZ, 0);
+    let heap_pages = kernel::KHEAP_SZ / kernel::PAGE_SZ;
+    let heap_start = pool
+        .reserve_contiguous_pages(heap_pages, 1)
+        .expect("QEMU RAM should contain a contiguous kernel heap");
+    assert_eq!(heap_start, kernel_end);
+    heap::promote(heap_start, kernel::KHEAP_SZ);
     println!(
-        "[kernel-qemu] frame pool ready base={:#x} free_start={:#x} end={:#x} free_pages={}",
+        "[kernel-qemu] frame pool ready base={:#x} end={:#x} boot_reserved_pages={} heap_pages={} free_pages={} heap={:#x}..{:#x}",
         QEMU_VIRT_RAM_START,
-        kernel_end,
         QEMU_VIRT_RAM_END,
-        pool.free_count()
+        boot_reserved_pages,
+        heap_pages,
+        pool.free_count(),
+        heap_start,
+        heap_start + kernel::KHEAP_SZ,
     );
     pool
 }

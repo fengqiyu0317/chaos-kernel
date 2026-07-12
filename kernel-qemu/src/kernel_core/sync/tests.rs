@@ -73,10 +73,7 @@ fn ensure_timer_wheel() {
 // AGENT: build a tiny fully-free frame pool for scheduler-only selftests that
 // do not exercise QEMU physical-memory discovery.
 fn test_frame_pool(pages: usize) -> FramePool {
-    let pool = FramePool::new(pages, MEM_OFF);
-    let end = MEM_OFF + pages * PAGE_SZ;
-    pool.mark_free_range(MEM_OFF, end);
-    pool
+    FramePool::new(pages, MEM_OFF)
 }
 
 // AGENT: WaitToken::current must bind to the current simulator task id and give

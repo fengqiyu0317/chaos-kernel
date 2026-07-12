@@ -1,6 +1,5 @@
 // AGENT: keep this module focused on physical-frame pool allocation.
 use alloc::{sync::Arc, vec::Vec};
-use core::cmp::{max, min};
 
 use super::{AllocatorState, Mutex, PgFrame, PAGE_SZ};
 
@@ -11,32 +10,27 @@ pub struct FramePool {
     pub(crate) cap: usize,
     pub(crate) base_paddr: usize,
 }
+
 impl FramePool {
-    // AGENT: create a QEMU frame pool with no pages free until the boot path
-    // marks linker/RAM-derived ranges usable.
+    // AGENT: put the complete RAM span under one allocator; the boot path then
+    // permanently claims firmware, linked-kernel, and heap ranges from it.
     pub fn new(n: usize, base_paddr: usize) -> Self {
         Self {
-            allocator: Arc::new(Mutex::new(AllocatorState::new(0, 0))),
+            allocator: Arc::new(Mutex::new(AllocatorState::new(0, n))),
             cap: n,
             base_paddr,
         }
     }
 
-    // AGENT: install the contiguous boot-discovered range as the allocator's
-    // bump interval instead of materializing one bitmap entry per frame.
-    pub fn mark_free_range(&self, start_paddr: usize, end_paddr: usize) {
-        let Some(start) = align_up_page(start_paddr) else {
-            return;
-        };
-        let start = max(start, self.base_paddr);
-        let end = min(align_down_page(end_paddr), self.limit_paddr());
-        if end <= start {
-            return;
-        }
-
-        let first = (start - self.base_paddr) / PAGE_SZ;
-        let last = min((end - self.base_paddr) / PAGE_SZ, self.cap);
-        self.allocator.lock().unwrap().reset(first, last);
+    // AGENT: permanently claim a physically contiguous run through the same
+    // allocator as PgFrame; no PgFrame handle exists to release this boot range.
+    pub fn reserve_contiguous_pages(&self, count: usize, align_pages: usize) -> Option<usize> {
+        let first = self
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate_contiguous(0, count, align_pages)?;
+        self.frame_id_to_paddr(first)
     }
 
     // AGENT: map a frame id back to the physical address owned by this pool.
@@ -110,15 +104,4 @@ impl FramePool {
     fn pg_frame_from_allocated(&self, id: usize) -> PgFrame {
         PgFrame::from_allocated(id, self.allocator.clone(), self.base_paddr)
     }
-}
-
-// AGENT: align physical range starts without wrapping on overflow.
-fn align_up_page(addr: usize) -> Option<usize> {
-    addr.checked_add(PAGE_SZ - 1)
-        .map(|value| value & !(PAGE_SZ - 1))
-}
-
-// AGENT: align physical range ends down to a page boundary.
-fn align_down_page(addr: usize) -> usize {
-    addr & !(PAGE_SZ - 1)
 }

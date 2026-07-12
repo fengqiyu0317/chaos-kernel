@@ -3,8 +3,8 @@
 use super::*;
 use crate::kernel::kernel_core::{init_timer_wheel, TIMER_WHEEL};
 use crate::kernel::{
-    Context, FramePool, Kernel, SigAction, TaskRunState, MEM_OFF, PAGE_SZ, PRIO_MIN, SIGCONT,
-    SIGSTOP, SIGUSR1, SIGUSR2,
+    Context, FramePool, Kernel, SigAction, TaskRunState, MEM_OFF, PRIO_MIN, SIGCONT, SIGSTOP,
+    SIGUSR1, SIGUSR2,
 };
 
 // AGENT: expose focused scheduler queue checks to the optional QEMU boot
@@ -29,10 +29,7 @@ fn ensure_timer_wheel() {
 
 // AGENT: build a tiny fully-free frame pool for scheduler-only selftests.
 fn test_frame_pool(pages: usize) -> FramePool {
-    let pool = FramePool::new(pages, MEM_OFF);
-    let end = MEM_OFF + pages * PAGE_SZ;
-    pool.mark_free_range(MEM_OFF, end);
-    pool
+    FramePool::new(pages, MEM_OFF)
 }
 
 // AGENT: same-priority tasks should be selected in insertion order.
