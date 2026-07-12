@@ -69,41 +69,7 @@ impl FramePool {
             .unwrap_or(usize::MAX)
     }
 
-    // AGENT: allocate the requested frame id instead of ignoring the argument.
-    pub fn get(&self, id: usize) -> Option<usize> {
-        self.allocator.lock().unwrap().allocate_id(id)
-    }
-    // AGENT: share the single-frame allocation path with the batch scanner.
-    pub fn get_inner(&self) -> Option<usize> {
-        self.batch_alloc(1).pop()
-    }
-    // AGENT: scan only physically aligned candidate starts and reject
-    // impossible alignment shifts before they can overflow.
-    pub fn get_contig(&self, sz: usize, align_log2: usize) -> Option<usize> {
-        if sz == 0 || align_log2 >= usize::BITS as usize {
-            return None;
-        }
-        let align_pages = 1usize << align_log2;
-        let align_bytes = align_pages.checked_mul(PAGE_SZ)?;
-        let first = self.first_aligned_frame_id(align_bytes)?;
-        self.allocator
-            .lock()
-            .unwrap()
-            .allocate_contiguous(first, sz, align_pages)
-    }
-    // AGENT: return a caller-owned frame id and surface duplicate or invalid
-    // releases as allocator invariant violations.
-    pub fn put(&self, idx: usize) {
-        let released = self.allocator.lock().unwrap().release(idx);
-        assert!(
-            released,
-            "frame {} was released twice or was never allocated",
-            idx
-        );
-    }
-    pub fn avail(&self, idx: usize) -> bool {
-        self.allocator.lock().unwrap().is_free(idx)
-    }
+    // AGENT: expose allocator pressure without leaking raw frame ownership.
     pub fn free_count(&self) -> usize {
         self.allocator.lock().unwrap().free_count()
     }
@@ -115,37 +81,34 @@ impl FramePool {
 
     // AGENT: allocate a physical frame as a RAII page-frame handle.
     pub fn alloc_pg_frame(&self) -> Option<PgFrame> {
-        let id = self.get_inner()?;
+        let id = self.allocator.lock().unwrap().allocate()?;
         Some(self.pg_frame_from_allocated(id))
     }
 
     // AGENT: allocate a specific physical frame as a RAII page-frame handle.
     pub fn get_pg_frame(&self, id: usize) -> Option<PgFrame> {
-        self.get(id)?;
+        self.allocator.lock().unwrap().allocate_id(id)?;
         Some(self.pg_frame_from_allocated(id))
+    }
+
+    // AGENT: return batch ownership only through PgFrame handles; a partial
+    // allocation is dropped here so callers observe all-or-nothing semantics.
+    pub fn alloc_pg_frames(&self, count: usize) -> Option<Vec<PgFrame>> {
+        let ids = self.allocator.lock().unwrap().allocate_batch(count);
+        let frames: Vec<PgFrame> = ids
+            .into_iter()
+            .map(|id| self.pg_frame_from_allocated(id))
+            .collect();
+        if frames.len() == count {
+            Some(frames)
+        } else {
+            None
+        }
     }
 
     // AGENT: attach RAII ownership to a frame that is already marked allocated.
     fn pg_frame_from_allocated(&self, id: usize) -> PgFrame {
         PgFrame::from_allocated(id, self.allocator.clone(), self.base_paddr)
-    }
-
-    // AGENT: find the first frame id whose physical address satisfies an
-    // alignment in bytes; callers can then advance by the equivalent page span.
-    fn first_aligned_frame_id(&self, align_bytes: usize) -> Option<usize> {
-        if align_bytes == 0 || !align_bytes.is_power_of_two() || self.base_paddr % PAGE_SZ != 0 {
-            return None;
-        }
-        let offset = self.base_paddr & (align_bytes - 1);
-        if offset == 0 {
-            Some(0)
-        } else {
-            Some((align_bytes - offset) / PAGE_SZ)
-        }
-    }
-
-    pub fn batch_alloc(&self, count: usize) -> Vec<usize> {
-        self.allocator.lock().unwrap().allocate_batch(count)
     }
 }
 

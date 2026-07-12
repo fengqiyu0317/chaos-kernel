@@ -61,8 +61,8 @@ fn hash_combine_mixes_zero_values() {
     assert_ne!(hash_combine(hash_combine(0, 0), 1), hash_combine(0, 1));
 }
 
-// AGENT: FramePool covers the whole physical-memory span while its shared
-// allocator state exposes only the boot-discovered free range for allocation.
+// AGENT: FramePool exposes only RAII frame ownership and rolls incomplete
+// batches back when the boot-discovered free range cannot satisfy a request.
 #[cfg_attr(test, test)]
 fn frame_pool_tracks_total_and_free_pages() {
     let pool = FramePool::new(8, MEM_OFF);
@@ -70,12 +70,22 @@ fn frame_pool_tracks_total_and_free_pages() {
 
     assert_eq!(pool.total_pages(), 8);
     assert_eq!(pool.free_count(), 4);
-    assert_eq!(pool.get(1), None);
+    assert!(pool.get_pg_frame(1).is_none());
 
-    assert_eq!(pool.get(3), Some(3));
+    let frame = pool.get_pg_frame(3).unwrap();
+    assert_eq!(frame.id(), 3);
     assert_eq!(pool.free_count(), 3);
+    drop(frame);
+    assert_eq!(pool.free_count(), 4);
 
-    pool.put(3);
+    assert!(pool.alloc_pg_frames(5).is_none());
+    assert_eq!(pool.free_count(), 4);
+
+    let frames = pool.alloc_pg_frames(3).unwrap();
+    let frame_ids = frames.iter().map(|frame| frame.id()).collect::<Vec<_>>();
+    assert_eq!(frame_ids.as_slice(), &[2, 3, 4]);
+    assert_eq!(pool.free_count(), 1);
+    drop(frames);
     assert_eq!(pool.free_count(), 4);
 }
 
