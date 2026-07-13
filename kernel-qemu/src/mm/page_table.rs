@@ -5,20 +5,21 @@ use core::mem;
 
 use super::{
     FramePool, Mutex, PgFrame, SharedPage, PTE_A, PTE_D, PTE_R, PTE_U, PTE_W, PTE_X, VM_EXEC,
-    VM_READ, VM_WRITE,
+    VM_READ, VM_SHARED, VM_WRITE,
 };
 
 // AGENT: QEMU PTE metadata keeps current hardware leaf state while VmRegion
 // remains the single source of VM flags.
 pub struct PageTableEntry {
-    pub frame: SharedPage,
-    pub pte_flags: usize,
-    pub cow: bool,
+    pub(super) frame: SharedPage,
+    pub(super) pte_flags: usize,
+    pub(super) cow: bool,
 }
 
 // AGENT: keep resident leaf-state transitions beside the metadata they mutate.
 impl PageTableEntry {
-    // AGENT: default page-table entries are anonymous zero-filled pages.
+    // AGENT: wrap a caller-initialized anonymous frame; the caller must zero a
+    // newly allocated frame before exposing the mapping to user space.
     pub fn new(frame: PgFrame, flags: u32) -> Self {
         Self {
             frame: SharedPage::new(frame),
@@ -27,8 +28,10 @@ impl PageTableEntry {
         }
     }
 
-    // AGENT: attach an existing shared physical page without enabling COW.
+    // AGENT: attach an explicitly shared physical page without enabling COW,
+    // and catch accidental use for a private mapping during development.
     pub(super) fn from_shared(frame: SharedPage, flags: u32) -> Self {
+        debug_assert!(flags & VM_SHARED != 0);
         Self {
             frame,
             pte_flags: vm_flags_to_pte_flags(flags),
@@ -50,6 +53,8 @@ impl PageTableEntry {
         flags: u32,
         pool: &FramePool,
     ) -> Result<usize, &'static str> {
+        debug_assert!(self.cow);
+        debug_assert!(flags & VM_WRITE != 0);
         let paddr = self.frame.fault(pool)?;
         self.pte_flags = vm_flags_to_pte_flags(flags);
         self.cow = false;
@@ -64,10 +69,10 @@ impl PageTableEntry {
         }
     }
 
-    // AGENT: derive current direct-write access from the Sv39 leaf flags instead
-    // of storing a duplicate software boolean.
+    // AGENT: require both the Sv39 write bit and the absence of a pending
+    // software COW fault so an inconsistent entry fails closed.
     pub(super) fn is_writable(&self) -> bool {
-        self.pte_flags & PTE_W != 0
+        !self.cow && self.pte_flags & PTE_W != 0
     }
 
     // AGENT: expose the physical-frame identity while keeping ownership in the
@@ -76,8 +81,10 @@ impl PageTableEntry {
         self.frame.frame_id()
     }
 
-    // AGENT: clone only when a new PTE mapping should share the same frame.
+    // AGENT: clone only when a new PTE mapping should share the same frame;
+    // reject propagation of a writable COW state in debug builds.
     pub(super) fn clone_mapping(&self) -> Self {
+        debug_assert!(!self.cow || self.pte_flags & PTE_W == 0);
         Self {
             frame: self.frame.clone(),
             pte_flags: self.pte_flags,

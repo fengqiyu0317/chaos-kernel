@@ -21,7 +21,40 @@ pub fn run_all(pool: &FramePool) {
     prepared_user_image_loads_elf_segment_and_stack(pool);
     prepared_user_image_loads_segments_sharing_a_page(pool);
     prepared_user_image_loads_out_of_order_segments(pool);
+    forked_writable_page_resolves_cow(pool);
     shm_segment_maps_shared_physical_page(pool);
+}
+
+// AGENT: keep PageTableEntry visibility and writable-state hardening covered by
+// proving that the supported writable-private fork path still separates pages.
+fn forked_writable_page_resolves_cow(pool: &FramePool) {
+    let addr = 0x1800_0000;
+    let mut parent = AddrSpace::new();
+    parent
+        .map_region(VmRegion::new(addr, PAGE_SZ, VM_READ | VM_WRITE), pool)
+        .expect("parent page should map");
+    parent
+        .write_user_bytes(addr, b"parent", pool)
+        .expect("parent page should be writable before fork");
+
+    let mut child = AddrSpace::fork_from(&parent, pool).expect("address space should fork");
+    child
+        .write_user_bytes(addr, b"child!", pool)
+        .expect("child write should resolve COW");
+
+    let mut parent_bytes = [0u8; 6];
+    let mut child_bytes = [0u8; 6];
+    parent
+        .read_user_bytes(addr, &mut parent_bytes)
+        .expect("parent page should remain readable");
+    child
+        .read_user_bytes(addr, &mut child_bytes)
+        .expect("child page should remain readable");
+    assert_eq!(&parent_bytes, b"parent");
+    assert_eq!(&child_bytes, b"child!");
+
+    parent.release_all_pages(pool);
+    child.release_all_pages(pool);
 }
 
 // AGENT: capability inheritance keeps only the mask-approved bits and clamps
