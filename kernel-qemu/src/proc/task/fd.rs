@@ -1,0 +1,373 @@
+// AGENT: isolate descriptor allocation, duplication, close cleanup, and
+// checkpoint-fd translation from task lifecycle state.
+use super::*;
+
+// AGENT: collect close side effects under the fd-table lock and execute them
+// after unlocking so callbacks and Drop cannot re-enter the table.
+struct FdCloseCleanup {
+    closed_entry: FdEntry,
+    closed_fd_source_subs: Vec<usize>,
+    epoll_source_subs: Vec<(FdEntry, usize)>,
+}
+
+// AGENT: detach all epoll source callbacks before dropping a closed entry.
+impl FdCloseCleanup {
+    // AGENT: run deferred unsubscriptions outside the fd-table lock.
+    fn run(self) {
+        for sub_id in self.closed_fd_source_subs {
+            self.closed_entry.unregister_epoll_source(sub_id);
+        }
+        for (source, sub_id) in self.epoll_source_subs {
+            source.unregister_epoll_source(sub_id);
+        }
+        drop(self.closed_entry);
+    }
+}
+
+// AGENT: restrict the first checkpoint fd surface to supported stdio entries.
+fn checkpoint_fd_kind(fd: usize) -> Result<SavedFdKind, &'static str> {
+    match fd {
+        0 => Ok(SavedFdKind::Stdin),
+        1 => Ok(SavedFdKind::Stdout),
+        2 => Ok(SavedFdKind::Stderr),
+        _ => Err("enotsup"),
+    }
+}
+
+// AGENT: assign stable image ids to shared open-file descriptions by Arc identity.
+fn checkpoint_description_id(
+    entry: &FdEntry,
+    descriptions: &mut Vec<(FdEntry, u32)>,
+) -> Result<u32, &'static str> {
+    for (known, id) in descriptions.iter() {
+        if entry.same_open_description(known) {
+            return Ok(*id);
+        }
+    }
+    let id = u32::try_from(descriptions.len() + 1).map_err(|_| "einval")?;
+    descriptions.push((entry.clone(), id));
+    Ok(id)
+}
+
+// AGENT: rebuild the stdio-like instances supported by checkpoint restore.
+fn checkpoint_stdio_instance(
+    kind: SavedFdKind,
+    status_flags: u32,
+) -> Result<(FInstance, FdOpt), &'static str> {
+    let mut opt = match kind {
+        SavedFdKind::Stdin => FdOpt {
+            rd: true,
+            wr: false,
+            ap: false,
+            nb: false,
+        },
+        SavedFdKind::Stdout | SavedFdKind::Stderr => FdOpt {
+            rd: false,
+            wr: true,
+            ap: false,
+            nb: false,
+        },
+        SavedFdKind::RegularMemoryFile
+        | SavedFdKind::Pipe
+        | SavedFdKind::Epoll
+        | SavedFdKind::Socket
+        | SavedFdKind::Tty => return Err("enotsup"),
+    };
+    opt.apply_status_flags(status_flags as usize);
+    let path = match kind {
+        SavedFdKind::Stdin => "/dev/stdin",
+        SavedFdKind::Stdout => "/dev/stdout",
+        SavedFdKind::Stderr => "/dev/stderr",
+        _ => return Err("enotsup"),
+    };
+    Ok((FInstance::new(path), opt))
+}
+
+// AGENT: seed stdio through the normal allocator so the table and free-fd set
+// remain consistent with all later open, dup, and close operations.
+pub(super) fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str> {
+    let stdin_opt = FdOpt {
+        rd: true,
+        wr: false,
+        ap: false,
+        nb: false,
+    };
+    let stdout_opt = FdOpt {
+        rd: false,
+        wr: true,
+        ap: false,
+        nb: false,
+    };
+    let stdin_instance = FInstance::new("/dev/tty");
+    let stdout_instance = FInstance::new("/dev/tty");
+    let stderr_instance = stdout_instance.dup();
+    let stdin = task.add_file_with_status(FLike::File(FHandle::new(stdin_instance)), stdin_opt)?;
+    let stdout =
+        task.add_file_with_status(FLike::File(FHandle::new(stdout_instance)), stdout_opt)?;
+    let stderr =
+        task.add_file_with_status(FLike::File(FHandle::new(stderr_instance)), stdout_opt)?;
+    if (stdin, stdout, stderr) != (0, 1, 2) {
+        return Err("ebadf");
+    }
+    Ok(())
+}
+
+// AGENT: implement the complete Task fd-table surface in the descriptor module.
+impl Task {
+    // AGENT: peek at the lowest free descriptor without scanning occupied slots.
+    pub fn get_free_fd(&self) -> Option<usize> {
+        self.get_free_fd_from(0)
+    }
+
+    // AGENT: find a free descriptor at or above an F_DUPFD-style lower bound.
+    pub fn get_free_fd_from(&self, start: usize) -> Option<usize> {
+        let free_fds = self.process.free_fds.lock().unwrap();
+        free_fds.range(start..).next().copied()
+    }
+
+    // AGENT: reserve a free descriptor while the caller holds the fd-table lock.
+    fn reserve_fd_from_locked(
+        free_fds: &mut BTreeSet<usize>,
+        start: usize,
+    ) -> Result<usize, &'static str> {
+        let fd = free_fds.range(start..).next().copied().ok_or("emfile")?;
+        free_fds.remove(&fd);
+        Ok(fd)
+    }
+
+    // AGENT: install a new entry with a fresh shared open-file description.
+    pub fn add_file(&self, fl: FLike) -> Result<usize, &'static str> {
+        self.add_file_with_cloexec(fl, false)
+    }
+
+    // AGENT: install an entry with explicit open-file-description status.
+    pub fn add_file_with_status(&self, fl: FLike, status: FdOpt) -> Result<usize, &'static str> {
+        self.add_file_with_cloexec_and_status(fl, status, false)
+    }
+
+    // AGENT: install an entry and record per-descriptor close-on-exec state.
+    pub fn add_file_with_cloexec(&self, fl: FLike, cloexec: bool) -> Result<usize, &'static str> {
+        let mut files = self.process.files.lock().unwrap();
+        let mut free_fds = self.process.free_fds.lock().unwrap();
+        let fd = Self::reserve_fd_from_locked(&mut free_fds, 0)?;
+        files.insert(fd, FdEntry::with_cloexec(fl, cloexec));
+        Ok(fd)
+    }
+
+    // AGENT: install an entry with explicit status and close-on-exec state.
+    pub fn add_file_with_cloexec_and_status(
+        &self,
+        fl: FLike,
+        status: FdOpt,
+        cloexec: bool,
+    ) -> Result<usize, &'static str> {
+        let mut files = self.process.files.lock().unwrap();
+        let mut free_fds = self.process.free_fds.lock().unwrap();
+        let fd = Self::reserve_fd_from_locked(&mut free_fds, 0)?;
+        files.insert(fd, FdEntry::with_status(fl, status, cloexec));
+        Ok(fd)
+    }
+
+    // AGENT: reserve and install two descriptors atomically for pipe-like calls.
+    pub fn add_file_pair_with_cloexec(
+        &self,
+        first: FLike,
+        second: FLike,
+        cloexec: bool,
+    ) -> Result<(usize, usize), &'static str> {
+        let mut files = self.process.files.lock().unwrap();
+        let mut free_fds = self.process.free_fds.lock().unwrap();
+        let first_fd = Self::reserve_fd_from_locked(&mut free_fds, 0)?;
+        let second_fd = match Self::reserve_fd_from_locked(&mut free_fds, 0) {
+            Ok(fd) => fd,
+            Err(err) => {
+                free_fds.insert(first_fd);
+                return Err(err);
+            }
+        };
+        files.insert(first_fd, FdEntry::with_cloexec(first, cloexec));
+        files.insert(second_fd, FdEntry::with_cloexec(second, cloexec));
+        Ok((first_fd, second_fd))
+    }
+
+    // AGENT: expose a compatibility FLike view without direct table mutation.
+    pub fn get_file(&self, fd: usize) -> Option<FLike> {
+        self.process
+            .files
+            .lock()
+            .unwrap()
+            .get(&fd)
+            .map(FdEntry::as_flike)
+    }
+
+    // AGENT: clone an entry while preserving shared open-description semantics.
+    pub fn get_fd_entry(&self, fd: usize) -> Option<FdEntry> {
+        self.process.files.lock().unwrap().get(&fd).cloned()
+    }
+
+    // AGENT: snapshot stdio descriptors with cloexec, status, offset, and sharing.
+    pub fn snapshot_checkpoint_fds(&self) -> Result<Vec<SavedFdEntry>, &'static str> {
+        let files = self.process.files.lock().unwrap();
+        let mut descriptions: Vec<(FdEntry, u32)> = Vec::new();
+        let mut saved = Vec::with_capacity(files.len());
+        for (&fd, entry) in files.iter() {
+            let kind = checkpoint_fd_kind(fd)?;
+            if !entry.is_regular_file() {
+                return Err("enotsup");
+            }
+            let description_id = checkpoint_description_id(entry, &mut descriptions)?;
+            saved.push(SavedFdEntry {
+                fd: u32::try_from(fd).map_err(|_| "einval")?,
+                description_id,
+                cloexec: entry.is_cloexec(),
+                status_flags: u32::try_from(entry.status_flags_bits()).map_err(|_| "einval")?,
+                kind,
+                offset: entry.offset(),
+            });
+        }
+        Ok(saved)
+    }
+
+    // AGENT: restore stdio descriptors and reconstruct shared description ids.
+    pub fn restore_checkpoint_fds(&self, fds: &[SavedFdEntry]) -> Result<(), &'static str> {
+        let mut restored = BTreeMap::new();
+        let mut descriptions: BTreeMap<u32, FdEntry> = BTreeMap::new();
+        for saved in fds {
+            let fd = usize::try_from(saved.fd).map_err(|_| "einval")?;
+            if fd >= MAX_FD || restored.contains_key(&fd) {
+                return Err("ebadf");
+            }
+            let entry = if let Some(template) = descriptions.get(&saved.description_id) {
+                template.dup(saved.cloexec)
+            } else {
+                let (instance, status) = checkpoint_stdio_instance(saved.kind, saved.status_flags)?;
+                let entry = FdEntry::with_status(
+                    FLike::File(FHandle::new(instance)),
+                    status,
+                    saved.cloexec,
+                );
+                entry.seek(FSeek::Start(saved.offset))?;
+                descriptions.insert(saved.description_id, entry.clone());
+                entry
+            };
+            restored.insert(fd, entry);
+        }
+
+        let mut free_fds = ProcessState::initial_free_fds();
+        for fd in restored.keys() {
+            free_fds.remove(fd);
+        }
+        *self.process.files.lock().unwrap() = restored;
+        *self.process.free_fds.lock().unwrap() = free_fds;
+        Ok(())
+    }
+
+    // AGENT: remove one descriptor and collect epoll unsubscriptions for later.
+    fn remove_fd_locked(
+        files: &mut BTreeMap<usize, FdEntry>,
+        fd: usize,
+    ) -> Result<FdCloseCleanup, &'static str> {
+        let closed_entry = files.remove(&fd).ok_or("ebadf")?;
+
+        let mut closed_fd_source_subs = Vec::new();
+        for entry in files.values() {
+            if let Some(epoll) = entry.epoll_instance() {
+                if let Some(sub_id) = epoll.remove_closed_fd(fd) {
+                    closed_fd_source_subs.push(sub_id);
+                }
+            }
+        }
+
+        let mut epoll_source_subs = Vec::new();
+        let still_open = files
+            .values()
+            .any(|entry| entry.same_open_description(&closed_entry));
+        if !still_open {
+            if let Some(epoll) = closed_entry.epoll_instance() {
+                for (watched_fd, sub_id) in epoll.drain_source_subs_on_close() {
+                    if let Some(source) = files.get(&watched_fd).cloned() {
+                        epoll_source_subs.push((source, sub_id));
+                    }
+                }
+            }
+        }
+
+        Ok(FdCloseCleanup {
+            closed_entry,
+            closed_fd_source_subs,
+            epoll_source_subs,
+        })
+    }
+
+    // AGENT: close an fd, detach epoll registrations, and drop it after unlock.
+    pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
+        if fd >= MAX_FD {
+            return Err("ebadf");
+        }
+
+        let cleanup = {
+            let mut files = self.process.files.lock().unwrap();
+            let cleanup = Self::remove_fd_locked(&mut files, fd)?;
+            self.process.free_fds.lock().unwrap().insert(fd);
+            cleanup
+        };
+
+        cleanup.run();
+        Ok(())
+    }
+
+    // AGENT: duplicate an entry onto the lowest available descriptor.
+    pub fn dup_fd(&self, old_fd: usize, cloexec: bool) -> Result<usize, &'static str> {
+        self.dup_fd_from(old_fd, 0, cloexec)
+    }
+
+    // AGENT: duplicate an entry at or above the requested lower bound.
+    pub fn dup_fd_from(
+        &self,
+        old_fd: usize,
+        start: usize,
+        cloexec: bool,
+    ) -> Result<usize, &'static str> {
+        let mut files = self.process.files.lock().unwrap();
+        let entry = files.get(&old_fd).cloned().ok_or("ebadf")?;
+        let new_entry = entry.dup(cloexec);
+        let mut free_fds = self.process.free_fds.lock().unwrap();
+        let new_fd = Self::reserve_fd_from_locked(&mut free_fds, start)?;
+        files.insert(new_fd, new_entry);
+        Ok(new_fd)
+    }
+
+    // AGENT: replace a dup2 target through the same epoll-aware close path.
+    pub fn dup2_fd(&self, old_fd: usize, new_fd: usize) -> Result<usize, &'static str> {
+        if old_fd >= MAX_FD || new_fd >= MAX_FD {
+            return Err("ebadf");
+        }
+        let cleanup = {
+            let mut files = self.process.files.lock().unwrap();
+            let entry = files.get(&old_fd).cloned().ok_or("ebadf")?;
+            if old_fd == new_fd {
+                return Ok(new_fd);
+            }
+            let cleanup = if files.contains_key(&new_fd) {
+                Some(Self::remove_fd_locked(&mut files, new_fd)?)
+            } else {
+                None
+            };
+            files.insert(new_fd, entry.dup(false));
+            self.process.free_fds.lock().unwrap().remove(&new_fd);
+            cleanup
+        };
+        if let Some(cleanup) = cleanup {
+            cleanup.run();
+        }
+        Ok(new_fd)
+    }
+
+    // AGENT: update per-descriptor close-on-exec state without changing the OFD.
+    pub fn set_cloexec(&self, fd: usize, val: bool) -> Result<(), &'static str> {
+        let mut files = self.process.files.lock().unwrap();
+        let entry = files.get_mut(&fd).ok_or("ebadf")?;
+        entry.set_cloexec(val);
+        Ok(())
+    }
+}
