@@ -2,7 +2,7 @@
 // metadata management.
 use alloc::sync::Arc;
 
-use super::{copy_page, AllocatorState, FramePool, Mutex, PAGE_SZ};
+use super::{copy_page, FramePool, FramePoolState, Mutex, PAGE_SZ};
 
 // AGENT: PgFrame is the RAII mapping handle for a physical frame; cloning it
 // represents another PTE sharing that frame.
@@ -11,10 +11,11 @@ pub struct PgFrame {
     inner: Arc<PgFrameInner>,
 }
 
-// AGENT: return the frame to its pool when the final PgFrame mapping handle drops.
+// AGENT: return the frame to the dedicated physical-frame bitmap when the final
+// PgFrame mapping handle drops.
 struct PgFrameInner {
     id: usize,
-    allocator: Arc<Mutex<AllocatorState>>,
+    state: Arc<Mutex<FramePoolState>>,
     base_paddr: usize,
 }
 
@@ -23,13 +24,13 @@ impl PgFrame {
     // AGENT: construct a frame handle only for a slot already reserved by FramePool.
     pub(crate) fn from_allocated(
         id: usize,
-        allocator: Arc<Mutex<AllocatorState>>,
+        state: Arc<Mutex<FramePoolState>>,
         base_paddr: usize,
     ) -> Self {
         Self {
             inner: Arc::new(PgFrameInner {
                 id,
-                allocator,
+                state,
                 base_paddr,
             }),
         }
@@ -64,7 +65,7 @@ impl PgFrame {
 // violations instead of silently accepting invalid or duplicate releases.
 impl Drop for PgFrameInner {
     fn drop(&mut self) {
-        let released = self.allocator.lock().unwrap().release(self.id);
+        let released = self.state.lock().unwrap().release_one(self.id);
         assert!(
             released,
             "PgFrame {} was released twice or was never allocated",

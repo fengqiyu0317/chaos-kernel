@@ -21,8 +21,9 @@
 - `kernel-qemu/src/heap.rs` 改为两阶段 allocator：early 阶段继续使用 `sheap..eheap` bump；live 阶段的每次分配都按需申请一段连续物理页，并返回 direct-map 页首地址。
 - 按用户当前需求删除 slab、size class、`SlabPage` 和 `AllocHeader`；`GlobalAlloc::dealloc` 直接使用原指针和调用者必须传回的 `Layout` 重建页数，再将完整物理区间返回 `FramePool`。
 - `kernel-qemu/src/main.rs` 调整启动顺序为 early heap、FramePool、kernel Sv39/direct map、动态堆接管；删除 `KHEAP_SZ` 连续物理堆预留。固件和链接内核占用的启动页改用普通 `alloc_pg_frames()` 获取，并由全局 `BOOT_RESERVED_FRAMES` 保存 RAII 句柄。
-- `kernel-qemu/src/allocator.rs` 将回收 id 的 `BTreeSet` 改为初始化时建立的位图，并让 batch 调用者在加锁前准备输出 `Vec`，避免全局堆缺页路径递归进入自身。
-- `kernel-qemu/src/mm/alloc.rs` 增加动态连续页获取/原子归还接口，并删除不返回所有权句柄的 `reserve_contiguous_pages()`；`kernel-qemu/src/mm/tests.rs` 验证动态 heap span 能归还，以及启动页句柄存活期内不会被重用。
+- `kernel-qemu/src/allocator.rs` 恢复原有 `BTreeSet` 回收 id 实现，只服务文件块等上层资源；`FramePool` 不再使用通用 `AllocatorState`。同时删除分层后无调用者的连续分配、batch 分配和 `free_count` 接口。
+- `kernel-qemu/src/mm/alloc.rs` 新增 FramePool 专用的固定 `Box<[usize]>` 位图状态，在 early heap 阶段一次性建立；物理帧单页、batch、连续区间的 claim/release 以及 `PgFrame::drop` 均不再触发全局堆分配。同时保留动态连续页获取/原子归还接口，并删除不返回所有权句柄的 `reserve_contiguous_pages()`。
+- `kernel-qemu/src/mm/tests.rs` 验证动态 heap span 能归还、启动页句柄存活期内不会被重用，以及物理帧数不是机器字位数整倍时位图尾部不会泄露无效帧。
 - heap smoke 覆盖 `Vec`、`Box`、`BTreeMap`、`Arc`、跨页大块和 8 KiB 对齐分配，验证简化后临时占用的 17 页全部归还。
 
 测试结果：

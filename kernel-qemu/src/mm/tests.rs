@@ -9,6 +9,7 @@ pub fn run_all() {
     rotate_bits_masks_zero_distance_rotation();
     hash_combine_mixes_zero_values();
     frame_pool_tracks_total_and_free_pages();
+    frame_pool_bitmap_handles_partial_final_word();
     frame_pool_reclaims_dynamic_heap_pages();
     vm_region_and_map_preserve_range_semantics();
     buddy_allocator_alloc_free_smoke();
@@ -95,6 +96,23 @@ fn frame_pool_tracks_total_and_free_pages() {
     assert_eq!(pool.free_count(), 6);
     drop(boot_frames);
     assert_eq!(pool.free_count(), 8);
+}
+
+// AGENT: a fixed physical-frame bitmap must expose exactly `cap` frames even
+// when its final machine word contains unused tail bits.
+#[cfg_attr(test, test)]
+fn frame_pool_bitmap_handles_partial_final_word() {
+    let pages = usize::BITS as usize + 1;
+    let pool = FramePool::new(pages, MEM_OFF);
+    let frames = pool.alloc_pg_frames(pages).unwrap();
+
+    assert_eq!(frames.first().map(|frame| frame.id()), Some(0));
+    assert_eq!(frames.last().map(|frame| frame.id()), Some(pages - 1));
+    assert_eq!(pool.free_count(), 0);
+    assert!(pool.alloc_pg_frame().is_none());
+
+    drop(frames);
+    assert_eq!(pool.free_count(), pages);
 }
 
 // AGENT: dynamic heap spans use the shared frame state and return their complete
