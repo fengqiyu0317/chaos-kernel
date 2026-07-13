@@ -50,6 +50,10 @@ const QEMU_VIRT_RAM_END: usize = 0x8800_0000;
 // satp still points at them.
 static KERNEL_PAGE_TABLE: IrqOnceCell<kernel::PageTable> = IrqOnceCell::new();
 
+// AGENT: retain RAII ownership of every firmware and linked-kernel frame for
+// the complete boot lifetime so ordinary FramePool allocation cannot reuse it.
+static BOOT_RESERVED_FRAMES: IrqOnceCell<Vec<kernel::PgFrame>> = IrqOnceCell::new();
+
 // AGENT: optional first-stage init ELF installed as the normal /bin/init file.
 // Keep this empty until a real RISC-V user ELF is produced.
 const ROOT_INIT_ELF: &[u8] = &[];
@@ -59,11 +63,13 @@ const ROOT_INIT_ELF: &[u8] = &[];
 pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     clear_bss();
     heap::init();
-    let frame_pool = init_qemu_frame_pool();
-    kernel::kernel_core::init_timer_wheel();
+    let frame_pool = Arc::new(init_qemu_frame_pool());
+    install_kernel_page_table(frame_pool.as_ref());
+    heap::promote(frame_pool.clone());
 
     println!("[kernel-qemu] boot hart={} dtb={:#x}", hartid, dtb_pa);
     heap::smoke_check();
+    kernel::kernel_core::init_timer_wheel();
     #[cfg(feature = "qemu-mm-selftest")]
     {
         println!("[kernel-qemu] mm bits selftest start");
@@ -85,7 +91,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         kernel::proc::sched::tests::run_all();
         println!("[kernel-qemu] sched selftest passed");
     }
-    let kernel = init_qemu_kernel_backend(frame_pool);
+    let kernel = init_qemu_kernel_backend(frame_pool.as_ref().clone());
     // AGENT: run ProcInit stack-writing checks only after the real QEMU frame
     // pool and direct map are installed.
     #[cfg(feature = "qemu-proc-selftest")]
@@ -132,7 +138,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
 // AGENT: Install a leaked Kernel as the QEMU scheduler/timer backend so real
 // timer interrupts can drive migrated Kernel::schedule_tick() state.
 fn init_qemu_kernel_backend(frame_pool: kernel::FramePool) -> &'static kernel::Kernel {
-    install_kernel_page_table(&frame_pool);
     let root_block = Arc::new(kernel::RamBlockDevice::empty());
     let kernel = Box::leak(Box::new(kernel::Kernel::new_with_block_device(
         frame_pool, root_block,
@@ -185,34 +190,33 @@ fn install_kernel_page_table(frame_pool: &kernel::FramePool) {
     );
 }
 
-// AGENT: account for the complete QEMU RAM span in FramePool, keep firmware and
-// linked boot memory reserved, then claim the post-bootstrap heap from free
-// physical frames before ordinary alloc users run.
+// AGENT: account for the complete QEMU RAM span in FramePool, retain ordinary
+// PgFrame handles for firmware plus the linked boot image, and leave later
+// pages available to the live heap after the direct map is active.
 fn init_qemu_frame_pool() -> kernel::FramePool {
     let total_pages = (QEMU_VIRT_RAM_END - QEMU_VIRT_RAM_START) / kernel::PAGE_SZ;
     let pool = kernel::FramePool::new(total_pages, QEMU_VIRT_RAM_START);
     let kernel_end = align_up_page(core::ptr::addr_of!(ekernel) as usize);
     let boot_reserved_pages = (kernel_end - QEMU_VIRT_RAM_START) / kernel::PAGE_SZ;
-    let boot_reserved_start = pool
-        .reserve_contiguous_pages(boot_reserved_pages, 1)
+    let boot_reserved_frames = pool
+        .alloc_pg_frames(boot_reserved_pages)
         .expect("QEMU RAM should contain the firmware and linked kernel");
-    assert_eq!(boot_reserved_start, QEMU_VIRT_RAM_START);
-    assert_eq!(kernel::KHEAP_SZ % kernel::PAGE_SZ, 0);
-    let heap_pages = kernel::KHEAP_SZ / kernel::PAGE_SZ;
-    let heap_start = pool
-        .reserve_contiguous_pages(heap_pages, 1)
-        .expect("QEMU RAM should contain a contiguous kernel heap");
-    assert_eq!(heap_start, kernel_end);
-    heap::promote(heap_start, kernel::KHEAP_SZ);
+    assert!(
+        boot_reserved_frames
+            .iter()
+            .enumerate()
+            .all(|(id, frame)| frame.id() == id),
+        "fresh FramePool should allocate the boot prefix first"
+    );
+    if BOOT_RESERVED_FRAMES.init(boot_reserved_frames).is_err() {
+        panic!("QEMU boot frames retained more than once");
+    }
     println!(
-        "[kernel-qemu] frame pool ready base={:#x} end={:#x} boot_reserved_pages={} heap_pages={} free_pages={} heap={:#x}..{:#x}",
+        "[kernel-qemu] frame pool ready base={:#x} end={:#x} boot_reserved_pages={} free_pages={}",
         QEMU_VIRT_RAM_START,
         QEMU_VIRT_RAM_END,
         boot_reserved_pages,
-        heap_pages,
         pool.free_count(),
-        heap_start,
-        heap_start + kernel::KHEAP_SZ,
     );
     pool
 }

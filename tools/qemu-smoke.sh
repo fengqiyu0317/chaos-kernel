@@ -23,7 +23,11 @@ timeout 15s qemu-system-riscv64 \
     -kernel "$KERNEL" 2>&1 | tee "$LOG"
 
 grep -F "[kernel-qemu] boot" "$LOG"
+# AGENT: keep the ordinary boot gate sensitive to fixed-arena regressions and
+# page leaks in the post-bootstrap global allocator.
+grep -F "[kernel-qemu] dynamic heap ready" "$LOG"
 grep -F "[kernel-qemu] heap alloc smoke" "$LOG"
+grep -F "[kernel-qemu] heap reclaim smoke passed" "$LOG"
 grep -F "[kernel-qemu] timer tick observed" "$LOG"
 grep -F "[kernel-qemu] timer wheel target observed" "$LOG"
 grep -F "[kernel-qemu] shutdown" "$LOG"

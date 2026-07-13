@@ -9,7 +9,7 @@ pub fn run_all() {
     rotate_bits_masks_zero_distance_rotation();
     hash_combine_mixes_zero_values();
     frame_pool_tracks_total_and_free_pages();
-    frame_pool_reserves_kernel_heap_pages();
+    frame_pool_reclaims_dynamic_heap_pages();
     vm_region_and_map_preserve_range_semantics();
     buddy_allocator_alloc_free_smoke();
     buddy_free_merges_with_nonzero_base();
@@ -62,12 +62,17 @@ fn hash_combine_mixes_zero_values() {
     assert_ne!(hash_combine(hash_combine(0, 0), 1), hash_combine(0, 1));
 }
 
-// AGENT: FramePool permanently claims boot pages through the shared allocator,
-// exposes only RAII frame ownership, and rolls incomplete batches back.
+// AGENT: FramePool retains allocated pages through RAII handles and rolls
+// incomplete batches back without needing a separate permanent reservation API.
 #[cfg_attr(test, test)]
 fn frame_pool_tracks_total_and_free_pages() {
     let pool = FramePool::new(8, MEM_OFF);
-    assert_eq!(pool.reserve_contiguous_pages(2, 1), Some(MEM_OFF));
+    let boot_frames = pool.alloc_pg_frames(2).unwrap();
+    let boot_frame_ids = boot_frames
+        .iter()
+        .map(|frame| frame.id())
+        .collect::<Vec<_>>();
+    assert_eq!(boot_frame_ids.as_slice(), &[0, 1]);
 
     assert_eq!(pool.total_pages(), 8);
     assert_eq!(pool.free_count(), 6);
@@ -88,22 +93,35 @@ fn frame_pool_tracks_total_and_free_pages() {
     assert_eq!(pool.free_count(), 3);
     drop(frames);
     assert_eq!(pool.free_count(), 6);
+    drop(boot_frames);
+    assert_eq!(pool.free_count(), 8);
 }
 
-// AGENT: permanent kernel arenas must claim usable physical pages through the
-// same FramePool and must never become constructible as PgFrame handles.
+// AGENT: dynamic heap spans use the shared frame state and return their complete
+// ownership range instead of permanently reserving one boot arena.
 #[cfg_attr(test, test)]
-fn frame_pool_reserves_kernel_heap_pages() {
+fn frame_pool_reclaims_dynamic_heap_pages() {
     let pool = FramePool::new(8, MEM_OFF);
-    let heap = pool.reserve_contiguous_pages(2, 2).unwrap();
+    let heap = pool.alloc_contiguous_pages(2, 2).unwrap();
     assert_eq!(heap, MEM_OFF);
     assert_eq!(pool.free_count(), 6);
     assert!(pool.get_pg_frame(0).is_none());
     assert!(pool.get_pg_frame(1).is_none());
+    assert!(pool.release_contiguous_pages(heap, 2));
+    assert_eq!(pool.free_count(), 8);
+
+    let frame = pool.get_pg_frame(0).unwrap();
+    assert_eq!(pool.free_count(), 7);
+    drop(frame);
+    assert_eq!(pool.free_count(), 8);
+
+    let heap = pool.alloc_contiguous_pages(2, 2).unwrap();
     let frame = pool.get_pg_frame(2).unwrap();
     assert_eq!(pool.free_count(), 5);
     drop(frame);
     assert_eq!(pool.free_count(), 6);
+    assert!(pool.release_contiguous_pages(heap, 2));
+    assert_eq!(pool.free_count(), 8);
 }
 
 // AGENT: keep the buddy smoke check in the MM helper tests and call it from

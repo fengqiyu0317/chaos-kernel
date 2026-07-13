@@ -1,6 +1,6 @@
 # Chaos 项目交接状态
 
-更新日期：2026-07-11
+更新日期：2026-07-13
 
 ## 目标
 
@@ -55,6 +55,7 @@
 - 2026-06-30：`kernel-qemu` 的迁入地址空间已新增最小 Sv39 helper：`PageTableEntry` 不再保存 `SharedPage` / resident `Vec<u8>` 页面内容，而是保存真实 `PgFrame` metadata；`map_region()` / `map_file_region()` 会建立 Sv39 leaf PTE，`read_user_bytes()` / `write_user_bytes()` 通过页表翻译和物理页 copy 访问用户页。当前仍未开启全局分页，也未完成 trap 级 COW/page fault recovery。
 - 2026-07-11：`kernel-qemu` 已将 ELF 解析从 `fs/elf_loader.rs` 移入 `proc/elf.rs`，并新增 `proc/user_image.rs` 统一承担 `PT_LOAD` 映射、文件段复制、BSS 零填充、最终权限、用户栈和 `brk` 初始化；`new_user_task()` 与 `exec` 现在共用 `prepare_user_image()`，并新增 QEMU proc selftest 覆盖该公共路径。
 - 2026-07-11：`kernel-qemu` ELF loader 已支持多个 `PT_LOAD` 共享同一虚拟页；`parse_elf()` 按页聚合覆盖范围和权限，`prepare_user_image()` 每页只映射一次，再逐段复制文件内容、清零 BSS，最后按覆盖段权限并集统一 `protect()`。
+- 2026-07-13：`kernel-qemu` 全局堆已从“启动时永久预留连续 8 MiB 物理区间”改为两阶段模型：linker `sheap..eheap` 只负责构造 `FramePool` / Sv39 direct map 前的 early bump 自举；direct map 启用后，`GlobalAlloc` 的每次分配按页向共享 `FramePool` 申请连续区间，释放时依据原指针和 `Layout` 把完整区间归还。当前刻意不实现 slab 或每对象 header，以小对象至少占一页为代价保持实现简单。`AllocatorState` 的回收集合同步改为预分配位图，避免全局堆向 `FramePool` 要页时因 `BTreeSet` 再次分配而递归。
 
 ## 关键文件
 
@@ -79,7 +80,7 @@
 - `chaos/kernel-qemu/src/trap.rs`：kernel/user trap vector 安装、trap frame helper、早期 trap 分发和 page fault / illegal instruction 结构化失败诊断。
 - `chaos/kernel-qemu/src/syscall.rs`：RISC-V `a7` / `a0..a5` syscall ABI 解码、`kernel-sim` 风格内部 syscall 编号映射和返回值写回。
 - `chaos/kernel-qemu/src/semantics.rs`：M9 第一批 `read` / `write` / `exit` / `getpid` 最小 syscall 语义入口，后续替换为迁移后的 `kernel-sim` 进程、fd 和用户内存语义。
-- `chaos/kernel-qemu/src/heap.rs`：M9 early global heap，提供 `alloc` crate 的早期 bump allocator、自检和 OOM handler。
+- `chaos/kernel-qemu/src/heap.rs`：M9 两阶段 global heap，提供 linker early bump 自举、FramePool 按分配独占连续页、页级回收、自检和 OOM handler。
 - `chaos/kernel-qemu/linker-qemu.ld`：预留 `sheap..eheap` early heap 区间，并让 `ekernel` 位于该保留区之后。
 - `chaos/kernel-qemu/src/mm/sv39.rs`：最小 Sv39 page-table walk / map / unmap / translate helper 和物理页 copy/zero helper。
 - `chaos/kernel-qemu/src/mm/address_space.rs`：迁入地址空间的 VMA、PTE metadata、真实 frame 映射、COW metadata 和 usercopy 入口。
@@ -89,6 +90,21 @@
 - `chaos/kernel/src/kernel.rs`：禁止修改的原始内核文件。
 
 ## 测试结果
+
+本次 M9 动态内核堆修改后执行过：
+
+```bash
+cd kernel-qemu
+cargo check --target riscv64gc-unknown-none-elf
+cargo check --target riscv64gc-unknown-none-elf --all-features
+cargo build --release --features qemu-selftest
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check
+```
+
+结果：普通 target check、all-features target check 和 release selftest build 均通过；`tools/qemu-smoke.sh` 通过并输出 `dynamic heap ready ... owned_pages=0`、`heap reclaim smoke passed free_pages=31791` 和正常 shutdown。`qemu-selftest` 组合启动也通过，依次完成 MM、sync、sched、proc、fs syscall、checkpoint 自检后 shutdown；简化后的堆 smoke 中临时占用的 17 页在对象释放后全部归还，`owned_pages` 回到 0，未再启动时固定占用连续 8 MiB。
 
 本次 M9 MM/Sv39 地址空间修改后执行过：
 

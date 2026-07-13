@@ -5,6 +5,7 @@ use super::{AllocatorState, Mutex, PgFrame, PAGE_SZ};
 
 // AGENT: share the complete bounded frame allocator state with PgFrame so
 // final-owner drops can return ids without parallel limit bookkeeping.
+#[derive(Clone)]
 pub struct FramePool {
     pub(crate) allocator: Arc<Mutex<AllocatorState>>,
     pub(crate) cap: usize,
@@ -12,8 +13,8 @@ pub struct FramePool {
 }
 
 impl FramePool {
-    // AGENT: put the complete RAM span under one allocator; the boot path then
-    // permanently claims firmware, linked-kernel, and heap ranges from it.
+    // AGENT: put the complete RAM span under one allocator; boot-held frames,
+    // page-backed heap spans, page tables, and user pages share this state.
     pub fn new(n: usize, base_paddr: usize) -> Self {
         Self {
             allocator: Arc::new(Mutex::new(AllocatorState::new(0, n))),
@@ -22,15 +23,25 @@ impl FramePool {
         }
     }
 
-    // AGENT: permanently claim a physically contiguous run through the same
-    // allocator as PgFrame; no PgFrame handle exists to release this boot range.
-    pub fn reserve_contiguous_pages(&self, count: usize, align_pages: usize) -> Option<usize> {
+    // AGENT: allocate one temporary contiguous run for the direct-mapped heap.
+    pub fn alloc_contiguous_pages(&self, count: usize, align_pages: usize) -> Option<usize> {
         let first = self
             .allocator
             .lock()
             .unwrap()
             .allocate_contiguous(0, count, align_pages)?;
         self.frame_id_to_paddr(first)
+    }
+
+    // AGENT: return one page-backed heap allocation to the shared frame pool.
+    pub fn release_contiguous_pages(&self, paddr: usize, count: usize) -> bool {
+        let Some(first) = self.paddr_to_frame_id(paddr) else {
+            return false;
+        };
+        self.allocator
+            .lock()
+            .unwrap()
+            .release_contiguous(first, count)
     }
 
     // AGENT: map a frame id back to the physical address owned by this pool.
@@ -88,7 +99,11 @@ impl FramePool {
     // AGENT: return batch ownership only through PgFrame handles; a partial
     // allocation is dropped here so callers observe all-or-nothing semantics.
     pub fn alloc_pg_frames(&self, count: usize) -> Option<Vec<PgFrame>> {
-        let ids = self.allocator.lock().unwrap().allocate_batch(count);
+        let mut ids = Vec::with_capacity(count);
+        self.allocator
+            .lock()
+            .unwrap()
+            .allocate_batch_into(count, &mut ids);
         let frames: Vec<PgFrame> = ids
             .into_iter()
             .map(|id| self.pg_frame_from_allocated(id))

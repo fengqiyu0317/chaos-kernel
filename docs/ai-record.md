@@ -1,6 +1,6 @@
 # Chaos AI 工作日志
 
-更新时间：2026-06-27
+更新时间：2026-07-13
 
 ## 维护约定
 
@@ -11,6 +11,40 @@
   - `/home/huawei/.codex/sessions/2026/06/18/rollout-2026-06-18T23-57-15-019edb73-6ad9-7b23-8162-c76a589a57a9.jsonl`
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
+
+## 2026-07-13：kernel-qemu 可回收页级内核堆
+
+目标：保留必要的 linker early heap 自举，但移除启动时永久占用连续 8 MiB 物理内存的内核堆；在 Sv39 direct map 启用后，让 `GlobalAlloc` 按需从现有 `FramePool` 获取和归还物理页。
+
+已完成修改：
+
+- `kernel-qemu/src/heap.rs` 改为两阶段 allocator：early 阶段继续使用 `sheap..eheap` bump；live 阶段的每次分配都按需申请一段连续物理页，并返回 direct-map 页首地址。
+- 按用户当前需求删除 slab、size class、`SlabPage` 和 `AllocHeader`；`GlobalAlloc::dealloc` 直接使用原指针和调用者必须传回的 `Layout` 重建页数，再将完整物理区间返回 `FramePool`。
+- `kernel-qemu/src/main.rs` 调整启动顺序为 early heap、FramePool、kernel Sv39/direct map、动态堆接管；删除 `KHEAP_SZ` 连续物理堆预留。固件和链接内核占用的启动页改用普通 `alloc_pg_frames()` 获取，并由全局 `BOOT_RESERVED_FRAMES` 保存 RAII 句柄。
+- `kernel-qemu/src/allocator.rs` 将回收 id 的 `BTreeSet` 改为初始化时建立的位图，并让 batch 调用者在加锁前准备输出 `Vec`，避免全局堆缺页路径递归进入自身。
+- `kernel-qemu/src/mm/alloc.rs` 增加动态连续页获取/原子归还接口，并删除不返回所有权句柄的 `reserve_contiguous_pages()`；`kernel-qemu/src/mm/tests.rs` 验证动态 heap span 能归还，以及启动页句柄存活期内不会被重用。
+- heap smoke 覆盖 `Vec`、`Box`、`BTreeMap`、`Arc`、跨页大块和 8 KiB 对齐分配，验证简化后临时占用的 17 页全部归还。
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo check --target riscv64gc-unknown-none-elf
+cargo check --target riscv64gc-unknown-none-elf --all-features
+cargo build --release --features qemu-selftest
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check
+```
+
+结果：全部通过。普通 QEMU smoke 输出 `dynamic heap ready ... owned_pages=0`、`heap reclaim smoke passed free_pages=31791`、timer tick 和 shutdown；`qemu-selftest` 组合运行通过 MM、sync、sched、proc、fs syscall、checkpoint 全部自检后 shutdown。
+
+当前边界：
+
+- 每个动态堆对象至少独占一个物理页，小对象空间利用率较低；当前仍要求单次分配的物理页连续，这是本阶段为保持简单而接受的边界。
+- 用户态 `VmMap::brk` 仍是独立的进程地址空间语义，不参与内核 `GlobalAlloc`。
+- 未修改 `kernel-sim/` 和禁止修改的 `kernel/src/kernel.rs`。
 
 ## 2026-06-18：kernel-sim 阶段状态
 
