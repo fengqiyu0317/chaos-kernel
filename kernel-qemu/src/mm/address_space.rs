@@ -1,96 +1,11 @@
 // AGENT
 use super::*;
-
-// AGENT: QEMU PTE metadata keeps current hardware leaf state while VmRegion
-// remains the single source of VM flags.
-pub struct PageTableEntry {
-    pub frame: SharedPage,
-    pub pte_flags: usize,
-    pub cow: bool,
-}
-
-impl PageTableEntry {
-    // AGENT: default page-table entries are anonymous zero-filled pages.
-    pub fn new(frame: PgFrame, flags: u32) -> Self {
-        Self {
-            frame: SharedPage::new(frame),
-            pte_flags: vm_flags_to_pte_flags(flags),
-            cow: false,
-        }
-    }
-
-    // AGENT: attach an existing shared physical page without enabling COW.
-    fn from_shared(frame: SharedPage, flags: u32) -> Self {
-        Self {
-            frame,
-            pte_flags: vm_flags_to_pte_flags(flags),
-            cow: false,
-        }
-    }
-
-    fn as_cow(&mut self) {
-        self.cow = true;
-        self.pte_flags = pte_flags_without_write(self.pte_flags);
-    }
-
-    // AGENT: resolve COW frame ownership and restore write permissions from the
-    // owning VmRegion flags instead of keeping a duplicate PTE-side copy.
-    fn resolve_write(&mut self, flags: u32, pool: &FramePool) -> Result<usize, &'static str> {
-        let paddr = self.frame.fault(pool)?;
-        self.pte_flags = vm_flags_to_pte_flags(flags);
-        self.cow = false;
-        Ok(paddr)
-    }
-
-    // AGENT: update only hardware-facing leaf flags; VmRegion owns VM flags.
-    fn set_flags(&mut self, flags: u32) {
-        self.pte_flags = vm_flags_to_pte_flags(flags);
-        if self.cow {
-            self.pte_flags = pte_flags_without_write(self.pte_flags);
-        }
-    }
-
-    // AGENT: derive current direct-write access from the Sv39 leaf flags instead
-    // of storing a duplicate software boolean.
-    fn is_writable(&self) -> bool {
-        self.pte_flags & PTE_W != 0
-    }
-
-    pub fn frame_id(&self) -> usize {
-        self.frame.frame_id()
-    }
-
-    // AGENT: clone only when a new PTE mapping should share the same frame.
-    fn clone_mapping(&self) -> Self {
-        Self {
-            frame: self.frame.clone(),
-            pte_flags: self.pte_flags,
-            cow: self.cow,
-        }
-    }
-}
-
-// AGENT: store software resident-page metadata separately from the real Sv39
-// page table so the BTreeMap is not mistaken for hardware page-table storage.
-struct ResidentPageTable {
-    entries: Mutex<BTreeMap<usize, PageTableEntry>>,
-}
-
-impl ResidentPageTable {
-    // AGENT: initialize the software resident-page table independently of VmMap
-    // and Sv39 root allocation.
-    fn new() -> Self {
-        Self {
-            entries: Mutex::new(BTreeMap::new()),
-        }
-    }
-
-    // AGENT: atomically detach all resident metadata before dropping pages.
-    fn take_all(&self) -> BTreeMap<usize, PageTableEntry> {
-        let mut entries = self.entries.lock().unwrap();
-        mem::take(&mut *entries)
-    }
-}
+// AGENT: import resident page-table metadata from its dedicated module so this
+// file only coordinates address-space operations.
+use super::page_table::{pte_flags_without_write, vm_flags_to_pte_flags, ResidentPageTable};
+// AGENT: preserve the former address_space::PageTableEntry API after moving its
+// implementation into the dedicated page_table module.
+pub use super::page_table::PageTableEntry;
 
 // AGENT: coordinate VmMap, resident page metadata, and the owned Sv39 page table
 // without storing page-table implementation fields directly on AddrSpace.
@@ -680,33 +595,4 @@ fn page_range(base: usize, len: usize) -> impl Iterator<Item = usize> {
 // they are used to allocate or write restored memory.
 fn checked_u64_to_usize(value: u64) -> Result<usize, &'static str> {
     usize::try_from(value).map_err(|_| "einval")
-}
-
-// AGENT: translate migrated VM flags into legal Sv39 leaf permissions while
-// keeping PROT_NONE pages non-user and VM_WRITE leaves hardware-legal.
-fn vm_flags_to_pte_flags(flags: u32) -> usize {
-    let can_read = flags & VM_READ != 0;
-    let can_write = flags & VM_WRITE != 0;
-    let can_exec = flags & VM_EXEC != 0;
-
-    if !can_read && !can_write && !can_exec {
-        return PTE_A | PTE_R;
-    }
-
-    let mut pte_flags = PTE_A | PTE_U;
-    if can_read {
-        pte_flags |= PTE_R;
-    }
-    if can_write {
-        pte_flags |= PTE_R | PTE_W | PTE_D;
-    }
-    if can_exec {
-        pte_flags |= PTE_X;
-    }
-    pte_flags
-}
-
-// AGENT: strip write/dirty bits when software COW owns the next write fault.
-fn pte_flags_without_write(flags: usize) -> usize {
-    flags & !(PTE_W | PTE_D)
 }
