@@ -30,40 +30,20 @@ pub fn rotate_bits(value: u64, amount: u32, width: u32) -> u64 {
     ((v << actual) | (v >> (width - actual))) & mask
 }
 
-// AGENT: use the core integer primitive instead of maintaining a handwritten
-// SWAR popcount implementation.
-pub fn popcount64(v: u64) -> u32 {
-    v.count_ones()
-}
-
-// AGENT: use the core integer primitive instead of maintaining a handwritten
-// leading-zero scan.
-pub fn clz64(v: u64) -> u32 {
-    v.leading_zeros()
-}
-
-// AGENT: return the zero-based index of the least significant set bit; this is
-// not the C/POSIX one-based ffs() convention.
-pub fn ffs64(v: u64) -> Option<u32> {
-    if v == 0 {
-        return None;
-    }
-    Some(v.trailing_zeros())
-}
-
-pub fn align_up(addr: usize, align: usize) -> usize {
+// AGENT: report invalid alignments and arithmetic overflow to callers instead
+// of returning the unaligned input as if alignment had succeeded.
+pub fn checked_align_up(addr: usize, align: usize) -> Option<usize> {
     if !align.is_power_of_two() {
-        return addr;
+        return None;
     }
     addr.checked_add(align - 1)
         .map(|value| value & !(align - 1))
-        .unwrap_or(addr)
 }
 
+// AGENT: centralize power-of-two address flooring while treating a bad
+// alignment as an internal caller error rather than silently accepting it.
 pub fn align_down(addr: usize, align: usize) -> usize {
-    if !align.is_power_of_two() {
-        return addr;
-    }
+    assert!(align.is_power_of_two(), "alignment must be a power of two");
     addr & !(align - 1)
 }
 
@@ -72,24 +52,6 @@ pub fn log2_floor(v: usize) -> usize {
         return 0;
     }
     (size_of::<usize>() * 8) - 1 - (v.leading_zeros() as usize)
-}
-
-// AGENT: use the conventional 64-bit hash_combine formula so zero-valued
-// fields still perturb the accumulated seed.
-pub fn hash_combine(seed: u64, value: u64) -> u64 {
-    seed ^ (value
-        .wrapping_add(0x9e3779b97f4a7c15)
-        .wrapping_add(seed << 6)
-        .wrapping_add(seed >> 2))
-}
-
-pub fn murmurhash3_finalize(mut h: u64) -> u64 {
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51afd7ed558ccd);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
-    h ^= h >> 33;
-    h
 }
 
 pub struct BuddyAllocator {

@@ -21,14 +21,14 @@ pub fn validate_access(mode: u8, addr: usize, len: usize, pid: usize) -> Result<
             if !check_access(addr, len) {
                 return Err("efault");
             }
-            let page_start = addr & !(PAGE_SZ - 1);
-            let page_end = end.checked_add(PAGE_SZ - 1).ok_or("eoverflow")? & !(PAGE_SZ - 1);
+            let page_start = align_down(addr, PAGE_SZ);
+            let page_end = checked_align_up(end, PAGE_SZ).ok_or("eoverflow")?;
             let _pages = (page_end - page_start) / PAGE_SZ;
             Ok(())
         }
         2 => {
-            let aligned_addr = addr & !(PAGE_SZ - 1);
-            let aligned_end = end.checked_add(PAGE_SZ - 1).ok_or("eoverflow")? & !(PAGE_SZ - 1);
+            let aligned_addr = align_down(addr, PAGE_SZ);
+            let aligned_end = checked_align_up(end, PAGE_SZ).ok_or("eoverflow")?;
             let span = aligned_end - aligned_addr;
             if span > KHEAP_SZ {
                 return Err("efault");

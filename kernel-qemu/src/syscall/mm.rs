@@ -20,7 +20,7 @@ pub(super) fn sys_mmap(
     if len == 0 {
         return Err("einval");
     }
-    let aligned_len = len.checked_add(PAGE_SZ - 1).ok_or("enomem")? & !(PAGE_SZ - 1);
+    let aligned_len = checked_align_up(len, PAGE_SZ).ok_or("enomem")?;
     let known_prot = PROT_READ | PROT_WRITE | PROT_EXEC;
     if prot & !known_prot != 0 {
         return Err("einval");
@@ -100,7 +100,7 @@ pub(super) fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize,
     if len == 0 || addr % PAGE_SZ != 0 {
         return Err("einval");
     }
-    let aligned_len = len.checked_add(PAGE_SZ - 1).ok_or("enomem")? & !(PAGE_SZ - 1);
+    let aligned_len = checked_align_up(len, PAGE_SZ).ok_or("enomem")?;
     let end = addr.checked_add(aligned_len).ok_or("enomem")?;
     if end > KERN_BASE {
         return Err("enomem");
@@ -129,7 +129,7 @@ pub(super) fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str>
     if new_brk >= KERN_BASE {
         return Err("enomem");
     }
-    let aligned = new_brk.checked_add(PAGE_SZ - 1).ok_or("enomem")? & !(PAGE_SZ - 1);
+    let aligned = checked_align_up(new_brk, PAGE_SZ).ok_or("enomem")?;
     let task = kernel.cur_task(0).ok_or("esrch")?;
     task.process
         .addr_space

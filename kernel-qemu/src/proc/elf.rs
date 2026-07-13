@@ -179,11 +179,8 @@ fn load_segment_page_range(vaddr: usize, mem_size: usize) -> Result<(usize, usiz
     if vaddr >= SV39_USER_TOP || mem_end > SV39_USER_TOP {
         return Err("bad_phdr");
     }
-    let page_start = vaddr & !(PAGE_SZ - 1);
-    let page_end = mem_end
-        .checked_add(PAGE_SZ - 1)
-        .map(|end| end & !(PAGE_SZ - 1))
-        .ok_or("bad_phdr")?;
+    let page_start = align_down(vaddr, PAGE_SZ);
+    let page_end = checked_align_up(mem_end, PAGE_SZ).ok_or("bad_phdr")?;
     if page_start >= page_end {
         return Err("bad_phdr");
     }

@@ -259,7 +259,7 @@ impl AddrSpace {
     // AGENT: COW fault resolution preflights the Sv39 leaf before mutating
     // resident metadata, then mirrors the changed leaf into the hardware table.
     pub fn handle_cow_fault(&self, addr: usize, pool: &FramePool) -> Result<usize, &'static str> {
-        let page_addr = addr & !(PAGE_SZ - 1);
+        let page_addr = align_down(addr, PAGE_SZ);
         let region = self.vm_map.find(addr).ok_or("segfault")?;
         let flags = region.flags;
         if flags & VM_WRITE == 0 {
@@ -333,7 +333,7 @@ impl AddrSpace {
         }
 
         let region_end = region.end();
-        let page_addr = cur & !(PAGE_SZ - 1);
+        let page_addr = align_down(cur, PAGE_SZ);
         let page_off = cur & (PAGE_SZ - 1);
         let len = min(end - cur, min(PAGE_SZ - page_off, region_end - cur));
         let need_cow = {
@@ -354,7 +354,7 @@ impl AddrSpace {
             pte.frame.paddr()
         };
         let paddr = self.sv39.translate(cur, PageAccess::Write)?;
-        if (paddr & !(PAGE_SZ - 1)) != frame_paddr {
+        if align_down(paddr, PAGE_SZ) != frame_paddr {
             return Err("efault");
         }
         Ok(UserWriteChunk { paddr, len })
@@ -665,12 +665,12 @@ impl AddrSpace {
 
 // AGENT: keep page iteration panic-free; callers still validate ranges before use.
 fn page_range(base: usize, len: usize) -> impl Iterator<Item = usize> {
-    let start = base & !(PAGE_SZ - 1);
+    let start = align_down(base, PAGE_SZ);
     let end = match base
         .checked_add(len)
-        .and_then(|end| end.checked_add(PAGE_SZ - 1))
+        .and_then(|end| checked_align_up(end, PAGE_SZ))
     {
-        Some(end) => end & !(PAGE_SZ - 1),
+        Some(end) => end,
         None => start,
     };
     (start..end).step_by(PAGE_SZ)

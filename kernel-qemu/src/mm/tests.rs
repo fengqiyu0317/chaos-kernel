@@ -1,11 +1,14 @@
 // AGENT: keep bit-helper regressions next to the QEMU MM helper module and
 // expose the same checks to the optional QEMU boot self-test path.
 use super::*;
-use crate::kernel::{FramePool, VmMap, VmRegion, MEM_OFF, PAGE_SZ, VM_READ, VM_WRITE};
+use crate::kernel::{
+    hash_combine, FramePool, VmMap, VmRegion, MEM_OFF, PAGE_SZ, VM_READ, VM_WRITE,
+};
 
 // AGENT: run the new VMA boundary regression with the existing QEMU MM checks.
 pub fn run_all() {
-    align_up_rejects_overflow();
+    checked_align_up_rejects_invalid_results();
+    bitwise_merge_replaces_only_masked_bits();
     rotate_bits_masks_zero_distance_rotation();
     hash_combine_mixes_zero_values();
     frame_pool_tracks_total_and_free_pages();
@@ -42,10 +45,22 @@ fn vm_region_and_map_preserve_range_semantics() {
 }
 
 #[cfg_attr(test, test)]
-fn align_up_rejects_overflow() {
-    assert_eq!(align_up(0x1003, PAGE_SIZE), 0x2000);
-    assert_eq!(align_up(usize::MAX, PAGE_SIZE), usize::MAX);
-    assert_eq!(align_up(0x1000, 3), 0x1000);
+// AGENT: checked alignment must distinguish valid results from overflow and
+// invalid alignment instead of returning an ambiguous input value.
+fn checked_align_up_rejects_invalid_results() {
+    assert_eq!(checked_align_up(0x1003, PAGE_SIZE), Some(0x2000));
+    assert_eq!(checked_align_up(usize::MAX, PAGE_SIZE), None);
+    assert_eq!(checked_align_up(0x1000, 3), None);
+}
+
+// AGENT: retain the migrated masked-field helper with an executable contract
+// showing that unmasked PTE/register-style bits remain unchanged.
+#[cfg_attr(test, test)]
+fn bitwise_merge_replaces_only_masked_bits() {
+    assert_eq!(
+        bitwise_merge(0b1010_0000, 0b0000_0101, 0b0000_1111),
+        0b1010_0101
+    );
 }
 
 // AGENT: rotate helpers must not leak bits outside the requested field.
@@ -146,7 +161,7 @@ fn frame_pool_reclaims_dynamic_heap_pages() {
 // rust_main only when the explicit QEMU self-test feature is enabled.
 #[cfg_attr(test, test)]
 fn buddy_allocator_alloc_free_smoke() {
-    let base = align_up(0x8021_8123, PAGE_SIZE);
+    let base = checked_align_up(0x8021_8123, PAGE_SIZE).unwrap();
     let mut alloc = BuddyAllocator::new(base, 4, 2);
     let frame = alloc.alloc_order(0).unwrap();
 

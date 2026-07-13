@@ -1,7 +1,7 @@
 // AGENT: keep user-address range validation separate from physical allocation.
 use core::mem;
 
-use super::{KERN_BASE, KHEAP_SZ, PAGE_SZ};
+use super::{align_down, checked_align_up, KERN_BASE, KHEAP_SZ, PAGE_SZ};
 
 // AGENT: reject user ranges whose end overflows before reaching KERN_BASE.
 pub fn check_access(addr: usize, len: usize) -> bool {
@@ -23,9 +23,9 @@ pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
     if boundary >= KERN_BASE {
         return false;
     }
-    let page_start = addr & !(PAGE_SZ - 1);
-    let page_end = match boundary.checked_add(PAGE_SZ - 1) {
-        Some(end) => end & !(PAGE_SZ - 1),
+    let page_start = align_down(addr, PAGE_SZ);
+    let page_end = match checked_align_up(boundary, PAGE_SZ) {
+        Some(end) => end,
         None => return false,
     };
     let n_pages = (page_end - page_start) / PAGE_SZ;

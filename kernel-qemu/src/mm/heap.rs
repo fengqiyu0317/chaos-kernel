@@ -1,11 +1,12 @@
 // AGENT: isolate migrated heap-boundary helpers from physical-frame allocation.
-use super::PAGE_SZ;
+use super::{align_down, checked_align_up, PAGE_SZ};
 
-// AGENT: calculate the page-aligned end of the migrated heap interval.
-pub fn heap_init(base: usize, sz: usize) -> usize {
-    let aligned_base = (base + PAGE_SZ - 1) & !(PAGE_SZ - 1);
-    let aligned_sz = sz & !(PAGE_SZ - 1);
-    let end = aligned_base + aligned_sz;
+// AGENT: calculate the page-aligned end with the shared checked helpers and
+// reject an impossible migrated heap interval instead of wrapping addresses.
+pub fn heap_init(base: usize, sz: usize) -> Option<usize> {
+    let aligned_base = checked_align_up(base, PAGE_SZ)?;
+    let aligned_sz = align_down(sz, PAGE_SZ);
+    let end = aligned_base.checked_add(aligned_sz)?;
     let _metadata_pages = (aligned_sz / PAGE_SZ + 63) / 64;
-    end
+    Some(end)
 }

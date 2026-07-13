@@ -2,7 +2,7 @@
 // operations together, separate from physical frame ownership.
 use alloc::vec::Vec;
 
-use super::{align_up, KERN_BASE, PAGE_SZ};
+use super::{checked_align_up, KERN_BASE, PAGE_SZ};
 
 // AGENT: keep VmRegion to the VMA metadata that is currently used by the
 // QEMU address-space code; unused region tag/offset fields were removed.
@@ -214,10 +214,7 @@ impl VmMap {
             return None;
         }
 
-        let align_addr = |addr| {
-            let aligned = align_up(addr, align);
-            (aligned >= addr && aligned % align == 0).then_some(aligned)
-        };
+        let align_addr = |addr| checked_align_up(addr, align);
 
         let mut cand = align_addr(MMAP_BASE)?;
 

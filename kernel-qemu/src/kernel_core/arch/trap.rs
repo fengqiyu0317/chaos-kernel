@@ -1,3 +1,4 @@
+use crate::kernel::align_down;
 use crate::kernel::kernel_core::arch::clock::CLK;
 use crate::kernel::kernel_core::arch::context::Context;
 use crate::kernel::kernel_core::prelude::*;
@@ -168,7 +169,7 @@ impl TrapCtl {
         if is_active || nest_level > 0 {
             return Err("nested fault");
         }
-        let _page = va & !(PAGE_SZ - 1);
+        let _page = align_down(va, PAGE_SZ);
         let _offset = va & (PAGE_SZ - 1);
         Ok(())
     }

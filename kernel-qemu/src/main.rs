@@ -297,7 +297,8 @@ fn wait_for_timer_wheel_probe(token: &kernel::WaitToken) {
 
 // AGENT: page-align linker symbols before seeding physical frame ranges.
 fn align_up_page(addr: usize) -> usize {
-    (addr + kernel::PAGE_SZ - 1) & !(kernel::PAGE_SZ - 1)
+    kernel::checked_align_up(addr, kernel::PAGE_SZ)
+        .expect("linked kernel end address overflowed page alignment")
 }
 
 // AGENT: Keep panic output observable in QEMU before powering off.
