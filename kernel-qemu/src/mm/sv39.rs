@@ -14,6 +14,9 @@ pub const PTE_D: usize = 1 << 7;
 const PTE_COUNT: usize = 512;
 const PTE_FLAG_MASK: usize = 0x3ff;
 const PTE_PPN_MASK: usize = ((1usize << 44) - 1) << 10;
+const LEAF_INPUT_FLAG_MASK: usize = PTE_FLAG_MASK & !PTE_V;
+const SV39_VADDR_BITS: usize = 39;
+const SV39_PADDR_BITS: usize = 56;
 
 static DIRECT_MAP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -107,19 +110,25 @@ fn pte_is_valid(pte: usize) -> bool {
     pte & PTE_V != 0
 }
 
-// AGENT: accept only architectural Sv39 leaf permissions: a leaf must be
-// readable or executable, and writable pages must also be readable.
-fn leaf_flags_are_valid(flags: usize) -> bool {
+// AGENT: classify the architectural R/W/X combinations shared by raw PTE
+// decoding and caller-supplied leaf flags.
+fn leaf_permissions_are_valid(flags: usize) -> bool {
     let readable = flags & PTE_R != 0;
     let writable = flags & PTE_W != 0;
     let executable = flags & PTE_X != 0;
     (readable || executable) && (!writable || readable)
 }
 
+// AGENT: accept only the low Sv39 leaf flag field supplied by callers; PTE_V is
+// owned by make_leaf_pte(), while bits 8..9 remain available as software RSW.
+fn leaf_flags_are_valid(flags: usize) -> bool {
+    flags & !LEAF_INPUT_FLAG_MASK == 0 && leaf_permissions_are_valid(flags)
+}
+
 // AGENT: distinguish a valid architectural leaf from invalid and reserved PTE
 // encodings instead of treating every nonzero R/W/X combination as a leaf.
 fn pte_is_leaf(pte: usize) -> bool {
-    pte_is_valid(pte) && leaf_flags_are_valid(pte)
+    pte_is_valid(pte) && leaf_permissions_are_valid(pte)
 }
 
 // AGENT: follow an entry as a next-level page-table pointer only when it is
@@ -130,6 +139,36 @@ fn pte_is_table(pte: usize) -> bool {
 
 fn vpn_indices(va: usize) -> [usize; 3] {
     [(va >> 30) & 0x1ff, (va >> 21) & 0x1ff, (va >> 12) & 0x1ff]
+}
+
+// AGENT: reject addresses whose upper bits would be discarded by vpn_indices()
+// instead of allowing non-canonical virtual addresses to alias legal mappings.
+fn va_is_sv39_canonical(va: usize) -> bool {
+    let low_bits = va & ((1usize << SV39_VADDR_BITS) - 1);
+    canonicalize_sv39(low_bits) == va
+}
+
+// AGENT: validate a 4 KiB virtual leaf address before walking the Sv39 tree.
+fn leaf_vaddr_is_valid(va: usize) -> bool {
+    va % PAGE_SZ == 0 && va_is_sv39_canonical(va)
+}
+
+// AGENT: keep physical leaf and root addresses within the 44-bit PPN field
+// decoded by pte_paddr(), in addition to requiring 4 KiB alignment.
+fn page_paddr_is_valid(pa: usize) -> bool {
+    pa % PAGE_SZ == 0 && pa >> SV39_PADDR_BITS == 0
+}
+
+// AGENT: reserve physical address zero as PageTable's uninitialized-root
+// sentinel while accepting it as an architecturally encodable leaf address.
+fn root_paddr_is_valid(root_paddr: usize) -> bool {
+    root_paddr != 0 && page_paddr_is_valid(root_paddr)
+}
+
+// AGENT: share leaf input validation between the owned PageTable entry point
+// and its private raw-root mutation helpers.
+fn leaf_args_are_valid(va: usize, pa: usize, flags: usize) -> bool {
+    leaf_vaddr_is_valid(va) && page_paddr_is_valid(pa) && leaf_flags_are_valid(flags)
 }
 
 fn pte_addr(table_paddr: usize, index: usize) -> *mut usize {
@@ -206,7 +245,7 @@ fn map(
     pool: &FramePool,
     page_table_frames: &mut Vec<PgFrame>,
 ) -> Result<(), &'static str> {
-    if root_paddr == 0 || va % PAGE_SZ != 0 || pa % PAGE_SZ != 0 || !leaf_flags_are_valid(flags) {
+    if !root_paddr_is_valid(root_paddr) || !leaf_args_are_valid(va, pa, flags) {
         return Err("einval");
     }
     let (table, index) = walk_create(root_paddr, va, pool, page_table_frames)?;
@@ -220,7 +259,7 @@ fn map(
 
 // AGENT: replace one existing raw leaf only behind the owned PageTable API.
 fn update_leaf(root_paddr: usize, va: usize, pa: usize, flags: usize) -> Result<(), &'static str> {
-    if root_paddr == 0 || va % PAGE_SZ != 0 || pa % PAGE_SZ != 0 || !leaf_flags_are_valid(flags) {
+    if !root_paddr_is_valid(root_paddr) || !leaf_args_are_valid(va, pa, flags) {
         return Err("einval");
     }
     let (table, index, old) = walk_existing(root_paddr, va)?;
@@ -234,7 +273,7 @@ fn update_leaf(root_paddr: usize, va: usize, pa: usize, flags: usize) -> Result<
 // AGENT: expose one normalized 4 KiB leaf to resident/Sv39 consistency checks
 // without leaking the raw hardware PTE encoding to AddrSpace.
 fn leaf_mapping(root_paddr: usize, va: usize) -> Result<Sv39Leaf, &'static str> {
-    if root_paddr == 0 || va % PAGE_SZ != 0 {
+    if !root_paddr_is_valid(root_paddr) || !leaf_vaddr_is_valid(va) {
         return Err("einval");
     }
     let (_, _, pte) = walk_existing(root_paddr, va)?;
@@ -251,12 +290,11 @@ fn leaf_mapping(root_paddr: usize, va: usize) -> Result<Sv39Leaf, &'static str> 
 // AGENT: reconstruct a canonical Sv39 address from the low 39 virtual-address
 // bits accumulated while walking a hardware page-table tree.
 fn canonicalize_sv39(vaddr: usize) -> usize {
-    const SV39_BITS: usize = 39;
-    const SV39_SIGN_BIT: usize = 1usize << (SV39_BITS - 1);
+    const SV39_SIGN_BIT: usize = 1usize << (SV39_VADDR_BITS - 1);
     if vaddr & SV39_SIGN_BIT == 0 {
         vaddr
     } else {
-        vaddr | (!0usize << SV39_BITS)
+        vaddr | (!0usize << SV39_VADDR_BITS)
     }
 }
 
@@ -302,7 +340,7 @@ fn collect_leaf_mappings(
 
 // AGENT: clear one raw leaf only behind the owned PageTable API.
 fn unmap(root_paddr: usize, va: usize) -> Result<usize, &'static str> {
-    if root_paddr == 0 || va % PAGE_SZ != 0 {
+    if !root_paddr_is_valid(root_paddr) || !leaf_vaddr_is_valid(va) {
         return Err("einval");
     }
     let (table, index, old) = walk_existing(root_paddr, va)?;
@@ -315,7 +353,7 @@ fn unmap(root_paddr: usize, va: usize) -> Result<usize, &'static str> {
 
 // AGENT: keep raw-root translation private so callers use an owned PageTable.
 fn translate(root_paddr: usize, va: usize, access: PageAccess) -> Result<usize, &'static str> {
-    if root_paddr == 0 {
+    if !root_paddr_is_valid(root_paddr) || !va_is_sv39_canonical(va) {
         return Err("efault");
     }
     let (_, _, pte) = walk_existing(root_paddr, va)?;
@@ -404,6 +442,9 @@ impl PageTable {
         flags: usize,
         pool: &FramePool,
     ) -> Result<(), &'static str> {
+        if !leaf_args_are_valid(va, pa, flags) {
+            return Err("einval");
+        }
         let root = self.ensure_root(pool)?;
         map(root, va, pa, flags, pool, &mut self.table_frames)
     }
@@ -511,6 +552,7 @@ pub mod tests {
     // AGENT: run every Sv39-specific MM regression from the QEMU boot hook.
     pub fn run_all() {
         leaf_classification_rejects_invalid_encodings();
+        leaf_input_validation_rejects_aliases_and_truncation();
     }
 
     // AGENT: enforce the Sv39 distinction between next-level pointers, legal
@@ -530,5 +572,32 @@ pub mod tests {
         assert!(pte_is_leaf(PTE_V | PTE_X));
         assert!(pte_is_leaf(PTE_V | PTE_R | PTE_W));
         assert!(pte_is_leaf(PTE_V | PTE_R | PTE_W | PTE_X));
+    }
+
+    // AGENT: prove that leaf input validation rejects addresses and flags that
+    // the raw PTE encoder or VPN extraction would otherwise silently truncate.
+    #[cfg_attr(test, test)]
+    fn leaf_input_validation_rejects_aliases_and_truncation() {
+        let low_va = PAGE_SZ;
+        let noncanonical_alias = (1usize << SV39_VADDR_BITS) | low_va;
+        let high_va = canonicalize_sv39((1usize << (SV39_VADDR_BITS - 1)) | low_va);
+
+        assert!(va_is_sv39_canonical(low_va));
+        assert!(va_is_sv39_canonical(high_va));
+        assert!(!va_is_sv39_canonical(noncanonical_alias));
+        assert_eq!(vpn_indices(noncanonical_alias), vpn_indices(low_va));
+
+        assert!(page_paddr_is_valid(0));
+        assert!(page_paddr_is_valid(0x8000_0000));
+        assert!(!page_paddr_is_valid(1usize << SV39_PADDR_BITS));
+
+        assert!(leaf_flags_are_valid(PTE_R | PTE_U | PTE_A));
+        assert!(leaf_flags_are_valid(PTE_R | (0b11 << 8)));
+        assert!(!leaf_flags_are_valid(PTE_W));
+        assert!(!leaf_flags_are_valid(PTE_V | PTE_R));
+        assert!(!leaf_flags_are_valid(PTE_R | (1usize << 10)));
+
+        assert!(leaf_args_are_valid(low_va, 0, PTE_R));
+        assert!(!leaf_args_are_valid(noncanonical_alias, 0, PTE_R));
     }
 }
