@@ -2,8 +2,10 @@
 // expose the same checks to the optional QEMU boot self-test path.
 use super::*;
 use crate::kernel::{
-    hash_combine, FramePool, VmMap, VmRegion, MEM_OFF, PAGE_SZ, VM_READ, VM_WRITE,
+    hash_combine, BuddyAllocator, FramePool, VmMap, VmRegion, MEM_OFF, PAGE_SZ, VM_READ, VM_WRITE,
 };
+use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 // AGENT: run the new VMA boundary regression with the existing QEMU MM checks.
 pub fn run_all() {
@@ -48,8 +50,8 @@ fn vm_region_and_map_preserve_range_semantics() {
 // AGENT: checked alignment must distinguish valid results from overflow and
 // invalid alignment instead of returning an ambiguous input value.
 fn checked_align_up_rejects_invalid_results() {
-    assert_eq!(checked_align_up(0x1003, PAGE_SIZE), Some(0x2000));
-    assert_eq!(checked_align_up(usize::MAX, PAGE_SIZE), None);
+    assert_eq!(checked_align_up(0x1003, PAGE_SZ), Some(0x2000));
+    assert_eq!(checked_align_up(usize::MAX, PAGE_SZ), None);
     assert_eq!(checked_align_up(0x1000, 3), None);
 }
 
@@ -161,7 +163,7 @@ fn frame_pool_reclaims_dynamic_heap_pages() {
 // rust_main only when the explicit QEMU self-test feature is enabled.
 #[cfg_attr(test, test)]
 fn buddy_allocator_alloc_free_smoke() {
-    let base = checked_align_up(0x8021_8123, PAGE_SIZE).unwrap();
+    let base = checked_align_up(0x8021_8123, PAGE_SZ).unwrap();
     let mut alloc = BuddyAllocator::new(base, 4, 2);
     let frame = alloc.alloc_order(0).unwrap();
 
@@ -179,7 +181,7 @@ fn buddy_free_merges_with_nonzero_base() {
     let second = alloc.alloc_order(0).unwrap();
 
     assert_eq!(first, base);
-    assert_eq!(second, base + PAGE_SIZE);
+    assert_eq!(second, base + PAGE_SZ);
     assert_eq!(alloc.free_order(first, 0), Ok(()));
     assert_eq!(alloc.free_order(second, 0), Ok(()));
     assert!(alloc.free_lists[2].contains(&base));
@@ -196,11 +198,11 @@ fn buddy_free_rejects_duplicate_and_bad_ranges() {
     assert_eq!(alloc.free_order(block, 1), Ok(()));
     assert_eq!(alloc.free_order(block, 1), Err("double free"));
     assert_eq!(
-        alloc.free_order(base + PAGE_SIZE / 2, 0),
+        alloc.free_order(base + PAGE_SZ / 2, 0),
         Err("unaligned address")
     );
     assert_eq!(
-        alloc.free_order(base + 4 * PAGE_SIZE, 0),
+        alloc.free_order(base + 4 * PAGE_SZ, 0),
         Err("address outside managed range")
     );
 }

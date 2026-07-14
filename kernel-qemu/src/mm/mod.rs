@@ -5,6 +5,9 @@ pub mod access;
 pub mod address_space;
 pub mod alloc;
 pub mod bits;
+// AGENT: expose the experimental buddy allocator as a focused MM module while
+// preserving the existing flat re-exported API.
+pub mod buddy;
 pub mod direct_map;
 pub mod frame;
 pub mod heap;
@@ -18,6 +21,7 @@ pub use self::access::*;
 pub use self::address_space::*;
 pub use self::alloc::*;
 pub use self::bits::*;
+pub use self::buddy::*;
 pub use self::direct_map::*;
 pub use self::frame::*;
 pub use self::heap::*;
