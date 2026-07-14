@@ -186,107 +186,6 @@ fn write_pte(table_paddr: usize, index: usize, value: usize) {
     }
 }
 
-// AGENT: walk to the 4 KiB leaf slot, allocating intermediate page-table pages
-// from the same FramePool used by migrated AddrSpace mappings.
-fn walk_create(
-    root_paddr: usize,
-    va: usize,
-    pool: &FramePool,
-    page_table_frames: &mut Vec<PgFrame>,
-) -> Result<(usize, usize), &'static str> {
-    let indices = vpn_indices(va);
-    let mut table = root_paddr;
-    for &index in &indices[..2] {
-        let pte = read_pte(table, index);
-        if pte_is_valid(pte) {
-            if pte_is_leaf(pte) {
-                return Err("overlap");
-            }
-            if !pte_is_table(pte) {
-                return Err("efault");
-            }
-            table = pte_paddr(pte);
-            continue;
-        }
-
-        let frame = pool.alloc_pg_frame().ok_or("enomem")?;
-        let next_table = frame.paddr();
-        zero_page(next_table);
-        write_pte(table, index, make_table_pte(next_table));
-        page_table_frames.push(frame);
-        table = next_table;
-    }
-    Ok((table, indices[2]))
-}
-
-// AGENT: descend only through valid next-level pointers so malformed writable-
-// without-readable entries can never be dereferenced as page-table pages.
-fn walk_existing(root_paddr: usize, va: usize) -> Result<(usize, usize, usize), &'static str> {
-    let indices = vpn_indices(va);
-    let mut table = root_paddr;
-    for &index in &indices[..2] {
-        let pte = read_pte(table, index);
-        if !pte_is_table(pte) {
-            return Err("efault");
-        }
-        table = pte_paddr(pte);
-    }
-    let leaf = read_pte(table, indices[2]);
-    Ok((table, indices[2], leaf))
-}
-
-// AGENT: keep raw-root mapping private so owned PageTable methods remain the
-// only hardware mutation boundary exposed outside this module.
-fn map(
-    root_paddr: usize,
-    va: usize,
-    pa: usize,
-    flags: usize,
-    pool: &FramePool,
-    page_table_frames: &mut Vec<PgFrame>,
-) -> Result<(), &'static str> {
-    if !root_paddr_is_valid(root_paddr) || !leaf_args_are_valid(va, pa, flags) {
-        return Err("einval");
-    }
-    let (table, index) = walk_create(root_paddr, va, pool, page_table_frames)?;
-    let old = read_pte(table, index);
-    if pte_is_valid(old) {
-        return Err("overlap");
-    }
-    write_pte(table, index, make_leaf_pte(pa, flags));
-    Ok(())
-}
-
-// AGENT: replace one existing raw leaf only behind the owned PageTable API.
-fn update_leaf(root_paddr: usize, va: usize, pa: usize, flags: usize) -> Result<(), &'static str> {
-    if !root_paddr_is_valid(root_paddr) || !leaf_args_are_valid(va, pa, flags) {
-        return Err("einval");
-    }
-    let (table, index, old) = walk_existing(root_paddr, va)?;
-    if !pte_is_leaf(old) {
-        return Err("efault");
-    }
-    write_pte(table, index, make_leaf_pte(pa, flags));
-    Ok(())
-}
-
-// AGENT: expose one normalized 4 KiB leaf to resident/Sv39 consistency checks
-// without leaking the raw hardware PTE encoding to AddrSpace.
-fn leaf_mapping(root_paddr: usize, va: usize) -> Result<Sv39Leaf, &'static str> {
-    if !root_paddr_is_valid(root_paddr) || !leaf_vaddr_is_valid(va) {
-        return Err("einval");
-    }
-    let (_, _, pte) = walk_existing(root_paddr, va)?;
-    if !pte_is_leaf(pte) {
-        return Err("efault");
-    }
-    Ok(Sv39Leaf {
-        vaddr: va,
-        paddr: pte_paddr(pte),
-        flags: pte & PTE_FLAG_MASK & !PTE_V,
-    })
-}
-
 // AGENT: reconstruct a canonical Sv39 address from the low 39 virtual-address
 // bits accumulated while walking a hardware page-table tree.
 fn canonicalize_sv39(vaddr: usize) -> usize {
@@ -296,80 +195,6 @@ fn canonicalize_sv39(vaddr: usize) -> usize {
     } else {
         vaddr | (!0usize << SV39_VADDR_BITS)
     }
-}
-
-// AGENT: walk every valid 4 KiB leaf so consistency validation can also detect
-// hardware mappings that have no resident owner.
-fn collect_leaf_mappings(
-    table_paddr: usize,
-    level: usize,
-    vaddr_prefix: usize,
-    leaves: &mut Vec<Sv39Leaf>,
-) -> Result<(), &'static str> {
-    for index in 0..PTE_COUNT {
-        let pte = read_pte(table_paddr, index);
-        if !pte_is_valid(pte) {
-            continue;
-        }
-
-        let shift = 12 + level * 9;
-        let vaddr = vaddr_prefix | (index << shift);
-        if pte_is_leaf(pte) {
-            if level != 0 {
-                return Err("unexpected huge leaf");
-            }
-            leaves.push(Sv39Leaf {
-                vaddr: canonicalize_sv39(vaddr),
-                paddr: pte_paddr(pte),
-                flags: pte & PTE_FLAG_MASK & !PTE_V,
-            });
-            continue;
-        }
-
-        if !pte_is_table(pte) {
-            return Err("invalid Sv39 PTE");
-        }
-
-        if level == 0 {
-            return Err("invalid Sv39 leaf table");
-        }
-        collect_leaf_mappings(pte_paddr(pte), level - 1, vaddr, leaves)?;
-    }
-    Ok(())
-}
-
-// AGENT: clear one raw leaf only behind the owned PageTable API.
-fn unmap(root_paddr: usize, va: usize) -> Result<usize, &'static str> {
-    if !root_paddr_is_valid(root_paddr) || !leaf_vaddr_is_valid(va) {
-        return Err("einval");
-    }
-    let (table, index, old) = walk_existing(root_paddr, va)?;
-    if !pte_is_leaf(old) {
-        return Err("efault");
-    }
-    write_pte(table, index, 0);
-    Ok(pte_paddr(old))
-}
-
-// AGENT: keep raw-root translation private so callers use an owned PageTable.
-fn translate(root_paddr: usize, va: usize, access: PageAccess) -> Result<usize, &'static str> {
-    if !root_paddr_is_valid(root_paddr) || !va_is_sv39_canonical(va) {
-        return Err("efault");
-    }
-    let (_, _, pte) = walk_existing(root_paddr, va)?;
-    if !pte_is_leaf(pte) {
-        return Err("efault");
-    }
-    if pte & PTE_U == 0 {
-        return Err("efault");
-    }
-    match access {
-        PageAccess::Read if pte & PTE_R == 0 => return Err("efault"),
-        PageAccess::Write if pte & PTE_W == 0 => return Err("efault"),
-        PageAccess::Execute if pte & PTE_X == 0 => return Err("efault"),
-        _ => {}
-    }
-    Ok(pte_paddr(pte) + (va & (PAGE_SZ - 1)))
 }
 
 // AGENT: own a real Sv39 root and the intermediate page-table frames allocated
@@ -399,9 +224,10 @@ impl PageTable {
         }
     }
 
-    // AGENT: expose the live root only after the first mapping allocates it.
+    // AGENT: expose the live root only after the first mapping allocates a
+    // correctly aligned, architecturally encodable page-table frame.
     pub fn root_paddr(&self) -> Result<usize, &'static str> {
-        if self.root_paddr == 0 {
+        if !root_paddr_is_valid(self.root_paddr) {
             Err("efault")
         } else {
             Ok(self.root_paddr)
@@ -433,8 +259,91 @@ impl PageTable {
         Ok(self.root_paddr)
     }
 
+    // AGENT: walk this owned page table to a 4 KiB leaf slot, allocating and
+    // retaining every intermediate page-table frame inside PageTable.
+    fn walk_create(&mut self, va: usize, pool: &FramePool) -> Result<(usize, usize), &'static str> {
+        let indices = vpn_indices(va);
+        let mut table = self.root_paddr()?;
+        for &index in &indices[..2] {
+            let pte = read_pte(table, index);
+            if pte_is_valid(pte) {
+                if pte_is_leaf(pte) {
+                    return Err("overlap");
+                }
+                if !pte_is_table(pte) {
+                    return Err("efault");
+                }
+                table = pte_paddr(pte);
+                continue;
+            }
+
+            let frame = pool.alloc_pg_frame().ok_or("enomem")?;
+            let next_table = frame.paddr();
+            zero_page(next_table);
+            write_pte(table, index, make_table_pte(next_table));
+            self.table_frames.push(frame);
+            table = next_table;
+        }
+        Ok((table, indices[2]))
+    }
+
+    // AGENT: descend through this owned root only via valid next-level pointers
+    // so malformed writable-without-readable entries are never dereferenced.
+    fn walk_existing(&self, va: usize) -> Result<(usize, usize, usize), &'static str> {
+        let indices = vpn_indices(va);
+        let mut table = self.root_paddr()?;
+        for &index in &indices[..2] {
+            let pte = read_pte(table, index);
+            if !pte_is_table(pte) {
+                return Err("efault");
+            }
+            table = pte_paddr(pte);
+        }
+        let leaf = read_pte(table, indices[2]);
+        Ok((table, indices[2], leaf))
+    }
+
+    // AGENT: recursively collect every valid 4 KiB leaf under an owned root so
+    // callers can detect hardware mappings that have no resident-page owner.
+    fn collect_leaf_mappings(
+        table_paddr: usize,
+        level: usize,
+        vaddr_prefix: usize,
+        leaves: &mut Vec<Sv39Leaf>,
+    ) -> Result<(), &'static str> {
+        for index in 0..PTE_COUNT {
+            let pte = read_pte(table_paddr, index);
+            if !pte_is_valid(pte) {
+                continue;
+            }
+
+            let shift = 12 + level * 9;
+            let vaddr = vaddr_prefix | (index << shift);
+            if pte_is_leaf(pte) {
+                if level != 0 {
+                    return Err("unexpected huge leaf");
+                }
+                leaves.push(Sv39Leaf {
+                    vaddr: canonicalize_sv39(vaddr),
+                    paddr: pte_paddr(pte),
+                    flags: pte & PTE_FLAG_MASK & !PTE_V,
+                });
+                continue;
+            }
+
+            if !pte_is_table(pte) {
+                return Err("invalid Sv39 PTE");
+            }
+            if level == 0 {
+                return Err("invalid Sv39 leaf table");
+            }
+            Self::collect_leaf_mappings(pte_paddr(pte), level - 1, vaddr, leaves)?;
+        }
+        Ok(())
+    }
+
     // AGENT: create a hardware leaf mapping while keeping intermediate table
-    // frame ownership inside this PageTable.
+    // frame ownership inside this PageTable instead of a raw-root helper.
     pub fn map_leaf(
         &mut self,
         va: usize,
@@ -445,8 +354,14 @@ impl PageTable {
         if !leaf_args_are_valid(va, pa, flags) {
             return Err("einval");
         }
-        let root = self.ensure_root(pool)?;
-        map(root, va, pa, flags, pool, &mut self.table_frames)
+        self.ensure_root(pool)?;
+        let (table, index) = self.walk_create(va, pool)?;
+        let old = read_pte(table, index);
+        if pte_is_valid(old) {
+            return Err("overlap");
+        }
+        write_pte(table, index, make_leaf_pte(pa, flags));
+        Ok(())
     }
 
     // AGENT: map a contiguous physical range at an equally contiguous virtual range.
@@ -471,15 +386,35 @@ impl PageTable {
         Ok(())
     }
 
-    // AGENT: update an existing hardware leaf through this owned Sv39 root.
+    // AGENT: update an existing hardware leaf directly through this PageTable's
+    // owned root, keeping the mutation implementation inside the owner type.
     pub fn update_leaf(&mut self, va: usize, pa: usize, flags: usize) -> Result<(), &'static str> {
-        update_leaf(self.root_paddr()?, va, pa, flags)
+        if !leaf_args_are_valid(va, pa, flags) {
+            return Err("einval");
+        }
+        let (table, index, old) = self.walk_existing(va)?;
+        if !pte_is_leaf(old) {
+            return Err("efault");
+        }
+        write_pte(table, index, make_leaf_pte(pa, flags));
+        Ok(())
     }
 
     // AGENT: return physical identity and normalized flags for one resident
-    // consistency check without giving callers raw mutable PTE access.
+    // consistency check without a parallel raw-root lookup function.
     pub(super) fn leaf_mapping(&self, va: usize) -> Result<Sv39Leaf, &'static str> {
-        leaf_mapping(self.root_paddr()?, va)
+        if !leaf_vaddr_is_valid(va) {
+            return Err("einval");
+        }
+        let (_, _, pte) = self.walk_existing(va)?;
+        if !pte_is_leaf(pte) {
+            return Err("efault");
+        }
+        Ok(Sv39Leaf {
+            vaddr: va,
+            paddr: pte_paddr(pte),
+            flags: pte & PTE_FLAG_MASK & !PTE_V,
+        })
     }
 
     // AGENT: snapshot every owned hardware leaf so AddrSpace can enforce the
@@ -489,19 +424,41 @@ impl PageTable {
             return Ok(Vec::new());
         }
         let mut leaves = Vec::new();
-        collect_leaf_mappings(self.root_paddr, 2, 0, &mut leaves)?;
+        Self::collect_leaf_mappings(self.root_paddr()?, 2, 0, &mut leaves)?;
         Ok(leaves)
     }
 
     // AGENT: require a live root and leaf when removing a mapping so callers
-    // cannot silently commit resident metadata against a missing Sv39 table.
+    // cannot commit resident metadata against a missing owned Sv39 table.
     pub fn unmap_leaf(&mut self, va: usize) -> Result<(), &'static str> {
-        unmap(self.root_paddr()?, va).map(|_| ())
+        if !leaf_vaddr_is_valid(va) {
+            return Err("einval");
+        }
+        let (table, index, old) = self.walk_existing(va)?;
+        if !pte_is_leaf(old) {
+            return Err("efault");
+        }
+        write_pte(table, index, 0);
+        Ok(())
     }
 
-    // AGENT: route user memory translation through the owned Sv39 tree.
+    // AGENT: translate user memory directly through this owned Sv39 tree and
+    // enforce the leaf's user and requested-access permission bits.
     pub fn translate(&self, va: usize, access: PageAccess) -> Result<usize, &'static str> {
-        translate(self.root_paddr()?, va, access)
+        if !va_is_sv39_canonical(va) {
+            return Err("efault");
+        }
+        let (_, _, pte) = self.walk_existing(va)?;
+        if !pte_is_leaf(pte) || pte & PTE_U == 0 {
+            return Err("efault");
+        }
+        match access {
+            PageAccess::Read if pte & PTE_R == 0 => return Err("efault"),
+            PageAccess::Write if pte & PTE_W == 0 => return Err("efault"),
+            PageAccess::Execute if pte & PTE_X == 0 => return Err("efault"),
+            _ => {}
+        }
+        Ok(pte_paddr(pte) + (va & (PAGE_SZ - 1)))
     }
 
     // AGENT: install this page table as the active Sv39 root and enable direct-map
