@@ -68,8 +68,8 @@ fn resident_and_sv39_stay_consistent_across_transitions(pool: &FramePool) {
         .expect("released address space should have no orphan mappings");
 }
 
-// AGENT: keep PageTableEntry visibility and writable-state hardening covered by
-// proving that the supported writable-private fork path still separates pages.
+// AGENT: keep resident frame/COW metadata and live Sv39 permission handling
+// covered by proving that a writable-private fork still separates pages.
 fn forked_writable_page_resolves_cow(pool: &FramePool) {
     let addr = 0x1800_0000;
     let mut parent = AddrSpace::new();

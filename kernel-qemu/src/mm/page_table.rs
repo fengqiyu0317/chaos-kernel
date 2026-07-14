@@ -8,22 +8,20 @@ use super::{
     VM_WRITE,
 };
 
-// AGENT: QEMU PTE metadata keeps current hardware leaf state while VmRegion
-// remains the single source of VM flags.
+// AGENT: resident metadata owns the mapped frame and software-only COW state;
+// VmRegion owns permission policy and Sv39 owns the live leaf flags.
 pub struct PageTableEntry {
     pub(super) frame: SharedPage,
-    pub(super) pte_flags: usize,
     pub(super) cow: bool,
 }
 
-// AGENT: keep resident leaf-state transitions beside the metadata they mutate.
+// AGENT: keep resident frame-ownership and COW transitions beside their data.
 impl PageTableEntry {
     // AGENT: wrap a caller-initialized anonymous frame; the caller must zero a
     // newly allocated frame before exposing the mapping to user space.
-    pub fn new(frame: PgFrame, flags: u32) -> Self {
+    pub fn new(frame: PgFrame) -> Self {
         Self {
             frame: SharedPage::new(frame),
-            pte_flags: vm_flags_to_pte_flags(flags),
             cow: false,
         }
     }
@@ -32,40 +30,23 @@ impl PageTableEntry {
     // and catch accidental use for a private mapping during development.
     pub(super) fn from_shared(frame: SharedPage, flags: u32) -> Self {
         debug_assert!(flags & VM_SHARED != 0);
-        Self {
-            frame,
-            pte_flags: vm_flags_to_pte_flags(flags),
-            cow: false,
-        }
+        Self { frame, cow: false }
     }
 
-    // AGENT: mark a writable private mapping as software COW and mirror the
-    // transition in its hardware-facing flags.
+    // AGENT: mark a private resident page as software COW after the Sv39 leaf
+    // has already been made read-only by AddrSpace.
     pub(super) fn as_cow(&mut self) {
         self.cow = true;
-        self.pte_flags = pte_flags_without_write(self.pte_flags);
     }
 
-    // AGENT: stage COW frame ownership and writable flags without changing the
-    // live resident entry, so a failed Sv39 update leaves the old state intact.
-    pub(super) fn prepare_resolved_write(
-        &self,
-        flags: u32,
-        pool: &FramePool,
-    ) -> Result<Self, &'static str> {
+    // AGENT: stage replacement frame ownership without changing the live
+    // resident entry, so a failed Sv39 update leaves the old state intact.
+    pub(super) fn prepare_resolved_write(&self, pool: &FramePool) -> Result<Self, &'static str> {
         debug_assert!(self.cow);
-        debug_assert!(flags & VM_WRITE != 0);
         Ok(Self {
             frame: self.frame.prepare_cow_copy(pool)?,
-            pte_flags: vm_flags_to_pte_flags(flags),
             cow: false,
         })
-    }
-
-    // AGENT: require both the Sv39 write bit and the absence of a pending
-    // software COW fault so an inconsistent entry fails closed.
-    pub(super) fn is_writable(&self) -> bool {
-        !self.cow && self.pte_flags & PTE_W != 0
     }
 
     // AGENT: expose the physical-frame identity while keeping ownership in the
@@ -74,13 +55,11 @@ impl PageTableEntry {
         self.frame.frame_id()
     }
 
-    // AGENT: clone only when a new PTE mapping should share the same frame;
-    // reject propagation of a writable COW state in debug builds.
+    // AGENT: clone resident ownership and software COW state for a child
+    // mapping; the live Sv39 flags are copied separately by AddrSpace.
     pub(super) fn clone_mapping(&self) -> Self {
-        debug_assert!(!self.cow || self.pte_flags & PTE_W == 0);
         Self {
             frame: self.frame.clone(),
-            pte_flags: self.pte_flags,
             cow: self.cow,
         }
     }
@@ -117,7 +96,7 @@ pub(super) fn vm_flags_to_pte_flags(flags: u32) -> usize {
     let can_exec = flags & VM_EXEC != 0;
 
     if !can_read && !can_write && !can_exec {
-        return PTE_A | PTE_R;
+        return PTE_R;
     }
 
     let mut pte_flags = PTE_A | PTE_U;

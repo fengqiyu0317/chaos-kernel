@@ -22,8 +22,8 @@ struct UserWriteChunk {
     len: usize,
 }
 
-// AGENT: stage one protection transition so every fallible hardware update can
-// complete before resident metadata is committed.
+// AGENT: stage one protection transition with a live-leaf rollback snapshot so
+// every fallible hardware update completes before VMA policy is committed.
 struct LeafFlagUpdate {
     vaddr: usize,
     paddr: usize,
@@ -74,20 +74,14 @@ impl AddrSpace {
         Ok(())
     }
 
-    // AGENT: enforce the three-way AddrSpace invariant: every resident page has
-    // matching VMA policy and Sv39 state, and every Sv39 leaf has an owner.
+    // AGENT: enforce the AddrSpace invariant directly between VMA policy,
+    // resident frame ownership, and the live Sv39 leaves.
     pub(crate) fn check_page_table_consistency(&self) -> Result<(), &'static str> {
         for (&vaddr, entry) in &self.resident_pages.entries {
             let region = self.vm_map.find(vaddr).ok_or("resident page outside VMA")?;
             let mut expected_flags = vm_flags_to_pte_flags(region.flags);
             if entry.cow {
                 expected_flags = pte_flags_without_write(expected_flags);
-            }
-            if entry.pte_flags != expected_flags {
-                return Err("resident flags disagree with VMA");
-            }
-            if entry.cow && entry.pte_flags & PTE_W != 0 {
-                return Err("writable COW resident page");
             }
 
             let leaf = self
@@ -97,8 +91,11 @@ impl AddrSpace {
             if leaf.paddr != entry.frame.paddr() {
                 return Err("resident and Sv39 physical pages disagree");
             }
-            if leaf.flags != entry.pte_flags {
-                return Err("resident and Sv39 flags disagree");
+            if leaf.flags != expected_flags {
+                return Err("Sv39 flags disagree with VMA/COW policy");
+            }
+            if entry.cow && leaf.flags & PTE_W != 0 {
+                return Err("writable COW Sv39 leaf");
             }
         }
 
@@ -212,8 +209,13 @@ impl AddrSpace {
                 continue;
             }
             let flags = region.flags;
+            let parent_leaf = parent.sv39.leaf_mapping(page_addr)?;
+            if parent_leaf.paddr != parent_entry.frame.paddr() {
+                return Err("resident and Sv39 physical pages disagree");
+            }
+            let mut child_leaf_flags = parent_leaf.flags;
             if flags & VM_WRITE != 0 && flags & VM_SHARED == 0 {
-                let cow_flags = pte_flags_without_write(parent_entry.pte_flags);
+                let cow_flags = pte_flags_without_write(parent_leaf.flags);
                 if let Err(err) =
                     parent
                         .sv39
@@ -225,16 +227,16 @@ impl AddrSpace {
                     return Err(err);
                 }
                 parent_entry.as_cow();
+                child_leaf_flags = cow_flags;
                 parent_leaf_changed = true;
             }
-            child_entries.push((page_addr, parent_entry.clone_mapping()));
+            child_entries.push((page_addr, parent_entry.clone_mapping(), child_leaf_flags));
         }
 
-        for (page_addr, entry) in child_entries.iter() {
-            let mapped =
-                child
-                    .sv39
-                    .map_leaf(*page_addr, entry.frame.paddr(), entry.pte_flags, pool);
+        for (page_addr, entry, leaf_flags) in child_entries.iter() {
+            let mapped = child
+                .sv39
+                .map_leaf(*page_addr, entry.frame.paddr(), *leaf_flags, pool);
             if let Err(err) = mapped {
                 if parent_leaf_changed {
                     crate::csr::sfence_vma();
@@ -242,7 +244,7 @@ impl AddrSpace {
                 return Err(err);
             }
         }
-        for (page_addr, entry) in child_entries {
+        for (page_addr, entry, _) in child_entries {
             child.resident_pages.entries.insert(page_addr, entry);
         }
         if parent_leaf_changed {
@@ -266,27 +268,41 @@ impl AddrSpace {
         if flags & VM_WRITE == 0 {
             return Err("segfault");
         }
+        let (old_paddr, is_cow) = self
+            .resident_pages
+            .entries
+            .get(&page_addr)
+            .map(|page| (page.frame.paddr(), page.cow))
+            .ok_or("segfault")?;
+        let old_leaf = self.sv39.leaf_mapping(page_addr)?;
+        if old_leaf.paddr != old_paddr {
+            return Err("efault");
+        }
+        if !is_cow {
+            return if old_leaf.flags & PTE_W != 0 {
+                Ok(old_paddr)
+            } else {
+                Err("segfault")
+            };
+        }
+        if old_leaf.flags & PTE_W != 0 {
+            return Err("efault");
+        }
+
+        let replacement = self
+            .resident_pages
+            .entries
+            .get(&page_addr)
+            .expect("staged COW resident page should remain present")
+            .prepare_resolved_write(pool)?;
+        let paddr = replacement.frame.paddr();
+        self.sv39
+            .update_leaf(page_addr, paddr, vm_flags_to_pte_flags(flags))?;
         let pte = self
             .resident_pages
             .entries
             .get_mut(&page_addr)
-            .ok_or("segfault")?;
-        if pte.is_writable() && !pte.cow {
-            return Ok(pte.frame.paddr());
-        }
-        if !pte.cow {
-            return Err("segfault");
-        }
-        let old_paddr = pte.frame.paddr();
-        let old_leaf = self.sv39.leaf_mapping(page_addr)?;
-        if old_leaf.paddr != old_paddr || old_leaf.flags != pte.pte_flags {
-            return Err("efault");
-        }
-
-        let replacement = pte.prepare_resolved_write(flags, pool)?;
-        let paddr = replacement.frame.paddr();
-        self.sv39
-            .update_leaf(page_addr, paddr, replacement.pte_flags)?;
+            .expect("staged COW resident page should remain present");
         let old_entry = mem::replace(pte, replacement);
         crate::csr::sfence_vma();
         drop(old_entry);
@@ -350,8 +366,7 @@ impl AddrSpace {
             .entries
             .get(&page_addr)
             .ok_or("efault")?;
-        let need_cow = !pte.is_writable() && pte.cow;
-        if need_cow {
+        if pte.cow {
             self.handle_cow_fault(cur, pool).map_err(|_| "efault")?;
         }
 
@@ -360,7 +375,7 @@ impl AddrSpace {
             .entries
             .get(&page_addr)
             .ok_or("efault")?;
-        if !pte.is_writable() {
+        if pte.cow {
             return Err("efault");
         }
         let frame_paddr = pte.frame.paddr();
@@ -409,14 +424,17 @@ impl AddrSpace {
             return Err("efault");
         }
         self.debug_check_page_table_consistency()?;
-        let pages_to_unmap: Vec<(usize, usize, usize)> = self
-            .resident_pages
-            .entries
-            .iter()
-            .filter_map(|(&addr, pte)| {
-                (addr >= start && addr < end).then(|| (addr, pte.frame.paddr(), pte.pte_flags))
-            })
-            .collect();
+        let mut pages_to_unmap = Vec::new();
+        for (&addr, page) in &self.resident_pages.entries {
+            if addr < start || addr >= end {
+                continue;
+            }
+            let leaf = self.sv39.leaf_mapping(addr)?;
+            if leaf.paddr != page.frame.paddr() {
+                return Err("resident and Sv39 physical pages disagree");
+            }
+            pages_to_unmap.push((addr, leaf.paddr, leaf.flags));
+        }
 
         let mut unmapped = 0usize;
         for &(addr, _, _) in &pages_to_unmap {
@@ -489,8 +507,8 @@ impl AddrSpace {
         Ok(())
     }
 
-    // AGENT: stage and apply all Sv39 protection changes before infallibly
-    // committing the matching VMA and resident metadata.
+    // AGENT: snapshot live leaf flags for rollback, apply every Sv39 protection
+    // change, then commit the matching VMA policy.
     pub fn protect(
         &mut self,
         start: usize,
@@ -522,6 +540,10 @@ impl AddrSpace {
         for (&vaddr, pte) in &self.resident_pages.entries {
             if vaddr >= start && vaddr < end {
                 let region = self.vm_map.find(vaddr).ok_or("efault")?;
+                let leaf = self.sv39.leaf_mapping(vaddr)?;
+                if leaf.paddr != pte.frame.paddr() {
+                    return Err("resident and Sv39 physical pages disagree");
+                }
                 let flags = (region.flags & !prot_mask) | requested_prot;
                 let mut new_pte_flags = vm_flags_to_pte_flags(flags);
                 if pte.cow {
@@ -529,8 +551,8 @@ impl AddrSpace {
                 }
                 updates.push(LeafFlagUpdate {
                     vaddr,
-                    paddr: pte.frame.paddr(),
-                    old_flags: pte.pte_flags,
+                    paddr: leaf.paddr,
+                    old_flags: leaf.flags,
                     new_flags: new_pte_flags,
                 });
             }
@@ -570,14 +592,6 @@ impl AddrSpace {
             if region.base >= start && region.end() <= end {
                 region.flags = (region.flags & !prot_mask) | requested_prot;
             }
-        }
-        for update in &updates {
-            let pte = self
-                .resident_pages
-                .entries
-                .get_mut(&update.vaddr)
-                .expect("staged resident protection entry should remain present");
-            pte.pte_flags = update.new_flags;
         }
         crate::csr::sfence_vma();
         Ok(())
@@ -650,7 +664,7 @@ impl AddrSpace {
         for (page_addr, frame) in mapped.into_iter() {
             self.resident_pages
                 .entries
-                .insert(page_addr, PageTableEntry::new(frame, flags));
+                .insert(page_addr, PageTableEntry::new(frame));
         }
         crate::csr::sfence_vma();
         Ok(())
