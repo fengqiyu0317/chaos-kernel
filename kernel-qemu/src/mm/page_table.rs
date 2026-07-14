@@ -4,8 +4,8 @@ use alloc::collections::BTreeMap;
 use core::mem;
 
 use super::{
-    FramePool, PgFrame, SharedPage, PTE_A, PTE_D, PTE_R, PTE_U, PTE_W, PTE_X, VM_EXEC, VM_READ,
-    VM_SHARED, VM_WRITE,
+    FramePool, PgFrame, SharedPage, PTE_A, PTE_R, PTE_U, PTE_W, PTE_X, VM_EXEC, VM_READ, VM_SHARED,
+    VM_WRITE,
 };
 
 // AGENT: QEMU PTE metadata keeps current hardware leaf state while VmRegion
@@ -125,7 +125,7 @@ pub(super) fn vm_flags_to_pte_flags(flags: u32) -> usize {
         pte_flags |= PTE_R;
     }
     if can_write {
-        pte_flags |= PTE_R | PTE_W | PTE_D;
+        pte_flags |= PTE_R | PTE_W;
     }
     if can_exec {
         pte_flags |= PTE_X;
@@ -133,7 +133,7 @@ pub(super) fn vm_flags_to_pte_flags(flags: u32) -> usize {
     pte_flags
 }
 
-// AGENT: strip write/dirty bits when software COW owns the next write fault.
+// AGENT: strip the write bit when software COW owns the next write fault.
 pub(super) fn pte_flags_without_write(flags: usize) -> usize {
-    flags & !(PTE_W | PTE_D)
+    flags & !PTE_W
 }
