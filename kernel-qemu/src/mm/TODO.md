@@ -29,7 +29,7 @@ Remaining replacement and hardening work:
 
 Semantic entries to preserve while replacing internals:
 
-- `AddrSpace`, `VmRegion`, `VmMap`, `PageTableEntry`, and `FramePool`.
+- `AddrSpace`, `VmRegion`, `VmMap`, `ResidentPage`, and `FramePool`.
 - `map_region()`, `unmap_range()`, `protect()`, `release_all_pages()`.
 - `read_user_bytes()` and `write_user_bytes()` until the standard QEMU
   usercopy/read-write path replaces them.

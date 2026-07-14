@@ -10,13 +10,13 @@ use super::{
 
 // AGENT: resident metadata owns the mapped frame and software-only COW state;
 // VmRegion owns permission policy and Sv39 owns the live leaf flags.
-pub struct PageTableEntry {
+pub struct ResidentPage {
     pub(super) frame: SharedPage,
     pub(super) cow: bool,
 }
 
 // AGENT: keep resident frame-ownership and COW transitions beside their data.
-impl PageTableEntry {
+impl ResidentPage {
     // AGENT: wrap a caller-initialized anonymous frame; the caller must zero a
     // newly allocated frame before exposing the mapping to user space.
     pub fn new(frame: PgFrame) -> Self {
@@ -68,7 +68,7 @@ impl PageTableEntry {
 // AGENT: store software resident-page metadata separately from the real Sv39
 // page table so the BTreeMap is not mistaken for hardware page-table storage.
 pub(super) struct ResidentPages {
-    pub(super) entries: BTreeMap<usize, PageTableEntry>,
+    pub(super) entries: BTreeMap<usize, ResidentPage>,
 }
 
 // AGENT: own resident page-table initialization and bulk-detach operations.
@@ -83,7 +83,7 @@ impl ResidentPages {
 
     // AGENT: detach all resident metadata only through an exclusive AddrSpace
     // borrow, keeping software metadata and Sv39 updates in one lock domain.
-    pub(super) fn take_all(&mut self) -> BTreeMap<usize, PageTableEntry> {
+    pub(super) fn take_all(&mut self) -> BTreeMap<usize, ResidentPage> {
         mem::take(&mut self.entries)
     }
 }

@@ -3,9 +3,9 @@ use super::*;
 // AGENT: import resident page-table metadata from its dedicated module so this
 // file only coordinates address-space operations.
 use super::page_table::{pte_flags_without_write, vm_flags_to_pte_flags, ResidentPages};
-// AGENT: preserve the former address_space::PageTableEntry API after moving its
-// implementation into the dedicated page_table module.
-pub use super::page_table::PageTableEntry;
+// AGENT: expose resident-page ownership metadata through address_space while
+// keeping its implementation in the dedicated page_table module.
+pub use super::page_table::ResidentPage;
 
 // AGENT: coordinate VmMap, resident page metadata, and the owned Sv39 page table
 // without storing page-table implementation fields directly on AddrSpace.
@@ -664,7 +664,7 @@ impl AddrSpace {
         for (page_addr, frame) in mapped.into_iter() {
             self.resident_pages
                 .entries
-                .insert(page_addr, PageTableEntry::new(frame));
+                .insert(page_addr, ResidentPage::new(frame));
         }
         crate::csr::sfence_vma();
         Ok(())
@@ -720,7 +720,7 @@ impl AddrSpace {
         for (page_addr, page) in mapped.into_iter() {
             self.resident_pages
                 .entries
-                .insert(page_addr, PageTableEntry::from_shared(page, flags));
+                .insert(page_addr, ResidentPage::from_shared(page, flags));
         }
         crate::csr::sfence_vma();
         Ok(())

@@ -193,7 +193,7 @@ RISC-V trap frame
 1. 直接迁入 `kernel-sim` MM 源码：
    - 以 `kernel-sim/src/kernel/mm/mod.rs`、`address_space.rs`、`alloc.rs`、`bits.rs`、`memory.rs` 为源。
    - 迁入到 `kernel-qemu/src/mm/` 的对应文件中，必要时拆出 `sv39.rs`、`usercopy.rs` 作为裸机适配文件。
-   - 保留 `AddrSpace`、`VmRegion`、`VmMap`、`PageTableEntry`、`FramePool`、`map_region()`、`unmap_range()`、`protect()`、`read_user_bytes()`、`write_user_bytes()` 等语义入口，后续在这些入口内部替换实现。
+   - 保留 `AddrSpace`、`VmRegion`、`VmMap`、`FramePool`、`map_region()`、`unmap_range()`、`protect()`、`read_user_bytes()`、`write_user_bytes()` 等语义入口；`kernel-sim` 的 `PageTableEntry` 物理页所有权语义在 QEMU 侧由 `ResidentPage` 承载，后续在这些入口内部替换实现。
    - 在 `kernel-qemu/src/main.rs` 注册 `mod mm;` 的时机以可构建为准；不能立即构建的迁入文件必须有明确 TODO 和下一步替换清单，但仍优先在这些迁入文件里完成 `std`、host lock、模拟页面和 host frame 依赖替换。
 
 2. 对迁入代码做 host 依赖清单：
@@ -211,7 +211,7 @@ RISC-V trap frame
    - RAM 范围先按 `0x8000_0000..0x8800_0000` 处理，空闲页起点为 `align_up(ekernel, PAGE_SIZE)`。
    - 分配器最终返回页对齐物理地址或 PPN；原 `Mutex<Vec<bool>>` 只能作为迁移起点，不能作为裸机最终实现。
 
-4. 在迁入的 `PageTableEntry` / `AddrSpace` 基础上接入 Sv39：
+4. 在迁入的 `ResidentPage` / `AddrSpace` 基础上接入 Sv39：
    - 新增或迁入后改造 PTE flags：`V/R/W/X/U/G/A/D`。
    - 在保留 `map_region()`、`unmap_range()`、`protect()` 等入口的前提下，把内部页记录替换为 Sv39 page table walk、map、unmap、translate。
    - 先采用恒等映射 `VA == PA`，降低开启分页后的地址切换风险。
