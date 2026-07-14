@@ -68,8 +68,7 @@ pub(super) fn sys_mmap(
             .addr_space
             .lock()
             .unwrap()
-            .vm_map
-            .find_free(aligned_len, PAGE_SZ)
+            .find_free_region(aligned_len, PAGE_SZ)
             .ok_or("enomem")?
     };
     let result_end = result_addr.checked_add(aligned_len).ok_or("enomem")?;
@@ -123,7 +122,7 @@ pub(super) fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str>
     if new_brk == 0 {
         return Ok(kernel
             .cur_task(0)
-            .map(|t| t.process.addr_space.lock().unwrap().vm_map.brk)
+            .map(|t| t.process.addr_space.lock().unwrap().brk())
             .unwrap_or(0x0040_0000));
     }
     if new_brk >= KERN_BASE {

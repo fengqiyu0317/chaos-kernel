@@ -21,8 +21,51 @@ pub fn run_all(pool: &FramePool) {
     prepared_user_image_loads_elf_segment_and_stack(pool);
     prepared_user_image_loads_segments_sharing_a_page(pool);
     prepared_user_image_loads_out_of_order_segments(pool);
+    resident_and_sv39_stay_consistent_across_transitions(pool);
     forked_writable_page_resolves_cow(pool);
     shm_segment_maps_shared_physical_page(pool);
+}
+
+// AGENT: exercise map, protection, unmap, and release transitions while
+// checking both directions of the resident-page/Sv39 invariant after each one.
+fn resident_and_sv39_stay_consistent_across_transitions(pool: &FramePool) {
+    let base = 0x1600_0000;
+    let mut addr_space = AddrSpace::new();
+
+    addr_space
+        .map_region(VmRegion::new(base, PAGE_SZ * 3, VM_READ | VM_WRITE), pool)
+        .expect("three-page consistency mapping should succeed");
+    addr_space
+        .check_page_table_consistency()
+        .expect("new resident pages should match Sv39");
+
+    addr_space
+        .protect(base + PAGE_SZ, PAGE_SZ, VM_READ)
+        .expect("middle-page protection should succeed");
+    addr_space
+        .check_page_table_consistency()
+        .expect("protected resident page should match Sv39");
+    assert!(addr_space
+        .write_user_bytes(base + PAGE_SZ, b"x", pool)
+        .is_err());
+
+    assert_eq!(
+        addr_space
+            .unmap_range(base + PAGE_SZ, PAGE_SZ, pool)
+            .expect("middle-page unmap should succeed"),
+        1
+    );
+    addr_space
+        .check_page_table_consistency()
+        .expect("remaining resident pages should match Sv39");
+    assert!(addr_space
+        .read_user_bytes(base + PAGE_SZ, &mut [0u8; 1])
+        .is_err());
+
+    assert_eq!(addr_space.release_all_pages(pool), 2);
+    addr_space
+        .check_page_table_consistency()
+        .expect("released address space should have no orphan mappings");
 }
 
 // AGENT: keep PageTableEntry visibility and writable-state hardening covered by
@@ -36,11 +79,23 @@ fn forked_writable_page_resolves_cow(pool: &FramePool) {
     parent
         .write_user_bytes(addr, b"parent", pool)
         .expect("parent page should be writable before fork");
+    parent
+        .check_page_table_consistency()
+        .expect("parent mapping should start consistent");
 
-    let mut child = AddrSpace::fork_from(&parent, pool).expect("address space should fork");
+    let mut child = AddrSpace::fork_from(&mut parent, pool).expect("address space should fork");
+    parent
+        .check_page_table_consistency()
+        .expect("parent COW state should match Sv39");
+    child
+        .check_page_table_consistency()
+        .expect("child COW state should match Sv39");
     child
         .write_user_bytes(addr, b"child!", pool)
         .expect("child write should resolve COW");
+    child
+        .check_page_table_consistency()
+        .expect("resolved child COW state should match Sv39");
 
     let mut parent_bytes = [0u8; 6];
     let mut child_bytes = [0u8; 6];
@@ -339,7 +394,7 @@ fn prepared_user_image_loads_elf_segment_and_stack(pool: &FramePool) {
         .read_user_usize(sp + mem::size_of::<usize>())
         .unwrap();
     assert_user_cstr(&image.addr_space, argv0, "init");
-    assert_eq!(image.addr_space.vm_map.brk, 0x0040_2000);
+    assert_eq!(image.addr_space.brk(), 0x0040_2000);
 
     image.addr_space.release_all_pages(pool);
 }
@@ -449,7 +504,7 @@ fn prepared_user_image_loads_segments_sharing_a_page(pool: &FramePool) {
         .write_user_bytes(right_vaddr, b"R", pool)
         .expect("RW segment should make the shared page writable");
     assert_eq!(
-        image.addr_space.vm_map.find(page_vaddr).unwrap().flags,
+        image.addr_space.mapped_region(page_vaddr).unwrap().flags,
         VM_READ | VM_WRITE | VM_EXEC
     );
     image.addr_space.release_all_pages(pool);

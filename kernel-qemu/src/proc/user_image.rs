@@ -127,7 +127,7 @@ fn populate_user_image(
         return Err("e2big");
     }
 
-    addr_space.vm_map.brk = checked_align_up(image_end, PAGE_SZ).ok_or("ph_overflow")?;
+    addr_space.set_brk_metadata(checked_align_up(image_end, PAGE_SZ).ok_or("ph_overflow")?)?;
     let mut thd_ctx = ThdCtx::default();
     thd_ctx.uctx.set_sp(sp as u64);
     thd_ctx.uctx.set_ip(entry as u64);

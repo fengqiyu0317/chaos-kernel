@@ -4,8 +4,8 @@ use alloc::collections::BTreeMap;
 use core::mem;
 
 use super::{
-    FramePool, Mutex, PgFrame, SharedPage, PTE_A, PTE_D, PTE_R, PTE_U, PTE_W, PTE_X, VM_EXEC,
-    VM_READ, VM_SHARED, VM_WRITE,
+    FramePool, PgFrame, SharedPage, PTE_A, PTE_D, PTE_R, PTE_U, PTE_W, PTE_X, VM_EXEC, VM_READ,
+    VM_SHARED, VM_WRITE,
 };
 
 // AGENT: QEMU PTE metadata keeps current hardware leaf state while VmRegion
@@ -46,27 +46,20 @@ impl PageTableEntry {
         self.pte_flags = pte_flags_without_write(self.pte_flags);
     }
 
-    // AGENT: resolve COW frame ownership and restore write permissions from the
-    // owning VmRegion flags instead of keeping a duplicate PTE-side copy.
-    pub(super) fn resolve_write(
-        &mut self,
+    // AGENT: stage COW frame ownership and writable flags without changing the
+    // live resident entry, so a failed Sv39 update leaves the old state intact.
+    pub(super) fn prepare_resolved_write(
+        &self,
         flags: u32,
         pool: &FramePool,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<Self, &'static str> {
         debug_assert!(self.cow);
         debug_assert!(flags & VM_WRITE != 0);
-        let paddr = self.frame.fault(pool)?;
-        self.pte_flags = vm_flags_to_pte_flags(flags);
-        self.cow = false;
-        Ok(paddr)
-    }
-
-    // AGENT: update only hardware-facing leaf flags; VmRegion owns VM flags.
-    pub(super) fn set_flags(&mut self, flags: u32) {
-        self.pte_flags = vm_flags_to_pte_flags(flags);
-        if self.cow {
-            self.pte_flags = pte_flags_without_write(self.pte_flags);
-        }
+        Ok(Self {
+            frame: self.frame.prepare_cow_copy(pool)?,
+            pte_flags: vm_flags_to_pte_flags(flags),
+            cow: false,
+        })
     }
 
     // AGENT: require both the Sv39 write bit and the absence of a pending
@@ -95,24 +88,24 @@ impl PageTableEntry {
 
 // AGENT: store software resident-page metadata separately from the real Sv39
 // page table so the BTreeMap is not mistaken for hardware page-table storage.
-pub(super) struct ResidentPageTable {
-    pub(super) entries: Mutex<BTreeMap<usize, PageTableEntry>>,
+pub(super) struct ResidentPages {
+    pub(super) entries: BTreeMap<usize, PageTableEntry>,
 }
 
 // AGENT: own resident page-table initialization and bulk-detach operations.
-impl ResidentPageTable {
+impl ResidentPages {
     // AGENT: initialize the software resident-page table independently of VmMap
     // and Sv39 root allocation.
     pub(super) fn new() -> Self {
         Self {
-            entries: Mutex::new(BTreeMap::new()),
+            entries: BTreeMap::new(),
         }
     }
 
-    // AGENT: atomically detach all resident metadata before dropping pages.
-    pub(super) fn take_all(&self) -> BTreeMap<usize, PageTableEntry> {
-        let mut entries = self.entries.lock().unwrap();
-        mem::take(&mut *entries)
+    // AGENT: detach all resident metadata only through an exclusive AddrSpace
+    // borrow, keeping software metadata and Sv39 updates in one lock domain.
+    pub(super) fn take_all(&mut self) -> BTreeMap<usize, PageTableEntry> {
+        mem::take(&mut self.entries)
     }
 }
 

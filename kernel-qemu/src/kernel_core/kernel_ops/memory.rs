@@ -15,7 +15,7 @@ impl Kernel {
         let task = self.cur_task(0).ok_or("esrch")?;
         match access {
             KernelPageFaultAccess::Store => {
-                let addr_space = task.process.addr_space.lock().unwrap();
+                let mut addr_space = task.process.addr_space.lock().unwrap();
                 addr_space.handle_cow_fault(addr, &self.pool).map(|_| ())
             }
             KernelPageFaultAccess::Instruction | KernelPageFaultAccess::Load => Err("segfault"),

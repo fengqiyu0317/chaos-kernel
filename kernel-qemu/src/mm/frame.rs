@@ -81,8 +81,8 @@ pub struct SharedPage {
     frame: PgFrame,
 }
 
-// AGENT: expose shared-frame identity and perform COW replacement as one
-// ownership operation.
+// AGENT: expose shared-frame identity and stage COW replacement without
+// mutating the live page-table owner before its Sv39 update commits.
 impl SharedPage {
     pub fn new(frame: PgFrame) -> Self {
         Self { frame }
@@ -104,16 +104,16 @@ impl SharedPage {
         self.frame.count()
     }
 
-    pub fn fault(&mut self, pool: &FramePool) -> Result<usize, &'static str> {
+    // AGENT: retain the old mapping while preparing a COW replacement; callers
+    // can discard this value on failure or commit it after updating Sv39.
+    pub(super) fn prepare_cow_copy(&self, pool: &FramePool) -> Result<Self, &'static str> {
         if self.is_unique() {
-            return Ok(self.paddr());
+            return Ok(self.clone());
         }
 
         let old_paddr = self.paddr();
         let new_frame = pool.alloc_pg_frame().ok_or("oom")?;
-        let new_paddr = new_frame.paddr();
-        copy_page(new_paddr, old_paddr);
-        self.frame = new_frame;
-        Ok(new_paddr)
+        copy_page(new_frame.paddr(), old_paddr);
+        Ok(Self::new(new_frame))
     }
 }

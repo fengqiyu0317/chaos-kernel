@@ -13,6 +13,7 @@ pub const PTE_D: usize = 1 << 7;
 
 const PTE_COUNT: usize = 512;
 const PTE_FLAG_MASK: usize = 0x3ff;
+const PTE_PPN_MASK: usize = ((1usize << 44) - 1) << 10;
 
 static DIRECT_MAP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -96,8 +97,10 @@ fn make_table_pte(paddr: usize) -> usize {
     ((paddr >> 12) << 10) | PTE_V
 }
 
+// AGENT: decode only the architectural PPN bits so reserved or extension bits
+// above bit 53 cannot be mistaken for part of the physical page address.
 fn pte_paddr(pte: usize) -> usize {
-    (pte >> 10) << 12
+    ((pte & PTE_PPN_MASK) >> 10) << 12
 }
 
 fn pte_is_valid(pte: usize) -> bool {
@@ -171,7 +174,9 @@ fn walk_existing(root_paddr: usize, va: usize) -> Result<(usize, usize, usize), 
     Ok((table, indices[2], leaf))
 }
 
-pub fn map(
+// AGENT: keep raw-root mapping private so owned PageTable methods remain the
+// only hardware mutation boundary exposed outside this module.
+fn map(
     root_paddr: usize,
     va: usize,
     pa: usize,
@@ -191,12 +196,8 @@ pub fn map(
     Ok(())
 }
 
-pub fn update_leaf(
-    root_paddr: usize,
-    va: usize,
-    pa: usize,
-    flags: usize,
-) -> Result<(), &'static str> {
+// AGENT: replace one existing raw leaf only behind the owned PageTable API.
+fn update_leaf(root_paddr: usize, va: usize, pa: usize, flags: usize) -> Result<(), &'static str> {
     if root_paddr == 0 || va % PAGE_SZ != 0 || pa % PAGE_SZ != 0 {
         return Err("einval");
     }
@@ -208,9 +209,9 @@ pub fn update_leaf(
     Ok(())
 }
 
-// AGENT: expose leaf lookup without permissions checks so higher-level MM code
-// can validate metadata/table coherence before changing resident page state.
-pub fn leaf_paddr(root_paddr: usize, va: usize) -> Result<usize, &'static str> {
+// AGENT: expose one normalized 4 KiB leaf to resident/Sv39 consistency checks
+// without leaking the raw hardware PTE encoding to AddrSpace.
+fn leaf_mapping(root_paddr: usize, va: usize) -> Result<Sv39Leaf, &'static str> {
     if root_paddr == 0 || va % PAGE_SZ != 0 {
         return Err("einval");
     }
@@ -218,10 +219,63 @@ pub fn leaf_paddr(root_paddr: usize, va: usize) -> Result<usize, &'static str> {
     if !pte_is_valid(pte) || !pte_is_leaf(pte) {
         return Err("efault");
     }
-    Ok(pte_paddr(pte))
+    Ok(Sv39Leaf {
+        vaddr: va,
+        paddr: pte_paddr(pte),
+        flags: pte & PTE_FLAG_MASK & !PTE_V,
+    })
 }
 
-pub fn unmap(root_paddr: usize, va: usize) -> Result<usize, &'static str> {
+// AGENT: reconstruct a canonical Sv39 address from the low 39 virtual-address
+// bits accumulated while walking a hardware page-table tree.
+fn canonicalize_sv39(vaddr: usize) -> usize {
+    const SV39_BITS: usize = 39;
+    const SV39_SIGN_BIT: usize = 1usize << (SV39_BITS - 1);
+    if vaddr & SV39_SIGN_BIT == 0 {
+        vaddr
+    } else {
+        vaddr | (!0usize << SV39_BITS)
+    }
+}
+
+// AGENT: walk every valid 4 KiB leaf so consistency validation can also detect
+// hardware mappings that have no resident owner.
+fn collect_leaf_mappings(
+    table_paddr: usize,
+    level: usize,
+    vaddr_prefix: usize,
+    leaves: &mut Vec<Sv39Leaf>,
+) -> Result<(), &'static str> {
+    for index in 0..PTE_COUNT {
+        let pte = read_pte(table_paddr, index);
+        if !pte_is_valid(pte) {
+            continue;
+        }
+
+        let shift = 12 + level * 9;
+        let vaddr = vaddr_prefix | (index << shift);
+        if pte_is_leaf(pte) {
+            if level != 0 {
+                return Err("unexpected huge leaf");
+            }
+            leaves.push(Sv39Leaf {
+                vaddr: canonicalize_sv39(vaddr),
+                paddr: pte_paddr(pte),
+                flags: pte & PTE_FLAG_MASK & !PTE_V,
+            });
+            continue;
+        }
+
+        if level == 0 {
+            return Err("invalid Sv39 leaf table");
+        }
+        collect_leaf_mappings(pte_paddr(pte), level - 1, vaddr, leaves)?;
+    }
+    Ok(())
+}
+
+// AGENT: clear one raw leaf only behind the owned PageTable API.
+fn unmap(root_paddr: usize, va: usize) -> Result<usize, &'static str> {
     if root_paddr == 0 || va % PAGE_SZ != 0 {
         return Err("einval");
     }
@@ -233,7 +287,8 @@ pub fn unmap(root_paddr: usize, va: usize) -> Result<usize, &'static str> {
     Ok(pte_paddr(old))
 }
 
-pub fn translate(root_paddr: usize, va: usize, access: PageAccess) -> Result<usize, &'static str> {
+// AGENT: keep raw-root translation private so callers use an owned PageTable.
+fn translate(root_paddr: usize, va: usize, access: PageAccess) -> Result<usize, &'static str> {
     if root_paddr == 0 {
         return Err("efault");
     }
@@ -259,6 +314,14 @@ pub struct PageTable {
     root_paddr: usize,
     root_frame: Option<PgFrame>,
     table_frames: Vec<PgFrame>,
+}
+
+// AGENT: provide a normalized hardware-leaf view for AddrSpace invariants and
+// QEMU selftests; PTE_V is implicit and therefore excluded from flags.
+pub(super) struct Sv39Leaf {
+    pub(super) vaddr: usize,
+    pub(super) paddr: usize,
+    pub(super) flags: usize,
 }
 
 impl PageTable {
@@ -342,38 +405,31 @@ impl PageTable {
     }
 
     // AGENT: update an existing hardware leaf through this owned Sv39 root.
-    pub fn update_leaf(&self, va: usize, pa: usize, flags: usize) -> Result<(), &'static str> {
+    pub fn update_leaf(&mut self, va: usize, pa: usize, flags: usize) -> Result<(), &'static str> {
         update_leaf(self.root_paddr()?, va, pa, flags)
     }
 
-    // AGENT: validate that resident metadata still has a matching hardware leaf
-    // before mutating COW ownership.
-    pub fn leaf_paddr(&self, va: usize) -> Result<usize, &'static str> {
-        leaf_paddr(self.root_paddr()?, va)
+    // AGENT: return physical identity and normalized flags for one resident
+    // consistency check without giving callers raw mutable PTE access.
+    pub(super) fn leaf_mapping(&self, va: usize) -> Result<Sv39Leaf, &'static str> {
+        leaf_mapping(self.root_paddr()?, va)
     }
 
-    // AGENT: keep callers simple when a not-yet-mapped address space has no root.
-    pub fn update_leaf_if_present(
-        &self,
-        va: usize,
-        pa: usize,
-        flags: usize,
-    ) -> Result<(), &'static str> {
+    // AGENT: snapshot every owned hardware leaf so AddrSpace can enforce the
+    // reverse invariant that no Sv39 user mapping exists without resident data.
+    pub(super) fn leaf_mappings(&self) -> Result<Vec<Sv39Leaf>, &'static str> {
         if self.root_paddr == 0 {
-            Ok(())
-        } else {
-            update_leaf(self.root_paddr, va, pa, flags)
+            return Ok(Vec::new());
         }
+        let mut leaves = Vec::new();
+        collect_leaf_mappings(self.root_paddr, 2, 0, &mut leaves)?;
+        Ok(leaves)
     }
 
-    // AGENT: remove a hardware leaf if this address space has already allocated
-    // a real Sv39 root and report page-table inconsistencies to the caller.
-    pub fn unmap_leaf_if_present(&self, va: usize) -> Result<(), &'static str> {
-        if self.root_paddr == 0 {
-            Ok(())
-        } else {
-            unmap(self.root_paddr, va).map(|_| ())
-        }
+    // AGENT: require a live root and leaf when removing a mapping so callers
+    // cannot silently commit resident metadata against a missing Sv39 table.
+    pub fn unmap_leaf(&mut self, va: usize) -> Result<(), &'static str> {
+        unmap(self.root_paddr()?, va).map(|_| ())
     }
 
     // AGENT: route user memory translation through the owned Sv39 tree.

@@ -18,7 +18,7 @@ impl Kernel {
         let (brk, vmas, pages) = {
             let addr_space = task.process.addr_space.lock().unwrap();
             let (vmas, pages) = addr_space.snapshot_checkpoint_memory()?;
-            (addr_space.vm_map.brk, vmas, pages)
+            (addr_space.brk(), vmas, pages)
         };
 
         let mut image = CheckpointImage::new_riscv64();

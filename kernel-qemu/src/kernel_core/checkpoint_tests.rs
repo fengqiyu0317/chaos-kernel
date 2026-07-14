@@ -10,7 +10,7 @@ pub fn run_all(kernel: &Kernel) {
 fn ensure_checkpoint_regions(kernel: &Kernel, current: &Task, data_addr: usize, pattern: &[u8]) {
     let stack_base = USR_STK_OFF;
     let mut addr_space = current.process.addr_space.lock().unwrap();
-    if addr_space.vm_map.find(data_addr).is_none() {
+    if addr_space.mapped_region(data_addr).is_none() {
         addr_space
             .map_region(
                 VmRegion::new(data_addr, PAGE_SZ, VM_READ | VM_WRITE),
@@ -18,7 +18,7 @@ fn ensure_checkpoint_regions(kernel: &Kernel, current: &Task, data_addr: usize, 
             )
             .expect("checkpoint data page should map");
     }
-    if addr_space.vm_map.find(stack_base).is_none() {
+    if addr_space.mapped_region(stack_base).is_none() {
         addr_space
             .map_region(
                 VmRegion::new(stack_base, PAGE_SZ, VM_READ | VM_WRITE | VM_GROWSDOWN),

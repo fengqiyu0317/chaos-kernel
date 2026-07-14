@@ -2,7 +2,7 @@
 use super::*;
 // AGENT: import resident page-table metadata from its dedicated module so this
 // file only coordinates address-space operations.
-use super::page_table::{pte_flags_without_write, vm_flags_to_pte_flags, ResidentPageTable};
+use super::page_table::{pte_flags_without_write, vm_flags_to_pte_flags, ResidentPages};
 // AGENT: preserve the former address_space::PageTableEntry API after moving its
 // implementation into the dedicated page_table module.
 pub use super::page_table::PageTableEntry;
@@ -10,8 +10,8 @@ pub use super::page_table::PageTableEntry;
 // AGENT: coordinate VmMap, resident page metadata, and the owned Sv39 page table
 // without storing page-table implementation fields directly on AddrSpace.
 pub struct AddrSpace {
-    pub vm_map: VmMap,
-    resident_pages: ResidentPageTable,
+    vm_map: VmMap,
+    resident_pages: ResidentPages,
     sv39: PageTable,
 }
 
@@ -22,12 +22,21 @@ struct UserWriteChunk {
     len: usize,
 }
 
+// AGENT: stage one protection transition so every fallible hardware update can
+// complete before resident metadata is committed.
+struct LeafFlagUpdate {
+    vaddr: usize,
+    paddr: usize,
+    old_flags: usize,
+    new_flags: usize,
+}
+
 impl AddrSpace {
     // AGENT: construct an address space with VM metadata but no allocated Sv39 root.
     pub fn new() -> Self {
         Self {
             vm_map: VmMap::new(),
-            resident_pages: ResidentPageTable::new(),
+            resident_pages: ResidentPages::new(),
             sv39: PageTable::new(),
         }
     }
@@ -38,11 +47,90 @@ impl AddrSpace {
         self.sv39.root_paddr().map(crate::csr::make_satp_sv39)
     }
 
+    // AGENT: expose VMA lookup without allowing callers to mutate policy behind
+    // the resident/Sv39 transaction boundary.
+    pub fn mapped_region(&self, addr: usize) -> Option<&VmRegion> {
+        self.vm_map.find(addr)
+    }
+
+    // AGENT: expose free-range search as a read-only AddrSpace operation.
+    pub fn find_free_region(&self, len: usize, align: usize) -> Option<usize> {
+        self.vm_map.find_free(len, align)
+    }
+
+    // AGENT: expose the current page-aligned program break without leaking the
+    // mutable VmMap container.
+    pub fn brk(&self) -> usize {
+        self.vm_map.brk
+    }
+
+    // AGENT: initialize or restore brk metadata after its image mappings have
+    // already been built through transactional AddrSpace helpers.
+    pub(crate) fn set_brk_metadata(&mut self, brk: usize) -> Result<(), &'static str> {
+        if brk % PAGE_SZ != 0 || brk >= KERN_BASE {
+            return Err("einval");
+        }
+        self.vm_map.brk = brk;
+        Ok(())
+    }
+
+    // AGENT: enforce the three-way AddrSpace invariant: every resident page has
+    // matching VMA policy and Sv39 state, and every Sv39 leaf has an owner.
+    pub(crate) fn check_page_table_consistency(&self) -> Result<(), &'static str> {
+        for (&vaddr, entry) in &self.resident_pages.entries {
+            let region = self.vm_map.find(vaddr).ok_or("resident page outside VMA")?;
+            let mut expected_flags = vm_flags_to_pte_flags(region.flags);
+            if entry.cow {
+                expected_flags = pte_flags_without_write(expected_flags);
+            }
+            if entry.pte_flags != expected_flags {
+                return Err("resident flags disagree with VMA");
+            }
+            if entry.cow && entry.pte_flags & PTE_W != 0 {
+                return Err("writable COW resident page");
+            }
+
+            let leaf = self
+                .sv39
+                .leaf_mapping(vaddr)
+                .map_err(|_| "resident page missing Sv39 leaf")?;
+            if leaf.paddr != entry.frame.paddr() {
+                return Err("resident and Sv39 physical pages disagree");
+            }
+            if leaf.flags != entry.pte_flags {
+                return Err("resident and Sv39 flags disagree");
+            }
+        }
+
+        let leaves = self.sv39.leaf_mappings()?;
+        if leaves.len() != self.resident_pages.entries.len() {
+            return Err("resident and Sv39 leaf counts disagree");
+        }
+        for leaf in leaves {
+            if !self.resident_pages.entries.contains_key(&leaf.vaddr) {
+                return Err("Sv39 leaf missing resident page");
+            }
+        }
+        Ok(())
+    }
+
+    // AGENT: keep the exhaustive resident/Sv39 audit on development paths while
+    // compiling it out of release hot paths that already use local preflight and
+    // transactional rollback for the pages they mutate.
+    fn debug_check_page_table_consistency(&self) -> Result<(), &'static str> {
+        #[cfg(debug_assertions)]
+        {
+            self.check_page_table_consistency()?;
+        }
+        Ok(())
+    }
+
     // AGENT: export VMA metadata and resident page bytes for process-level
     // checkpoint images without exposing the internal resident page table.
     pub fn snapshot_checkpoint_memory(
         &self,
     ) -> Result<(Vec<SavedVma>, Vec<SavedPage>), &'static str> {
+        self.check_page_table_consistency()?;
         let regions = self.vm_map.clone_regions();
         let mut saved_vmas = Vec::with_capacity(regions.len());
         for region in &regions {
@@ -53,13 +141,9 @@ impl AddrSpace {
             });
         }
 
-        let entries = self.resident_pages.entries.lock().unwrap();
-        let mut saved_pages = Vec::with_capacity(entries.len());
-        for (&vaddr, pte) in entries.iter() {
-            let paddr = self.sv39.leaf_paddr(vaddr)?;
-            if paddr != pte.frame.paddr() {
-                return Err("efault");
-            }
+        let mut saved_pages = Vec::with_capacity(self.resident_pages.entries.len());
+        for (&vaddr, pte) in &self.resident_pages.entries {
+            let paddr = pte.frame.paddr();
             let mut bytes = vec![0u8; PAGE_SZ];
             copy_from_phys(paddr, &mut bytes);
             saved_pages.push(SavedPage {
@@ -101,13 +185,14 @@ impl AddrSpace {
         for (start, len, flags) in final_regions {
             addr_space.protect(start, len, flags)?;
         }
-        addr_space.vm_map.brk = brk;
+        addr_space.set_brk_metadata(brk)?;
         Ok(addr_space)
     }
 
-    // AGENT: fork copies VmMap separately from resident-page metadata and then
-    // mirrors each resident leaf into the child's owned Sv39 page table.
-    pub fn fork_from(parent: &AddrSpace, pool: &FramePool) -> Result<Self, &'static str> {
+    // AGENT: fork exclusively updates parent COW metadata and Sv39 leaves, with
+    // exhaustive whole-address-space validation retained for debug builds.
+    pub fn fork_from(parent: &mut AddrSpace, pool: &FramePool) -> Result<Self, &'static str> {
+        parent.debug_check_page_table_consistency()?;
         let mut child = Self::new();
         child.vm_map.brk = parent.vm_map.brk;
         for region in parent.vm_map.clone_regions() {
@@ -118,9 +203,8 @@ impl AddrSpace {
         }
 
         let mut parent_leaf_changed = false;
-        let mut parent_entries = parent.resident_pages.entries.lock().unwrap();
         let mut child_entries = Vec::new();
-        for (&page_addr, parent_entry) in parent_entries.iter_mut() {
+        for (&page_addr, parent_entry) in parent.resident_pages.entries.iter_mut() {
             let Some(region) = parent.vm_map.find(page_addr) else {
                 continue;
             };
@@ -130,11 +214,11 @@ impl AddrSpace {
             let flags = region.flags;
             if flags & VM_WRITE != 0 && flags & VM_SHARED == 0 {
                 let cow_flags = pte_flags_without_write(parent_entry.pte_flags);
-                if let Err(err) = parent.sv39.update_leaf_if_present(
-                    page_addr,
-                    parent_entry.frame.paddr(),
-                    cow_flags,
-                ) {
+                if let Err(err) =
+                    parent
+                        .sv39
+                        .update_leaf(page_addr, parent_entry.frame.paddr(), cow_flags)
+                {
                     if parent_leaf_changed {
                         crate::csr::sfence_vma();
                     }
@@ -145,7 +229,6 @@ impl AddrSpace {
             }
             child_entries.push((page_addr, parent_entry.clone_mapping()));
         }
-        drop(parent_entries);
 
         for (page_addr, entry) in child_entries.iter() {
             let mapped =
@@ -159,29 +242,35 @@ impl AddrSpace {
                 return Err(err);
             }
         }
-        {
-            let mut child_resident = child.resident_pages.entries.lock().unwrap();
-            for (page_addr, entry) in child_entries {
-                child_resident.insert(page_addr, entry);
-            }
+        for (page_addr, entry) in child_entries {
+            child.resident_pages.entries.insert(page_addr, entry);
         }
         if parent_leaf_changed {
             crate::csr::sfence_vma();
         }
+        parent.debug_check_page_table_consistency()?;
+        child.debug_check_page_table_consistency()?;
         Ok(child)
     }
 
-    // AGENT: COW fault resolution preflights the Sv39 leaf before mutating
-    // resident metadata, then mirrors the changed leaf into the hardware table.
-    pub fn handle_cow_fault(&self, addr: usize, pool: &FramePool) -> Result<usize, &'static str> {
+    // AGENT: stage COW state, update Sv39, commit resident ownership, flush stale
+    // translations, and only then allow the old frame owner to drop.
+    pub fn handle_cow_fault(
+        &mut self,
+        addr: usize,
+        pool: &FramePool,
+    ) -> Result<usize, &'static str> {
         let page_addr = align_down(addr, PAGE_SZ);
         let region = self.vm_map.find(addr).ok_or("segfault")?;
         let flags = region.flags;
         if flags & VM_WRITE == 0 {
             return Err("segfault");
         }
-        let mut entries = self.resident_pages.entries.lock().unwrap();
-        let pte = entries.get_mut(&page_addr).ok_or("segfault")?;
+        let pte = self
+            .resident_pages
+            .entries
+            .get_mut(&page_addr)
+            .ok_or("segfault")?;
         if pte.is_writable() && !pte.cow {
             return Ok(pte.frame.paddr());
         }
@@ -189,13 +278,18 @@ impl AddrSpace {
             return Err("segfault");
         }
         let old_paddr = pte.frame.paddr();
-        if self.sv39.leaf_paddr(page_addr)? != old_paddr {
+        let old_leaf = self.sv39.leaf_mapping(page_addr)?;
+        if old_leaf.paddr != old_paddr || old_leaf.flags != pte.pte_flags {
             return Err("efault");
         }
 
-        let paddr = pte.resolve_write(flags, pool)?;
-        self.sv39.update_leaf(page_addr, paddr, pte.pte_flags)?;
+        let replacement = pte.prepare_resolved_write(flags, pool)?;
+        let paddr = replacement.frame.paddr();
+        self.sv39
+            .update_leaf(page_addr, paddr, replacement.pte_flags)?;
+        let old_entry = mem::replace(pte, replacement);
         crate::csr::sfence_vma();
+        drop(old_entry);
         Ok(paddr)
     }
 
@@ -234,8 +328,8 @@ impl AddrSpace {
         Ok(usize::from_ne_bytes(bytes))
     }
 
-    // AGENT: prepare one write chunk by checking VMA permissions, resolving COW
-    // outside resident-page locks, and verifying metadata matches the Sv39 leaf.
+    // AGENT: prepare one write chunk under the exclusive AddrSpace borrow,
+    // resolving COW before verifying metadata against the live Sv39 leaf.
     fn prepare_user_write_chunk(
         &mut self,
         cur: usize,
@@ -251,23 +345,25 @@ impl AddrSpace {
         let page_addr = align_down(cur, PAGE_SZ);
         let page_off = cur & (PAGE_SZ - 1);
         let len = min(end - cur, min(PAGE_SZ - page_off, region_end - cur));
-        let need_cow = {
-            let entries = self.resident_pages.entries.lock().unwrap();
-            let pte = entries.get(&page_addr).ok_or("efault")?;
-            !pte.is_writable() && pte.cow
-        };
+        let pte = self
+            .resident_pages
+            .entries
+            .get(&page_addr)
+            .ok_or("efault")?;
+        let need_cow = !pte.is_writable() && pte.cow;
         if need_cow {
             self.handle_cow_fault(cur, pool).map_err(|_| "efault")?;
         }
 
-        let frame_paddr = {
-            let entries = self.resident_pages.entries.lock().unwrap();
-            let pte = entries.get(&page_addr).ok_or("efault")?;
-            if !pte.is_writable() {
-                return Err("efault");
-            }
-            pte.frame.paddr()
-        };
+        let pte = self
+            .resident_pages
+            .entries
+            .get(&page_addr)
+            .ok_or("efault")?;
+        if !pte.is_writable() {
+            return Err("efault");
+        }
+        let frame_paddr = pte.frame.paddr();
         let paddr = self.sv39.translate(cur, PageAccess::Write)?;
         if align_down(paddr, PAGE_SZ) != frame_paddr {
             return Err("efault");
@@ -297,13 +393,13 @@ impl AddrSpace {
         Ok(())
     }
 
-    // AGENT: unmapping removes resident metadata and Sv39 leaves; file-backed
-    // writeback is intentionally not implemented in kernel-qemu yet.
+    // AGENT: unmap hardware leaves transactionally, flush stale translations,
+    // then drop resident frame ownership and VMA metadata.
     pub fn unmap_range(
         &mut self,
         start: usize,
         len: usize,
-        _pool: &FramePool,
+        pool: &FramePool,
     ) -> Result<usize, &'static str> {
         if len == 0 || start % PAGE_SZ != 0 || len % PAGE_SZ != 0 {
             return Err("einval");
@@ -312,59 +408,63 @@ impl AddrSpace {
         if end > KERN_BASE {
             return Err("efault");
         }
-        let mut entries = self.resident_pages.entries.lock().unwrap();
-        let pages_to_unmap: Vec<(usize, usize)> = entries
+        self.debug_check_page_table_consistency()?;
+        let pages_to_unmap: Vec<(usize, usize, usize)> = self
+            .resident_pages
+            .entries
             .iter()
             .filter_map(|(&addr, pte)| {
-                (addr >= start && addr < end).then(|| (addr, pte.frame.paddr()))
+                (addr >= start && addr < end).then(|| (addr, pte.frame.paddr(), pte.pte_flags))
             })
             .collect();
-        for &(addr, paddr) in &pages_to_unmap {
-            if self.sv39.leaf_paddr(addr)? != paddr {
-                return Err("efault");
+
+        let mut unmapped = 0usize;
+        for &(addr, _, _) in &pages_to_unmap {
+            if let Err(err) = self.sv39.unmap_leaf(addr) {
+                for &(rollback_addr, rollback_paddr, rollback_flags) in
+                    pages_to_unmap[..unmapped].iter().rev()
+                {
+                    self.sv39
+                        .map_leaf(rollback_addr, rollback_paddr, rollback_flags, pool)
+                        .expect("preflighted Sv39 unmap rollback should succeed");
+                }
+                if unmapped != 0 {
+                    crate::csr::sfence_vma();
+                }
+                return Err(err);
             }
-        }
-        self.vm_map.remove_range(start, len);
-        for &(addr, _) in &pages_to_unmap {
-            self.sv39.unmap_leaf_if_present(addr)?;
-            let _dropped = entries.remove(&addr);
+            unmapped += 1;
         }
         crate::csr::sfence_vma();
+
+        self.vm_map.remove_range(start, len);
+        for &(addr, _, _) in &pages_to_unmap {
+            let _dropped = self.resident_pages.entries.remove(&addr);
+        }
         Ok(pages_to_unmap.len())
     }
 
     // AGENT: process teardown removes hardware leaves before resident frames can
     // drop, then releases the now-inactive Sv39 page-table frames.
     pub fn release_all_pages(&mut self, _pool: &FramePool) -> usize {
-        self.vm_map.regions.clear();
+        self.check_page_table_consistency()
+            .expect("address space should be consistent before release");
 
-        let released = {
-            let entries = self.resident_pages.entries.lock().unwrap();
-            let mut released = 0;
-            for (&addr, pte) in entries.iter() {
-                if pte.frame.is_unique() {
-                    released += 1;
-                }
-                let paddr = self
-                    .sv39
-                    .leaf_paddr(addr)
-                    .expect("resident page should have an Sv39 leaf");
-                assert_eq!(
-                    paddr,
-                    pte.frame.paddr(),
-                    "resident page and Sv39 leaf disagree"
-                );
-                self.sv39
-                    .unmap_leaf_if_present(addr)
-                    .expect("resident Sv39 leaf should unmap");
+        let mut released = 0;
+        for (&addr, pte) in &self.resident_pages.entries {
+            if pte.frame.is_unique() {
+                released += 1;
             }
-            released
-        };
+            self.sv39
+                .unmap_leaf(addr)
+                .expect("resident Sv39 leaf should unmap");
+        }
 
         crate::csr::sfence_vma();
         self.sv39.deactivate_if_current();
         drop(self.resident_pages.take_all());
         self.sv39.clear();
+        self.vm_map.regions.clear();
         crate::csr::sfence_vma();
         released
     }
@@ -389,8 +489,8 @@ impl AddrSpace {
         Ok(())
     }
 
-    // AGENT: apply page-aligned protection changes to VmMap metadata and mirror
-    // them into already-resident Sv39 leaves.
+    // AGENT: stage and apply all Sv39 protection changes before infallibly
+    // committing the matching VMA and resident metadata.
     pub fn protect(
         &mut self,
         start: usize,
@@ -415,34 +515,69 @@ impl AddrSpace {
             covered = region_end;
         }
 
-        {
-            let entries = self.resident_pages.entries.lock().unwrap();
-            for (&addr, pte) in entries.iter() {
-                if addr >= start && addr < end && self.sv39.leaf_paddr(addr)? != pte.frame.paddr() {
-                    return Err("efault");
+        self.debug_check_page_table_consistency()?;
+        let prot_mask = VM_READ | VM_WRITE | VM_EXEC;
+        let requested_prot = new_flags & prot_mask;
+        let mut updates = Vec::new();
+        for (&vaddr, pte) in &self.resident_pages.entries {
+            if vaddr >= start && vaddr < end {
+                let region = self.vm_map.find(vaddr).ok_or("efault")?;
+                let flags = (region.flags & !prot_mask) | requested_prot;
+                let mut new_pte_flags = vm_flags_to_pte_flags(flags);
+                if pte.cow {
+                    new_pte_flags = pte_flags_without_write(new_pte_flags);
                 }
+                updates.push(LeafFlagUpdate {
+                    vaddr,
+                    paddr: pte.frame.paddr(),
+                    old_flags: pte.pte_flags,
+                    new_flags: new_pte_flags,
+                });
             }
         }
 
-        self.split_protection_boundary(end)?;
-        self.split_protection_boundary(start)?;
+        let old_regions = self.vm_map.clone_regions();
+        if let Err(err) = self.split_protection_boundary(end) {
+            self.vm_map.regions = old_regions;
+            return Err(err);
+        }
+        if let Err(err) = self.split_protection_boundary(start) {
+            self.vm_map.regions = old_regions;
+            return Err(err);
+        }
 
-        let prot_mask = VM_READ | VM_WRITE | VM_EXEC;
-        let requested_prot = new_flags & prot_mask;
+        let mut applied = 0usize;
+        for update in &updates {
+            if let Err(err) = self
+                .sv39
+                .update_leaf(update.vaddr, update.paddr, update.new_flags)
+            {
+                for rollback in updates[..applied].iter().rev() {
+                    self.sv39
+                        .update_leaf(rollback.vaddr, rollback.paddr, rollback.old_flags)
+                        .expect("preflighted Sv39 protection rollback should succeed");
+                }
+                self.vm_map.regions = old_regions;
+                if applied != 0 {
+                    crate::csr::sfence_vma();
+                }
+                return Err(err);
+            }
+            applied += 1;
+        }
+
         for region in self.vm_map.regions.iter_mut() {
             if region.base >= start && region.end() <= end {
                 region.flags = (region.flags & !prot_mask) | requested_prot;
             }
         }
-
-        let mut entries = self.resident_pages.entries.lock().unwrap();
-        for (addr, pte) in entries.iter_mut() {
-            if *addr >= start && *addr < end {
-                let flags = self.vm_map.find(*addr).ok_or("efault")?.flags;
-                pte.set_flags(flags);
-                self.sv39
-                    .update_leaf_if_present(*addr, pte.frame.paddr(), pte.pte_flags)?;
-            }
+        for update in &updates {
+            let pte = self
+                .resident_pages
+                .entries
+                .get_mut(&update.vaddr)
+                .expect("staged resident protection entry should remain present");
+            pte.pte_flags = update.new_flags;
         }
         crate::csr::sfence_vma();
         Ok(())
@@ -473,6 +608,7 @@ impl AddrSpace {
         if region_end > KERN_BASE {
             return Err("einval");
         }
+        self.debug_check_page_table_consistency()?;
 
         let flags = region.flags;
         let region_base = region.base;
@@ -498,17 +634,23 @@ impl AddrSpace {
                 .map_leaf(page_addr, frame.paddr(), pte_flags, pool)
             {
                 for (mapped_addr, _) in mapped.iter() {
-                    let _ = self.sv39.unmap_leaf_if_present(*mapped_addr);
+                    self.sv39
+                        .unmap_leaf(*mapped_addr)
+                        .expect("new anonymous Sv39 leaf rollback should succeed");
                 }
                 self.vm_map.remove_range(region_base, region_len);
+                if !mapped.is_empty() {
+                    crate::csr::sfence_vma();
+                }
                 return Err(err);
             }
             mapped.push((page_addr, frame));
         }
 
-        let mut entries = self.resident_pages.entries.lock().unwrap();
         for (page_addr, frame) in mapped.into_iter() {
-            entries.insert(page_addr, PageTableEntry::new(frame, flags));
+            self.resident_pages
+                .entries
+                .insert(page_addr, PageTableEntry::new(frame, flags));
         }
         crate::csr::sfence_vma();
         Ok(())
@@ -531,6 +673,7 @@ impl AddrSpace {
         if shared_pages.len() != region.len / PAGE_SZ {
             return Err("einval");
         }
+        self.debug_check_page_table_consistency()?;
 
         region.flags |= VM_SHARED;
         let flags = region.flags;
@@ -547,17 +690,23 @@ impl AddrSpace {
         for (page_addr, page) in pages.into_iter().zip(shared_pages.iter()) {
             if let Err(err) = self.sv39.map_leaf(page_addr, page.paddr(), pte_flags, pool) {
                 for (mapped_addr, _) in mapped.iter() {
-                    let _ = self.sv39.unmap_leaf_if_present(*mapped_addr);
+                    self.sv39
+                        .unmap_leaf(*mapped_addr)
+                        .expect("new shared Sv39 leaf rollback should succeed");
                 }
                 self.vm_map.remove_range(region_base, region_len);
+                if !mapped.is_empty() {
+                    crate::csr::sfence_vma();
+                }
                 return Err(err);
             }
             mapped.push((page_addr, page.clone()));
         }
 
-        let mut entries = self.resident_pages.entries.lock().unwrap();
         for (page_addr, page) in mapped.into_iter() {
-            entries.insert(page_addr, PageTableEntry::from_shared(page, flags));
+            self.resident_pages
+                .entries
+                .insert(page_addr, PageTableEntry::from_shared(page, flags));
         }
         crate::csr::sfence_vma();
         Ok(())
