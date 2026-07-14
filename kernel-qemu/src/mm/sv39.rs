@@ -376,7 +376,7 @@ impl PageTable {
         if va_start % PAGE_SZ != 0 || pa_start % PAGE_SZ != 0 {
             return Err("einval");
         }
-        let pages = len.checked_add(PAGE_SZ - 1).ok_or("einval")? / PAGE_SZ;
+        let pages = checked_align_up(len, PAGE_SZ).ok_or("einval")? / PAGE_SZ;
         for page in 0..pages {
             let offset = page.checked_mul(PAGE_SZ).ok_or("einval")?;
             let va = va_start.checked_add(offset).ok_or("einval")?;
@@ -494,6 +494,8 @@ pub fn build_kernel_page_table(
 
     let mut page_table = PageTable::new();
     let len = ram_end - ram_start;
+    // AGENT TODO: replace this coarse whole-RAM RWX mapping with section-aware
+    // permissions: text R-X, read-only data R--, and writable data/heap RW-.
     let flags = PTE_R | PTE_W | PTE_X | PTE_G | PTE_A | PTE_D;
     page_table.map_linear(ram_start, ram_start, len, flags, pool)?;
     page_table.map_linear(p2v(ram_start), ram_start, len, flags, pool)?;
