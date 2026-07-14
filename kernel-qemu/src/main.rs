@@ -74,6 +74,9 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     {
         println!("[kernel-qemu] mm bits selftest start");
         mm_bits::tests::run_all();
+        // AGENT: exercise strict Sv39 PTE classification in the existing MM
+        // boot selftest after the kernel page table and direct map are active.
+        kernel::mm::sv39::tests::run_all();
         println!("[kernel-qemu] mm bits selftest passed");
     }
     // AGENT: mirror the MM optional boot self-test path for QEMU sync primitives.

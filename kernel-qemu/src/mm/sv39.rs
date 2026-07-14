@@ -107,8 +107,25 @@ fn pte_is_valid(pte: usize) -> bool {
     pte & PTE_V != 0
 }
 
+// AGENT: accept only architectural Sv39 leaf permissions: a leaf must be
+// readable or executable, and writable pages must also be readable.
+fn leaf_flags_are_valid(flags: usize) -> bool {
+    let readable = flags & PTE_R != 0;
+    let writable = flags & PTE_W != 0;
+    let executable = flags & PTE_X != 0;
+    (readable || executable) && (!writable || readable)
+}
+
+// AGENT: distinguish a valid architectural leaf from invalid and reserved PTE
+// encodings instead of treating every nonzero R/W/X combination as a leaf.
 fn pte_is_leaf(pte: usize) -> bool {
-    pte & (PTE_R | PTE_W | PTE_X) != 0
+    pte_is_valid(pte) && leaf_flags_are_valid(pte)
+}
+
+// AGENT: follow an entry as a next-level page-table pointer only when it is
+// valid and all three leaf permission bits are clear.
+fn pte_is_table(pte: usize) -> bool {
+    pte_is_valid(pte) && pte & (PTE_R | PTE_W | PTE_X) == 0
 }
 
 fn vpn_indices(va: usize) -> [usize; 3] {
@@ -146,6 +163,9 @@ fn walk_create(
             if pte_is_leaf(pte) {
                 return Err("overlap");
             }
+            if !pte_is_table(pte) {
+                return Err("efault");
+            }
             table = pte_paddr(pte);
             continue;
         }
@@ -160,12 +180,14 @@ fn walk_create(
     Ok((table, indices[2]))
 }
 
+// AGENT: descend only through valid next-level pointers so malformed writable-
+// without-readable entries can never be dereferenced as page-table pages.
 fn walk_existing(root_paddr: usize, va: usize) -> Result<(usize, usize, usize), &'static str> {
     let indices = vpn_indices(va);
     let mut table = root_paddr;
     for &index in &indices[..2] {
         let pte = read_pte(table, index);
-        if !pte_is_valid(pte) || pte_is_leaf(pte) {
+        if !pte_is_table(pte) {
             return Err("efault");
         }
         table = pte_paddr(pte);
@@ -184,7 +206,7 @@ fn map(
     pool: &FramePool,
     page_table_frames: &mut Vec<PgFrame>,
 ) -> Result<(), &'static str> {
-    if root_paddr == 0 || va % PAGE_SZ != 0 || pa % PAGE_SZ != 0 {
+    if root_paddr == 0 || va % PAGE_SZ != 0 || pa % PAGE_SZ != 0 || !leaf_flags_are_valid(flags) {
         return Err("einval");
     }
     let (table, index) = walk_create(root_paddr, va, pool, page_table_frames)?;
@@ -198,7 +220,7 @@ fn map(
 
 // AGENT: replace one existing raw leaf only behind the owned PageTable API.
 fn update_leaf(root_paddr: usize, va: usize, pa: usize, flags: usize) -> Result<(), &'static str> {
-    if root_paddr == 0 || va % PAGE_SZ != 0 || pa % PAGE_SZ != 0 {
+    if root_paddr == 0 || va % PAGE_SZ != 0 || pa % PAGE_SZ != 0 || !leaf_flags_are_valid(flags) {
         return Err("einval");
     }
     let (table, index, old) = walk_existing(root_paddr, va)?;
@@ -264,6 +286,10 @@ fn collect_leaf_mappings(
                 flags: pte & PTE_FLAG_MASK & !PTE_V,
             });
             continue;
+        }
+
+        if !pte_is_table(pte) {
+            return Err("invalid Sv39 PTE");
         }
 
         if level == 0 {
@@ -474,4 +500,35 @@ pub fn build_kernel_page_table(
     page_table.map_linear(ram_start, ram_start, len, flags, pool)?;
     page_table.map_linear(p2v(ram_start), ram_start, len, flags, pool)?;
     Ok(page_table)
+}
+
+// AGENT: keep pure PTE classification regressions available to both Rust tests
+// and the optional QEMU MM boot selftest.
+#[cfg(any(test, feature = "qemu-mm-selftest"))]
+pub mod tests {
+    use super::*;
+
+    // AGENT: run every Sv39-specific MM regression from the QEMU boot hook.
+    pub fn run_all() {
+        leaf_classification_rejects_invalid_encodings();
+    }
+
+    // AGENT: enforce the Sv39 distinction between next-level pointers, legal
+    // leaves, invalid entries, and the reserved writable-without-readable form.
+    #[cfg_attr(test, test)]
+    fn leaf_classification_rejects_invalid_encodings() {
+        assert!(!pte_is_leaf(0));
+        assert!(!pte_is_table(0));
+        assert!(!pte_is_leaf(PTE_R));
+        assert!(!pte_is_leaf(PTE_V));
+        assert!(pte_is_table(PTE_V));
+        assert!(!pte_is_leaf(PTE_V | PTE_W));
+        assert!(!pte_is_table(PTE_V | PTE_W));
+        assert!(!pte_is_leaf(PTE_V | PTE_W | PTE_X));
+
+        assert!(pte_is_leaf(PTE_V | PTE_R));
+        assert!(pte_is_leaf(PTE_V | PTE_X));
+        assert!(pte_is_leaf(PTE_V | PTE_R | PTE_W));
+        assert!(pte_is_leaf(PTE_V | PTE_R | PTE_W | PTE_X));
+    }
 }
