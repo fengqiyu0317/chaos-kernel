@@ -263,7 +263,7 @@ fn update_leaf(root_paddr: usize, va: usize, pa: usize, flags: usize) -> Result<
         return Err("einval");
     }
     let (table, index, old) = walk_existing(root_paddr, va)?;
-    if !pte_is_valid(old) || !pte_is_leaf(old) {
+    if !pte_is_leaf(old) {
         return Err("efault");
     }
     write_pte(table, index, make_leaf_pte(pa, flags));
@@ -277,7 +277,7 @@ fn leaf_mapping(root_paddr: usize, va: usize) -> Result<Sv39Leaf, &'static str> 
         return Err("einval");
     }
     let (_, _, pte) = walk_existing(root_paddr, va)?;
-    if !pte_is_valid(pte) || !pte_is_leaf(pte) {
+    if !pte_is_leaf(pte) {
         return Err("efault");
     }
     Ok(Sv39Leaf {
@@ -344,7 +344,7 @@ fn unmap(root_paddr: usize, va: usize) -> Result<usize, &'static str> {
         return Err("einval");
     }
     let (table, index, old) = walk_existing(root_paddr, va)?;
-    if !pte_is_valid(old) || !pte_is_leaf(old) {
+    if !pte_is_leaf(old) {
         return Err("efault");
     }
     write_pte(table, index, 0);
@@ -357,7 +357,7 @@ fn translate(root_paddr: usize, va: usize, access: PageAccess) -> Result<usize, 
         return Err("efault");
     }
     let (_, _, pte) = walk_existing(root_paddr, va)?;
-    if !pte_is_valid(pte) || !pte_is_leaf(pte) {
+    if !pte_is_leaf(pte) {
         return Err("efault");
     }
     if pte & PTE_U == 0 {
