@@ -97,22 +97,20 @@ impl VmRegion {
     }
 }
 
-// AGENT: keep VmMap to mutable per-address-space state; the fixed mmap search
-// base is not stored per address space, and mutation stays inside the MM layer.
+// AGENT: keep VmMap focused on mutable VMA collection state; address-space-wide
+// metadata such as the program break stays with AddrSpace.
 pub struct VmMap {
     pub(super) regions: Vec<VmRegion>,
-    pub(super) brk: usize,
 }
 
 const MMAP_BASE: usize = 0x7000_0000;
 
 // AGENT: keep sorted-region mutation and free-gap queries at the collection boundary.
 impl VmMap {
-    // AGENT: initialize only the VM metadata that can differ by address space.
+    // AGENT: initialize an empty per-address-space VMA collection.
     pub fn new() -> Self {
         Self {
             regions: Vec::new(),
-            brk: 0x0040_0000,
         }
     }
 

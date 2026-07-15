@@ -7,10 +7,11 @@ use super::page_table::{pte_flags_without_write, vm_flags_to_pte_flags, Resident
 // keeping its implementation in the dedicated page_table module.
 pub use super::page_table::ResidentPage;
 
-// AGENT: coordinate VmMap, resident page metadata, and the owned Sv39 page table
-// without storing page-table implementation fields directly on AddrSpace.
+// AGENT: own address-space-wide layout metadata and coordinate VmMap, resident
+// page metadata, and the Sv39 page table at their shared consistency boundary.
 pub struct AddrSpace {
     vm_map: VmMap,
+    brk: usize,
     resident_pages: ResidentPages,
     sv39: PageTable,
 }
@@ -32,10 +33,12 @@ struct LeafFlagUpdate {
 }
 
 impl AddrSpace {
-    // AGENT: construct an address space with VM metadata but no allocated Sv39 root.
+    // AGENT: construct an address space with its initial program break, empty VMA
+    // metadata, and no allocated Sv39 root.
     pub fn new() -> Self {
         Self {
             vm_map: VmMap::new(),
+            brk: 0x0040_0000,
             resident_pages: ResidentPages::new(),
             sv39: PageTable::new(),
         }
@@ -58,10 +61,9 @@ impl AddrSpace {
         self.vm_map.find_free(len, align)
     }
 
-    // AGENT: expose the current page-aligned program break without leaking the
-    // mutable VmMap container.
+    // AGENT: expose the current page-aligned program break owned by AddrSpace.
     pub fn brk(&self) -> usize {
-        self.vm_map.brk
+        self.brk
     }
 
     // AGENT: initialize or restore brk metadata after its image mappings have
@@ -70,7 +72,7 @@ impl AddrSpace {
         if brk % PAGE_SZ != 0 || brk > USER_TOP {
             return Err("einval");
         }
-        self.vm_map.brk = brk;
+        self.brk = brk;
         Ok(())
     }
 
@@ -191,7 +193,7 @@ impl AddrSpace {
     pub fn fork_from(parent: &mut AddrSpace, pool: &FramePool) -> Result<Self, &'static str> {
         parent.debug_check_page_table_consistency()?;
         let mut child = Self::new();
-        child.vm_map.brk = parent.vm_map.brk;
+        child.brk = parent.brk;
         for region in parent.vm_map.clone_regions() {
             if region.flags & VM_DONTCOPY != 0 {
                 continue;
@@ -715,14 +717,14 @@ impl AddrSpace {
     // AGENT: resize heap through the public mapping helpers so VmMap, resident
     // metadata, and Sv39 leaves stay synchronized.
     pub fn resize_brk(&mut self, new_brk: usize, pool: &FramePool) -> Result<(), &'static str> {
-        let old_brk = self.vm_map.brk;
+        let old_brk = self.brk;
         if new_brk < old_brk {
             self.unmap_range(new_brk, old_brk - new_brk, pool)?;
         } else if new_brk > old_brk {
             let heap = VmRegion::new(old_brk, new_brk - old_brk, VM_READ | VM_WRITE);
             self.map_region(heap, pool)?;
         }
-        self.vm_map.brk = new_brk;
+        self.brk = new_brk;
         Ok(())
     }
 }
