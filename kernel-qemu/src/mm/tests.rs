@@ -2,7 +2,8 @@
 // expose the same checks to the optional QEMU boot self-test path.
 use super::*;
 use crate::kernel::{
-    hash_combine, BuddyAllocator, FramePool, VmMap, VmRegion, MEM_OFF, PAGE_SZ, VM_READ, VM_WRITE,
+    hash_combine, BuddyAllocator, FramePool, VmMap, VmRegion, KERN_BASE, MEM_OFF, PAGE_SZ, VM_READ,
+    VM_WRITE,
 };
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -19,6 +20,8 @@ pub fn run_all() {
     frame_pool_reclaims_dynamic_heap_pages();
     vm_region_and_map_preserve_range_semantics();
     vm_region_merge_rejects_invalid_endpoints();
+    vm_map_insert_coalesces_both_neighbors();
+    vm_map_insert_rejects_invalid_ranges_and_overlaps();
     buddy_allocator_alloc_free_smoke();
     buddy_free_merges_with_nonzero_base();
     buddy_free_rejects_duplicate_and_bad_ranges();
@@ -68,12 +71,91 @@ fn vm_region_and_map_preserve_range_semantics() {
     ))
     .unwrap();
 
-    assert_eq!(map.regions.len(), 1);
-    assert!(map.find(base + PAGE_SZ).is_some());
+    let merged = map.find(base + PAGE_SZ).unwrap();
+    assert_eq!(merged.base, base);
+    assert_eq!(merged.len, 3 * PAGE_SZ);
     map.remove_range(base + PAGE_SZ, PAGE_SZ);
-    assert_eq!(map.regions.len(), 2);
-    assert_eq!(map.regions[0].checked_end(), Some(base + PAGE_SZ));
-    assert_eq!(map.regions[1].base, base + 2 * PAGE_SZ);
+    assert_eq!(map.total_mapped(), 2 * PAGE_SZ);
+    assert_eq!(map.find(base).unwrap().checked_end(), Some(base + PAGE_SZ));
+    assert_eq!(
+        map.find(base + 2 * PAGE_SZ).unwrap().base,
+        base + 2 * PAGE_SZ
+    );
+}
+
+// AGENT: cover insertion before the first VMA and insertion that bridges two
+// matching neighbors, preserving sorted and maximally coalesced metadata.
+#[cfg_attr(test, test)]
+fn vm_map_insert_coalesces_both_neighbors() {
+    let base = 0x2000_0000;
+
+    let mut prepend = VmMap::new();
+    prepend
+        .insert(VmRegion::new(base + PAGE_SZ, PAGE_SZ, VM_READ))
+        .unwrap();
+    prepend
+        .insert(VmRegion::new(base, PAGE_SZ, VM_READ))
+        .unwrap();
+    let prepended = prepend.find(base + PAGE_SZ).unwrap();
+    assert_eq!(prepended.base, base);
+    assert_eq!(prepended.len, 2 * PAGE_SZ);
+
+    let mut bridge = VmMap::new();
+    bridge
+        .insert(VmRegion::new(base, PAGE_SZ, VM_READ | VM_WRITE))
+        .unwrap();
+    bridge
+        .insert(VmRegion::new(
+            base + 2 * PAGE_SZ,
+            PAGE_SZ,
+            VM_READ | VM_WRITE,
+        ))
+        .unwrap();
+    bridge
+        .insert(VmRegion::new(base + PAGE_SZ, PAGE_SZ, VM_READ | VM_WRITE))
+        .unwrap();
+    let bridged = bridge.find(base + PAGE_SZ).unwrap();
+    assert_eq!(bridged.base, base);
+    assert_eq!(bridged.len, 3 * PAGE_SZ);
+}
+
+// AGENT: exercise every rejected range shape used by insert and both neighbor
+// overlap checks, while retaining the legal half-open KERN_BASE boundary.
+#[cfg_attr(test, test)]
+fn vm_map_insert_rejects_invalid_ranges_and_overlaps() {
+    let base = 0x3000_0000;
+    let mut map = VmMap::new();
+
+    assert!(map.insert(VmRegion::new(base, 0, VM_READ)).is_err());
+    assert!(map
+        .insert(VmRegion::new(base + 1, PAGE_SZ, VM_READ))
+        .is_err());
+    assert!(map
+        .insert(VmRegion::new(base, PAGE_SZ + 1, VM_READ))
+        .is_err());
+
+    let last_page = usize::MAX - (PAGE_SZ - 1);
+    assert!(map
+        .insert(VmRegion::new(last_page, PAGE_SZ, VM_READ))
+        .is_err());
+    assert!(map
+        .insert(VmRegion::new(KERN_BASE, PAGE_SZ, VM_READ))
+        .is_err());
+
+    map.insert(VmRegion::new(base + PAGE_SZ, 2 * PAGE_SZ, VM_READ))
+        .unwrap();
+    assert!(map
+        .insert(VmRegion::new(base, 2 * PAGE_SZ, VM_WRITE))
+        .is_err());
+    assert!(map
+        .insert(VmRegion::new(base + 2 * PAGE_SZ, 2 * PAGE_SZ, VM_WRITE))
+        .is_err());
+
+    let mut boundary = VmMap::new();
+    boundary
+        .insert(VmRegion::new(KERN_BASE - PAGE_SZ, PAGE_SZ, VM_READ))
+        .unwrap();
+    assert!(boundary.find(KERN_BASE - 1).is_some());
 }
 
 #[cfg_attr(test, test)]

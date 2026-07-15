@@ -96,10 +96,10 @@ impl VmRegion {
 }
 
 // AGENT: keep VmMap to mutable per-address-space state; the fixed mmap search
-// base is not stored per address space.
+// base is not stored per address space, and mutation stays inside the MM layer.
 pub struct VmMap {
-    pub regions: Vec<VmRegion>,
-    pub brk: usize,
+    pub(super) regions: Vec<VmRegion>,
+    pub(super) brk: usize,
 }
 
 const MMAP_BASE: usize = 0x7000_0000;
