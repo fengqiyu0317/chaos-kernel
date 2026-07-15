@@ -7,7 +7,7 @@ pub fn validate_access(mode: u8, addr: usize, len: usize, pid: usize) -> Result<
         return Ok(());
     }
     let end = addr.checked_add(len).ok_or("eoverflow")?;
-    if end >= KERN_BASE {
+    if end > USER_TOP {
         return Err("efault");
     }
     match mode {

@@ -8,7 +8,7 @@ impl Kernel {
         addr: usize,
         access: KernelPageFaultAccess,
     ) -> Result<(), &'static str> {
-        if addr >= KERN_BASE {
+        if addr >= USER_TOP {
             return Err("efault");
         }
 

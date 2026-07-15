@@ -2,10 +2,12 @@
 // operations together, separate from physical frame ownership.
 use alloc::vec::Vec;
 
-use super::{checked_align_up, KERN_BASE, PAGE_SZ};
+use super::{checked_align_up, PAGE_SZ, USER_TOP};
 
 // AGENT: keep VmRegion to the VMA metadata that is currently used by the
-// QEMU address-space code; unused region tag/offset fields were removed.
+// QEMU address-space code; derive Clone so transactional callers can snapshot
+// the complete metadata list without duplicating its fields here.
+#[derive(Clone)]
 pub struct VmRegion {
     pub base: usize,
     pub len: usize,
@@ -123,7 +125,7 @@ impl VmMap {
 
         let rb = region.base;
         let re = region.checked_end().ok_or("overflow")?;
-        if re > KERN_BASE {
+        if re > USER_TOP {
             return Err("efault");
         }
 
@@ -205,10 +207,11 @@ impl VmMap {
     }
 
     // AGENT: search free VM gaps with checked candidate/end arithmetic and reuse
-    // the shared MM alignment helper with stricter failure checks.
+    // the shared MM alignment helper; reject lengths that could not later be
+    // inserted as page-granular VMA metadata.
     pub fn find_free(&self, len: usize, align: usize) -> Option<usize> {
-        if len == 0 {
-            return Some(MMAP_BASE);
+        if len == 0 || len % PAGE_SZ != 0 {
+            return None;
         }
 
         let align = if align <= 1 { PAGE_SZ } else { align };
@@ -222,7 +225,7 @@ impl VmMap {
 
         loop {
             let end = cand.checked_add(len)?;
-            if end > KERN_BASE {
+            if end > USER_TOP {
                 return None;
             }
 
@@ -238,39 +241,9 @@ impl VmMap {
         }
     }
 
-    // AGENT: report a saturated total instead of wrapping mapped byte counts.
-    pub fn total_mapped(&self) -> usize {
-        let mut s = 0usize;
-        for r in self.regions.iter() {
-            s = s.saturating_add(r.len);
-        }
-        s
-    }
-
-    // AGENT: copy VMA metadata without exposing mutable access to the source map.
-    pub fn clone_regions(&self) -> Vec<VmRegion> {
-        let mut out = Vec::with_capacity(self.regions.len());
-        for r in self.regions.iter() {
-            let nr = VmRegion {
-                base: r.base,
-                len: r.len,
-                flags: r.flags,
-            };
-            out.push(nr);
-        }
-        out
-    }
-
-    // AGENT: measure the unmapped interval after one sorted VMA without underflow.
-    pub fn gap_after(&self, idx: usize) -> usize {
-        if idx >= self.regions.len() {
-            return 0;
-        }
-        let re = self.regions[idx].end();
-        if idx + 1 < self.regions.len() {
-            self.regions[idx + 1].base.saturating_sub(re)
-        } else {
-            KERN_BASE.saturating_sub(re)
-        }
+    // AGENT: snapshot VMA metadata for fork, checkpoint, and transactional
+    // rollback callers without exposing mutable access to the source map.
+    pub(super) fn clone_regions(&self) -> Vec<VmRegion> {
+        self.regions.clone()
     }
 }

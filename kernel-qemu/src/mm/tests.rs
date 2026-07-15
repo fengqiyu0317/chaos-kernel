@@ -2,8 +2,8 @@
 // expose the same checks to the optional QEMU boot self-test path.
 use super::*;
 use crate::kernel::{
-    hash_combine, BuddyAllocator, FramePool, VmMap, VmRegion, KERN_BASE, MEM_OFF, PAGE_SZ, VM_READ,
-    VM_WRITE,
+    check_access, check_access_rw, hash_combine, BuddyAllocator, FramePool, VmMap, VmRegion,
+    MEM_OFF, PAGE_SZ, USER_TOP, VM_READ, VM_WRITE,
 };
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -22,6 +22,8 @@ pub fn run_all() {
     vm_region_merge_rejects_invalid_endpoints();
     vm_map_insert_coalesces_both_neighbors();
     vm_map_insert_rejects_invalid_ranges_and_overlaps();
+    user_range_checks_use_sv39_lower_half();
+    vm_map_find_free_rejects_non_page_granular_lengths();
     buddy_allocator_alloc_free_smoke();
     buddy_free_merges_with_nonzero_base();
     buddy_free_rejects_duplicate_and_bad_ranges();
@@ -75,12 +77,12 @@ fn vm_region_and_map_preserve_range_semantics() {
     assert_eq!(merged.base, base);
     assert_eq!(merged.len, 3 * PAGE_SZ);
     map.remove_range(base + PAGE_SZ, PAGE_SZ);
-    assert_eq!(map.total_mapped(), 2 * PAGE_SZ);
-    assert_eq!(map.find(base).unwrap().checked_end(), Some(base + PAGE_SZ));
-    assert_eq!(
-        map.find(base + 2 * PAGE_SZ).unwrap().base,
-        base + 2 * PAGE_SZ
-    );
+    let left = map.find(base).unwrap();
+    assert_eq!(left.checked_end(), Some(base + PAGE_SZ));
+    assert_eq!(left.len, PAGE_SZ);
+    let right = map.find(base + 2 * PAGE_SZ).unwrap();
+    assert_eq!(right.base, base + 2 * PAGE_SZ);
+    assert_eq!(right.len, PAGE_SZ);
 }
 
 // AGENT: cover insertion before the first VMA and insertion that bridges two
@@ -120,7 +122,7 @@ fn vm_map_insert_coalesces_both_neighbors() {
 }
 
 // AGENT: exercise every rejected range shape used by insert and both neighbor
-// overlap checks, while retaining the legal half-open KERN_BASE boundary.
+// overlap checks, while retaining the legal half-open USER_TOP boundary.
 #[cfg_attr(test, test)]
 fn vm_map_insert_rejects_invalid_ranges_and_overlaps() {
     let base = 0x3000_0000;
@@ -139,7 +141,7 @@ fn vm_map_insert_rejects_invalid_ranges_and_overlaps() {
         .insert(VmRegion::new(last_page, PAGE_SZ, VM_READ))
         .is_err());
     assert!(map
-        .insert(VmRegion::new(KERN_BASE, PAGE_SZ, VM_READ))
+        .insert(VmRegion::new(USER_TOP, PAGE_SZ, VM_READ))
         .is_err());
 
     map.insert(VmRegion::new(base + PAGE_SZ, 2 * PAGE_SZ, VM_READ))
@@ -153,9 +155,32 @@ fn vm_map_insert_rejects_invalid_ranges_and_overlaps() {
 
     let mut boundary = VmMap::new();
     boundary
-        .insert(VmRegion::new(KERN_BASE - PAGE_SZ, PAGE_SZ, VM_READ))
+        .insert(VmRegion::new(USER_TOP - PAGE_SZ, PAGE_SZ, VM_READ))
         .unwrap();
-    assert!(boundary.find(KERN_BASE - 1).is_some());
+    assert!(boundary.find(USER_TOP - 1).is_some());
+}
+
+// AGENT: enforce the shared exclusive USER_TOP boundary in coarse user-access
+// guards, including the legal final page and the first byte above it.
+#[cfg_attr(test, test)]
+fn user_range_checks_use_sv39_lower_half() {
+    assert!(check_access(USER_TOP - PAGE_SZ, PAGE_SZ));
+    assert!(check_access_rw(USER_TOP - PAGE_SZ, PAGE_SZ, true));
+    assert!(!check_access(USER_TOP - PAGE_SZ, PAGE_SZ + 1));
+    assert!(!check_access_rw(USER_TOP - PAGE_SZ, PAGE_SZ + 1, true));
+    assert!(!check_access(USER_TOP, 1));
+}
+
+// AGENT: keep free-range selection consistent with VmMap::insert so it never
+// returns a candidate for zero-length or non-page-granular VMA metadata.
+#[cfg_attr(test, test)]
+fn vm_map_find_free_rejects_non_page_granular_lengths() {
+    let map = VmMap::new();
+
+    assert_eq!(map.find_free(0, PAGE_SZ), None);
+    assert_eq!(map.find_free(PAGE_SZ - 1, PAGE_SZ), None);
+    assert_eq!(map.find_free(PAGE_SZ + 1, PAGE_SZ), None);
+    assert_eq!(map.find_free(PAGE_SZ, PAGE_SZ), Some(0x7000_0000));
 }
 
 #[cfg_attr(test, test)]

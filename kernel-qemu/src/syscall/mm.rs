@@ -72,7 +72,7 @@ pub(super) fn sys_mmap(
             .ok_or("enomem")?
     };
     let result_end = result_addr.checked_add(aligned_len).ok_or("enomem")?;
-    if result_end > KERN_BASE {
+    if result_end > USER_TOP {
         return Err("enomem");
     }
     let pages_needed = aligned_len / PAGE_SZ;
@@ -101,7 +101,7 @@ pub(super) fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize,
     }
     let aligned_len = checked_align_up(len, PAGE_SZ).ok_or("enomem")?;
     let end = addr.checked_add(aligned_len).ok_or("enomem")?;
-    if end > KERN_BASE {
+    if end > USER_TOP {
         return Err("enomem");
     }
     let task = kernel.cur_task(0).ok_or("esrch")?;
@@ -125,7 +125,7 @@ pub(super) fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str>
             .map(|t| t.process.addr_space.lock().unwrap().brk())
             .unwrap_or(0x0040_0000));
     }
-    if new_brk >= KERN_BASE {
+    if new_brk > USER_TOP {
         return Err("enomem");
     }
     let aligned = checked_align_up(new_brk, PAGE_SZ).ok_or("enomem")?;

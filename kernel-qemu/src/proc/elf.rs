@@ -1,9 +1,6 @@
 // AGENT
 use super::*;
 
-// AGENT: Sv39 lower-half canonical user addresses occupy [0, 2^38).
-const SV39_USER_TOP: usize = 1usize << 38;
-
 // AGENT: retain the validated subset of one ELF PT_LOAD program header for
 // later process-image construction.
 #[derive(Clone, Debug)]
@@ -176,7 +173,7 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, &'static str> {
 // range and return the exact page interval consumed by AddrSpace::map_region.
 fn load_segment_page_range(vaddr: usize, mem_size: usize) -> Result<(usize, usize), &'static str> {
     let mem_end = vaddr.checked_add(mem_size).ok_or("bad_phdr")?;
-    if vaddr >= SV39_USER_TOP || mem_end > SV39_USER_TOP {
+    if vaddr >= USER_TOP || mem_end > USER_TOP {
         return Err("bad_phdr");
     }
     let page_start = align_down(vaddr, PAGE_SZ);

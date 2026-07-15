@@ -25,6 +25,9 @@ pub(crate) use BTreeMap as HashMap;
 // AGENT: simulated realtime starts at this Unix epoch second.
 pub const BOOT_EPOCH: usize = 0;
 pub const PAGE_SZ: usize = 4096;
+// AGENT: keep user mappings inside the canonical low half of Sv39; this is an
+// exclusive upper bound, so the last valid user byte is USER_TOP - 1.
+pub const USER_TOP: usize = 1usize << 38;
 pub const N_PROC: usize = 256;
 pub const MAX_FD: usize = 256; // AGENT
 pub const N_FRAMES: usize = 65536;

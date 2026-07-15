@@ -67,7 +67,7 @@ impl AddrSpace {
     // AGENT: initialize or restore brk metadata after its image mappings have
     // already been built through transactional AddrSpace helpers.
     pub(crate) fn set_brk_metadata(&mut self, brk: usize) -> Result<(), &'static str> {
-        if brk % PAGE_SZ != 0 || brk >= KERN_BASE {
+        if brk % PAGE_SZ != 0 || brk > USER_TOP {
             return Err("einval");
         }
         self.vm_map.brk = brk;
@@ -312,7 +312,7 @@ impl AddrSpace {
     // AGENT: validate user copy boundaries before touching VmMap or Sv39 state.
     fn checked_user_end(addr: usize, len: usize) -> Result<usize, &'static str> {
         let end = addr.checked_add(len).ok_or("efault")?;
-        if end > KERN_BASE {
+        if end > USER_TOP {
             return Err("efault");
         }
         Ok(end)
@@ -420,7 +420,7 @@ impl AddrSpace {
             return Err("einval");
         }
         let end = start.checked_add(len).ok_or("efault")?;
-        if end > KERN_BASE {
+        if end > USER_TOP {
             return Err("efault");
         }
         self.debug_check_page_table_consistency()?;
@@ -520,7 +520,7 @@ impl AddrSpace {
             return Err("einval");
         }
         let end = start.checked_add(len).ok_or("efault")?;
-        if end > KERN_BASE {
+        if end > USER_TOP {
             return Err("efault");
         }
 
@@ -605,7 +605,7 @@ impl AddrSpace {
             return Err("einval");
         }
         let region_end = region.checked_end().ok_or("einval")?;
-        if region_end > KERN_BASE {
+        if region_end > USER_TOP {
             return Err("einval");
         }
         self.debug_check_page_table_consistency()?;
@@ -667,7 +667,7 @@ impl AddrSpace {
         if region.len == 0 || region.base % PAGE_SZ != 0 || region.len % PAGE_SZ != 0 {
             return Err("einval");
         }
-        if region.checked_end().ok_or("einval")? > KERN_BASE {
+        if region.checked_end().ok_or("einval")? > USER_TOP {
             return Err("einval");
         }
         if shared_pages.len() != region.len / PAGE_SZ {
