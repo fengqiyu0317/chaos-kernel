@@ -74,7 +74,8 @@ impl VmRegion {
         Some((left, right))
     }
 
-    // AGENT: merge only when both endpoints and combined length are representable.
+    // AGENT: merge only forward-adjacent regions whose two endpoints and
+    // combined length are representable.
     pub fn merge_with(&self, other: &VmRegion) -> Option<VmRegion> {
         let se = self.checked_end()?;
         if se != other.base {
@@ -83,7 +84,8 @@ impl VmRegion {
         if self.flags != other.flags {
             return None;
         }
-        let combined_len = self.len.checked_add(other.len)?;
+        let combined_end = other.checked_end()?;
+        let combined_len = combined_end.checked_sub(self.base)?;
         let combined = VmRegion {
             base: self.base,
             len: combined_len,

@@ -7,7 +7,8 @@ use crate::kernel::{
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-// AGENT: run the new VMA boundary regression with the existing QEMU MM checks.
+// AGENT: run the VMA boundary and checked-merge regressions with the existing
+// QEMU MM checks.
 pub fn run_all() {
     checked_align_up_rejects_invalid_results();
     bitwise_merge_replaces_only_masked_bits();
@@ -17,9 +18,38 @@ pub fn run_all() {
     frame_pool_bitmap_handles_partial_final_word();
     frame_pool_reclaims_dynamic_heap_pages();
     vm_region_and_map_preserve_range_semantics();
+    vm_region_merge_rejects_invalid_endpoints();
     buddy_allocator_alloc_free_smoke();
     buddy_free_merges_with_nonzero_base();
     buddy_free_rejects_duplicate_and_bad_ranges();
+}
+
+// AGENT: verify that VmRegion merging is directional, permission-preserving,
+// and rejects an unrepresentable endpoint instead of publishing an invalid VMA.
+#[cfg_attr(test, test)]
+fn vm_region_merge_rejects_invalid_endpoints() {
+    let base = 0x1800_0000;
+    let left = VmRegion::new(base, PAGE_SZ, VM_READ);
+    let right = VmRegion::new(base + PAGE_SZ, PAGE_SZ, VM_READ);
+    let merged = left
+        .merge_with(&right)
+        .expect("adjacent regions with matching flags should merge");
+    assert_eq!(merged.base, base);
+    assert_eq!(merged.len, 2 * PAGE_SZ);
+    assert_eq!(merged.flags, VM_READ);
+
+    assert!(right.merge_with(&left).is_none());
+    assert!(left
+        .merge_with(&VmRegion::new(base + 2 * PAGE_SZ, PAGE_SZ, VM_READ))
+        .is_none());
+    assert!(left
+        .merge_with(&VmRegion::new(base + PAGE_SZ, PAGE_SZ, VM_WRITE))
+        .is_none());
+
+    let high_base = usize::MAX - (3 * PAGE_SZ - 1);
+    let high_left = VmRegion::new(high_base, PAGE_SZ, VM_READ);
+    let overflowing_right = VmRegion::new(high_base + PAGE_SZ, 3 * PAGE_SZ, VM_READ);
+    assert!(high_left.merge_with(&overflowing_right).is_none());
 }
 
 // AGENT: keep a boot-time regression at the new VmRegion/VmMap module boundary
