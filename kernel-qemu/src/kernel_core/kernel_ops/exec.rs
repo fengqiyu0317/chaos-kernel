@@ -66,7 +66,7 @@ impl Kernel {
         task.process.sig_state.lock().unwrap().clear_non_caught();
         {
             let mut current_addr_space = task.process.addr_space.lock().unwrap();
-            current_addr_space.release_all_pages(&self.pool);
+            current_addr_space.release_all_pages();
             *current_addr_space = prepared.addr_space;
         }
         *task.process.exec_path.lock().unwrap() = prepared.exec_path;

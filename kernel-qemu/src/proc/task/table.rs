@@ -449,7 +449,7 @@ impl TaskTable {
         let task = match self.spawn(path) {
             Ok(task) => task,
             Err(err) => {
-                image.addr_space.release_all_pages(pool);
+                image.addr_space.release_all_pages();
                 return Err(err);
             }
         };

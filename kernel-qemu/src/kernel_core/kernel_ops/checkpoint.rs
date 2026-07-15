@@ -73,7 +73,7 @@ impl Kernel {
         let task = self.tasks.spawn("checkpoint-restore")?;
         {
             let mut current_addr_space = task.process.addr_space.lock().unwrap();
-            current_addr_space.release_all_pages(&self.pool);
+            current_addr_space.release_all_pages();
             *current_addr_space = addr_space;
         }
         task.restore_checkpoint_fds(&image.fds)?;

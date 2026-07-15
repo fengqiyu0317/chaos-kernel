@@ -62,7 +62,7 @@ fn resident_and_sv39_stay_consistent_across_transitions(pool: &FramePool) {
         .read_user_bytes(base + PAGE_SZ, &mut [0u8; 1])
         .is_err());
 
-    assert_eq!(addr_space.release_all_pages(pool), 2);
+    assert_eq!(addr_space.release_all_pages(), 2);
     addr_space
         .check_page_table_consistency()
         .expect("released address space should have no orphan mappings");
@@ -108,8 +108,8 @@ fn forked_writable_page_resolves_cow(pool: &FramePool) {
     assert_eq!(&parent_bytes, b"parent");
     assert_eq!(&child_bytes, b"child!");
 
-    parent.release_all_pages(pool);
-    child.release_all_pages(pool);
+    parent.release_all_pages();
+    child.release_all_pages();
 }
 
 // AGENT: capability inheritance keeps only the mask-approved bits and clamps
@@ -396,7 +396,7 @@ fn prepared_user_image_loads_elf_segment_and_stack(pool: &FramePool) {
     assert_user_cstr(&image.addr_space, argv0, "init");
     assert_eq!(image.addr_space.brk(), 0x0040_2000);
 
-    image.addr_space.release_all_pages(pool);
+    image.addr_space.release_all_pages();
 }
 
 // AGENT: keep foreign-machine, unsupported ET_DYN, and invalid-entry ELF
@@ -507,7 +507,7 @@ fn prepared_user_image_loads_segments_sharing_a_page(pool: &FramePool) {
         image.addr_space.mapped_region(page_vaddr).unwrap().flags,
         VM_READ | VM_WRITE | VM_EXEC
     );
-    image.addr_space.release_all_pages(pool);
+    image.addr_space.release_all_pages();
 }
 
 // AGENT: prove that program-header order does not control virtual-address order
@@ -538,7 +538,7 @@ fn prepared_user_image_loads_out_of_order_segments(pool: &FramePool) {
     assert_eq!(&high, b"high");
     assert_eq!(&low, b"low");
     assert_eq!(image.thd_ctx.uctx.ip, high_vaddr as u64);
-    image.addr_space.release_all_pages(pool);
+    image.addr_space.release_all_pages();
 }
 
 // AGENT: build a compact ELF64 fixture with one PT_LOAD segment for the QEMU

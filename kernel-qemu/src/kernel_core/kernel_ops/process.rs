@@ -35,7 +35,7 @@ impl Kernel {
         let child_pid = task.process_pid();
 
         self.release_exit_thread_resources(task, thread_ids);
-        task.release_process_exit_resources(&self.pool);
+        task.release_process_exit_resources();
         self.tasks.reparent_children_to_init(task);
         self.switch_away_from_exited_current(cpu, task.id());
 

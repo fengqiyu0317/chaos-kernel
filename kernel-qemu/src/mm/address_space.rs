@@ -463,8 +463,9 @@ impl AddrSpace {
     }
 
     // AGENT: process teardown removes hardware leaves before resident frames can
-    // drop, then releases the now-inactive Sv39 page-table frames.
-    pub fn release_all_pages(&mut self, _pool: &FramePool) -> usize {
+    // drop through RAII, then releases the now-inactive Sv39 page-table frames
+    // without requiring an unused allocator argument.
+    pub fn release_all_pages(&mut self) -> usize {
         self.check_page_table_consistency()
             .expect("address space should be consistent before release");
 
@@ -594,21 +595,6 @@ impl AddrSpace {
             }
         }
         crate::csr::sfence_vma();
-        Ok(())
-    }
-
-    // AGENT: split only VmMap region metadata; resident pages and Sv39 leaves are
-    // already page-granular and stay unchanged.
-    pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> {
-        let idx = self
-            .vm_map
-            .regions
-            .iter()
-            .position(|region| region.contains(addr))
-            .ok_or("enomem")?;
-        let (left, right) = self.vm_map.regions[idx].split_at(addr).ok_or("einval")?;
-        self.vm_map.regions[idx] = left;
-        self.vm_map.regions.insert(idx + 1, right);
         Ok(())
     }
 

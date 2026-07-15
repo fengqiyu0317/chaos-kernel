@@ -24,7 +24,7 @@ pub(crate) fn prepare_user_image(
             thd_ctx,
         }),
         Err(err) => {
-            addr_space.release_all_pages(pool);
+            addr_space.release_all_pages();
             Err(err)
         }
     }
