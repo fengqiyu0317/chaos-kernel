@@ -192,9 +192,6 @@ impl AddrSpace {
         let mut child = Self::new();
         child.brk = parent.brk;
         for region in parent.vm_map.clone_regions() {
-            if region.flags & VM_DONTCOPY != 0 {
-                continue;
-            }
             child.vm_map.insert(region)?;
         }
 
@@ -204,9 +201,6 @@ impl AddrSpace {
             let Some(region) = parent.vm_map.find(page_addr) else {
                 continue;
             };
-            if region.flags & VM_DONTCOPY != 0 {
-                continue;
-            }
             let flags = region.flags;
             let parent_leaf = parent.sv39.leaf_mapping(page_addr)?;
             if parent_leaf.paddr != parent_entry.frame.paddr() {

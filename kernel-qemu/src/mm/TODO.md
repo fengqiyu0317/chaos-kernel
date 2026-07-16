@@ -26,6 +26,11 @@ Remaining replacement and hardening work:
 - `CLK` timer references with the QEMU timer tick source.
 - Host `FramePool` slot accounting with QEMU physical-memory initialization
   from linker symbols and the QEMU `virt` RAM range.
+- Implement fork-advice semantics as one complete feature: add `madvise`
+  syscall dispatch, validate `MADV_DONTFORK` / `MADV_DOFORK`, split VMAs at
+  advice-range boundaries, update the VMA policy, and cover fork inheritance
+  with QEMU regressions. Do not restore a standalone `VM_DONTCOPY` bit before
+  those producer and verification paths exist.
 
 Semantic entries to preserve while replacing internals:
 

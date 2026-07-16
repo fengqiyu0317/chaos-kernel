@@ -113,7 +113,6 @@ pub const VM_WRITE: u32 = 0x02;
 pub const VM_EXEC: u32 = 0x04;
 pub const VM_SHARED: u32 = 0x08;
 pub const VM_GROWSDOWN: u32 = 0x10;
-pub const VM_DONTCOPY: u32 = 0x20;
 pub const VM_HUGETLB: u32 = 0x40;
 pub const VM_PFNMAP: u32 = 0x80;
 
