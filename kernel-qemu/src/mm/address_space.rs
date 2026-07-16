@@ -73,9 +73,8 @@ impl AddrSpace {
         Ok(())
     }
 
-    // AGENT: enforce the AddrSpace invariant directly between VMA policy,
-    // resident frame ownership, and live Sv39 leaves whose unused A/D state is
-    // preset so hardware cannot silently change the compared policy flags.
+    // AGENT: enforce the AddrSpace invariant in both directions without
+    // allocating a leaf snapshot, keeping the audit safe on teardown paths.
     pub(crate) fn check_page_table_consistency(&self) -> Result<(), &'static str> {
         for (&vaddr, entry) in &self.resident_pages.entries {
             let region = self.vm_map.find(vaddr).ok_or("resident page outside VMA")?;
@@ -102,14 +101,14 @@ impl AddrSpace {
             }
         }
 
-        let leaves = self.sv39.leaf_mappings()?;
-        if leaves.len() != self.resident_pages.entries.len() {
-            return Err("resident and Sv39 leaf counts disagree");
-        }
-        for leaf in leaves {
+        let leaf_count = self.sv39.for_each_leaf(|leaf| {
             if !self.resident_pages.entries.contains_key(&leaf.vaddr) {
                 return Err("Sv39 leaf missing resident page");
             }
+            Ok(())
+        })?;
+        if leaf_count != self.resident_pages.entries.len() {
+            return Err("resident and Sv39 leaf counts disagree");
         }
         Ok(())
     }
@@ -397,8 +396,9 @@ impl AddrSpace {
         Ok(())
     }
 
-    // AGENT: unmap hardware leaves transactionally, flush stale translations,
-    // then drop resident frame ownership and VMA metadata.
+    // AGENT: preflight only resident pages inside the requested BTreeMap range,
+    // unmap hardware leaves transactionally, flush stale translations, then drop
+    // resident frame ownership and VMA metadata.
     pub fn unmap_range(
         &mut self,
         start: usize,
@@ -414,10 +414,7 @@ impl AddrSpace {
         }
         self.debug_check_page_table_consistency()?;
         let mut pages_to_unmap = Vec::new();
-        for (&addr, page) in &self.resident_pages.entries {
-            if addr < start || addr >= end {
-                continue;
-            }
+        for (&addr, page) in self.resident_pages.entries.range(start..end) {
             let leaf = self.sv39.leaf_mapping(addr)?;
             if leaf.paddr != page.frame.paddr() {
                 return Err("resident and Sv39 physical pages disagree");
@@ -451,18 +448,14 @@ impl AddrSpace {
         Ok(pages_to_unmap.len())
     }
 
-    // AGENT: process teardown removes hardware leaves before resident frames can
-    // drop through RAII, then releases the now-inactive Sv39 page-table frames
-    // without requiring an unused allocator argument.
-    pub fn release_all_pages(&mut self) -> usize {
+    // AGENT: process teardown removes hardware leaves before resident frames
+    // drop through RAII, then releases Sv39 frames without reporting an
+    // ambiguous count for aliased resident pages and internal table pages.
+    pub fn release_all_pages(&mut self) {
         self.check_page_table_consistency()
             .expect("address space should be consistent before release");
 
-        let mut released = 0;
-        for (&addr, pte) in &self.resident_pages.entries {
-            if pte.frame.is_unique() {
-                released += 1;
-            }
+        for &addr in self.resident_pages.entries.keys() {
             self.sv39
                 .unmap_leaf(addr)
                 .expect("resident Sv39 leaf should unmap");
@@ -474,7 +467,6 @@ impl AddrSpace {
         self.sv39.clear();
         self.vm_map.regions.clear();
         crate::csr::sfence_vma();
-        released
     }
 
     // AGENT: split VmMap metadata only when a protection boundary falls inside a

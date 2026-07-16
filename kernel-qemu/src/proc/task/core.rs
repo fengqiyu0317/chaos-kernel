@@ -153,8 +153,8 @@ impl ProcessState {
     }
 
     // AGENT: move droppable resources out of locks before process teardown and
-    // rely on address-space RAII rather than forwarding an unused frame pool.
-    pub fn release_exit_resources(&self) -> usize {
+    // let address-space RAII reclaim frames without forwarding a bogus count.
+    pub fn release_exit_resources(&self) {
         let old_resources = (
             take_mutex_default(&self.debug_fds),
             take_mutex_default(&self.files),
@@ -165,9 +165,8 @@ impl ProcessState {
             take_mutex_default(&self.shm_ctx),
         );
         let _woken_futex_waiters = self.futex.wake_all();
-        let released_pages = self.addr_space.lock().unwrap().release_all_pages();
+        self.addr_space.lock().unwrap().release_all_pages();
         drop(old_resources);
-        released_pages
     }
 }
 
@@ -406,9 +405,9 @@ impl Task {
     }
 
     // AGENT: release per-process resources that no later wait status needs
-    // without threading an unused allocator argument through the task layer.
-    pub fn release_process_exit_resources(&self) -> usize {
-        self.process.release_exit_resources()
+    // without exposing the removed ambiguous page-release count.
+    pub fn release_process_exit_resources(&self) {
+        self.process.release_exit_resources();
     }
 
     // AGENT: clear CLONE_CHILD_CLEARTID before waking one futex waiter.

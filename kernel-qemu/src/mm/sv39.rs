@@ -303,14 +303,18 @@ impl PageTable {
         Ok((table, indices[2], leaf))
     }
 
-    // AGENT: recursively collect every valid 4 KiB leaf under an owned root so
-    // callers can detect hardware mappings that have no resident-page owner.
-    fn collect_leaf_mappings(
+    // AGENT: visit every valid 4 KiB leaf without allocating a snapshot so
+    // teardown-time consistency checks remain usable under memory pressure.
+    fn visit_leaf_mappings<F>(
         table_paddr: usize,
         level: usize,
         vaddr_prefix: usize,
-        leaves: &mut Vec<Sv39Leaf>,
-    ) -> Result<(), &'static str> {
+        visitor: &mut F,
+    ) -> Result<usize, &'static str>
+    where
+        F: FnMut(Sv39Leaf) -> Result<(), &'static str>,
+    {
+        let mut leaf_count = 0usize;
         for index in 0..PTE_COUNT {
             let pte = read_pte(table_paddr, index);
             if !pte_is_valid(pte) {
@@ -323,11 +327,12 @@ impl PageTable {
                 if level != 0 {
                     return Err("unexpected huge leaf");
                 }
-                leaves.push(Sv39Leaf {
+                visitor(Sv39Leaf {
                     vaddr: canonicalize_sv39(vaddr),
                     paddr: pte_paddr(pte),
                     flags: pte & PTE_FLAG_MASK & !PTE_V,
-                });
+                })?;
+                leaf_count = leaf_count.checked_add(1).ok_or("too many Sv39 leaves")?;
                 continue;
             }
 
@@ -337,9 +342,12 @@ impl PageTable {
             if level == 0 {
                 return Err("invalid Sv39 leaf table");
             }
-            Self::collect_leaf_mappings(pte_paddr(pte), level - 1, vaddr, leaves)?;
+            let child_count = Self::visit_leaf_mappings(pte_paddr(pte), level - 1, vaddr, visitor)?;
+            leaf_count = leaf_count
+                .checked_add(child_count)
+                .ok_or("too many Sv39 leaves")?;
         }
-        Ok(())
+        Ok(leaf_count)
     }
 
     // AGENT: create a hardware leaf mapping while keeping intermediate table
@@ -417,15 +425,16 @@ impl PageTable {
         })
     }
 
-    // AGENT: snapshot every owned hardware leaf so AddrSpace can enforce the
-    // reverse invariant that no Sv39 user mapping exists without resident data.
-    pub(super) fn leaf_mappings(&self) -> Result<Vec<Sv39Leaf>, &'static str> {
+    // AGENT: expose an allocation-free hardware-leaf walk so AddrSpace can
+    // enforce the reverse resident-owner invariant during teardown as well.
+    pub(super) fn for_each_leaf<F>(&self, mut visitor: F) -> Result<usize, &'static str>
+    where
+        F: FnMut(Sv39Leaf) -> Result<(), &'static str>,
+    {
         if self.root_paddr == 0 {
-            return Ok(Vec::new());
+            return Ok(0);
         }
-        let mut leaves = Vec::new();
-        Self::collect_leaf_mappings(self.root_paddr()?, 2, 0, &mut leaves)?;
-        Ok(leaves)
+        Self::visit_leaf_mappings(self.root_paddr()?, 2, 0, &mut visitor)
     }
 
     // AGENT: require a live root and leaf when removing a mapping so callers

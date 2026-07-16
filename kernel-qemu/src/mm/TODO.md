@@ -26,6 +26,13 @@ Remaining replacement and hardening work:
 - `CLK` timer references with the QEMU timer tick source.
 - Host `FramePool` slot accounting with QEMU physical-memory initialization
   from linker symbols and the QEMU `virt` RAM range.
+- Complete file-backed `mmap` on top of the existing
+  `FileNode`/`FileStorage`/`BlockCache` path: consume and validate `fd`/`offset`
+  in `sys_mmap()`, populate real resident frames from file contents, retain
+  per-page backing metadata, keep `MAP_PRIVATE` changes private, and flush
+  dirty `MAP_SHARED` pages transactionally before `unmap_range()` removes any
+  mapping. Add QEMU regressions for load, writeback, private isolation, invalid
+  descriptors/offsets, and writeback-failure rollback.
 - Implement fork-advice semantics as one complete feature: add `madvise`
   syscall dispatch, validate `MADV_DONTFORK` / `MADV_DOFORK`, split VMAs at
   advice-range boundaries, update the VMA policy, and cover fork inheritance

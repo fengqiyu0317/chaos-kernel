@@ -25,6 +25,7 @@ pub fn run_all(pool: &FramePool) {
     writable_non_cow_page_is_not_recovered_as_cow(pool);
     forked_writable_page_resolves_cow(pool);
     shm_segment_maps_shared_physical_page(pool);
+    release_all_pages_drops_same_space_aliases(pool);
 }
 
 // AGENT: exercise map, protection, unmap, and release transitions while
@@ -63,7 +64,7 @@ fn resident_and_sv39_stay_consistent_across_transitions(pool: &FramePool) {
         .read_user_bytes(base + PAGE_SZ, &mut [0u8; 1])
         .is_err());
 
-    assert_eq!(addr_space.release_all_pages(), 2);
+    addr_space.release_all_pages();
     addr_space
         .check_page_table_consistency()
         .expect("released address space should have no orphan mappings");
@@ -92,7 +93,10 @@ fn writable_non_cow_page_is_not_recovered_as_cow(pool: &FramePool) {
     addr_space
         .check_page_table_consistency()
         .expect("rejected non-COW recovery should leave the mapping unchanged");
-    assert_eq!(addr_space.release_all_pages(), 1);
+    addr_space.release_all_pages();
+    addr_space
+        .check_page_table_consistency()
+        .expect("released non-COW address space should be empty");
 }
 
 // AGENT: prove parent and child carry independent mapping-local COW state by
@@ -686,6 +690,35 @@ fn shm_segment_maps_shared_physical_page(pool: &FramePool) {
         .read_user_bytes(right_addr + 17, &mut bytes)
         .expect("shared mapping should be readable");
     assert_eq!(&bytes, b"shared");
+}
+
+// AGENT: cover two virtual mappings that own the same physical frame inside one
+// address space and verify bulk release drops both resident aliases.
+fn release_all_pages_drops_same_space_aliases(pool: &FramePool) {
+    let base = 0x3100_0000;
+    let frame = pool
+        .alloc_pg_frame()
+        .expect("alias regression should allocate one shared frame");
+    let owner = SharedPage::new(frame);
+    let aliases = [owner.clone(), owner.clone()];
+    let mut addr_space = AddrSpace::new();
+
+    addr_space
+        .map_shared_pages(
+            VmRegion::new(base, PAGE_SZ * aliases.len(), VM_READ | VM_WRITE),
+            &aliases,
+            pool,
+        )
+        .expect("same-space aliases should map");
+    drop(aliases);
+    assert_eq!(owner.sharers(), 3);
+
+    addr_space.release_all_pages();
+    addr_space
+        .check_page_table_consistency()
+        .expect("alias release should leave no resident or Sv39 mappings");
+    assert!(addr_space.mapped_region(base).is_none());
+    assert_eq!(owner.sharers(), 1);
 }
 
 // AGENT: read a known-length C string from user memory and verify its trailing
