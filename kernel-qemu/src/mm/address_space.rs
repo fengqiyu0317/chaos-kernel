@@ -357,24 +357,17 @@ impl AddrSpace {
         let page_addr = align_down(cur, PAGE_SZ);
         let page_off = cur & (PAGE_SZ - 1);
         let len = min(end - cur, min(PAGE_SZ - page_off, region_end - cur));
-        let pte = self
+        let (is_cow, resident_paddr) = self
             .resident_pages
             .entries
             .get(&page_addr)
+            .map(|pte| (pte.cow, pte.frame.paddr()))
             .ok_or("efault")?;
-        if pte.cow {
-            self.handle_cow_fault(cur, pool).map_err(|_| "efault")?;
-        }
-
-        let pte = self
-            .resident_pages
-            .entries
-            .get(&page_addr)
-            .ok_or("efault")?;
-        if pte.cow {
-            return Err("efault");
-        }
-        let frame_paddr = pte.frame.paddr();
+        let frame_paddr = if is_cow {
+            self.handle_cow_fault(cur, pool).map_err(|_| "efault")?
+        } else {
+            resident_paddr
+        };
         let paddr = self.sv39.translate(cur, PageAccess::Write)?;
         if align_down(paddr, PAGE_SZ) != frame_paddr {
             return Err("efault");
