@@ -469,26 +469,6 @@ impl AddrSpace {
         crate::csr::sfence_vma();
     }
 
-    // AGENT: split VmMap metadata only when a protection boundary falls inside a
-    // mapped region; resident pages and Sv39 leaves stay page-granular.
-    fn split_protection_boundary(&mut self, addr: usize) -> Result<(), &'static str> {
-        let Some(idx) = self
-            .vm_map
-            .regions
-            .iter()
-            .position(|region| region.contains(addr))
-        else {
-            return Ok(());
-        };
-        if self.vm_map.regions[idx].base == addr {
-            return Ok(());
-        }
-        let (left, right) = self.vm_map.regions[idx].split_at(addr).ok_or("einval")?;
-        self.vm_map.regions[idx] = left;
-        self.vm_map.regions.insert(idx + 1, right);
-        Ok(())
-    }
-
     // AGENT: snapshot live leaf flags for rollback, apply every Sv39 protection
     // change, then commit the matching VMA policy.
     pub fn protect(
@@ -509,9 +489,6 @@ impl AddrSpace {
         while covered < end {
             let region = self.vm_map.find(covered).ok_or("efault")?;
             let region_end = min(region.end(), end);
-            if region_end <= covered {
-                return Err("efault");
-            }
             covered = region_end;
         }
 
@@ -541,11 +518,11 @@ impl AddrSpace {
         }
 
         let old_regions = self.vm_map.clone_regions();
-        if let Err(err) = self.split_protection_boundary(end) {
+        if let Err(err) = self.vm_map.split_at_boundary(end) {
             self.vm_map.regions = old_regions;
             return Err(err);
         }
-        if let Err(err) = self.split_protection_boundary(start) {
+        if let Err(err) = self.vm_map.split_at_boundary(start) {
             self.vm_map.regions = old_regions;
             return Err(err);
         }

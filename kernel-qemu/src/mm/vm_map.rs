@@ -175,6 +175,22 @@ impl VmMap {
         region.contains(addr).then_some(region)
     }
 
+    // AGENT: make an interior address a VMA collection boundary while leaving
+    // existing boundaries and unmapped addresses unchanged.
+    pub(super) fn split_at_boundary(&mut self, addr: usize) -> Result<(), &'static str> {
+        let Some(idx) = self.regions.iter().position(|region| region.contains(addr)) else {
+            return Ok(());
+        };
+        if self.regions[idx].base == addr {
+            return Ok(());
+        }
+
+        let (left, right) = self.regions[idx].split_at(addr).ok_or("einval")?;
+        self.regions[idx] = left;
+        self.regions.insert(idx + 1, right);
+        Ok(())
+    }
+
     // AGENT: remove the requested half-open range from VMA metadata by keeping
     // any non-overlapping left/right fragments.
     pub fn remove_range(&mut self, base: usize, len: usize) {
