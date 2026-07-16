@@ -3,7 +3,7 @@
 use alloc::collections::BTreeMap;
 use core::mem;
 
-use super::{SharedPage, PTE_A, PTE_R, PTE_U, PTE_W, PTE_X, VM_EXEC, VM_READ, VM_WRITE};
+use super::{SharedPage, PTE_A, PTE_D, PTE_R, PTE_U, PTE_W, PTE_X, VM_EXEC, VM_READ, VM_WRITE};
 
 // AGENT: store software resident-page metadata separately from the real Sv39
 // page table so the BTreeMap is not mistaken for hardware page-table storage.
@@ -28,18 +28,19 @@ impl ResidentPages {
     }
 }
 
-// AGENT: translate migrated VM flags into legal Sv39 leaf permissions while
-// keeping PROT_NONE pages non-user and VM_WRITE leaves hardware-legal.
+// AGENT: translate migrated VM flags into legal Sv39 leaf permissions, preset
+// unused A/D state to avoid hardware mutation or Svade faults, and keep
+// PROT_NONE pages non-user plus VM_WRITE leaves hardware-legal.
 pub(super) fn vm_flags_to_pte_flags(flags: u32) -> usize {
     let can_read = flags & VM_READ != 0;
     let can_write = flags & VM_WRITE != 0;
     let can_exec = flags & VM_EXEC != 0;
 
     if !can_read && !can_write && !can_exec {
-        return PTE_R;
+        return PTE_R | PTE_A | PTE_D;
     }
 
-    let mut pte_flags = PTE_A | PTE_U;
+    let mut pte_flags = PTE_A | PTE_D | PTE_U;
     if can_read {
         pte_flags |= PTE_R;
     }

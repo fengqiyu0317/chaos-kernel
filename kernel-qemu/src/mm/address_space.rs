@@ -74,7 +74,8 @@ impl AddrSpace {
     }
 
     // AGENT: enforce the AddrSpace invariant directly between VMA policy,
-    // resident frame ownership, and the live Sv39 leaves.
+    // resident frame ownership, and live Sv39 leaves whose unused A/D state is
+    // preset so hardware cannot silently change the compared policy flags.
     pub(crate) fn check_page_table_consistency(&self) -> Result<(), &'static str> {
         for (&vaddr, entry) in &self.resident_pages.entries {
             let region = self.vm_map.find(vaddr).ok_or("resident page outside VMA")?;
@@ -92,6 +93,9 @@ impl AddrSpace {
             }
             if leaf.flags != expected_flags {
                 return Err("Sv39 flags disagree with VMA/COW policy");
+            }
+            if leaf.flags & (PTE_A | PTE_D) != PTE_A | PTE_D {
+                return Err("Sv39 leaf has unset accessed/dirty state");
             }
             if entry.cow && leaf.flags & PTE_W != 0 {
                 return Err("writable COW Sv39 leaf");
@@ -248,13 +252,15 @@ impl AddrSpace {
         Ok(child)
     }
 
-    // AGENT: stage COW state, update Sv39, commit resident ownership, flush stale
-    // translations, and only then allow the old frame owner to drop.
+    // AGENT: reject non-COW faults, then stage COW state, update Sv39, commit
+    // resident ownership, flush stale translations, and only then allow the old
+    // frame owner to drop.
     pub fn handle_cow_fault(
         &mut self,
         addr: usize,
         pool: &FramePool,
     ) -> Result<usize, &'static str> {
+        self.debug_check_page_table_consistency()?;
         let page_addr = align_down(addr, PAGE_SZ);
         let region = self.vm_map.find(addr).ok_or("segfault")?;
         let flags = region.flags;
@@ -272,11 +278,7 @@ impl AddrSpace {
             return Err("efault");
         }
         if !is_cow {
-            return if old_leaf.flags & PTE_W != 0 {
-                Ok(old_paddr)
-            } else {
-                Err("segfault")
-            };
+            return Err("segfault");
         }
         if old_leaf.flags & PTE_W != 0 {
             return Err("efault");
@@ -299,6 +301,7 @@ impl AddrSpace {
         let old_entry = mem::replace(pte, replacement);
         crate::csr::sfence_vma();
         drop(old_entry);
+        self.debug_check_page_table_consistency()?;
         Ok(paddr)
     }
 

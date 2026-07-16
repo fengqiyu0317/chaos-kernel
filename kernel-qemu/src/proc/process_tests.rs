@@ -22,6 +22,7 @@ pub fn run_all(pool: &FramePool) {
     prepared_user_image_loads_segments_sharing_a_page(pool);
     prepared_user_image_loads_out_of_order_segments(pool);
     resident_and_sv39_stay_consistent_across_transitions(pool);
+    writable_non_cow_page_is_not_recovered_as_cow(pool);
     forked_writable_page_resolves_cow(pool);
     shm_segment_maps_shared_physical_page(pool);
 }
@@ -66,6 +67,32 @@ fn resident_and_sv39_stay_consistent_across_transitions(pool: &FramePool) {
     addr_space
         .check_page_table_consistency()
         .expect("released address space should have no orphan mappings");
+}
+
+// AGENT: reject a store-fault recovery request for an ordinary writable page so
+// the trap path cannot retry a persistent non-COW fault without changing state.
+fn writable_non_cow_page_is_not_recovered_as_cow(pool: &FramePool) {
+    let addr = 0x1700_0000;
+    let mut addr_space = AddrSpace::new();
+    addr_space
+        .map_region(VmRegion::new(addr, PAGE_SZ, VM_READ | VM_WRITE), pool)
+        .expect("ordinary writable page should map");
+    addr_space
+        .check_page_table_consistency()
+        .expect("ordinary leaf should include stable A/D state");
+
+    assert_eq!(
+        addr_space.handle_cow_fault(addr, pool),
+        Err("segfault"),
+        "a non-COW writable mapping must not be reported as a recovered fault"
+    );
+    addr_space
+        .write_user_bytes(addr, b"ok", pool)
+        .expect("ordinary kernel usercopy should remain writable");
+    addr_space
+        .check_page_table_consistency()
+        .expect("rejected non-COW recovery should leave the mapping unchanged");
+    assert_eq!(addr_space.release_all_pages(), 1);
 }
 
 // AGENT: prove parent and child carry independent mapping-local COW state by
