@@ -68,8 +68,8 @@ fn resident_and_sv39_stay_consistent_across_transitions(pool: &FramePool) {
         .expect("released address space should have no orphan mappings");
 }
 
-// AGENT: keep resident frame/COW metadata and live Sv39 permission handling
-// covered by proving that a writable-private fork still separates pages.
+// AGENT: prove parent and child carry independent mapping-local COW state by
+// resolving each side in turn while their page contents remain separated.
 fn forked_writable_page_resolves_cow(pool: &FramePool) {
     let addr = 0x1800_0000;
     let mut parent = AddrSpace::new();
@@ -106,6 +106,21 @@ fn forked_writable_page_resolves_cow(pool: &FramePool) {
         .read_user_bytes(addr, &mut child_bytes)
         .expect("child page should remain readable");
     assert_eq!(&parent_bytes, b"parent");
+    assert_eq!(&child_bytes, b"child!");
+
+    parent
+        .write_user_bytes(addr, b"newpar", pool)
+        .expect("parent should resolve its own remaining COW state");
+    parent
+        .check_page_table_consistency()
+        .expect("resolved parent COW state should match Sv39");
+    parent
+        .read_user_bytes(addr, &mut parent_bytes)
+        .expect("resolved parent page should remain readable");
+    child
+        .read_user_bytes(addr, &mut child_bytes)
+        .expect("child page should remain isolated");
+    assert_eq!(&parent_bytes, b"newpar");
     assert_eq!(&child_bytes, b"child!");
 
     parent.release_all_pages();

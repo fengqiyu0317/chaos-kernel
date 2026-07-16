@@ -3,9 +3,6 @@ use super::*;
 // AGENT: import resident page-table metadata from its dedicated module so this
 // file only coordinates address-space operations.
 use super::page_table::{pte_flags_without_write, vm_flags_to_pte_flags, ResidentPages};
-// AGENT: expose resident-page ownership metadata through address_space while
-// keeping its implementation in the dedicated page_table module.
-pub use super::page_table::ResidentPage;
 
 // AGENT: own address-space-wide layout metadata and coordinate VmMap, resident
 // page metadata, and the Sv39 page table at their shared consistency boundary.
@@ -232,7 +229,7 @@ impl AddrSpace {
                 child_leaf_flags = cow_flags;
                 parent_leaf_changed = true;
             }
-            child_entries.push((page_addr, parent_entry.clone_mapping(), child_leaf_flags));
+            child_entries.push((page_addr, parent_entry.clone(), child_leaf_flags));
         }
 
         for (page_addr, entry, leaf_flags) in child_entries.iter() {
@@ -652,7 +649,7 @@ impl AddrSpace {
         for (page_addr, frame) in mapped.into_iter() {
             self.resident_pages
                 .entries
-                .insert(page_addr, ResidentPage::new(frame));
+                .insert(page_addr, SharedPage::new(frame));
         }
         crate::csr::sfence_vma();
         Ok(())
@@ -706,9 +703,8 @@ impl AddrSpace {
         }
 
         for (page_addr, page) in mapped.into_iter() {
-            self.resident_pages
-                .entries
-                .insert(page_addr, ResidentPage::from_shared(page, flags));
+            debug_assert!(!page.cow);
+            self.resident_pages.entries.insert(page_addr, page);
         }
         crate::csr::sfence_vma();
         Ok(())

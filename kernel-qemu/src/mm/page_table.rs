@@ -3,72 +3,12 @@
 use alloc::collections::BTreeMap;
 use core::mem;
 
-use super::{
-    FramePool, PgFrame, SharedPage, PTE_A, PTE_R, PTE_U, PTE_W, PTE_X, VM_EXEC, VM_READ, VM_SHARED,
-    VM_WRITE,
-};
-
-// AGENT: resident metadata owns the mapped frame and software-only COW state;
-// VmRegion owns permission policy and Sv39 owns the live leaf flags.
-pub struct ResidentPage {
-    pub(super) frame: SharedPage,
-    pub(super) cow: bool,
-}
-
-// AGENT: keep resident frame-ownership and COW transitions beside their data.
-impl ResidentPage {
-    // AGENT: wrap a caller-initialized anonymous frame; the caller must zero a
-    // newly allocated frame before exposing the mapping to user space.
-    pub fn new(frame: PgFrame) -> Self {
-        Self {
-            frame: SharedPage::new(frame),
-            cow: false,
-        }
-    }
-
-    // AGENT: attach an explicitly shared physical page without enabling COW,
-    // and catch accidental use for a private mapping during development.
-    pub(super) fn from_shared(frame: SharedPage, flags: u32) -> Self {
-        debug_assert!(flags & VM_SHARED != 0);
-        Self { frame, cow: false }
-    }
-
-    // AGENT: mark a private resident page as software COW after the Sv39 leaf
-    // has already been made read-only by AddrSpace.
-    pub(super) fn as_cow(&mut self) {
-        self.cow = true;
-    }
-
-    // AGENT: stage replacement frame ownership without changing the live
-    // resident entry, so a failed Sv39 update leaves the old state intact.
-    pub(super) fn prepare_resolved_write(&self, pool: &FramePool) -> Result<Self, &'static str> {
-        debug_assert!(self.cow);
-        Ok(Self {
-            frame: self.frame.prepare_cow_copy(pool)?,
-            cow: false,
-        })
-    }
-
-    // AGENT: expose the physical-frame identity while keeping ownership in the
-    // resident page-table entry.
-    pub fn frame_id(&self) -> usize {
-        self.frame.frame_id()
-    }
-
-    // AGENT: clone resident ownership and software COW state for a child
-    // mapping; the live Sv39 flags are copied separately by AddrSpace.
-    pub(super) fn clone_mapping(&self) -> Self {
-        Self {
-            frame: self.frame.clone(),
-            cow: self.cow,
-        }
-    }
-}
+use super::{SharedPage, PTE_A, PTE_R, PTE_U, PTE_W, PTE_X, VM_EXEC, VM_READ, VM_WRITE};
 
 // AGENT: store software resident-page metadata separately from the real Sv39
 // page table so the BTreeMap is not mistaken for hardware page-table storage.
 pub(super) struct ResidentPages {
-    pub(super) entries: BTreeMap<usize, ResidentPage>,
+    pub(super) entries: BTreeMap<usize, SharedPage>,
 }
 
 // AGENT: own resident page-table initialization and bulk-detach operations.
@@ -83,7 +23,7 @@ impl ResidentPages {
 
     // AGENT: detach all resident metadata only through an exclusive AddrSpace
     // borrow, keeping software metadata and Sv39 updates in one lock domain.
-    pub(super) fn take_all(&mut self) -> BTreeMap<usize, ResidentPage> {
+    pub(super) fn take_all(&mut self) -> BTreeMap<usize, SharedPage> {
         mem::take(&mut self.entries)
     }
 }

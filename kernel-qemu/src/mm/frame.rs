@@ -74,18 +74,18 @@ impl Drop for PgFrameInner {
     }
 }
 
-// AGENT: SharedPage is the resident physical page object shared by forked PTEs;
-// keep COW frame splitting beside the PgFrame ownership it wraps.
+// AGENT: SharedPage is one by-value page handle: clones share the PgFrame while
+// each wrapper keeps independent mapping-local COW state.
 #[derive(Clone)]
 pub struct SharedPage {
-    frame: PgFrame,
+    pub(super) frame: PgFrame,
+    pub(super) cow: bool,
 }
 
-// AGENT: expose shared-frame identity and stage COW replacement without
-// mutating the live page-table owner before its Sv39 update commits.
+// AGENT: keep shared-frame identity and mapping-local COW transitions together.
 impl SharedPage {
     pub fn new(frame: PgFrame) -> Self {
-        Self { frame }
+        Self { frame, cow: false }
     }
 
     pub fn frame_id(&self) -> usize {
@@ -104,16 +104,24 @@ impl SharedPage {
         self.frame.count()
     }
 
-    // AGENT: retain the old mapping while preparing a COW replacement; callers
-    // can discard this value on failure or commit it after updating Sv39.
-    pub(super) fn prepare_cow_copy(&self, pool: &FramePool) -> Result<Self, &'static str> {
-        if self.is_unique() {
-            return Ok(self.clone());
-        }
+    // AGENT: mark this mapping handle as COW without changing sibling wrappers
+    // that share the same PgFrame.
+    pub(super) fn as_cow(&mut self) {
+        self.cow = true;
+    }
 
-        let old_paddr = self.paddr();
-        let new_frame = pool.alloc_pg_frame().ok_or("oom")?;
-        copy_page(new_frame.paddr(), old_paddr);
-        Ok(Self::new(new_frame))
+    // AGENT: stage a writable replacement wrapper without changing the live
+    // mapping until AddrSpace has committed the corresponding Sv39 update.
+    pub(super) fn prepare_resolved_write(&self, pool: &FramePool) -> Result<Self, &'static str> {
+        debug_assert!(self.cow);
+        let frame = if self.frame.is_unique() {
+            self.frame.clone()
+        } else {
+            let old_paddr = self.frame.paddr();
+            let new_frame = pool.alloc_pg_frame().ok_or("oom")?;
+            copy_page(new_frame.paddr(), old_paddr);
+            new_frame
+        };
+        Ok(Self { frame, cow: false })
     }
 }
