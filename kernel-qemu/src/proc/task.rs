@@ -3,8 +3,20 @@
 use super::*;
 
 mod core;
+mod exit_reason;
 mod fd;
+mod pid;
+mod process_state;
+mod sched_entity;
 mod table;
+mod task_info;
+mod thread_context;
 
 pub use self::core::*;
+pub use self::exit_reason::*;
+pub use self::pid::*;
+pub use self::process_state::*;
+pub use self::sched_entity::*;
 pub use self::table::*;
+pub use self::task_info::*;
+pub use self::thread_context::*;
