@@ -217,15 +217,9 @@ impl Kernel {
                             break;
                         }
                     };
-                    match enter_signal_handler(&task, sig, handler, interrupted) {
-                        Some(ctx) => {
-                            active_frame = Some(ctx.clone());
-                            updated_frame = Some(ctx);
-                        }
-                        None => {
-                            break;
-                        }
-                    }
+                    let ctx = enter_signal_handler(&task, sig, handler, interrupted);
+                    active_frame = Some(ctx.clone());
+                    updated_frame = Some(ctx);
                     break;
                 }
             }
@@ -348,7 +342,7 @@ fn enter_signal_handler(
     sig: PendingSignal,
     handler: usize,
     interrupted: TrapFrame,
-) -> Option<TrapFrame> {
+) -> TrapFrame {
     let old_mask = *task.sig_mask.lock().unwrap();
     let mut sig_frames = task.sig_frames.lock().unwrap();
     sig_frames.push(SigFrame {
@@ -363,5 +357,5 @@ fn enter_signal_handler(
     next.regs[11] = sig.sender_tid as usize;
     next.regs[12] = sig_frames.last().unwrap().saved_frame.sepc;
     next.sepc = handler;
-    Some(next)
+    next
 }
