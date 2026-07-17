@@ -258,8 +258,8 @@ fn spawn_root_creates_single_pid_one_init(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
     let init = table.spawn_root().expect("first root spawn should succeed");
 
-    assert_eq!(init.id(), Pid::INIT);
-    assert_eq!(init.process_pid(), Pid::INIT);
+    assert_eq!(init.id(), INIT_PID);
+    assert_eq!(init.process_pid(), INIT_PID);
     assert_eq!(table.root.lock().unwrap().as_ref().map(|t| t.id()), Some(1));
     assert_eq!(table.spawn_root().err(), Some("eexist"));
     assert_eq!(table.count(), 1);
@@ -271,7 +271,7 @@ fn spawn_root_rejects_nonempty_task_table(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
     let first = table.spawn().expect("standalone spawn should work");
 
-    assert_eq!(first.id(), Pid::INIT);
+    assert_eq!(first.id(), INIT_PID);
     assert_eq!(table.spawn_root().err(), Some("ebusy"));
     assert!(table.root.lock().unwrap().is_none());
     assert_eq!(table.count(), 1);
@@ -284,7 +284,7 @@ fn register_rejects_duplicate_pid_without_replacing_task(pool: &FramePool) {
     let first = table.spawn().expect("standalone spawn should work");
     let duplicate = Task::make(first.id(), pool).expect("duplicate task stack should allocate");
 
-    assert_eq!(table.register(&duplicate, Pid(first.id())), Err("eexist"));
+    assert_eq!(table.register(&duplicate, first.id()), Err("eexist"));
     assert!(Arc::ptr_eq(&table.find(first.id()).unwrap(), &first));
 
     let group = table.pgid_group(first.id() as Pgid);

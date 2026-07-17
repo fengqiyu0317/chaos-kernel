@@ -65,7 +65,7 @@ impl Task {
 
     // AGENT: expose the owning process id separately from the schedulable id.
     pub fn process_pid(&self) -> usize {
-        self.process.pid.lock().unwrap().get()
+        *self.process.pid.lock().unwrap()
     }
 
     // AGENT: expose session identity for process-group checks.

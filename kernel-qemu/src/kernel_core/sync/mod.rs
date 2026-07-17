@@ -18,8 +18,8 @@
 // - FutexBucket is wired to SYS_FUTEX and process-exit cleanup.
 //
 // Partially wired paths:
-// - Sema is created through SemArr/SemCtx and uses remove()/release(), but
-//   semget/semop/semctl-style syscall dispatch is not present.
+// - Sema is created through SemArr and uses remove()/release(), but process-local
+//   handles, SEM_UNDO, and semget/semop/semctl-style syscall dispatch are TODO.
 //
 // Unused or reserved paths:
 // - KernLock::enter/try_enter/held/owner/level are available for focused tests

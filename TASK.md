@@ -497,6 +497,9 @@ cargo test --test pressure
 ### M9 `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
 
 - `[M3][M9][重要] TODO`: `kernel-qemu` 当前 `SYS_EXIT` 仍通过 `exit_task()` 释放同一 `ProcessState` 的全部线程，等价于进程级退出。后续应增加只终止当前 `Task` 的单线程退出路径，维护线程组存活计数，并仅在最后一个线程退出时提交进程级资源释放、父进程通知和 zombie 状态；完成该边界后，再随 `clone` / `set_tid_address` syscall 一并迁移 `clear_child_tid` 写零与 futex 唤醒语义。
+- `[M5][M9][重要] TODO`: 在 `kernel-qemu` 重新引入 `ProcessState.cwd` 前，先迁移完整的每进程工作目录语义：实现 `getcwd` / `chdir`，让 `openat`、`exec` 及其他路径 syscall 按 cwd 解析相对路径，并明确 fork 继承、exec 保留、挂载点与路径规范化边界；在这些语义接入前，不保留始终为 `/` 且无消费者的占位字段。
+- `[M6][M9][重要] TODO`: 在 `kernel-qemu` 重新引入 `ProcessState.sem_ctx` 前，先接入 System V semaphore syscall 与进程级 semid 句柄表；保持 fork 继承 semaphore set 引用但不继承 `SEM_UNDO` 累积量，exit 时应用 undo 并释放本地句柄，同时与 `Kernel.sem_store` 的全局对象生命周期对齐。
+- `[M6][M9][重要] TODO`: 在 `kernel-qemu` 重新引入 `ProcessState.shm_ctx` 前，先实现 `shmget` / `shmat` / `shmdt` / `shmctl` 及进程级附着表；记录 shm id、附着虚拟地址与全局 `Kernel.shm_store` segment 的关系，让 fork 继承附着、exit 解除附着，并通过 `AddrSpace` 的共享页映射保证多进程可见性。
 
 ### M10 QEMU 进程级 checkpoint / restore
 

@@ -2,7 +2,7 @@
 use super::*;
 
 // AGENT: own resources shared by every thread in one process, including the fd
-// allocator, address space, signal state, IPC contexts, and family links.
+// allocator, address space, signal state, and family links.
 pub struct ProcessState {
     // AGENT: debug-only descriptor names used by smoke tests; real descriptors
     // live in the files table below.
@@ -11,13 +11,10 @@ pub struct ProcessState {
     pub subtasks: Mutex<Vec<Arc<Task>>>,
     pub files: Mutex<BTreeMap<usize, FdEntry>>,
     pub free_fds: Mutex<BTreeSet<usize>>,
-    pub cwd: Mutex<String>,
     pub exec_path: Mutex<String>,
     // AGENT: distinguish process futex words by waiter address in one bucket.
     pub futex: Arc<FutexBucket>,
-    pub sem_ctx: Mutex<SemCtx>,
-    pub shm_ctx: Mutex<ShmCtx>,
-    pub pid: Mutex<Pid>,
+    pub pid: Mutex<usize>,
     pub pgid: Mutex<Pgid>,
     // AGENT: retain the session id used by setpgid/setsid validation.
     pub sid: Mutex<usize>,
@@ -52,12 +49,9 @@ impl ProcessState {
             subtasks: Mutex::new(Vec::new()),
             files: Mutex::new(BTreeMap::new()),
             free_fds: Mutex::new(Self::initial_free_fds()),
-            cwd: Mutex::new("/".to_string()),
             exec_path: Mutex::new(String::new()),
             futex: Arc::new(FutexBucket::new()),
-            sem_ctx: Mutex::new(SemCtx::default()),
-            shm_ctx: Mutex::new(ShmCtx::default()),
-            pid: Mutex::new(Pid::new()),
+            pid: Mutex::new(UNREGISTERED_PID),
             pgid: Mutex::new(0),
             sid: Mutex::new(0),
             did_exec: AtomicBool::new(false),
@@ -107,8 +101,6 @@ impl ProcessState {
             take_mutex_default(&self.free_fds),
             take_mutex_default(&self.sig_queue),
             replace_mutex_value(&self.sig_state, SigSet::new()),
-            take_mutex_default(&self.sem_ctx),
-            take_mutex_default(&self.shm_ctx),
         );
         let _woken_futex_waiters = self.futex.wake_all();
         self.addr_space.lock().unwrap().release_all_pages();

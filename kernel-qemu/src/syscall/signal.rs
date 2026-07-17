@@ -21,7 +21,7 @@ pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
     }
 
     let protected =
-        |tid: usize| (sig == SIGKILL as usize || sig == SIGSTOP as usize) && tid <= Pid::INIT;
+        |tid: usize| (sig == SIGKILL as usize || sig == SIGSTOP as usize) && tid <= INIT_PID;
     let send_one = |t: &Arc<Task>| -> bool {
         if protected(t.id()) {
             return false;

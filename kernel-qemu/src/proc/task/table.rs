@@ -153,13 +153,13 @@ impl TaskTable {
         let slot = self.reserve_task_slot()?;
         if self
             .seq
-            .compare_exchange(Pid::INIT, Pid::INIT + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(INIT_PID, INIT_PID + 1, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
             return Err("ebusy");
         }
 
-        let task = self.insert_new_process(Pid::INIT)?;
+        let task = self.insert_new_process(INIT_PID)?;
         *root = Some(task.clone());
         slot.release();
         Ok(task)
@@ -194,31 +194,30 @@ impl TaskTable {
     }
 
     // AGENT: publish a process once while synchronizing pid/group/thread indexes.
-    pub fn register(&self, task: &Arc<Task>, pid: Pid) -> Result<(), &'static str> {
-        let pid_value = pid.get();
-        if pid_value == 0 || task.id() != pid_value {
+    pub fn register(&self, task: &Arc<Task>, pid: usize) -> Result<(), &'static str> {
+        if pid == UNREGISTERED_PID || task.id() != pid {
             return Err("einval");
         }
 
-        let default_pgid = Pgid::try_from(pid_value).map_err(|_| "einval")?;
+        let default_pgid = Pgid::try_from(pid).map_err(|_| "einval")?;
         let pgid = match *task.process.pgid.lock().unwrap() {
             0 => default_pgid,
             existing if existing > 0 => existing,
             _ => return Err("einval"),
         };
         let sid = match *task.process.sid.lock().unwrap() {
-            0 => pid_value,
+            0 => pid,
             existing => existing,
         };
 
         let mut map = self.map.write().unwrap();
-        if map.contains_key(&pid_value) || task.process.pid.lock().unwrap().get() != 0 {
+        if map.contains_key(&pid) || *task.process.pid.lock().unwrap() != UNREGISTERED_PID {
             return Err("eexist");
         }
 
         {
             let mut groups = self.groups.lock().unwrap();
-            Self::add_pid_to_group_locked(&mut groups, pgid, sid, pid_value)?;
+            Self::add_pid_to_group_locked(&mut groups, pgid, sid, pid)?;
         }
 
         *task.process.pid.lock().unwrap() = pid;
@@ -227,12 +226,12 @@ impl TaskTable {
 
         {
             let mut threads = task.process.threads.lock().unwrap();
-            if !threads.contains(&pid_value) {
-                threads.push(pid_value);
+            if !threads.contains(&pid) {
+                threads.push(pid);
             }
         }
 
-        map.insert(pid_value, task.clone());
+        map.insert(pid, task.clone());
         Ok(())
     }
 
@@ -305,7 +304,7 @@ impl TaskTable {
     // AGENT: share process construction and registration across spawn paths.
     fn insert_new_process(&self, id: usize) -> Result<Arc<Task>, &'static str> {
         let task = Task::make(id, &self.pool)?;
-        self.register(&task, Pid(id))?;
+        self.register(&task, id)?;
         Ok(task)
     }
 
@@ -356,10 +355,8 @@ impl TaskTable {
         let child = Task::make_with_addr_space(child_id, child_addr_space, &self.pool)?;
 
         let debug_fds = proc_src.process.debug_fds.lock().unwrap().clone();
-        let cwd = proc_src.process.cwd.lock().unwrap().clone();
         let exec_path = proc_src.process.exec_path.lock().unwrap().clone();
         *child.process.debug_fds.lock().unwrap() = debug_fds;
-        *child.process.cwd.lock().unwrap() = cwd;
         *child.process.exec_path.lock().unwrap() = exec_path;
 
         // AGENT: copy fd entries and free-slot state as one inherited snapshot.
@@ -383,15 +380,11 @@ impl TaskTable {
         // AGENT: inherit the parent group/session with a fresh pre-exec window.
         let pgid = *proc_src.process.pgid.lock().unwrap();
         let sid = *proc_src.process.sid.lock().unwrap();
-        let sem_ctx = proc_src.process.sem_ctx.lock().unwrap().clone();
-        let shm_ctx = proc_src.process.shm_ctx.lock().unwrap().clone();
         let sig_mask = *src.sig_mask.lock().unwrap();
 
         *child.process.pgid.lock().unwrap() = pgid;
         *child.process.sid.lock().unwrap() = sid;
         child.process.did_exec.store(false, Ordering::SeqCst);
-        *child.process.sem_ctx.lock().unwrap() = sem_ctx;
-        *child.process.shm_ctx.lock().unwrap() = shm_ctx;
         *child.sig_mask.lock().unwrap() = sig_mask;
 
         // AGENT: inherit signal dispositions but never pending signals.
@@ -403,7 +396,7 @@ impl TaskTable {
             child_sched.policy = parent_policy;
             child_sched.slice_left = child_sched.policy.time_slice();
         }
-        self.register(&child, Pid(child_id))?;
+        self.register(&child, child_id)?;
         Self::attach_child(&proc_src, &child);
         task_slot.release();
         Ok(child)

@@ -104,101 +104,6 @@ impl SemArr {
     }
 }
 
-type SemId = usize;
-type SemNum = u16;
-type SemOp = i16;
-
-// AGENT: keep process-local semaphore handles and SEM_UNDO adjustments together.
-#[derive(Default)]
-pub struct SemCtx {
-    pub arrays: BTreeMap<SemId, Arc<SemArr>>,
-    pub undos: BTreeMap<(SemId, SemNum), SemOp>,
-}
-impl SemCtx {
-    // AGENT: reuse the lowest free process-local semaphore id.
-    fn next_id(&self) -> SemId {
-        (0..).find(|i| !self.arrays.contains_key(i)).unwrap()
-    }
-
-    // AGENT: look up a semaphore without using Index so stale undo records cannot panic.
-    fn sem(&self, id: SemId, num: SemNum) -> Option<&Sema> {
-        self.arrays
-            .get(&id)
-            .and_then(|arr| arr.sems.get(num as usize))
-    }
-
-    // AGENT: apply one accumulated simplified SEM_UNDO adjustment.
-    fn apply_undo(sem: &Sema, op: SemOp) {
-        let steps = if op < 0 {
-            (0isize - op as isize) as usize
-        } else {
-            op as usize
-        };
-        for _ in 0..steps {
-            if op > 0 {
-                sem.release();
-            } else if sem.try_acquire() != Ok(true) {
-                break;
-            }
-        }
-    }
-
-    // AGENT: allocate a process-local handle for a semaphore set.
-    pub fn add(&mut self, arr: Arc<SemArr>) -> SemId {
-        let id = self.next_id();
-        self.arrays.insert(id, arr);
-        id
-    }
-
-    // AGENT: dropping a local handle also drops any undo state tied to that reused id.
-    pub fn remove(&mut self, id: SemId) {
-        self.arrays.remove(&id);
-        self.undos.retain(|&(undo_id, _), _| undo_id != id);
-    }
-
-    // AGENT: clone the Arc so callers can operate without holding the SemCtx lock.
-    pub fn get(&self, id: SemId) -> Option<Arc<SemArr>> {
-        self.arrays.get(&id).cloned()
-    }
-
-    // AGENT: record the inverse operation only for live semaphores.
-    pub fn add_undo(&mut self, id: SemId, num: SemNum, op: SemOp) -> bool {
-        if self.sem(id, num).is_none() {
-            return false;
-        }
-        let key = (id, num);
-        let old = *self.undos.get(&(id, num)).unwrap_or(&0);
-        let next = old.saturating_sub(op);
-        if next == 0 {
-            self.undos.remove(&key);
-        } else {
-            self.undos.insert(key, next);
-        }
-        true
-    }
-}
-// AGENT: fork-style copies inherit handles but not SEM_UNDO adjustments.
-impl Clone for SemCtx {
-    fn clone(&self) -> Self {
-        SemCtx {
-            arrays: self.arrays.clone(),
-            undos: BTreeMap::new(),
-        }
-    }
-}
-// AGENT: process teardown applies any accumulated simplified SEM_UNDO adjustments.
-impl Drop for SemCtx {
-    fn drop(&mut self) {
-        for (&(id, num), &op) in &self.undos {
-            if let Some(sem) = self.sem(id, num) {
-                Self::apply_undo(sem, op);
-            }
-        }
-    }
-}
-
-type ShmId = usize;
-
 // AGENT: keep System V shared-memory backing as real shared physical pages.
 pub struct ShmSegment {
     pages: Vec<SharedPage>,
@@ -228,17 +133,6 @@ impl ShmSegment {
     }
 }
 
-#[derive(Clone)]
-pub struct ShmTag {
-    pub addr: usize,
-    pub segment: Arc<ShmSegment>,
-}
-impl ShmTag {
-    pub fn set_addr(&mut self, a: usize) {
-        self.addr = a;
-    }
-}
-
 pub fn shm_get_or_create(
     key: usize,
     npages: usize,
@@ -257,38 +151,4 @@ pub fn shm_get_or_create(
     let segment = ShmSegment::new(npages, pool)?;
     m.insert(key, Arc::downgrade(&segment));
     Ok(segment)
-}
-
-#[derive(Default)]
-pub struct ShmCtx {
-    pub ids: BTreeMap<ShmId, ShmTag>,
-}
-impl ShmCtx {
-    pub fn add(&mut self, segment: Arc<ShmSegment>) -> ShmId {
-        let id = (0..).find(|i| !self.ids.contains_key(i)).unwrap();
-        self.ids.insert(id, ShmTag { addr: 0, segment });
-        id
-    }
-    pub fn get(&self, id: ShmId) -> Option<ShmTag> {
-        self.ids.get(&id).cloned()
-    }
-    pub fn set(&mut self, id: ShmId, tag: ShmTag) {
-        self.ids.insert(id, tag);
-    }
-    pub fn get_id_by_addr(&self, addr: usize) -> Option<ShmId> {
-        self.ids
-            .iter()
-            .find(|(_, v)| v.addr == addr)
-            .map(|(k, _)| *k)
-    }
-    pub fn pop(&mut self, id: ShmId) {
-        self.ids.remove(&id);
-    }
-}
-impl Clone for ShmCtx {
-    fn clone(&self) -> Self {
-        ShmCtx {
-            ids: self.ids.clone(),
-        }
-    }
 }
