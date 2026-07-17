@@ -37,7 +37,7 @@ pub(super) fn sys_futex(
             } else {
                 Some(read_futex_timeout(&current, timeout_addr)?)
             };
-            let futex = current.get_futex();
+            let futex = current.process.futex.clone();
             match futex.wait(uaddr, val as u32, timeout, || {
                 read_user_u32(&current, uaddr)
             }) {
@@ -49,7 +49,7 @@ pub(super) fn sys_futex(
         1 => {
             let wake_count = val;
             let current = kernel.cur_task(0).ok_or("esrch")?;
-            Ok(current.get_futex().wake(uaddr, wake_count))
+            Ok(current.process.futex.wake(uaddr, wake_count))
         }
         3 => {
             if !check_access(uaddr2, 4) {
@@ -62,7 +62,8 @@ pub(super) fn sys_futex(
             let wake_limit = val;
             let current = kernel.cur_task(0).ok_or("esrch")?;
             Ok(current
-                .get_futex()
+                .process
+                .futex
                 .requeue(uaddr, uaddr2, wake_limit, requeue_count))
         }
         5 => {
@@ -74,7 +75,7 @@ pub(super) fn sys_futex(
             }
             let val2 = timeout_addr;
             let current = kernel.cur_task(0).ok_or("esrch")?;
-            let futex = current.get_futex();
+            let futex = current.process.futex.clone();
             futex.wake_op(
                 uaddr,
                 val,
@@ -92,7 +93,7 @@ pub(super) fn sys_futex(
                 return Err("einval");
             }
             let current = kernel.cur_task(0).ok_or("esrch")?;
-            let futex = current.get_futex();
+            let futex = current.process.futex.clone();
             match futex.cmp_requeue(uaddr, uaddr2, val, timeout_addr, val3 as u32, || {
                 read_user_u32(&current, uaddr)
             }) {
