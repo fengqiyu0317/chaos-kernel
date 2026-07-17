@@ -10,7 +10,6 @@ pub mod bits;
 pub mod buddy;
 pub mod direct_map;
 pub mod frame;
-pub mod heap;
 pub mod kernel_stack;
 // AGENT: keep resident page-table metadata separate from AddrSpace operations.
 pub mod page_table;
@@ -24,7 +23,6 @@ pub use self::bits::*;
 pub use self::buddy::*;
 pub use self::direct_map::*;
 pub use self::frame::*;
-pub use self::heap::*;
 pub use self::kernel_stack::*;
 pub use self::page_table::*;
 pub use self::sv39::*;
