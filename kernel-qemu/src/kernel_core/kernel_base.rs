@@ -82,8 +82,9 @@ impl Kernel {
         cache_chains: usize,
     ) -> Self {
         let file_blocks = Arc::new(FileBlockAllocator::new(block_device.block_count()));
+        let tasks = TaskTable::new(pool.clone());
         Self {
-            tasks: TaskTable::new(),
+            tasks,
             run_queue: RunQueue::new(),
             cache: Arc::new(BlockCache::new(cache_chains)),
             block_device,

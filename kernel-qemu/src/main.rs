@@ -83,7 +83,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     #[cfg(feature = "qemu-sync-selftest")]
     {
         println!("[kernel-qemu] sync selftest start");
-        kernel::kernel_core::sync::tests::run_all();
+        kernel::kernel_core::sync::tests::run_all(frame_pool.as_ref());
         println!("[kernel-qemu] sync selftest passed");
     }
     // AGENT: expose focused RunQueue regressions through the same optional
@@ -91,7 +91,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     #[cfg(feature = "qemu-sched-selftest")]
     {
         println!("[kernel-qemu] sched selftest start");
-        kernel::proc::sched::tests::run_all();
+        kernel::proc::sched::tests::run_all(frame_pool.as_ref());
         println!("[kernel-qemu] sched selftest passed");
     }
     let kernel = init_qemu_kernel_backend(frame_pool.as_ref().clone());

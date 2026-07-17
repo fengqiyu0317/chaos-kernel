@@ -9,6 +9,7 @@ pub fn run_all(pool: &FramePool) {
     capset_raise_ambient_requires_owned_inheritable_cap();
     capset_drop_cap_clears_ambient();
     kernel_stack_uses_and_releases_frame_pool_run(pool);
+    task_spawn_reports_kernel_stack_exhaustion();
     spawn_root_creates_single_pid_one_init(pool);
     spawn_root_rejects_nonempty_task_table(pool);
     register_rejects_duplicate_pid_without_replacing_task(pool);
@@ -44,6 +45,16 @@ fn kernel_stack_uses_and_releases_frame_pool_run(pool: &FramePool) {
 
     drop(stack);
     assert_eq!(pool.free_count(), free_before);
+}
+
+// AGENT: propagate a missing four-page stack run as enomem without registering
+// a partially constructed task or touching the synthetic pool's addresses.
+fn task_spawn_reports_kernel_stack_exhaustion() {
+    let pool = FramePool::new(KSTK_SZ / PAGE_SZ - 1, MEM_OFF);
+    let table = TaskTable::new(pool);
+
+    assert_eq!(table.spawn("no-stack").err(), Some("enomem"));
+    assert_eq!(table.count(), 0);
 }
 
 // AGENT: exercise map, protection, unmap, and release transitions while

@@ -55,8 +55,8 @@ impl FramePoolState {
         Some(id)
     }
 
-    // AGENT: claim the first aligned free run needed by the direct-mapped heap
-    // without creating per-run ownership metadata.
+    // AGENT: claim the first aligned free run needed by direct-mapped consumers
+    // such as the dynamic heap and task kernel stacks.
     fn claim_contiguous(&mut self, count: usize, align: usize) -> Option<usize> {
         if count == 0 || align == 0 {
             return None;
@@ -88,8 +88,8 @@ impl FramePoolState {
         true
     }
 
-    // AGENT: validate a whole heap run before clearing it so failed releases do
-    // not publish only a prefix of the pages.
+    // AGENT: validate a whole contiguous run before clearing it so a failed
+    // release cannot publish only a prefix of the pages.
     fn release_contiguous(&mut self, first: usize, count: usize) -> bool {
         let Some(end) = first.checked_add(count) else {
             return false;
@@ -174,7 +174,7 @@ impl FramePool {
         }
     }
 
-    // AGENT: allocate one temporary contiguous run for the direct-mapped heap.
+    // AGENT: allocate one aligned contiguous run for a direct-mapped owner.
     pub fn alloc_contiguous_pages(&self, count: usize, align_pages: usize) -> Option<usize> {
         let first = self
             .state
@@ -184,7 +184,7 @@ impl FramePool {
         self.frame_id_to_paddr(first)
     }
 
-    // AGENT: return one page-backed heap allocation to the shared frame pool.
+    // AGENT: return one direct-mapped contiguous allocation to the shared pool.
     pub fn release_contiguous_pages(&self, paddr: usize, count: usize) -> bool {
         let Some(first) = self.paddr_to_frame_id(paddr) else {
             return false;

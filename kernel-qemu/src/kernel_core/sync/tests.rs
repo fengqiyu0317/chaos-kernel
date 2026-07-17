@@ -12,8 +12,9 @@ use crate::kernel::{
     TaskRunState, CLK, CLK_ALL, SIGUSR1,
 };
 
-// AGENT: include BlockCache fixed-payload regressions in the sync selftest set.
-pub fn run_all() {
+// AGENT: include BlockCache fixed-payload regressions and use the boot-discovered
+// physical pool for tests that now allocate real task kernel-stack pages.
+pub fn run_all(pool: &FramePool) {
     #[cfg(feature = "qemu-sync-selftest")]
     crate::kernel::fs::block_device::tests::run_all();
     #[cfg(feature = "qemu-sync-selftest")]
@@ -27,12 +28,12 @@ pub fn run_all() {
     wait_token_timeout_wake_wins_once();
     wait_token_zero_duration_times_out_without_timer_wheel();
     wait_token_expired_deadline_times_out_immediately();
-    wait_token_timer_target_times_out_on_schedule_tick();
-    wait_token_event_wake_uses_installed_scheduler_backend();
-    wait_token_block_current_keeps_placeholder_stack();
-    wait_token_current_wake_finishes_without_requeue();
-    wait_token_tick_leaves_sleeping_current_parked();
-    wait_token_interruptible_wait_reports_signal_not_event();
+    wait_token_timer_target_times_out_on_schedule_tick(pool);
+    wait_token_event_wake_uses_installed_scheduler_backend(pool);
+    wait_token_block_current_keeps_placeholder_stack(pool);
+    wait_token_current_wake_finishes_without_requeue(pool);
+    wait_token_tick_leaves_sleeping_current_parked(pool);
+    wait_token_interruptible_wait_reports_signal_not_event(pool);
     futex_wait_returns_changed_without_queueing();
     futex_wait_propagates_word_read_fault();
     futex_wait_timeout_removes_published_waiter();
@@ -41,7 +42,7 @@ pub fn run_all() {
     pipe_uses_bounded_ring_buffer_and_reports_writable();
     pipe_rejects_wrong_direction_direct_io();
     pipe_epoll_closed_status_reports_hup_and_err();
-    fd_close_detaches_epoll_subscription_before_reuse();
+    fd_close_detaches_epoll_subscription_before_reuse(pool);
     epoll_ready_list_deduplicates_and_requeues();
 }
 
@@ -68,12 +69,6 @@ fn ensure_timer_wheel() {
     if TIMER_WHEEL.get().is_none() {
         init_timer_wheel();
     }
-}
-
-// AGENT: build a tiny fully-free frame pool for scheduler-only selftests that
-// do not exercise QEMU physical-memory discovery.
-fn test_frame_pool(pages: usize) -> FramePool {
-    FramePool::new(pages, MEM_OFF)
 }
 
 // AGENT: WaitToken::current must bind to the current simulator task id and give
@@ -168,11 +163,10 @@ fn wait_token_expired_deadline_times_out_immediately() {
 
 // AGENT: the QEMU timer wheel dispatches TimerTarget::WakeToken through the same
 // timeout marker used by WaitToken::wait_with_timer().
-#[cfg_attr(test, test)]
-fn wait_token_timer_target_times_out_on_schedule_tick() {
+fn wait_token_timer_target_times_out_on_schedule_tick(pool: &FramePool) {
     reset_wait_token_state(16);
 
-    let kernel = Kernel::new(test_frame_pool(8));
+    let kernel = Kernel::new(pool.clone());
     let token = WaitToken::current();
     let deadline = CLK.load(Ordering::Relaxed) + 1;
 
@@ -199,11 +193,10 @@ fn wait_token_timer_target_times_out_on_schedule_tick() {
 
 // AGENT: when a QEMU scheduler backend is installed, a token event wake should
 // make the sleeping owner task runnable through Kernel::wake_task_for_wait().
-#[cfg_attr(test, test)]
-fn wait_token_event_wake_uses_installed_scheduler_backend() {
+fn wait_token_event_wake_uses_installed_scheduler_backend(pool: &FramePool) {
     reset_wait_token_state(17);
 
-    let kernel = Box::leak(Box::new(Kernel::new(test_frame_pool(8))));
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     let task = kernel.tasks.spawn_root().expect("spawn test init task");
     task.set_sched_state(TaskRunState::Sleeping);
     set_current_task_id(Some(task.id()));
@@ -219,11 +212,10 @@ fn wait_token_event_wake_uses_installed_scheduler_backend() {
 
 // AGENT: the current bridge records the current task as sleeping without
 // pretending that its kernel stack has really switched away.
-#[cfg_attr(test, test)]
-fn wait_token_block_current_keeps_placeholder_stack() {
+fn wait_token_block_current_keeps_placeholder_stack(pool: &FramePool) {
     reset_wait_token_state(24);
 
-    let kernel = Box::leak(Box::new(Kernel::new(test_frame_pool(8))));
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init task should be current");
     let peer = kernel.tasks.spawn("peer").expect("spawn peer task");
@@ -241,11 +233,10 @@ fn wait_token_block_current_keeps_placeholder_stack() {
 
 // AGENT: waking the task whose stack is still spinning should not enqueue a
 // duplicate runnable entry; wait completion restores it to Running in place.
-#[cfg_attr(test, test)]
-fn wait_token_current_wake_finishes_without_requeue() {
+fn wait_token_current_wake_finishes_without_requeue(pool: &FramePool) {
     reset_wait_token_state(25);
 
-    let kernel = Box::leak(Box::new(Kernel::new(test_frame_pool(8))));
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     kernel.proc_init();
     install_qemu_wait_kernel(kernel);
     let task = kernel.cur_task(0).expect("init task should be current");
@@ -265,11 +256,10 @@ fn wait_token_current_wake_finishes_without_requeue() {
 
 // AGENT: timer ticks must not time-slice the temporary sleeping-current state
 // used by the spin wait bridge.
-#[cfg_attr(test, test)]
-fn wait_token_tick_leaves_sleeping_current_parked() {
+fn wait_token_tick_leaves_sleeping_current_parked(pool: &FramePool) {
     reset_wait_token_state(26);
 
-    let kernel = Box::leak(Box::new(Kernel::new(test_frame_pool(8))));
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init task should be current");
     let peer = kernel.tasks.spawn("peer").expect("spawn peer task");
@@ -289,11 +279,10 @@ fn wait_token_tick_leaves_sleeping_current_parked() {
 
 // AGENT: interruptible waits must distinguish pending signals from real event
 // readiness so syscall callers can return EINTR.
-#[cfg_attr(test, test)]
-fn wait_token_interruptible_wait_reports_signal_not_event() {
+fn wait_token_interruptible_wait_reports_signal_not_event(pool: &FramePool) {
     reset_wait_token_state(27);
 
-    let kernel = Box::leak(Box::new(Kernel::new(test_frame_pool(8))));
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     kernel.proc_init();
     install_qemu_wait_kernel(kernel);
     let task = kernel.cur_task(0).expect("init task should be current");
@@ -432,11 +421,10 @@ fn futex_requeue_skips_completed_waiters_when_moving() {
 
 // AGENT: closing a watched fd must remove the old epoll interest and cancel its
 // pipe source callback before the same fd number can be reused for another file.
-#[cfg_attr(test, test)]
-fn fd_close_detaches_epoll_subscription_before_reuse() {
+fn fd_close_detaches_epoll_subscription_before_reuse(pool: &FramePool) {
     reset_wait_token_state(23);
 
-    let kernel = Kernel::new(test_frame_pool(8));
+    let kernel = Kernel::new(pool.clone());
     let task = kernel.tasks.spawn_root().expect("spawn test init task");
     let (old_read, old_write) = PipeNode::pair();
     let (read_fd, write_fd) = task
