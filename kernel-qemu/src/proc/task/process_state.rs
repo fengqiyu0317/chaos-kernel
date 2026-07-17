@@ -27,7 +27,7 @@ pub struct ProcessState {
 // AGENT: initialize and tear down process-owned shared state in one place.
 impl ProcessState {
     // AGENT: initialize process state around the supplied address space.
-    pub fn new(addr_space: AddrSpace) -> Self {
+    pub(super) fn new(addr_space: AddrSpace) -> Self {
         Self {
             parent: Mutex::new(None),
             subtasks: Mutex::new(Vec::new()),
@@ -44,16 +44,6 @@ impl ProcessState {
             sig_state: Mutex::new(SigSet::new()),
             addr_space: Mutex::new(addr_space),
         }
-    }
-
-    // AGENT: allocate a fresh process with an empty address space.
-    pub fn new_shared() -> Arc<Self> {
-        Arc::new(Self::new(AddrSpace::new()))
-    }
-
-    // AGENT: allocate a fresh process around a prepared or forked address space.
-    pub fn new_with_addr_space(addr_space: AddrSpace) -> Arc<Self> {
-        Arc::new(Self::new(addr_space))
     }
 
     // AGENT: update one process-wide disposition while holding the pending

@@ -20,7 +20,7 @@ impl Task {
     // AGENT: construct a standalone task with a fresh process and a fallible
     // FramePool-backed kernel stack.
     pub fn make(id: usize, pool: &FramePool) -> Result<Arc<Self>, &'static str> {
-        Self::make_with_process(id, ProcessState::new_shared(), pool)
+        Self::make_with_addr_space(id, AddrSpace::new(), pool)
     }
 
     // AGENT: construct a new process task around a prepared address space while
@@ -30,7 +30,7 @@ impl Task {
         addr_space: AddrSpace,
         pool: &FramePool,
     ) -> Result<Arc<Self>, &'static str> {
-        Self::make_with_process(id, ProcessState::new_with_addr_space(addr_space), pool)
+        Self::make_with_process(id, Arc::new(ProcessState::new(addr_space)), pool)
     }
 
     // AGENT: give every schedulable task a directly frame-backed kernel stack
