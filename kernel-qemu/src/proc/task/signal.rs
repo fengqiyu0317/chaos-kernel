@@ -8,7 +8,7 @@ use crate::trap::TrapFrame;
 impl Task {
     // AGENT: enqueue a non-duplicated standard pending signal for this process.
     pub(crate) fn enqueue_signal(&self, signo: i32, sender_tid: isize) -> bool {
-        if signo <= 0 || signo as u32 >= NSIG {
+        if signo <= 0 || signo as u32 > NSIG {
             return false;
         }
         let mut sq = self.process.sig_queue.lock().unwrap();
@@ -42,14 +42,17 @@ impl Task {
         let sq = self.process.sig_queue.lock().unwrap();
         let sig_state = self.process.sig_state.lock().unwrap();
         sq.iter().any(|(sig, _)| {
-            if *sig <= 0 || (*sig as u32) >= NSIG {
+            if *sig <= 0 || (*sig as u32) > NSIG {
                 return false;
             }
             let signo = *sig as u32;
-            if (mask & (1u64 << signo)) != 0 {
+            let bit = signal_bit(signo).expect("validated pending signal");
+            if (mask & bit) != 0 {
                 return false;
             }
-            sig_state.get_action(signo).resolve(signo) != SignalDeliveryAction::Ignore
+            sig_state
+                .get_action(signo)
+                .is_some_and(|action| action.resolve(signo) != SignalDeliveryAction::Ignore)
         })
     }
 
@@ -60,7 +63,7 @@ impl Task {
             let (signo, sender_tid) = {
                 let mut sq = self.process.sig_queue.lock().unwrap();
                 let pos = sq.iter().position(|(sig, _)| {
-                    *sig > 0 && (*sig as u32) < NSIG && (mask & (1u64 << (*sig as u64))) == 0
+                    *sig > 0 && signal_bit(*sig as u32).is_some_and(|bit| (mask & bit) == 0)
                 })?;
                 sq.remove(pos)?
             };
@@ -69,7 +72,7 @@ impl Task {
                 if sig_state.is_ignored(signo as u32) {
                     continue;
                 }
-                sig_state.get_action(signo as u32).clone()
+                sig_state.get_action(signo as u32)?.clone()
             };
             return Some(PendingSignal {
                 signo: signo as u32,
@@ -93,8 +96,8 @@ impl Task {
             saved_frame: interrupted.clone(),
             saved_mask: old_mask,
         });
-        let next_mask = (old_mask | sig.action.mask | (1u64 << sig.signo))
-            & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
+        let delivered_bit = signal_bit(sig.signo).expect("validated pending signal");
+        let next_mask = (old_mask | sig.action.mask | delivered_bit) & !UNMASKABLE_SIGNAL_MASK;
         *self.sig_mask.lock().unwrap() = next_mask;
 
         let mut next = interrupted;

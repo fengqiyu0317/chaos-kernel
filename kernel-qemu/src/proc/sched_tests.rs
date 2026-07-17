@@ -3,8 +3,9 @@
 use super::*;
 use crate::kernel::kernel_core::{init_timer_wheel, TIMER_WHEEL};
 use crate::kernel::{
-    FramePool, Kernel, SigAction, SignalDeliveryAction, TaskRunState, PRIO_MIN, SIGCHLD, SIGCONT,
-    SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGWINCH, SIG_IGN, SYS_SIGRETURN,
+    signal_bit, FramePool, Kernel, SigAction, SigSet, SignalDeliveryAction, TaskRunState, NSIG,
+    PRIO_MIN, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2,
+    SIGWINCH, SIG_DFL, SIG_IGN, SYS_SIGRETURN,
 };
 use crate::trap::TrapFrame;
 
@@ -14,6 +15,8 @@ pub fn run_all(pool: &FramePool) {
     dequeue_preserves_fifo_for_equal_priority();
     duplicate_enqueue_updates_policy_without_duplicate_entry();
     kernel_boost_updates_task_policy_and_queue_cache(pool);
+    signal_numbering_uses_all_linux_slots();
+    highest_signal_can_be_queued_and_blocked(pool);
     default_signal_actions_follow_linux_classes();
     ignored_signal_is_neither_queued_nor_woken(pool);
     changing_to_ignored_action_discards_pending_signal(pool);
@@ -21,6 +24,77 @@ pub fn run_all(pool: &FramePool) {
     sigcont_resumes_stopped_task_without_resuming_for_plain_signal(pool);
     sigcont_keeps_sleeping_task_asleep_until_wait_wakeup(pool);
     signal_handler_uses_supplied_interrupted_frame(pool);
+}
+
+// AGENT: pin the Linux/RISC-V 1..=64 ABI to compact table slots and sigset_t
+// bits so neither signal 1 nor signal 64 is lost at an endpoint.
+#[cfg_attr(test, test)]
+fn signal_numbering_uses_all_linux_slots() {
+    let mut actions = SigSet::new();
+    assert_eq!(actions.actions.len(), NSIG as usize);
+    assert_eq!(signal_bit(1), Some(1));
+    assert_eq!(signal_bit(NSIG), Some(1u64 << 63));
+    assert_eq!(signal_bit(0), None);
+    assert_eq!(signal_bit(NSIG + 1), None);
+
+    assert!(!actions.set_action(0, SigAction::default_action()));
+    assert!(actions.set_action(
+        1,
+        SigAction {
+            handler: 0x4000,
+            mask: 0,
+        },
+    ));
+    assert!(actions.set_action(
+        NSIG,
+        SigAction {
+            handler: 0x5000,
+            mask: 0,
+        },
+    ));
+    assert_eq!(
+        actions.get_action(1).map(|action| action.handler),
+        Some(0x4000)
+    );
+    assert_eq!(
+        actions.get_action(NSIG).map(|action| action.handler),
+        Some(0x5000)
+    );
+    assert!(actions.get_action(0).is_none());
+    assert!(actions.get_action(NSIG + 1).is_none());
+
+    actions.clear_non_caught();
+    assert_eq!(
+        actions.get_action(1).map(|action| action.handler),
+        Some(SIG_DFL)
+    );
+    assert_eq!(
+        actions.get_action(NSIG).map(|action| action.handler),
+        Some(SIG_DFL)
+    );
+}
+
+// AGENT: exercise signal 64 through the live pending queue and task mask so
+// endpoint validation cannot regress independently from the table helpers.
+fn highest_signal_can_be_queued_and_blocked(pool: &FramePool) {
+    ensure_timer_wheel();
+
+    let kernel = Kernel::new(pool.clone());
+    let task = kernel.tasks.spawn().expect("spawn worker");
+    let highest_bit = signal_bit(NSIG).expect("signal 64 must occupy bit 63");
+    *task.sig_mask.lock().unwrap() = highest_bit;
+
+    kernel.send_signal_to_task(&task, NSIG as i32, -1);
+    assert_eq!(task.process.sig_queue.lock().unwrap().len(), 1);
+    assert!(!task.has_interrupting_signal());
+    assert!(task.take_deliverable_signal().is_none());
+
+    *task.sig_mask.lock().unwrap() = 0;
+    assert!(task.has_interrupting_signal());
+    assert_eq!(
+        task.take_deliverable_signal().map(|signal| signal.signo),
+        Some(NSIG)
+    );
 }
 
 // AGENT: keep the SIG_DFL policy table pinned to the Linux/RISC-V ignore,
@@ -238,7 +312,7 @@ fn signal_handler_uses_supplied_interrupted_frame(pool: &FramePool) {
         SIGUSR1,
         SigAction {
             handler,
-            mask: 1u64 << SIGUSR2,
+            mask: signal_bit(SIGUSR2).expect("valid SIGUSR2"),
         },
     ));
 
@@ -266,8 +340,14 @@ fn signal_handler_uses_supplied_interrupted_frame(pool: &FramePool) {
         }
     }
     assert_eq!(next.sstatus, interrupted.sstatus);
-    assert_ne!(*task.sig_mask.lock().unwrap() & (1u64 << SIGUSR1), 0);
-    assert_ne!(*task.sig_mask.lock().unwrap() & (1u64 << SIGUSR2), 0);
+    assert_ne!(
+        *task.sig_mask.lock().unwrap() & signal_bit(SIGUSR1).expect("valid SIGUSR1"),
+        0
+    );
+    assert_ne!(
+        *task.sig_mask.lock().unwrap() & signal_bit(SIGUSR2).expect("valid SIGUSR2"),
+        0
+    );
 
     {
         let sig_frames = task.sig_frames.lock().unwrap();

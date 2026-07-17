@@ -116,7 +116,7 @@ impl Kernel {
     // AGENT: central signal send path so pending-signal enqueue and scheduler
     // wakeup stay together.
     pub fn send_signal_to_task(&self, task: &Arc<Task>, signo: i32, sender_tid: isize) {
-        if signo <= 0 || signo as u32 >= NSIG {
+        if signo <= 0 || signo as u32 > NSIG {
             return;
         }
         let signo = signo as u32;

@@ -148,6 +148,8 @@ pub const SCHED_FIFO: u8 = 1;
 pub const SCHED_RR: u8 = 2;
 pub const SCHED_BATCH: u8 = 3;
 
+// AGENT: Linux/RISC-V exposes signal numbers 1 through 64 inclusive; signal
+// tables and masks translate that public number to the zero-based slot/bit.
 pub const NSIG: u32 = 64;
 pub const SIG_DFL: usize = 0;
 pub const SIG_IGN: usize = 1;

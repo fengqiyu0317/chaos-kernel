@@ -11,10 +11,12 @@ struct UserSigAction {
     sa_flags: i32,
 }
 
+// AGENT: accept Linux signal numbers through 64 while retaining signal zero as
+// kill's existence/permission probe rather than enqueueing it for delivery.
 pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let pid = a0 as isize;
     let sig = a1;
-    if sig >= NSIG as usize {
+    if sig > NSIG as usize {
         return Err("einval");
     }
 
@@ -83,6 +85,8 @@ pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
     }
 }
 
+// AGENT: validate the inclusive Linux/RISC-V signal-number range before
+// reading or installing one process-wide disposition.
 pub(super) fn sys_sigaction(
     kernel: &Kernel,
     a0: usize,
@@ -95,7 +99,7 @@ pub(super) fn sys_sigaction(
     let act_addr = a1;
     let oldact_addr = a2;
     let act_size = mem::size_of::<UserSigAction>();
-    if signo == 0 || signo >= NSIG as usize {
+    if signo == 0 || signo > NSIG as usize {
         return Err("einval");
     }
     if signo == SIGKILL as usize || signo == SIGSTOP as usize {
@@ -113,7 +117,7 @@ pub(super) fn sys_sigaction(
     if oldact_addr != 0 {
         let action = {
             let sig_state = cur.process.sig_state.lock().unwrap();
-            sig_state.get_action(signo).clone()
+            sig_state.get_action(signo).ok_or("einval")?.clone()
         };
         let old = UserSigAction {
             sa_handler: action.handler,
@@ -149,6 +153,8 @@ pub(super) fn sys_sigaction(
     Ok(0)
 }
 
+// AGENT: preserve userspace's signo-minus-one sigset_t representation while
+// enforcing the kernel invariant that SIGKILL and SIGSTOP remain unblocked.
 pub(super) fn sys_sigprocmask(
     kernel: &Kernel,
     a0: usize,
@@ -167,7 +173,9 @@ pub(super) fn sys_sigprocmask(
     if oldset_addr != 0 && !check_access(oldset_addr, 8) {
         return Err("efault");
     }
-    let unmaskable: u64 = (1u64 << SIGKILL) | (1u64 << SIGSTOP);
+    // AGENT: userspace sigset_t maps signal N to bit N-1, including the
+    // unmaskable SIGKILL and SIGSTOP bits removed at this syscall boundary.
+    let unmaskable = UNMASKABLE_SIGNAL_MASK;
     let t = kernel.cur_task(0).ok_or("esrch")?;
     let old_mask = *t.sig_mask.lock().unwrap();
     if oldset_addr != 0 {

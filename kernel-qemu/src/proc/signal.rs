@@ -2,6 +2,29 @@
 use super::*;
 use crate::trap::TrapFrame;
 
+// AGENT: translate the Linux/RISC-V signal-number ABI (1..=64) to compact
+// zero-based storage without reserving an unused slot for signal zero.
+pub const fn signal_index(signo: u32) -> Option<usize> {
+    if signo == 0 || signo > NSIG {
+        None
+    } else {
+        Some((signo - 1) as usize)
+    }
+}
+
+// AGENT: keep sigset_t compatible with Linux: signal 1 occupies bit 0 and
+// signal 64 occupies bit 63 of the one-word mask.
+pub const fn signal_bit(signo: u32) -> Option<u64> {
+    match signal_index(signo) {
+        Some(index) => Some(1u64 << index),
+        None => None,
+    }
+}
+
+// AGENT: SIGKILL and SIGSTOP can never be blocked; express their mask with the
+// same signo-minus-one mapping used for userspace sigset_t values.
+pub const UNMASKABLE_SIGNAL_MASK: u64 = (1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1));
+
 // AGENT: keep only signal disposition state with live delivery semantics;
 // sigaction flag support remains an explicit syscall-boundary TODO.
 #[derive(Clone)]
@@ -71,8 +94,8 @@ pub struct SigSet {
 }
 
 impl SigSet {
-    // AGENT: initialize exactly the signal action slots accepted by the current
-    // QEMU signal paths; valid delivered signals are below NSIG.
+    // AGENT: allocate one compact action slot for every Linux/RISC-V signal;
+    // signal_index() maps public numbers 1..=NSIG onto these NSIG slots.
     pub fn new() -> Self {
         let mut actions = Vec::with_capacity(NSIG as usize);
         for _ in 0..NSIG {
@@ -81,21 +104,23 @@ impl SigSet {
         Self { actions }
     }
 
+    // AGENT: reject invalid or uncatchable signals before translating the
+    // public one-based signal number to its compact action-table index.
     pub fn set_action(&mut self, signo: u32, action: SigAction) -> bool {
-        if signo > 0 && signo < NSIG && signo != SIGKILL && signo != SIGSTOP {
-            self.actions[signo as usize] = action;
-            true
-        } else {
-            false
+        let Some(index) = signal_index(signo) else {
+            return false;
+        };
+        if signo == SIGKILL || signo == SIGSTOP {
+            return false;
         }
+        self.actions[index] = action;
+        true
     }
 
-    pub fn get_action(&self, signo: u32) -> &SigAction {
-        if (signo as usize) < self.actions.len() {
-            &self.actions[signo as usize]
-        } else {
-            &self.actions[0]
-        }
+    // AGENT: make an invalid signal lookup explicit instead of aliasing it to
+    // a real disposition slot now that signal 1 occupies actions[0].
+    pub fn get_action(&self, signo: u32) -> Option<&SigAction> {
+        self.actions.get(signal_index(signo)?)
     }
 
     pub fn fork_copy(&self) -> Self {
@@ -104,20 +129,19 @@ impl SigSet {
         }
     }
 
+    // AGENT: resolve only valid signal-number lookups; invalid inputs cannot
+    // inherit the disposition of any real signal.
     pub fn is_ignored(&self, signo: u32) -> bool {
-        if (signo as usize) < self.actions.len() {
-            self.actions[signo as usize].resolve(signo) == SignalDeliveryAction::Ignore
-        } else {
-            false
-        }
+        self.get_action(signo)
+            .is_some_and(|action| action.resolve(signo) == SignalDeliveryAction::Ignore)
     }
 
-    // AGENT: exec keeps ignored dispositions but resets caught handlers to a
-    // clean default action, including stale handler masks.
+    // AGENT: exec visits every compact slot, including signal 1 at index zero,
+    // and resets caught handlers while preserving ignored dispositions.
     pub fn clear_non_caught(&mut self) {
-        for i in 1..self.actions.len() {
-            if self.actions[i].handler != SIG_DFL && self.actions[i].handler != SIG_IGN {
-                self.actions[i] = SigAction::default_action();
+        for action in &mut self.actions {
+            if action.handler != SIG_DFL && action.handler != SIG_IGN {
+                *action = SigAction::default_action();
             }
         }
     }
