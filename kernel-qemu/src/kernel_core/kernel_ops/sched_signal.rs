@@ -191,26 +191,22 @@ impl Kernel {
         let mut updated_context = None;
         while let Some(sig) = task.take_deliverable_signal() {
             delivered += 1;
-            match sig.action.handler {
-                SIG_IGN => continue,
-                SIG_DFL => match sig.signo {
-                    SIGCHLD => continue,
-                    SIGCONT => continue,
-                    SIGSTOP => {
-                        task.set_job_stopped(true);
-                        task.set_sched_state(TaskRunState::Runnable);
-                        self.run_queue.remove(task.id());
-                        self.run_queue.clear_current();
-                        self.set_cur(cpu, None);
-                        self.schedule_next_runnable(cpu);
-                        break;
-                    }
-                    _ => {
-                        self.exit_task(cpu, &task, ExitReason::Signal(sig.signo as u8));
-                        break;
-                    }
-                },
-                handler => {
+            match sig.action.resolve(sig.signo) {
+                SignalDeliveryAction::Ignore | SignalDeliveryAction::Continue => continue,
+                SignalDeliveryAction::Stop => {
+                    task.set_job_stopped(true);
+                    task.set_sched_state(TaskRunState::Runnable);
+                    self.run_queue.remove(task.id());
+                    self.run_queue.clear_current();
+                    self.set_cur(cpu, None);
+                    self.schedule_next_runnable(cpu);
+                    break;
+                }
+                SignalDeliveryAction::Terminate => {
+                    self.exit_task(cpu, &task, ExitReason::Signal(sig.signo as u8));
+                    break;
+                }
+                SignalDeliveryAction::Handler(handler) => {
                     let interrupted =
                         match active_context.take().or_else(|| task_user_context(&task)) {
                             Some(ctx) => ctx,

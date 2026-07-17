@@ -81,6 +81,23 @@ impl ProcessState {
         Arc::new(Self::new(addr_space))
     }
 
+    // AGENT: update one process-wide disposition while holding the pending
+    // queue first, then discard an already-pending signal when its new
+    // disposition ignores it, even if a thread currently blocks that signal.
+    pub fn set_signal_action(&self, signo: u32, action: SigAction) -> bool {
+        let mut sig_queue = self.sig_queue.lock().unwrap();
+        let should_discard = action.resolve(signo) == SignalDeliveryAction::Ignore;
+        let mut sig_state = self.sig_state.lock().unwrap();
+        if !sig_state.set_action(signo, action) {
+            return false;
+        }
+        drop(sig_state);
+        if should_discard {
+            sig_queue.retain(|(pending, _)| *pending != signo as i32);
+        }
+        true
+    }
+
     // AGENT: move droppable resources out of locks before process teardown and
     // let address-space RAII reclaim frames without forwarding a bogus count.
     pub fn release_exit_resources(&self) {

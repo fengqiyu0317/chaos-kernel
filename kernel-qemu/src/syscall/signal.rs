@@ -135,15 +135,16 @@ pub(super) fn sys_sigaction(
         } else {
             act.sa_handler
         };
-        let mut sig_state = cur.process.sig_state.lock().unwrap();
-        sig_state.set_action(
+        if !cur.process.set_signal_action(
             signo,
             SigAction {
                 handler,
                 flags: (sa_flags & 0xFFFF_FFFF) as u32,
                 mask: sa_mask,
             },
-        );
+        ) {
+            return Err("einval");
+        }
     }
     Ok(0)
 }

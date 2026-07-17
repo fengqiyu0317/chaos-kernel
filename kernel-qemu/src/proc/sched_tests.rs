@@ -3,8 +3,8 @@
 use super::*;
 use crate::kernel::kernel_core::{init_timer_wheel, TIMER_WHEEL};
 use crate::kernel::{
-    Context, FramePool, Kernel, SigAction, TaskRunState, PRIO_MIN, SIGCONT, SIGSTOP, SIGUSR1,
-    SIGUSR2,
+    Context, FramePool, Kernel, SigAction, SignalDeliveryAction, TaskRunState, PRIO_MIN, SIGCHLD,
+    SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGWINCH, SIG_IGN,
 };
 
 // AGENT: expose focused scheduler queue checks to the optional QEMU boot
@@ -13,10 +13,88 @@ pub fn run_all(pool: &FramePool) {
     dequeue_preserves_fifo_for_equal_priority();
     duplicate_enqueue_updates_policy_without_duplicate_entry();
     kernel_boost_updates_task_policy_and_queue_cache(pool);
+    default_signal_actions_follow_linux_classes();
+    ignored_signal_is_neither_queued_nor_woken(pool);
+    changing_to_ignored_action_discards_pending_signal(pool);
     signal_stop_uses_job_stopped_flag(pool);
     sigcont_resumes_stopped_task_without_resuming_for_plain_signal(pool);
     sigcont_keeps_sleeping_task_asleep_until_wait_wakeup(pool);
     signal_handler_uses_supplied_interrupted_context(pool);
+}
+
+// AGENT: keep the SIG_DFL policy table pinned to the Linux/RISC-V ignore,
+// continue, stop, and terminate classes supported by the current carrier.
+#[cfg_attr(test, test)]
+fn default_signal_actions_follow_linux_classes() {
+    let action = SigAction::default_action();
+    for signo in [SIGCHLD, SIGURG, SIGWINCH] {
+        assert_eq!(action.resolve(signo), SignalDeliveryAction::Ignore);
+    }
+    assert_eq!(action.resolve(SIGCONT), SignalDeliveryAction::Continue);
+    for signo in [SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU] {
+        assert_eq!(action.resolve(signo), SignalDeliveryAction::Stop);
+    }
+    assert_eq!(action.resolve(SIGUSR1), SignalDeliveryAction::Terminate);
+
+    let handler = SigAction {
+        handler: 0x5000,
+        flags: 0,
+        mask: 0,
+    };
+    assert_eq!(
+        handler.resolve(SIGUSR1),
+        SignalDeliveryAction::Handler(0x5000)
+    );
+}
+
+// AGENT: default-ignored signals must not become pending or wake a task that is
+// sleeping for an unrelated wait condition.
+fn ignored_signal_is_neither_queued_nor_woken(pool: &FramePool) {
+    ensure_timer_wheel();
+
+    let kernel = Kernel::new(pool.clone());
+    let task = kernel.tasks.spawn().expect("spawn worker");
+    task.set_sched_state(TaskRunState::Sleeping);
+
+    kernel.send_signal_to_task(&task, SIGURG as i32, -1);
+
+    assert!(task.process.sig_queue.lock().unwrap().is_empty());
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    assert_eq!(kernel.run_queue.pick_next(), None);
+}
+
+// AGENT: installing SIG_IGN, or restoring SIG_DFL for a default-ignored
+// signal, discards an existing pending instance while the queue/state locks
+// make the transition atomic with signal generation.
+fn changing_to_ignored_action_discards_pending_signal(pool: &FramePool) {
+    ensure_timer_wheel();
+
+    let kernel = Kernel::new(pool.clone());
+    let task = kernel.tasks.spawn().expect("spawn worker");
+    assert!(task.enqueue_signal(SIGUSR1 as i32, -1));
+    assert!(task.process.set_signal_action(
+        SIGUSR1,
+        SigAction {
+            handler: SIG_IGN,
+            flags: 0,
+            mask: 0,
+        },
+    ));
+    assert!(task.process.sig_queue.lock().unwrap().is_empty());
+
+    assert!(task.process.set_signal_action(
+        SIGURG,
+        SigAction {
+            handler: 0x5000,
+            flags: 0,
+            mask: 0,
+        },
+    ));
+    assert!(task.enqueue_signal(SIGURG as i32, -1));
+    assert!(task
+        .process
+        .set_signal_action(SIGURG, SigAction::default_action()));
+    assert!(task.process.sig_queue.lock().unwrap().is_empty());
 }
 
 // AGENT: QEMU boot selftests initialize the timer wheel in rust_main(), while
@@ -158,14 +236,14 @@ fn signal_handler_uses_supplied_interrupted_context(pool: &FramePool) {
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init task should be current");
     let handler = 0x5000usize;
-    task.process.sig_state.lock().unwrap().set_action(
+    assert!(task.process.sig_state.lock().unwrap().set_action(
         SIGUSR1,
         SigAction {
             handler,
             flags: 0,
             mask: 1u64 << SIGUSR2,
         },
-    );
+    ));
 
     let mut interrupted = Context::new();
     interrupted.ip = 0x1234;

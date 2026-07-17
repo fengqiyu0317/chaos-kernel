@@ -208,6 +208,11 @@ impl Task {
             return false;
         }
         let mut sq = self.process.sig_queue.lock().unwrap();
+        let sig_state = self.process.sig_state.lock().unwrap();
+        if sig_state.is_ignored(signo as u32) {
+            return false;
+        }
+        drop(sig_state);
         if sq.iter().any(|(sig, _)| *sig == signo) {
             return false;
         }
@@ -240,8 +245,7 @@ impl Task {
             if (mask & (1u64 << signo)) != 0 {
                 return false;
             }
-            let action = sig_state.get_action(signo);
-            action.handler != SIG_IGN && !(action.handler == SIG_DFL && signo == SIGCHLD)
+            sig_state.get_action(signo).resolve(signo) != SignalDeliveryAction::Ignore
         })
     }
 

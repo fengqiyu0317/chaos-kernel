@@ -8,6 +8,17 @@ pub struct SigAction {
     pub mask: u64,
 }
 
+// AGENT: separate a stored sigaction disposition from the concrete operation
+// the carrier must perform when that disposition is resolved for one signal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalDeliveryAction {
+    Ignore,
+    Continue,
+    Stop,
+    Terminate,
+    Handler(usize),
+}
+
 impl SigAction {
     // AGENT: keep the canonical default disposition in one place so exec reset
     // paths do not leave stale sigaction flags or masks behind.
@@ -16,6 +27,22 @@ impl SigAction {
             handler: SIG_DFL,
             flags: 0,
             mask: 0,
+        }
+    }
+
+    // AGENT: resolve SIG_DFL through the Linux/RISC-V signal-specific default
+    // table; core-dump defaults currently collapse into signal termination
+    // because kernel-qemu has no core-image carrier yet.
+    pub fn resolve(&self, signo: u32) -> SignalDeliveryAction {
+        match self.handler {
+            SIG_IGN => SignalDeliveryAction::Ignore,
+            SIG_DFL => match signo {
+                SIGCHLD | SIGURG | SIGWINCH => SignalDeliveryAction::Ignore,
+                SIGCONT => SignalDeliveryAction::Continue,
+                SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU => SignalDeliveryAction::Stop,
+                _ => SignalDeliveryAction::Terminate,
+            },
+            handler => SignalDeliveryAction::Handler(handler),
         }
     }
 }
@@ -53,9 +80,12 @@ impl SigSet {
         Self { actions }
     }
 
-    pub fn set_action(&mut self, signo: u32, action: SigAction) {
+    pub fn set_action(&mut self, signo: u32, action: SigAction) -> bool {
         if signo > 0 && signo < NSIG && signo != SIGKILL && signo != SIGSTOP {
             self.actions[signo as usize] = action;
+            true
+        } else {
+            false
         }
     }
 
@@ -75,7 +105,7 @@ impl SigSet {
 
     pub fn is_ignored(&self, signo: u32) -> bool {
         if (signo as usize) < self.actions.len() {
-            self.actions[signo as usize].handler == SIG_IGN
+            self.actions[signo as usize].resolve(signo) == SignalDeliveryAction::Ignore
         } else {
             false
         }

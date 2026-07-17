@@ -156,6 +156,13 @@ pub const SIGKILL: u32 = 9;
 pub const SIGSTOP: u32 = 19;
 pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;
+// AGENT: Linux/RISC-V signal numbers whose default dispositions are not
+// termination; the delivery policy uses these to resolve SIG_DFL correctly.
+pub const SIGTSTP: u32 = 20;
+pub const SIGTTIN: u32 = 21;
+pub const SIGTTOU: u32 = 22;
+pub const SIGURG: u32 = 23;
+pub const SIGWINCH: u32 = 28;
 pub const SIGUSR1: u32 = 10;
 pub const SIGUSR2: u32 = 12;
 pub const SIGALRM: u32 = 14;
