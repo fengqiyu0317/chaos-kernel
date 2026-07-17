@@ -218,7 +218,7 @@ fn wait_token_block_current_keeps_placeholder_stack(pool: &FramePool) {
     let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init task should be current");
-    let peer = kernel.tasks.spawn("peer").expect("spawn peer task");
+    let peer = kernel.tasks.spawn().expect("spawn peer task");
     peer.set_sched_state(TaskRunState::Runnable);
     kernel.run_queue.enqueue(peer.id(), peer.sched_policy());
 
@@ -262,7 +262,7 @@ fn wait_token_tick_leaves_sleeping_current_parked(pool: &FramePool) {
     let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init task should be current");
-    let peer = kernel.tasks.spawn("peer").expect("spawn peer task");
+    let peer = kernel.tasks.spawn().expect("spawn peer task");
     task.set_sched_state(TaskRunState::Sleeping);
     kernel.run_queue.clear_current();
     peer.set_sched_state(TaskRunState::Runnable);

@@ -2,9 +2,10 @@
 // separately from the state types it composes.
 use super::*;
 
-// AGENT: represent one schedulable thread and link it to process-wide state.
+// AGENT: represent one schedulable thread with an immutable id and link it to
+// process-wide state; executable identity lives in ProcessState::exec_path.
 pub struct Task {
-    pub info: Mutex<TaskInfo>,
+    id: usize,
     pub process: Arc<ProcessState>,
     pub sig_mask: Mutex<u64>,
     pub kstk: Mutex<Option<KStk>>,
@@ -18,35 +19,30 @@ pub struct Task {
 impl Task {
     // AGENT: construct a standalone task with a fresh process and a fallible
     // FramePool-backed kernel stack.
-    pub fn make(id: usize, tag: &str, pool: &FramePool) -> Result<Arc<Self>, &'static str> {
-        Self::make_with_process(id, tag, ProcessState::new_shared(), pool)
+    pub fn make(id: usize, pool: &FramePool) -> Result<Arc<Self>, &'static str> {
+        Self::make_with_process(id, ProcessState::new_shared(), pool)
     }
 
     // AGENT: construct a new process task around a prepared address space while
     // allocating its thread-private kernel stack from the shared frame pool.
     pub(super) fn make_with_addr_space(
         id: usize,
-        tag: &str,
         addr_space: Arc<Mutex<AddrSpace>>,
         pool: &FramePool,
     ) -> Result<Arc<Self>, &'static str> {
-        Self::make_with_process(id, tag, ProcessState::new_with_addr_space(addr_space), pool)
+        Self::make_with_process(id, ProcessState::new_with_addr_space(addr_space), pool)
     }
 
     // AGENT: give every schedulable task a directly frame-backed kernel stack
     // and propagate physical-memory exhaustion to the task-creation boundary.
     pub(super) fn make_with_process(
         id: usize,
-        tag: &str,
         process: Arc<ProcessState>,
         pool: &FramePool,
     ) -> Result<Arc<Self>, &'static str> {
         let kstk = KStk::new(pool)?;
         Ok(Arc::new(Self {
-            info: Mutex::new(TaskInfo {
-                id,
-                tag: tag.to_string(),
-            }),
+            id,
             process,
             sig_mask: Mutex::new(0),
             kstk: Mutex::new(Some(kstk)),
@@ -58,17 +54,12 @@ impl Task {
 
     // AGENT: expose the schedulable thread id.
     pub fn id(&self) -> usize {
-        self.info.lock().unwrap().id
+        self.id
     }
 
     // AGENT: report the shared address-space switch token for trap handling.
     pub fn vm_token(&self) -> Result<usize, &'static str> {
         self.process.addr_space.lock().unwrap().vm_token()
-    }
-
-    // AGENT: clone the diagnostic task tag without leaking the info lock.
-    pub fn tag(&self) -> String {
-        self.info.lock().unwrap().tag.clone()
     }
 
     // AGENT: expose the owning process id separately from the schedulable id.
@@ -281,14 +272,17 @@ impl Task {
     }
 }
 
-// AGENT: keep Task debug output compact and independent of process resources.
+// AGENT: keep Task debug output compact while deriving executable identity from
+// the authoritative process-wide exec_path instead of a duplicated task tag.
 impl fmt::Debug for Task {
-    // AGENT: render only the schedulable id and diagnostic tag.
+    // AGENT: render the schedulable id and the current executable path, if set.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let info = self.info.lock().unwrap();
-        f.debug_struct("T")
-            .field("id", &info.id)
-            .field("tag", &info.tag)
-            .finish()
+        let exec_path = self.process.exec_path.lock().unwrap();
+        let mut debug = f.debug_struct("T");
+        debug.field("id", &self.id);
+        if !exec_path.is_empty() {
+            debug.field("exec_path", &*exec_path);
+        }
+        debug.finish()
     }
 }

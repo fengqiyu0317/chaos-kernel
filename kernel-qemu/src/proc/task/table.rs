@@ -131,10 +131,10 @@ impl TaskTable {
     }
 
     // AGENT: spawn a standalone process as its own session/process-group leader.
-    pub fn spawn(&self, tag: &str) -> Result<Arc<Task>, &'static str> {
+    pub fn spawn(&self) -> Result<Arc<Task>, &'static str> {
         let slot = self.reserve_task_slot()?;
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
-        let task = self.insert_new_process(id, tag)?;
+        let task = self.insert_new_process(id)?;
         slot.release();
         Ok(task)
     }
@@ -158,7 +158,7 @@ impl TaskTable {
             return Err("ebusy");
         }
 
-        let task = self.insert_new_process(Pid::INIT, "init")?;
+        let task = self.insert_new_process(Pid::INIT)?;
         *root = Some(task.clone());
         slot.release();
         Ok(task)
@@ -167,19 +167,6 @@ impl TaskTable {
     // AGENT: look up a schedulable task/thread id without treating it as a pid.
     pub fn find(&self, id: usize) -> Option<Arc<Task>> {
         self.map.read().unwrap().get(&id).cloned()
-    }
-
-    // AGENT: return one process representative per tag despite cloned threads.
-    pub fn find_by_tag(&self, tag: &str) -> Vec<Arc<Task>> {
-        let mut seen = BTreeSet::new();
-        self.map
-            .read()
-            .unwrap()
-            .values()
-            .filter(|task| task.tag() == tag)
-            .filter(|task| seen.insert(task.process_pid()))
-            .cloned()
-            .collect()
     }
 
     // AGENT: resolve a thread id to its explicit process leader.
@@ -315,8 +302,8 @@ impl TaskTable {
     }
 
     // AGENT: share process construction and registration across spawn paths.
-    fn insert_new_process(&self, id: usize, tag: &str) -> Result<Arc<Task>, &'static str> {
-        let task = Task::make(id, tag, &self.pool)?;
+    fn insert_new_process(&self, id: usize) -> Result<Arc<Task>, &'static str> {
+        let task = Task::make(id, &self.pool)?;
         self.register(&task, Pid(id))?;
         Ok(task)
     }
@@ -347,13 +334,12 @@ impl TaskTable {
         let task_slot = self.reserve_task_slot()?;
         let proc_src = self.process_of_tid(src.id()).unwrap_or_else(|| src.clone());
         let child_id = self.seq.fetch_add(1, Ordering::SeqCst);
-        let tag = proc_src.tag();
         let child_addr_space = {
             let mut parent_addr_space = proc_src.process.addr_space.lock().unwrap();
             let forked_addr_space = AddrSpace::fork_from(&mut parent_addr_space, pool)?;
             Arc::new(Mutex::new(forked_addr_space))
         };
-        let child = Task::make_with_addr_space(child_id, &tag, child_addr_space, &self.pool)?;
+        let child = Task::make_with_addr_space(child_id, child_addr_space, &self.pool)?;
 
         let debug_fds = proc_src.process.debug_fds.lock().unwrap().clone();
         let cwd = proc_src.process.cwd.lock().unwrap().clone();
@@ -420,8 +406,7 @@ impl TaskTable {
         let task_slot = self.reserve_task_slot()?;
         let proc_src = self.process_of_tid(src.id()).ok_or("esrch")?;
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
-        let task =
-            Task::make_with_process(id, &proc_src.tag(), proc_src.process.clone(), &self.pool)?;
+        let task = Task::make_with_process(id, proc_src.process.clone(), &self.pool)?;
         let mut ctx = src.thd_ctx.lock().unwrap().clone().ok_or("enoctx")?;
         ctx.uctx.set_ret(0);
         ctx.uctx.set_sp(stack_top);
@@ -453,7 +438,7 @@ impl TaskTable {
         pool: &FramePool,
     ) -> Result<Arc<Task>, &'static str> {
         let mut image = prepare_user_image(elf_data, args, envs, pool)?;
-        let task = match self.spawn(path) {
+        let task = match self.spawn() {
             Ok(task) => task,
             Err(err) => {
                 image.addr_space.release_all_pages();

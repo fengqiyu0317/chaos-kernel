@@ -70,7 +70,7 @@ impl Kernel {
         let addr_space =
             AddrSpace::restore_checkpoint_memory(brk, &image.vmas, &image.pages, &self.pool)?;
 
-        let task = self.tasks.spawn("checkpoint-restore")?;
+        let task = self.tasks.spawn()?;
         {
             let mut current_addr_space = task.process.addr_space.lock().unwrap();
             current_addr_space.release_all_pages();

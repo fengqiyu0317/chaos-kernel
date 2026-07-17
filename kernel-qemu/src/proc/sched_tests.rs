@@ -64,8 +64,8 @@ fn kernel_boost_updates_task_policy_and_queue_cache(pool: &FramePool) {
     ensure_timer_wheel();
 
     let kernel = Kernel::new(pool.clone());
-    let first = kernel.tasks.spawn("first").expect("spawn first task");
-    let second = kernel.tasks.spawn("second").expect("spawn second task");
+    let first = kernel.tasks.spawn().expect("spawn first task");
+    let second = kernel.tasks.spawn().expect("spawn second task");
 
     second.boost_priority(5);
     first.set_sched_state(TaskRunState::Runnable);
@@ -114,7 +114,7 @@ fn sigcont_resumes_stopped_task_without_resuming_for_plain_signal(pool: &FramePo
     ensure_timer_wheel();
 
     let kernel = Kernel::new(pool.clone());
-    let task = kernel.tasks.spawn("worker").expect("spawn worker");
+    let task = kernel.tasks.spawn().expect("spawn worker");
     task.set_sched_state(TaskRunState::Runnable);
     task.set_job_stopped(true);
 
@@ -135,7 +135,7 @@ fn sigcont_keeps_sleeping_task_asleep_until_wait_wakeup(pool: &FramePool) {
     ensure_timer_wheel();
 
     let kernel = Kernel::new(pool.clone());
-    let task = kernel.tasks.spawn("worker").expect("spawn worker");
+    let task = kernel.tasks.spawn().expect("spawn worker");
     task.set_sched_state(TaskRunState::Sleeping);
     task.set_job_stopped(true);
 

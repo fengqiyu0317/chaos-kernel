@@ -53,7 +53,7 @@ fn task_spawn_reports_kernel_stack_exhaustion() {
     let pool = FramePool::new(KSTK_SZ / PAGE_SZ - 1, MEM_OFF);
     let table = TaskTable::new(pool);
 
-    assert_eq!(table.spawn("no-stack").err(), Some("enomem"));
+    assert_eq!(table.spawn().err(), Some("enomem"));
     assert_eq!(table.count(), 0);
 }
 
@@ -267,7 +267,7 @@ fn spawn_root_creates_single_pid_one_init(pool: &FramePool) {
 // task has already consumed pid 1.
 fn spawn_root_rejects_nonempty_task_table(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
-    let first = table.spawn("worker").expect("standalone spawn should work");
+    let first = table.spawn().expect("standalone spawn should work");
 
     assert_eq!(first.id(), Pid::INIT);
     assert_eq!(table.spawn_root().err(), Some("ebusy"));
@@ -279,9 +279,8 @@ fn spawn_root_rejects_nonempty_task_table(pool: &FramePool) {
 // task-table entry or corrupting process-group membership.
 fn register_rejects_duplicate_pid_without_replacing_task(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
-    let first = table.spawn("worker").expect("standalone spawn should work");
-    let duplicate =
-        Task::make(first.id(), "duplicate", pool).expect("duplicate task stack should allocate");
+    let first = table.spawn().expect("standalone spawn should work");
+    let duplicate = Task::make(first.id(), pool).expect("duplicate task stack should allocate");
 
     assert_eq!(table.register(&duplicate, Pid(first.id())), Err("eexist"));
     assert!(Arc::ptr_eq(&table.find(first.id()).unwrap(), &first));
@@ -295,7 +294,7 @@ fn register_rejects_duplicate_pid_without_replacing_task(pool: &FramePool) {
 // present until wait/reap removes them from the table.
 fn pgid_group_keeps_zombie_members_until_reap(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
-    let task = table.spawn("worker").expect("standalone spawn should work");
+    let task = table.spawn().expect("standalone spawn should work");
     let pgid = *task.process.pgid.lock().unwrap();
 
     assert!(task.exit_proc(ExitReason::Code(0)));
@@ -309,7 +308,7 @@ fn pgid_group_keeps_zombie_members_until_reap(pool: &FramePool) {
 // delete the task table entry.
 fn reap_rejects_live_process(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
-    let task = table.spawn("worker").expect("standalone spawn should work");
+    let task = table.spawn().expect("standalone spawn should work");
 
     assert_eq!(table.reap(task.id()), Err("ebusy"));
     assert!(table.find(task.id()).is_some());
@@ -341,7 +340,7 @@ fn reap_zombie_process_removes_thread_group_once(pool: &FramePool) {
 // clone-specific return value, user stack, TLS, clear-child-tid, and signal mask.
 fn clone_thread_copies_caller_context_and_shares_process(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
-    let task = table.spawn("worker").expect("standalone spawn should work");
+    let task = table.spawn().expect("standalone spawn should work");
     let stack_top = 0x8000_0000;
     let tls = 0xabc;
     let clear_tid = 0xdead;
