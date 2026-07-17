@@ -1,10 +1,19 @@
 // AGENT
 use super::*;
+use crate::trap::TrapFrame;
 
-pub(super) fn sys_fork(kernel: &Kernel, _caller_token: usize) -> Result<usize, &'static str> {
+pub(super) fn sys_fork(
+    kernel: &Kernel,
+    _caller_token: usize,
+    caller_frame: Option<&TrapFrame>,
+) -> Result<usize, &'static str> {
     let parent_id = kernel.cur_task(0).map(|task| task.id()).ok_or("esrch")?;
-    // AGENT: keep syscall fork as a thin wrapper around the real fork path.
-    kernel.do_fork(parent_id)
+    // AGENT: the QEMU trap path supplies the live post-ecall frame; direct
+    // semantic tests retain the task-snapshot fallback.
+    match caller_frame {
+        Some(frame) => kernel.do_fork_from_frame(parent_id, frame),
+        None => kernel.do_fork(parent_id),
+    }
 }
 
 pub(super) fn sys_exec(
@@ -12,7 +21,7 @@ pub(super) fn sys_exec(
     a0: usize,
     a1: usize,
     a2: usize,
-) -> Result<usize, &'static str> {
+) -> Result<SyscallOutcome, &'static str> {
     let path_addr = a0;
     let argv_addr = a1;
     let envp_addr = a2;
@@ -25,8 +34,11 @@ pub(super) fn sys_exec(
         let envs = read_user_string_array(&addr_space, envp_addr, 64, 4096)?;
         (path, args, envs)
     };
-    kernel.do_exec(task_id, &path, args, envs)?;
-    Ok(0)
+    let user_entry = kernel.do_exec_for_trap(task_id, &path, args, envs)?;
+    Ok(SyscallOutcome::ReplaceUserContext {
+        entry: user_entry.entry,
+        stack_pointer: user_entry.stack_pointer,
+    })
 }
 
 fn read_user_c_string(

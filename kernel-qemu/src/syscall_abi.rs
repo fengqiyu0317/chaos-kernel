@@ -79,23 +79,42 @@ fn dispatch_installed_kernel(
         return;
     };
     let [a0, a1, a2, a3, a4, a5] = request.args;
-    let ret = match kernel.dispatch_syscall_without_signal_delivery(nr, a0, a1, a2, a3, a4, a5) {
-        Ok(value) => value,
-        Err(err) => errno_ret(err),
-    };
-    write_return(frame, ret);
-    if nr == INTERNAL_SYS_EXIT {
-        crate::sbi::shutdown();
-    }
-    if nr == crate::kernel::SYS_SIGRETURN {
-        if let Some(ctx) = kernel.current_user_context(0) {
-            frame.apply_user_context(&ctx);
+    let outcome = match kernel.dispatch_syscall_from_trap(nr, a0, a1, a2, a3, a4, a5, frame) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            write_return(frame, errno_ret(err));
+            deliver_pending_signal(kernel, frame);
+            return;
         }
-        return;
+    };
+    match outcome {
+        crate::kernel::SyscallOutcome::Return(value) => {
+            write_return(frame, value);
+            deliver_pending_signal(kernel, frame);
+        }
+        crate::kernel::SyscallOutcome::ReplaceUserContext {
+            entry,
+            stack_pointer,
+        } => {
+            frame.prepare_user_entry(entry, stack_pointer);
+            deliver_pending_signal(kernel, frame);
+        }
+        crate::kernel::SyscallOutcome::RestoreUserContext(restored) => {
+            *frame = restored;
+        }
+        crate::kernel::SyscallOutcome::NoReturn => {
+            if nr == INTERNAL_SYS_EXIT {
+                crate::sbi::shutdown();
+            }
+        }
     }
-    let interrupted = frame.capture_user_context();
-    if let Some(next) = kernel.deliver_pending_signals_from_context(0, interrupted) {
-        frame.apply_user_context(&next);
+}
+
+// AGENT: deliver one pending handler from the complete post-syscall frame and
+// replace the live stack slot only when signal state changes its continuation.
+fn deliver_pending_signal(kernel: &crate::kernel::Kernel, frame: &mut TrapFrame) {
+    if let Some(next) = kernel.deliver_pending_signals_from_frame(0, frame.clone()) {
+        *frame = next;
     }
 }
 

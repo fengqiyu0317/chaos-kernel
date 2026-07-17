@@ -1,4 +1,5 @@
 use super::*;
+use crate::trap::TrapFrame;
 
 impl Kernel {
     // AGENT: wait-token scheduling is still single-hart, so "current" means the
@@ -152,34 +153,36 @@ impl Kernel {
             .is_some_and(|task| !task.done() && task.has_interrupting_signal())
     }
 
-    // AGENT: deliver pending signals at simulator scheduling/syscall boundaries.
+    // AGENT: deliver pending signals outside a live trap borrow by snapshotting
+    // and reinstalling the authoritative frame in the task's kernel stack.
     pub fn deliver_pending_signals(&self, cpu: usize) -> usize {
-        self.deliver_pending_signals_inner(cpu, None).0
+        let task = self.cur_task(cpu);
+        let active_frame = task
+            .as_ref()
+            .and_then(|task| task.snapshot_user_trap_frame().ok());
+        let (delivered, updated_frame) = self.deliver_pending_signals_inner(cpu, active_frame);
+        if let (Some(task), Some(frame)) = (task, updated_frame) {
+            task.install_user_trap_frame(frame)
+                .expect("task frame disappeared during signal delivery");
+        }
+        delivered
     }
 
-    // AGENT: QEMU syscall return uses the live TrapFrame as the interrupted
-    // context, then receives an updated Context only when a handler is entered.
-    pub(crate) fn deliver_pending_signals_from_context(
+    // AGENT: QEMU syscall return supplies a clone of the live complete frame and
+    // receives a complete replacement only when a userspace handler is entered.
+    pub(crate) fn deliver_pending_signals_from_frame(
         &self,
         cpu: usize,
-        interrupted: Context,
-    ) -> Option<Context> {
+        interrupted: TrapFrame,
+    ) -> Option<TrapFrame> {
         self.deliver_pending_signals_inner(cpu, Some(interrupted)).1
-    }
-
-    // AGENT: expose the current simulated user context to the RISC-V ABI layer
-    // for sigreturn, where the restored context is the syscall result.
-    pub(crate) fn current_user_context(&self, cpu: usize) -> Option<Context> {
-        self.cur_task(cpu)
-            .as_ref()
-            .and_then(|task| task_user_context(task))
     }
 
     fn deliver_pending_signals_inner(
         &self,
         cpu: usize,
-        mut active_context: Option<Context>,
-    ) -> (usize, Option<Context>) {
+        mut active_frame: Option<TrapFrame>,
+    ) -> (usize, Option<TrapFrame>) {
         if cpu != 0 {
             return (0, None);
         }
@@ -188,7 +191,7 @@ impl Kernel {
             None => return (0, None),
         };
         let mut delivered = 0usize;
-        let mut updated_context = None;
+        let mut updated_frame = None;
         while let Some(sig) = task.take_deliverable_signal() {
             delivered += 1;
             match sig.action.resolve(sig.signo) {
@@ -207,18 +210,17 @@ impl Kernel {
                     break;
                 }
                 SignalDeliveryAction::Handler(handler) => {
-                    let interrupted =
-                        match active_context.take().or_else(|| task_user_context(&task)) {
-                            Some(ctx) => ctx,
-                            None => {
-                                task.requeue_signal_front(sig.signo as i32, sig.sender_tid);
-                                break;
-                            }
-                        };
+                    let interrupted = match active_frame.take().or_else(|| task_user_frame(&task)) {
+                        Some(ctx) => ctx,
+                        None => {
+                            task.requeue_signal_front(sig.signo as i32, sig.sender_tid);
+                            break;
+                        }
+                    };
                     match enter_signal_handler(&task, sig, handler, interrupted) {
                         Some(ctx) => {
-                            active_context = Some(ctx.clone());
-                            updated_context = Some(ctx);
+                            active_frame = Some(ctx.clone());
+                            updated_frame = Some(ctx);
                         }
                         None => {
                             break;
@@ -228,7 +230,7 @@ impl Kernel {
                 }
             }
         }
-        (delivered, updated_context)
+        (delivered, updated_frame)
     }
 
     // AGENT: advance global timers after CPU0 has advanced the logical clock.
@@ -334,24 +336,19 @@ impl Kernel {
     }
 }
 
-// AGENT: read the task's saved simulated user context without committing to a
-// signal frame yet; QEMU TrapFrame delivery supplies a fresher context instead.
-fn task_user_context(task: &Task) -> Option<Context> {
-    task.thd_ctx
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|ctx| ctx.uctx.clone())
+// AGENT: snapshot the complete off-CPU user frame without committing a signal frame yet.
+fn task_user_frame(task: &Task) -> Option<TrapFrame> {
+    task.snapshot_user_trap_frame().ok()
 }
 
-// AGENT: install one userspace handler frame and return the context that must
-// run next, keeping mask/frame mutation in one place for simulator and TrapFrame delivery.
+// AGENT: install one userspace handler frame and return the complete frame that
+// must run next, keeping mask/frame mutation in one architecture-aware place.
 fn enter_signal_handler(
     task: &Task,
     sig: PendingSignal,
     handler: usize,
-    interrupted: Context,
-) -> Option<Context> {
+    interrupted: TrapFrame,
+) -> Option<TrapFrame> {
     let old_mask = *task.sig_mask.lock().unwrap();
     let mut thd = task.thd_ctx.lock().unwrap();
     let Some(ctx) = thd.as_mut() else {
@@ -359,17 +356,16 @@ fn enter_signal_handler(
         return None;
     };
     ctx.sig_frames.push(SigFrame {
-        saved_ctx: interrupted.clone(),
+        saved_frame: interrupted.clone(),
         saved_mask: old_mask,
     });
     let next_mask = (old_mask | sig.action.mask | (1u64 << sig.signo))
         & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
     *task.sig_mask.lock().unwrap() = next_mask;
-    ctx.smask = next_mask;
-    ctx.uctx = interrupted;
-    ctx.uctx.r[0] = sig.signo as u64;
-    ctx.uctx.r[1] = sig.sender_tid as u64;
-    ctx.uctx.r[2] = ctx.sig_frames.last().unwrap().saved_ctx.ip;
-    ctx.uctx.set_ip(handler as u64);
-    Some(ctx.uctx.clone())
+    let mut next = interrupted;
+    next.regs[10] = sig.signo as usize;
+    next.regs[11] = sig.sender_tid as usize;
+    next.regs[12] = ctx.sig_frames.last().unwrap().saved_frame.sepc;
+    next.sepc = handler;
+    Some(next)
 }

@@ -1,6 +1,7 @@
 // AGENT: boot-time process regressions that need the QEMU FramePool, Sv39
 // page-table walker, and physical user-copy path to be initialized.
 use super::*;
+use crate::trap::TrapFrame;
 
 // AGENT: expose process, initial-stack, and shared ELF image regressions to the
 // optional QEMU boot selftest path.
@@ -15,6 +16,7 @@ pub fn run_all(pool: &FramePool) {
     register_rejects_duplicate_pid_without_replacing_task(pool);
     pgid_group_keeps_zombie_members_until_reap(pool);
     reap_rejects_live_process(pool);
+    fork_copies_complete_user_frame(pool);
     clone_thread_copies_caller_context_and_shares_process(pool);
     reap_zombie_process_removes_thread_group_once(pool);
     proc_init_push_at_writes_user_stack(pool);
@@ -315,6 +317,37 @@ fn reap_rejects_live_process(pool: &FramePool) {
     assert_eq!(table.count(), 1);
 }
 
+// AGENT: fork copies every architectural user register and return CSR from the
+// caller frame while changing only the child-side a0 return value.
+fn fork_copies_complete_user_frame(pool: &FramePool) {
+    let table = TaskTable::new(pool.clone());
+    let parent = table.spawn_root().expect("root spawn should work");
+    let mut source = TrapFrame::new();
+    for index in 1..source.regs.len() {
+        source.regs[index] = 0x1000 + index;
+    }
+    source.sstatus = 0x20;
+    source.sepc = 0x401004;
+    parent
+        .install_user_trap_frame(source.clone())
+        .expect("parent frame should install");
+    parent.thd_ctx.lock().unwrap().as_mut().unwrap().clear_tid = 0xdead;
+
+    let child = table
+        .fork_task(&parent, pool)
+        .expect("child fork should succeed");
+    let child_frame = child
+        .snapshot_user_trap_frame()
+        .expect("child frame should exist");
+    for index in 0..source.regs.len() {
+        let expected = if index == 10 { 0 } else { source.regs[index] };
+        assert_eq!(child_frame.regs[index], expected);
+    }
+    assert_eq!(child_frame.sstatus, source.sstatus);
+    assert_eq!(child_frame.sepc, source.sepc);
+    assert_eq!(child.thd_ctx.lock().unwrap().as_ref().unwrap().clear_tid, 0);
+}
+
 // AGENT: multi-threaded zombies are collected at process granularity, while all
 // same-process task-table entries disappear in the single reap step.
 fn reap_zombie_process_removes_thread_group_once(pool: &FramePool) {
@@ -346,16 +379,17 @@ fn clone_thread_copies_caller_context_and_shares_process(pool: &FramePool) {
     let clear_tid = 0xdead;
     let sig_mask = 0x24;
 
-    {
-        let mut thd = task.thd_ctx.lock().unwrap();
-        let ctx = thd.as_mut().expect("source context should exist");
-        ctx.uctx.set_ip(0x401000);
-        ctx.uctx.r[0] = 99;
-        ctx.uctx.r[3] = 0x7777;
-        ctx.uctx.set_sp(0x9000_0000);
-        ctx.clear_tid = 0x1111;
-        ctx.smask = 0x11;
+    let mut source = TrapFrame::new();
+    for index in 1..source.regs.len() {
+        source.regs[index] = 0x2000 + index;
     }
+    source.regs[2] = 0x9000_0000;
+    source.regs[10] = 99;
+    source.sstatus = 0x20;
+    source.sepc = 0x401000;
+    task.install_user_trap_frame(source.clone())
+        .expect("source frame should install");
+    task.thd_ctx.lock().unwrap().as_mut().unwrap().clear_tid = 0x1111;
     *task.sig_mask.lock().unwrap() = sig_mask;
 
     let thread = table
@@ -365,15 +399,23 @@ fn clone_thread_copies_caller_context_and_shares_process(pool: &FramePool) {
     assert!(Arc::ptr_eq(&task.process, &thread.process));
     assert!(task.process.threads.lock().unwrap().contains(&thread.id()));
     assert_eq!(*thread.sig_mask.lock().unwrap(), sig_mask);
+    let cloned = thread
+        .snapshot_user_trap_frame()
+        .expect("cloned frame should exist");
+    for index in 0..source.regs.len() {
+        let expected = match index {
+            2 => stack_top as usize,
+            4 => tls as usize,
+            10 => 0,
+            _ => source.regs[index],
+        };
+        assert_eq!(cloned.regs[index], expected);
+    }
+    assert_eq!(cloned.sepc, source.sepc);
+    assert_eq!(cloned.sstatus, source.sstatus);
     let thd = thread.thd_ctx.lock().unwrap();
-    let ctx = thd.as_ref().expect("cloned context should exist");
-    assert_eq!(ctx.uctx.ip, 0x401000);
-    assert_eq!(ctx.uctx.r[0], 0);
-    assert_eq!(ctx.uctx.r[3], 0x7777);
-    assert_eq!(ctx.uctx.r[N_REGS - 1], stack_top);
-    assert_eq!(ctx.uctx.r[N_REGS - 2], tls);
+    let ctx = thd.as_ref().expect("cloned metadata should exist");
     assert_eq!(ctx.clear_tid, clear_tid);
-    assert_eq!(ctx.smask, sig_mask);
 }
 
 // AGENT: construct a minimal init stack through real AddrSpace mappings and
@@ -444,7 +486,7 @@ fn prepared_user_image_loads_elf_segment_and_stack(pool: &FramePool) {
     )
     .expect("shared ELF image builder should succeed");
 
-    assert_eq!(image.thd_ctx.uctx.ip, segment_vaddr as u64);
+    assert_eq!(image.user_entry.entry, segment_vaddr);
     let mut loaded = [0u8; 4];
     image
         .addr_space
@@ -462,7 +504,7 @@ fn prepared_user_image_loads_elf_segment_and_stack(pool: &FramePool) {
         .write_user_bytes(segment_vaddr, b"x", pool)
         .is_err());
 
-    let sp = image.thd_ctx.uctx.r[N_REGS - 1] as usize;
+    let sp = image.user_entry.stack_pointer;
     assert_eq!(image.addr_space.read_user_usize(sp).unwrap(), 1);
     let argv0 = image
         .addr_space
@@ -612,7 +654,7 @@ fn prepared_user_image_loads_out_of_order_segments(pool: &FramePool) {
         .unwrap();
     assert_eq!(&high, b"high");
     assert_eq!(&low, b"low");
-    assert_eq!(image.thd_ctx.uctx.ip, high_vaddr as u64);
+    assert_eq!(image.user_entry.entry, high_vaddr);
     image.addr_space.release_all_pages();
 }
 

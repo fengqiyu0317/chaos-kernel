@@ -119,7 +119,7 @@ pub(super) fn sys_sigaction(
             sa_handler: action.handler,
             sa_sigaction: action.handler,
             sa_mask: action.mask,
-            sa_flags: action.flags as i32,
+            sa_flags: 0,
         };
         unsafe {
             ptr::write_unaligned(oldact_addr as *mut UserSigAction, old);
@@ -128,18 +128,18 @@ pub(super) fn sys_sigaction(
 
     if act_addr != 0 {
         let act = unsafe { ptr::read_unaligned(act_addr as *const UserSigAction) };
-        let sa_flags = if a3 != 0 { a3 } else { act.sa_flags as usize };
+        let requested_flags = if a3 != 0 { a3 } else { act.sa_flags as usize };
+        // TODO(AGENT): implement sigaction flags as one coherent delivery
+        // feature, starting with real SA_SIGINFO frames; until then reject
+        // nonzero flags instead of storing or partially honoring them.
+        if requested_flags != 0 {
+            return Err("enotsup");
+        }
         let sa_mask = if a4 != 0 { a4 as u64 } else { act.sa_mask };
-        let handler = if (sa_flags & 1) != 0 {
-            act.sa_sigaction
-        } else {
-            act.sa_handler
-        };
         if !cur.process.set_signal_action(
             signo,
             SigAction {
-                handler,
-                flags: (sa_flags & 0xFFFF_FFFF) as u32,
+                handler: act.sa_handler,
                 mask: sa_mask,
             },
         ) {
@@ -198,14 +198,13 @@ pub(super) fn sys_sigprocmask(
     Ok(0)
 }
 
-// AGENT: restore the last simulated signal frame.
-pub(super) fn sys_sigreturn(kernel: &Kernel) -> Result<usize, &'static str> {
+// AGENT: restore the last complete user signal frame through the syscall outcome
+// so the trap owner can replace its live frame without creating a second alias.
+pub(super) fn sys_sigreturn(kernel: &Kernel) -> Result<SyscallOutcome, &'static str> {
     let t = kernel.cur_task(0).ok_or("esrch")?;
     let mut thd = t.thd_ctx.lock().unwrap();
     let ctx = thd.as_mut().ok_or("einval")?;
     let frame = ctx.sig_frames.pop().ok_or("einval")?;
-    ctx.uctx = frame.saved_ctx;
-    ctx.smask = frame.saved_mask;
     *t.sig_mask.lock().unwrap() = frame.saved_mask;
-    Ok(0)
+    Ok(SyscallOutcome::RestoreUserContext(frame.saved_frame))
 }

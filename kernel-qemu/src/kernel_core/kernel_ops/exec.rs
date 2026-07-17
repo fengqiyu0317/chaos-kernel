@@ -1,9 +1,10 @@
 use super::*;
+use crate::trap::TrapFrame;
 
 struct PreparedExec {
     exec_path: String,
     addr_space: AddrSpace,
-    thd_ctx: ThdCtx,
+    user_entry: UserEntry,
     close_fds: Vec<usize>,
 }
 
@@ -38,8 +39,7 @@ impl Kernel {
         let elf_data = self.read_file_for_exec(&exec_path)?;
         // AGENT: delegate ELF mapping and stack construction to the common
         // user-image builder; exec retains only file and commit semantics.
-        let mut image = prepare_user_image(&elf_data, args, envs, &self.pool)?;
-        image.thd_ctx.smask = *task.sig_mask.lock().unwrap();
+        let image = prepare_user_image(&elf_data, args, envs, &self.pool)?;
         let close_fds = task
             .process
             .files
@@ -51,7 +51,7 @@ impl Kernel {
         Ok(PreparedExec {
             exec_path,
             addr_space: image.addr_space,
-            thd_ctx: image.thd_ctx,
+            user_entry: image.user_entry,
             close_fds,
         })
     }
@@ -59,7 +59,7 @@ impl Kernel {
     // AGENT: close FD_CLOEXEC descriptors, reset caught signal dispositions,
     // and mark successful exec so parent setpgid calls can reject children
     // after the exec boundary.
-    fn commit_exec(&self, task: &Arc<Task>, prepared: PreparedExec) {
+    fn commit_exec(&self, task: &Arc<Task>, prepared: PreparedExec) -> UserEntry {
         for fd in prepared.close_fds {
             let _ = task.close_fd(fd);
         }
@@ -71,9 +71,27 @@ impl Kernel {
         }
         *task.process.exec_path.lock().unwrap() = prepared.exec_path;
         task.process.did_exec.store(true, Ordering::SeqCst);
-        *task.thd_ctx.lock().unwrap() = Some(prepared.thd_ctx);
+        *task.thd_ctx.lock().unwrap() = Some(ThdCtx::default());
+        prepared.user_entry
     }
 
+    // AGENT: perform the address-space and process-state exec transaction while
+    // returning the architecture entry update to the caller that owns the live frame.
+    pub(crate) fn do_exec_for_trap(
+        &self,
+        task_id: usize,
+        path: &str,
+        args: Vec<String>,
+        envs: Vec<String>,
+    ) -> Result<UserEntry, &'static str> {
+        let task = self.tasks.find(task_id).ok_or("esrch")?;
+        task.kernel_stack_top().ok_or("ekstk")?;
+        let prepared = self.prepare_exec_image(&task, path, args, envs)?;
+        Ok(self.commit_exec(&task, prepared))
+    }
+
+    // AGENT: retain the direct semantic API used by focused tests by installing
+    // the returned entry into the off-CPU task's authoritative stack frame.
     pub fn do_exec(
         &self,
         task_id: usize,
@@ -81,9 +99,12 @@ impl Kernel {
         args: Vec<String>,
         envs: Vec<String>,
     ) -> Result<(), &'static str> {
+        let user_entry = self.do_exec_for_trap(task_id, path, args, envs)?;
         let task = self.tasks.find(task_id).ok_or("esrch")?;
-        let prepared = self.prepare_exec_image(&task, path, args, envs)?;
-        self.commit_exec(&task, prepared);
+        task.install_user_trap_frame(TrapFrame::for_user_entry(
+            user_entry.entry,
+            user_entry.stack_pointer,
+        ))?;
         Ok(())
     }
 }

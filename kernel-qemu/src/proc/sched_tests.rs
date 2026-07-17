@@ -3,9 +3,10 @@
 use super::*;
 use crate::kernel::kernel_core::{init_timer_wheel, TIMER_WHEEL};
 use crate::kernel::{
-    Context, FramePool, Kernel, SigAction, SignalDeliveryAction, TaskRunState, PRIO_MIN, SIGCHLD,
-    SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGWINCH, SIG_IGN,
+    FramePool, Kernel, SigAction, SignalDeliveryAction, TaskRunState, PRIO_MIN, SIGCHLD, SIGCONT,
+    SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGWINCH, SIG_IGN, SYS_SIGRETURN,
 };
+use crate::trap::TrapFrame;
 
 // AGENT: expose focused scheduler queue checks to the optional QEMU boot
 // selftest path and use its discovered RAM pool for real task kernel stacks.
@@ -19,7 +20,7 @@ pub fn run_all(pool: &FramePool) {
     signal_stop_uses_job_stopped_flag(pool);
     sigcont_resumes_stopped_task_without_resuming_for_plain_signal(pool);
     sigcont_keeps_sleeping_task_asleep_until_wait_wakeup(pool);
-    signal_handler_uses_supplied_interrupted_context(pool);
+    signal_handler_uses_supplied_interrupted_frame(pool);
 }
 
 // AGENT: keep the SIG_DFL policy table pinned to the Linux/RISC-V ignore,
@@ -38,7 +39,6 @@ fn default_signal_actions_follow_linux_classes() {
 
     let handler = SigAction {
         handler: 0x5000,
-        flags: 0,
         mask: 0,
     };
     assert_eq!(
@@ -76,7 +76,6 @@ fn changing_to_ignored_action_discards_pending_signal(pool: &FramePool) {
         SIGUSR1,
         SigAction {
             handler: SIG_IGN,
-            flags: 0,
             mask: 0,
         },
     ));
@@ -86,7 +85,6 @@ fn changing_to_ignored_action_discards_pending_signal(pool: &FramePool) {
         SIGURG,
         SigAction {
             handler: 0x5000,
-            flags: 0,
             mask: 0,
         },
     ));
@@ -227,9 +225,9 @@ fn sigcont_keeps_sleeping_task_asleep_until_wait_wakeup(pool: &FramePool) {
     assert_eq!(kernel.run_queue.pick_next(), Some(task.id()));
 }
 
-// AGENT: QEMU syscall delivery supplies the live TrapFrame-derived context; the
-// saved signal frame must use that context instead of a stale Task::uctx copy.
-fn signal_handler_uses_supplied_interrupted_context(pool: &FramePool) {
+// AGENT: QEMU syscall delivery supplies the complete live TrapFrame; handler
+// entry and sigreturn must preserve every register outside the handler ABI slots.
+fn signal_handler_uses_supplied_interrupted_frame(pool: &FramePool) {
     ensure_timer_wheel();
 
     let kernel = Kernel::new(pool.clone());
@@ -240,31 +238,54 @@ fn signal_handler_uses_supplied_interrupted_context(pool: &FramePool) {
         SIGUSR1,
         SigAction {
             handler,
-            flags: 0,
             mask: 1u64 << SIGUSR2,
         },
     ));
 
-    let mut interrupted = Context::new();
-    interrupted.ip = 0x1234;
-    interrupted.r[0] = 0xfeed;
-    interrupted.set_sp(0x8000_0000);
+    let mut interrupted = TrapFrame::new();
+    for index in 1..interrupted.regs.len() {
+        interrupted.regs[index] = 0x3000 + index;
+    }
+    interrupted.regs[10] = 0xfeed;
+    interrupted.regs[2] = 0x8000_0000;
+    interrupted.sstatus = 0x20;
+    interrupted.sepc = 0x1234;
 
     kernel.send_signal_to_task(&task, SIGUSR1 as i32, 77);
     let next = kernel
-        .deliver_pending_signals_from_context(0, interrupted.clone())
-        .expect("handler delivery should produce a next context");
+        .deliver_pending_signals_from_frame(0, interrupted.clone())
+        .expect("handler delivery should produce a next frame");
 
-    assert_eq!(next.ip, handler as u64);
-    assert_eq!(next.r[0], SIGUSR1 as u64);
-    assert_eq!(next.r[1], 77);
-    assert_eq!(next.r[2], interrupted.ip);
+    assert_eq!(next.sepc, handler);
+    assert_eq!(next.regs[10], SIGUSR1 as usize);
+    assert_eq!(next.regs[11], 77);
+    assert_eq!(next.regs[12], interrupted.sepc);
+    for index in 0..interrupted.regs.len() {
+        if !matches!(index, 10..=12) {
+            assert_eq!(next.regs[index], interrupted.regs[index]);
+        }
+    }
+    assert_eq!(next.sstatus, interrupted.sstatus);
     assert_ne!(*task.sig_mask.lock().unwrap() & (1u64 << SIGUSR1), 0);
     assert_ne!(*task.sig_mask.lock().unwrap() & (1u64 << SIGUSR2), 0);
 
-    let thd = task.thd_ctx.lock().unwrap();
-    let ctx = thd.as_ref().expect("task context should exist");
-    assert_eq!(ctx.sig_frames.len(), 1);
-    assert_eq!(ctx.sig_frames[0].saved_ctx.r[0], 0xfeed);
-    assert_eq!(ctx.sig_frames[0].saved_ctx.ip, interrupted.ip);
+    {
+        let thd = task.thd_ctx.lock().unwrap();
+        let ctx = thd.as_ref().expect("task metadata should exist");
+        assert_eq!(ctx.sig_frames.len(), 1);
+        assert_eq!(ctx.sig_frames[0].saved_frame, interrupted);
+    }
+
+    task.install_user_trap_frame(next)
+        .expect("handler frame should install");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_SIGRETURN, 0, 0, 0, 0, 0, 0),
+        Ok(0xfeed)
+    );
+    assert_eq!(
+        task.snapshot_user_trap_frame()
+            .expect("sigreturn frame should exist"),
+        interrupted
+    );
+    assert_eq!(*task.sig_mask.lock().unwrap(), 0);
 }

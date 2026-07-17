@@ -1,6 +1,7 @@
 // AGENT: define the schedulable Task and its task-local lifecycle behavior
 // separately from the state types it composes.
 use super::*;
+use crate::trap::TrapFrame;
 
 // AGENT: represent one schedulable thread with an immutable id and link it to
 // process-wide state; executable identity lives in ProcessState::exec_path.
@@ -10,7 +11,6 @@ pub struct Task {
     pub sig_mask: Mutex<u64>,
     pub kstk: Mutex<Option<KStk>>,
     pub thd_ctx: Mutex<Option<ThdCtx>>,
-    pub restored_trap_frame: Mutex<Option<SavedTrapFrame>>,
     pub sched: Mutex<SchedEntity>,
 }
 
@@ -41,15 +41,16 @@ impl Task {
         pool: &FramePool,
     ) -> Result<Arc<Self>, &'static str> {
         let kstk = KStk::new(pool)?;
-        Ok(Arc::new(Self {
+        let task = Arc::new(Self {
             id,
             process,
             sig_mask: Mutex::new(0),
             kstk: Mutex::new(Some(kstk)),
             thd_ctx: Mutex::new(Some(ThdCtx::default())),
-            restored_trap_frame: Mutex::new(None),
             sched: Mutex::new(SchedEntity::new()),
-        }))
+        });
+        task.install_user_trap_frame(TrapFrame::new())?;
+        Ok(task)
     }
 
     // AGENT: expose the schedulable thread id.
@@ -82,14 +83,43 @@ impl Task {
         self.kstk.lock().unwrap().as_ref().map(KStk::top)
     }
 
-    // AGENT: store a full checkpoint frame for the first restored user entry.
-    pub fn set_restored_trap_frame(&self, frame: SavedTrapFrame) {
-        *self.restored_trap_frame.lock().unwrap() = Some(frame);
+    // AGENT: compute the fixed trap-frame slot while its owning stack is still
+    // protected by the caller's kstk guard.
+    fn trap_frame_ptr_in(kstk: &KStk) -> Result<*mut TrapFrame, &'static str> {
+        let frame_addr = kstk
+            .top()
+            .checked_sub(mem::size_of::<TrapFrame>())
+            .ok_or("ekstk")?;
+        if frame_addr % mem::align_of::<TrapFrame>() != 0 {
+            return Err("ekstk");
+        }
+        Ok(frame_addr as *mut TrapFrame)
     }
 
-    // AGENT: consume a restored frame once it is materialized on the kernel stack.
-    pub fn take_restored_trap_frame(&self) -> Option<SavedTrapFrame> {
-        self.restored_trap_frame.lock().unwrap().take()
+    // AGENT: locate the architecture frame trap.S owns at the fixed top slot of
+    // this task's kernel stack. Callers must not create a second mutable access
+    // while the live trap path already holds &mut TrapFrame for the same slot.
+    pub(crate) fn user_trap_frame_ptr(&self) -> Result<*mut TrapFrame, &'static str> {
+        let kstk = self.kstk.lock().unwrap();
+        Self::trap_frame_ptr_in(kstk.as_ref().ok_or("ekstk")?)
+    }
+
+    // AGENT: initialize or replace an off-CPU task's complete user return frame.
+    pub fn install_user_trap_frame(&self, frame: TrapFrame) -> Result<(), &'static str> {
+        let kstk = self.kstk.lock().unwrap();
+        let ptr = Self::trap_frame_ptr_in(kstk.as_ref().ok_or("ekstk")?)?;
+        unsafe {
+            ptr.write(frame);
+        }
+        Ok(())
+    }
+
+    // AGENT: clone an off-CPU task's complete user return frame for fork,
+    // checkpoint, tests, or scheduler-side signal delivery.
+    pub fn snapshot_user_trap_frame(&self) -> Result<TrapFrame, &'static str> {
+        let kstk = self.kstk.lock().unwrap();
+        let ptr = Self::trap_frame_ptr_in(kstk.as_ref().ok_or("ekstk")?)?;
+        Ok(unsafe { (&*ptr).clone() })
     }
 
     // AGENT: report process death from the shared exit reason.

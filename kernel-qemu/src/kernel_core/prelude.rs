@@ -37,7 +37,6 @@ pub const MEM_OFF: usize = 0x8000_0000;
 pub const KHEAP_SZ: usize = 0x800000;
 pub const N_CHAINS: usize = 64;
 pub const RBUF_CAP: usize = 256;
-pub const N_REGS: usize = 16;
 pub const MNT_DEPTH: usize = 8;
 pub const MAX_CPU: usize = 8;
 pub const KSTK_SZ: usize = 0x4000;

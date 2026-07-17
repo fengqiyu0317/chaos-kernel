@@ -1,4 +1,5 @@
 use super::*;
+use crate::trap::TrapFrame;
 
 impl Kernel {
     // AGENT: assemble a first-version checkpoint image for the current CPU task
@@ -80,7 +81,7 @@ impl Kernel {
         self.timers
             .lock()
             .restore_checkpoint_timers(&image.timers, task.id())?;
-        task.set_restored_trap_frame(trap_frame);
+        task.install_user_trap_frame(TrapFrame::from_saved_checkpoint_frame(&trap_frame))?;
         task.set_sched_state(TaskRunState::Runnable);
         task.reset_slice();
         let task_id = task.id();

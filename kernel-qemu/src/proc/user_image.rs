@@ -1,11 +1,19 @@
 // AGENT
 use super::*;
 
-// AGENT: carry a fully prepared user address space and initial thread context
+// AGENT: carry a fully prepared user address space and initial architecture entry
 // across the transactional task-creation or exec commit boundary.
 pub(crate) struct PreparedUserImage {
     pub addr_space: AddrSpace,
-    pub thd_ctx: ThdCtx,
+    pub user_entry: UserEntry,
+}
+
+// AGENT: keep the pure exec result independent of the live TrapFrame reference
+// held by the architecture syscall adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UserEntry {
+    pub entry: usize,
+    pub stack_pointer: usize,
 }
 
 // AGENT: parse an ELF and construct one complete user image so initial task
@@ -19,9 +27,9 @@ pub(crate) fn prepare_user_image(
     let elf = parse_elf(elf_data)?;
     let mut addr_space = AddrSpace::new();
     match populate_user_image(&mut addr_space, elf_data, elf, args, envs, pool) {
-        Ok(thd_ctx) => Ok(PreparedUserImage {
+        Ok(user_entry) => Ok(PreparedUserImage {
             addr_space,
-            thd_ctx,
+            user_entry,
         }),
         Err(err) => {
             addr_space.release_all_pages();
@@ -59,7 +67,7 @@ fn populate_user_image(
     args: Vec<String>,
     envs: Vec<String>,
     pool: &FramePool,
-) -> Result<ThdCtx, &'static str> {
+) -> Result<UserEntry, &'static str> {
     let ParsedElf {
         entry,
         load_segments,
@@ -128,8 +136,8 @@ fn populate_user_image(
     }
 
     addr_space.set_brk_metadata(checked_align_up(image_end, PAGE_SZ).ok_or("ph_overflow")?)?;
-    let mut thd_ctx = ThdCtx::default();
-    thd_ctx.uctx.set_sp(sp as u64);
-    thd_ctx.uctx.set_ip(entry as u64);
-    Ok(thd_ctx)
+    Ok(UserEntry {
+        entry,
+        stack_pointer: sp,
+    })
 }

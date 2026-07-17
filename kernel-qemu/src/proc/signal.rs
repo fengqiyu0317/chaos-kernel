@@ -1,10 +1,12 @@
 // AGENT
 use super::*;
+use crate::trap::TrapFrame;
 
+// AGENT: keep only signal disposition state with live delivery semantics;
+// sigaction flag support remains an explicit syscall-boundary TODO.
 #[derive(Clone)]
 pub struct SigAction {
     pub handler: usize,
-    pub flags: u32,
     pub mask: u64,
 }
 
@@ -21,11 +23,10 @@ pub enum SignalDeliveryAction {
 
 impl SigAction {
     // AGENT: keep the canonical default disposition in one place so exec reset
-    // paths do not leave stale sigaction flags or masks behind.
+    // paths do not leave a stale handler mask behind.
     pub fn default_action() -> Self {
         Self {
             handler: SIG_DFL,
-            flags: 0,
             mask: 0,
         }
     }
@@ -47,10 +48,10 @@ impl SigAction {
     }
 }
 
-// AGENT: signal frame now stores only the state required by sigreturn.
+// AGENT: retain every architectural register and return CSR required by sigreturn.
 #[derive(Clone)]
 pub struct SigFrame {
-    pub saved_ctx: Context,
+    pub saved_frame: TrapFrame,
     pub saved_mask: u64,
 }
 
@@ -112,7 +113,7 @@ impl SigSet {
     }
 
     // AGENT: exec keeps ignored dispositions but resets caught handlers to a
-    // clean default action, including stale masks and flags.
+    // clean default action, including stale handler masks.
     pub fn clear_non_caught(&mut self) {
         for i in 1..self.actions.len() {
             if self.actions[i].handler != SIG_DFL && self.actions[i].handler != SIG_IGN {

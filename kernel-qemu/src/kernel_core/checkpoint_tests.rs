@@ -80,7 +80,13 @@ fn checkpoint_round_trip_restores_memory_and_trap_frame(kernel: &Kernel) {
         .read_user_bytes(data_addr, &mut restored_pattern)
         .expect("restored page should be readable");
     assert_eq!(restored_pattern, pattern);
-    assert_eq!(restored.take_restored_trap_frame(), Some(frame));
+    assert_eq!(
+        restored
+            .snapshot_user_trap_frame()
+            .expect("restored task should own a complete trap frame")
+            .to_saved_checkpoint_frame(),
+        frame
+    );
 }
 
 // AGENT: prove checkpoint/restore carries task-bound timer state and rebinds the

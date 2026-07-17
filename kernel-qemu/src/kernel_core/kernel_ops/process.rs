@@ -1,4 +1,5 @@
 use super::*;
+use crate::trap::TrapFrame;
 
 const WAIT4_WNOHANG: usize = 1;
 
@@ -103,11 +104,25 @@ impl Kernel {
     // state copying, while Kernel only publishes the child to the scheduler.
     pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> {
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
+        let caller_frame = parent.snapshot_user_trap_frame()?;
+        self.do_fork_from_frame(parent_id, &caller_frame)
+    }
+
+    // AGENT: fork from the complete frame captured by the active trap path so
+    // the child inherits every user register at the post-ecall continuation.
+    pub(crate) fn do_fork_from_frame(
+        &self,
+        parent_id: usize,
+        caller_frame: &TrapFrame,
+    ) -> Result<usize, &'static str> {
+        let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         if parent.done() {
             return Err("esrch");
         }
 
-        let child = self.tasks.fork_task(&parent, &self.pool)?;
+        let child = self
+            .tasks
+            .fork_task_from_frame(&parent, caller_frame, &self.pool)?;
         let child_id = child.id();
         child.set_sched_state(TaskRunState::Runnable);
         child.reset_slice();

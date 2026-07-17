@@ -1,13 +1,14 @@
 // AGENT
 use super::*;
+use crate::trap::TrapFrame;
 
 fn returning(result: Result<usize, &'static str>) -> Result<SyscallOutcome, &'static str> {
     result.map(SyscallOutcome::Return)
 }
 
 impl Kernel {
-    // AGENT: shared syscall decoder; callers choose whether signal delivery is
-    // the simulator Context path or the QEMU TrapFrame path.
+    // AGENT: shared syscall decoder; the QEMU trap caller may additionally
+    // supply its complete live frame for context-sensitive operations.
     fn dispatch_syscall_raw(
         &self,
         nr: usize,
@@ -17,6 +18,7 @@ impl Kernel {
         a3: usize,
         a4: usize,
         a5: usize,
+        caller_frame: Option<&TrapFrame>,
     ) -> Result<SyscallOutcome, &'static str> {
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
         let _ts_enter = CLK.load(Ordering::Relaxed);
@@ -44,8 +46,8 @@ impl Kernel {
             SYS_PIPE => returning(sys_pipe(self, a0, a1)),
             SYS_DUP => returning(sys_dup(self, a0)),
             SYS_DUP2 => returning(sys_dup2(self, a0, a1)),
-            SYS_FORK => returning(sys_fork(self, _caller_token)),
-            SYS_EXEC => returning(sys_exec(self, a0, a1, a2)),
+            SYS_FORK => returning(sys_fork(self, _caller_token, caller_frame)),
+            SYS_EXEC => sys_exec(self, a0, a1, a2),
             SYS_EXIT => sys_exit(self, a0),
             SYS_WAIT4 => returning(sys_wait4(self, a0, a1, a2, a3)),
             SYS_KILL => returning(sys_kill(self, a0, a1)),
@@ -62,15 +64,15 @@ impl Kernel {
             SYS_SPLICE => returning(sys_splice(self, a0, a1, a2, a3, a4, a5)),
             SYS_SIGACTION => returning(sys_sigaction(self, a0, a1, a2, a3, a4)),
             SYS_SIGPROCMASK => returning(sys_sigprocmask(self, a0, a1, a2)),
-            SYS_SIGRETURN => returning(sys_sigreturn(self)),
+            SYS_SIGRETURN => sys_sigreturn(self),
             SYS_FUTEX => returning(sys_futex(self, a0, a1, a2, a3, a4, a5)),
             _ => Err("enosys"),
         }
     }
 
-    // AGENT: QEMU trap-frame dispatch writes signal handler state directly into
-    // the active TrapFrame, so it asks for syscall behavior without the legacy
-    // simulator Context delivery step.
+    // AGENT: keep the task-owned-frame, no-signal-delivery adapter confined to
+    // the direct filesystem and scheduler semantic selftests that need it.
+    #[cfg(any(test, feature = "qemu-fs-selftest", feature = "qemu-sched-selftest"))]
     pub(crate) fn dispatch_syscall_without_signal_delivery(
         &self,
         nr: usize,
@@ -81,10 +83,40 @@ impl Kernel {
         a4: usize,
         a5: usize,
     ) -> Result<usize, &'static str> {
-        match self.dispatch_syscall_raw(nr, a0, a1, a2, a3, a4, a5)? {
+        match self.dispatch_syscall_raw(nr, a0, a1, a2, a3, a4, a5, None)? {
             SyscallOutcome::Return(value) => Ok(value),
+            SyscallOutcome::ReplaceUserContext {
+                entry,
+                stack_pointer,
+            } => {
+                let task = self.cur_task(0).ok_or("esrch")?;
+                task.install_user_trap_frame(TrapFrame::for_user_entry(entry, stack_pointer))?;
+                Ok(0)
+            }
+            SyscallOutcome::RestoreUserContext(frame) => {
+                let value = frame.regs[10];
+                let task = self.cur_task(0).ok_or("esrch")?;
+                task.install_user_trap_frame(frame)?;
+                Ok(value)
+            }
             SyscallOutcome::NoReturn => Ok(0),
         }
+    }
+
+    // AGENT: expose the architecture-sensitive syscall outcome to the owner of
+    // the live TrapFrame instead of installing through a second task-stack alias.
+    pub(crate) fn dispatch_syscall_from_trap(
+        &self,
+        nr: usize,
+        a0: usize,
+        a1: usize,
+        a2: usize,
+        a3: usize,
+        a4: usize,
+        a5: usize,
+        caller_frame: &TrapFrame,
+    ) -> Result<SyscallOutcome, &'static str> {
+        self.dispatch_syscall_raw(nr, a0, a1, a2, a3, a4, a5, Some(caller_frame))
     }
 
     pub fn dispatch_syscall(
@@ -97,9 +129,24 @@ impl Kernel {
         a4: usize,
         a5: usize,
     ) -> Result<usize, &'static str> {
-        match self.dispatch_syscall_raw(nr, a0, a1, a2, a3, a4, a5)? {
+        match self.dispatch_syscall_raw(nr, a0, a1, a2, a3, a4, a5, None)? {
             SyscallOutcome::Return(value) => {
                 self.deliver_pending_signals(0);
+                Ok(value)
+            }
+            SyscallOutcome::ReplaceUserContext {
+                entry,
+                stack_pointer,
+            } => {
+                let task = self.cur_task(0).ok_or("esrch")?;
+                task.install_user_trap_frame(TrapFrame::for_user_entry(entry, stack_pointer))?;
+                self.deliver_pending_signals(0);
+                Ok(0)
+            }
+            SyscallOutcome::RestoreUserContext(frame) => {
+                let value = frame.regs[10];
+                let task = self.cur_task(0).ok_or("esrch")?;
+                task.install_user_trap_frame(frame)?;
                 Ok(value)
             }
             SyscallOutcome::NoReturn => Ok(0),

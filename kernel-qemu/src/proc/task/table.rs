@@ -1,6 +1,7 @@
 // AGENT: isolate task registry, process-group membership, and process/thread
 // construction from the state stored by each Task.
 use super::*;
+use crate::trap::TrapFrame;
 
 // AGENT: track schedulable task ids and index process groups by process pid.
 pub struct TaskTable {
@@ -329,8 +330,21 @@ impl TaskTable {
         }
     }
 
-    // AGENT: fork inherited process state and the caller's child-side context.
+    // AGENT: preserve the direct semantic helper by snapshotting an off-CPU
+    // source task before delegating to the live-frame-aware fork path.
     pub fn fork_task(&self, src: &Arc<Task>, pool: &FramePool) -> Result<Arc<Task>, &'static str> {
+        let caller_frame = src.snapshot_user_trap_frame()?;
+        self.fork_task_from_frame(src, &caller_frame, pool)
+    }
+
+    // AGENT: fork inherited process state from the caller's complete live
+    // RISC-V frame instead of a lossy simulator Context mirror.
+    pub fn fork_task_from_frame(
+        &self,
+        src: &Arc<Task>,
+        caller_frame: &TrapFrame,
+        pool: &FramePool,
+    ) -> Result<Arc<Task>, &'static str> {
         let task_slot = self.reserve_task_slot()?;
         let proc_src = self.process_of_tid(src.id()).unwrap_or_else(|| src.clone());
         let child_id = self.seq.fetch_add(1, Ordering::SeqCst);
@@ -361,10 +375,13 @@ impl TaskTable {
         }
 
         let child_ctx = src.thd_ctx.lock().unwrap().clone().map(|mut ctx| {
-            ctx.uctx.set_ret(0);
+            ctx.clear_tid = 0;
             ctx
         });
         *child.thd_ctx.lock().unwrap() = child_ctx;
+        let mut child_frame = caller_frame.clone();
+        child_frame.set_return_value(0);
+        child.install_user_trap_frame(child_frame)?;
 
         // AGENT: inherit the parent group/session with a fresh pre-exec window.
         let pgid = *proc_src.process.pgid.lock().unwrap();
@@ -395,10 +412,24 @@ impl TaskTable {
         Ok(child)
     }
 
-    // AGENT: clone one thread context while sharing the owning process state.
+    // AGENT: preserve the direct semantic helper by snapshotting an off-CPU
+    // source task before delegating to the live-frame-aware clone path.
     pub fn clone_thread(
         &self,
         src: &Arc<Task>,
+        stack_top: u64,
+        tls: u64,
+        clear_tid: usize,
+    ) -> Result<Arc<Task>, &'static str> {
+        let caller_frame = src.snapshot_user_trap_frame()?;
+        self.clone_thread_from_frame(src, &caller_frame, stack_top, tls, clear_tid)
+    }
+
+    // AGENT: clone one complete user frame while sharing the owning process state.
+    pub fn clone_thread_from_frame(
+        &self,
+        src: &Arc<Task>,
+        caller_frame: &TrapFrame,
         stack_top: u64,
         tls: u64,
         clear_tid: usize,
@@ -408,14 +439,15 @@ impl TaskTable {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let task = Task::make_with_process(id, proc_src.process.clone(), &self.pool)?;
         let mut ctx = src.thd_ctx.lock().unwrap().clone().ok_or("enoctx")?;
-        ctx.uctx.set_ret(0);
-        ctx.uctx.set_sp(stack_top);
-        ctx.uctx.set_tls(tls);
         ctx.clear_tid = clear_tid;
         let caller_mask = *src.sig_mask.lock().unwrap();
-        ctx.smask = caller_mask;
         *task.sig_mask.lock().unwrap() = caller_mask;
         *task.thd_ctx.lock().unwrap() = Some(ctx);
+        let mut child_frame = caller_frame.clone();
+        child_frame.set_return_value(0);
+        child_frame.regs[2] = stack_top as usize;
+        child_frame.regs[4] = tls as usize;
+        task.install_user_trap_frame(child_frame)?;
         {
             let mut map = self.map.write().unwrap();
             if map.contains_key(&id) {
@@ -447,7 +479,10 @@ impl TaskTable {
         };
 
         *task.process.exec_path.lock().unwrap() = path.to_string();
-        *task.thd_ctx.lock().unwrap() = Some(image.thd_ctx);
+        task.install_user_trap_frame(TrapFrame::for_user_entry(
+            image.user_entry.entry,
+            image.user_entry.stack_pointer,
+        ))?;
         {
             let mut addr_space = task.process.addr_space.lock().unwrap();
             *addr_space = image.addr_space;

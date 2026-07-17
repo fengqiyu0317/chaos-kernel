@@ -1,9 +1,8 @@
 #![allow(dead_code)]
 
 use core::arch::global_asm;
-use core::mem;
 
-use crate::kernel::{Context, SavedTrapFrame, Task};
+use crate::kernel::{SavedTrapFrame, Task};
 use crate::{csr, println, sbi, timer};
 
 global_asm!(include_str!("trap.S"));
@@ -23,6 +22,7 @@ unsafe extern "C" {
 }
 
 // AGENT: RISC-V S-mode trap frame saved by trap.S before entering Rust.
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct TrapFrame {
     pub regs: [usize; 32],
@@ -237,41 +237,12 @@ pub unsafe fn enter_user_mode(frame: &TrapFrame) -> ! {
     unsafe { __user_trap_return(frame as *const TrapFrame) }
 }
 
-// AGENT: materialize a task's saved user context as a RISC-V trap frame at the
-// top of its owned kernel stack.
+// AGENT: return the complete user frame already installed in the fixed top slot
+// of this task's owned kernel stack.
 pub unsafe fn prepare_task_user_trap_frame(task: &Task) -> Result<*mut TrapFrame, &'static str> {
-    let stack_top = task.kernel_stack_top().ok_or("ekstk")?;
-    let frame_addr = stack_top
-        .checked_sub(mem::size_of::<TrapFrame>())
-        .ok_or("ekstk")?;
-    if frame_addr % mem::align_of::<TrapFrame>() != 0 {
-        return Err("ekstk");
-    }
-
-    if let Some(saved) = task.take_restored_trap_frame() {
-        let frame = frame_addr as *mut TrapFrame;
-        unsafe {
-            frame.write(TrapFrame::from_saved_checkpoint_frame(&saved));
-        }
-        return Ok(frame);
-    }
-
-    let (entry, user_sp) = {
-        let thd = task.thd_ctx.lock().unwrap();
-        let ctx = thd.as_ref().ok_or("enoctx")?;
-        (
-            ctx.uctx.ip as usize,
-            ctx.uctx.r[crate::kernel::N_REGS - 1] as usize,
-        )
-    };
-    if entry == 0 || user_sp == 0 {
+    let frame = task.user_trap_frame_ptr()?;
+    if unsafe { (*frame).sepc == 0 || (*frame).regs[2] == 0 } {
         return Err("enoexec");
-    }
-
-    let frame = frame_addr as *mut TrapFrame;
-    unsafe {
-        frame.write(TrapFrame::new());
-        (*frame).prepare_user_entry(entry, user_sp);
     }
     Ok(frame)
 }
@@ -341,8 +312,15 @@ impl TrapFrame {
         self.regs[10] = value;
     }
 
-    // AGENT: capture the complete RISC-V user trap frame for checkpoint images;
-    // Context keeps only simulator ABI fields and is not enough for restore.
+    // AGENT: construct one complete first-entry frame so task creation and exec
+    // install the same architecture state that trap.S later saves in place.
+    pub fn for_user_entry(entry: usize, user_sp: usize) -> Self {
+        let mut frame = Self::new();
+        frame.prepare_user_entry(entry, user_sp);
+        frame
+    }
+
+    // AGENT: capture the complete RISC-V user trap frame for checkpoint images.
     pub fn to_saved_checkpoint_frame(&self) -> SavedTrapFrame {
         let mut regs = [0u64; 32];
         for (dst, src) in regs.iter_mut().zip(self.regs.iter()) {
@@ -355,8 +333,7 @@ impl TrapFrame {
         }
     }
 
-    // AGENT: materialize a restored checkpoint frame for the normal trap-return
-    // path instead of rebuilding it from the lossy simulator Context.
+    // AGENT: materialize a restored checkpoint frame for the normal trap-return path.
     pub fn from_saved_checkpoint_frame(saved: &SavedTrapFrame) -> Self {
         let mut regs = [0usize; 32];
         for (dst, src) in regs.iter_mut().zip(saved.regs.iter()) {
@@ -367,37 +344,5 @@ impl TrapFrame {
             sstatus: saved.sstatus as usize,
             sepc: saved.sepc as usize,
         }
-    }
-
-    // AGENT: capture only the simulator-visible user context fields; Context.r
-    // is an ABI argument array, not the raw x0..x31 register file.
-    pub fn capture_user_context(&self) -> Context {
-        let mut ctx = Context::new();
-        ctx.ip = self.sepc as u64;
-        ctx.flags = self.sstatus as u64;
-        ctx.r[0] = self.regs[10] as u64;
-        ctx.r[1] = self.regs[11] as u64;
-        ctx.r[2] = self.regs[12] as u64;
-        ctx.r[3] = self.regs[13] as u64;
-        ctx.r[4] = self.regs[14] as u64;
-        ctx.r[5] = self.regs[15] as u64;
-        ctx.r[crate::kernel::N_REGS - 1] = self.regs[2] as u64;
-        ctx.r[crate::kernel::N_REGS - 2] = self.regs[4] as u64;
-        ctx
-    }
-
-    // AGENT: write the simulator-visible user context back through the RISC-V
-    // ABI slots that can be changed by signal delivery and sigreturn.
-    pub fn apply_user_context(&mut self, ctx: &Context) {
-        self.sepc = ctx.ip as usize;
-        self.sstatus = ctx.flags as usize;
-        self.regs[10] = ctx.r[0] as usize;
-        self.regs[11] = ctx.r[1] as usize;
-        self.regs[12] = ctx.r[2] as usize;
-        self.regs[13] = ctx.r[3] as usize;
-        self.regs[14] = ctx.r[4] as usize;
-        self.regs[15] = ctx.r[5] as usize;
-        self.regs[2] = ctx.r[crate::kernel::N_REGS - 1] as usize;
-        self.regs[4] = ctx.r[crate::kernel::N_REGS - 2] as usize;
     }
 }

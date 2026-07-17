@@ -1,5 +1,6 @@
 // AGENT
 use super::*;
+use crate::trap::TrapFrame;
 
 mod dispatch;
 mod epoll;
@@ -26,5 +27,10 @@ pub(crate) use self::time::*;
 
 pub(crate) enum SyscallOutcome {
     Return(usize),
+    // AGENT: exec committed a new image; the trap owner must atomically replace
+    // the live frame instead of mutating it through a second task-stack alias.
+    ReplaceUserContext { entry: usize, stack_pointer: usize },
+    // AGENT: sigreturn restores every architectural register and return CSR.
+    RestoreUserContext(TrapFrame),
     NoReturn,
 }
