@@ -202,7 +202,7 @@ pub(super) fn sys_sigprocmask(
 // so the trap owner can replace its live frame without creating a second alias.
 pub(super) fn sys_sigreturn(kernel: &Kernel) -> Result<SyscallOutcome, &'static str> {
     let t = kernel.cur_task(0).ok_or("esrch")?;
-    let frame = t.sig_frames.lock().unwrap().pop().ok_or("einval")?;
-    *t.sig_mask.lock().unwrap() = frame.saved_mask;
-    Ok(SyscallOutcome::RestoreUserContext(frame.saved_frame))
+    Ok(SyscallOutcome::RestoreUserContext(
+        t.restore_signal_frame()?,
+    ))
 }

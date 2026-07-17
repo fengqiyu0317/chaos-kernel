@@ -8,6 +8,7 @@ mod fd;
 mod pid;
 mod process_state;
 mod sched_entity;
+mod signal;
 mod table;
 
 pub use self::core::*;

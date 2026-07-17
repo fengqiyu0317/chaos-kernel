@@ -210,14 +210,17 @@ impl Kernel {
                     break;
                 }
                 SignalDeliveryAction::Handler(handler) => {
-                    let interrupted = match active_frame.take().or_else(|| task_user_frame(&task)) {
+                    let interrupted = match active_frame
+                        .take()
+                        .or_else(|| task.snapshot_user_trap_frame().ok())
+                    {
                         Some(ctx) => ctx,
                         None => {
                             task.requeue_signal_front(sig.signo as i32, sig.sender_tid);
                             break;
                         }
                     };
-                    let ctx = enter_signal_handler(&task, sig, handler, interrupted);
+                    let ctx = task.enter_signal_handler(sig, handler, interrupted);
                     active_frame = Some(ctx.clone());
                     updated_frame = Some(ctx);
                     break;
@@ -328,34 +331,4 @@ impl Kernel {
         self.run_queue.clear_current();
         false
     }
-}
-
-// AGENT: snapshot the complete off-CPU user frame without committing a signal frame yet.
-fn task_user_frame(task: &Task) -> Option<TrapFrame> {
-    task.snapshot_user_trap_frame().ok()
-}
-
-// AGENT: install one userspace handler frame and return the complete frame that
-// must run next, keeping mask/frame mutation in one architecture-aware place.
-fn enter_signal_handler(
-    task: &Task,
-    sig: PendingSignal,
-    handler: usize,
-    interrupted: TrapFrame,
-) -> TrapFrame {
-    let old_mask = *task.sig_mask.lock().unwrap();
-    let mut sig_frames = task.sig_frames.lock().unwrap();
-    sig_frames.push(SigFrame {
-        saved_frame: interrupted.clone(),
-        saved_mask: old_mask,
-    });
-    let next_mask = (old_mask | sig.action.mask | (1u64 << sig.signo))
-        & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
-    *task.sig_mask.lock().unwrap() = next_mask;
-    let mut next = interrupted;
-    next.regs[10] = sig.signo as usize;
-    next.regs[11] = sig.sender_tid as usize;
-    next.regs[12] = sig_frames.last().unwrap().saved_frame.sepc;
-    next.sepc = handler;
-    next
 }
