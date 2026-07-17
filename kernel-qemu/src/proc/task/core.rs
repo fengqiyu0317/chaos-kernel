@@ -16,34 +16,44 @@ pub struct Task {
 // AGENT: implement task identity, scheduling, exit teardown, and signal queues;
 // descriptor-specific methods live in task/fd.rs.
 impl Task {
-    // AGENT: construct a standalone task with a fresh process and address space.
-    pub fn make(id: usize, tag: &str) -> Arc<Self> {
-        Self::make_with_process(id, tag, ProcessState::new_shared())
+    // AGENT: construct a standalone task with a fresh process and a fallible
+    // FramePool-backed kernel stack.
+    pub fn make(id: usize, tag: &str, pool: &FramePool) -> Result<Arc<Self>, &'static str> {
+        Self::make_with_process(id, tag, ProcessState::new_shared(), pool)
     }
 
-    // AGENT: construct a new process task around a prepared address space.
+    // AGENT: construct a new process task around a prepared address space while
+    // allocating its thread-private kernel stack from the shared frame pool.
     pub(super) fn make_with_addr_space(
         id: usize,
         tag: &str,
         addr_space: Arc<Mutex<AddrSpace>>,
-    ) -> Arc<Self> {
-        Self::make_with_process(id, tag, ProcessState::new_with_addr_space(addr_space))
+        pool: &FramePool,
+    ) -> Result<Arc<Self>, &'static str> {
+        Self::make_with_process(id, tag, ProcessState::new_with_addr_space(addr_space), pool)
     }
 
-    // AGENT: give every schedulable task a kernel stack and thread context.
-    pub(super) fn make_with_process(id: usize, tag: &str, process: Arc<ProcessState>) -> Arc<Self> {
-        Arc::new(Self {
+    // AGENT: give every schedulable task a directly frame-backed kernel stack
+    // and propagate physical-memory exhaustion to the task-creation boundary.
+    pub(super) fn make_with_process(
+        id: usize,
+        tag: &str,
+        process: Arc<ProcessState>,
+        pool: &FramePool,
+    ) -> Result<Arc<Self>, &'static str> {
+        let kstk = KStk::new(pool)?;
+        Ok(Arc::new(Self {
             info: Mutex::new(TaskInfo {
                 id,
                 tag: tag.to_string(),
             }),
             process,
             sig_mask: Mutex::new(0),
-            kstk: Mutex::new(Some(KStk::new())),
+            kstk: Mutex::new(Some(kstk)),
             thd_ctx: Mutex::new(Some(ThdCtx::default())),
             restored_trap_frame: Mutex::new(None),
             sched: Mutex::new(SchedEntity::new()),
-        })
+        }))
     }
 
     // AGENT: expose the schedulable thread id.
@@ -91,24 +101,9 @@ impl Task {
         self.restored_trap_frame.lock().unwrap().take()
     }
 
-    // AGENT: link a process to its parent representative.
-    pub fn link_parent(&self, parent: &Arc<Task>) {
-        *self.process.parent.lock().unwrap() = Some(parent.clone());
-    }
-
-    // AGENT: link a child process representative into this process's child list.
-    pub fn link_child(&self, child: &Arc<Task>) {
-        self.process.subtasks.lock().unwrap().push(child.clone());
-    }
-
     // AGENT: report process death from the shared exit reason.
     pub fn done(&self) -> bool {
         self.process.exit_reason.lock().unwrap().is_some()
-    }
-
-    // AGENT: report the current number of child processes.
-    pub fn n_children(&self) -> usize {
-        self.process.subtasks.lock().unwrap().len()
     }
 
     // AGENT: read this task's scheduler placement state.
@@ -161,11 +156,6 @@ impl Task {
         sched.slice_left == 0
     }
 
-    // AGENT: expose the process futex bucket to synchronization syscalls.
-    pub fn get_futex(&self) -> Arc<FutexBucket> {
-        self.process.futex.clone()
-    }
-
     // AGENT: record process death once and notify process/parent waiters.
     pub(crate) fn exit_proc(&self, reason: ExitReason) -> bool {
         let mut exit_reason = self.process.exit_reason.lock().unwrap();
@@ -181,12 +171,6 @@ impl Task {
         }
         self.set_sched_state(TaskRunState::Zombie);
         true
-    }
-
-    // AGENT: release per-process resources that no later wait status needs
-    // without exposing the removed ambiguous page-release count.
-    pub fn release_process_exit_resources(&self) {
-        self.process.release_exit_resources();
     }
 
     // AGENT: clear CLONE_CHILD_CLEARTID before waking one futex waiter.

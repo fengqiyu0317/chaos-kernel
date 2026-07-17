@@ -3,20 +3,20 @@
 use super::*;
 use crate::kernel::kernel_core::{init_timer_wheel, TIMER_WHEEL};
 use crate::kernel::{
-    Context, FramePool, Kernel, SigAction, TaskRunState, MEM_OFF, PRIO_MIN, SIGCONT, SIGSTOP,
-    SIGUSR1, SIGUSR2,
+    Context, FramePool, Kernel, SigAction, TaskRunState, PRIO_MIN, SIGCONT, SIGSTOP, SIGUSR1,
+    SIGUSR2,
 };
 
 // AGENT: expose focused scheduler queue checks to the optional QEMU boot
-// selftest path.
-pub fn run_all() {
+// selftest path and use its discovered RAM pool for real task kernel stacks.
+pub fn run_all(pool: &FramePool) {
     dequeue_preserves_fifo_for_equal_priority();
     duplicate_enqueue_updates_policy_without_duplicate_entry();
-    kernel_boost_updates_task_policy_and_queue_cache();
-    signal_stop_uses_job_stopped_flag();
-    sigcont_resumes_stopped_task_without_resuming_for_plain_signal();
-    sigcont_keeps_sleeping_task_asleep_until_wait_wakeup();
-    signal_handler_uses_supplied_interrupted_context();
+    kernel_boost_updates_task_policy_and_queue_cache(pool);
+    signal_stop_uses_job_stopped_flag(pool);
+    sigcont_resumes_stopped_task_without_resuming_for_plain_signal(pool);
+    sigcont_keeps_sleeping_task_asleep_until_wait_wakeup(pool);
+    signal_handler_uses_supplied_interrupted_context(pool);
 }
 
 // AGENT: QEMU boot selftests initialize the timer wheel in rust_main(), while
@@ -25,11 +25,6 @@ fn ensure_timer_wheel() {
     if TIMER_WHEEL.get().is_none() {
         init_timer_wheel();
     }
-}
-
-// AGENT: build a tiny fully-free frame pool for scheduler-only selftests.
-fn test_frame_pool(pages: usize) -> FramePool {
-    FramePool::new(pages, MEM_OFF)
 }
 
 // AGENT: same-priority tasks should be selected in insertion order.
@@ -65,11 +60,10 @@ fn duplicate_enqueue_updates_policy_without_duplicate_entry() {
 
 // AGENT: Kernel-level boosts update the task-owned policy and refresh any
 // already queued runnable entry so the next pick observes the same priority.
-#[cfg_attr(test, test)]
-fn kernel_boost_updates_task_policy_and_queue_cache() {
+fn kernel_boost_updates_task_policy_and_queue_cache(pool: &FramePool) {
     ensure_timer_wheel();
 
-    let kernel = Kernel::new(test_frame_pool(8));
+    let kernel = Kernel::new(pool.clone());
     let first = kernel.tasks.spawn("first").expect("spawn first task");
     let second = kernel.tasks.spawn("second").expect("spawn second task");
 
@@ -98,11 +92,10 @@ fn kernel_boost_updates_task_policy_and_queue_cache() {
 
 // AGENT: SIGSTOP is process-level job-control state, not a scheduler run-state
 // variant; the stopped task stays runnable but cannot be queued.
-#[cfg_attr(test, test)]
-fn signal_stop_uses_job_stopped_flag() {
+fn signal_stop_uses_job_stopped_flag(pool: &FramePool) {
     ensure_timer_wheel();
 
-    let kernel = Kernel::new(test_frame_pool(8));
+    let kernel = Kernel::new(pool.clone());
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init task should be current");
 
@@ -117,11 +110,10 @@ fn signal_stop_uses_job_stopped_flag() {
 
 // AGENT: ordinary pending signals stay queued for a stopped task; SIGCONT is
 // the explicit transition back to runnable state.
-#[cfg_attr(test, test)]
-fn sigcont_resumes_stopped_task_without_resuming_for_plain_signal() {
+fn sigcont_resumes_stopped_task_without_resuming_for_plain_signal(pool: &FramePool) {
     ensure_timer_wheel();
 
-    let kernel = Kernel::new(test_frame_pool(8));
+    let kernel = Kernel::new(pool.clone());
     let task = kernel.tasks.spawn("worker").expect("spawn worker");
     task.set_sched_state(TaskRunState::Runnable);
     task.set_job_stopped(true);
@@ -139,11 +131,10 @@ fn sigcont_resumes_stopped_task_without_resuming_for_plain_signal() {
 
 // AGENT: SIGCONT clears job-control stop but does not collapse a still-blocked
 // wait into runnable state; the real wait wakeup owns that transition.
-#[cfg_attr(test, test)]
-fn sigcont_keeps_sleeping_task_asleep_until_wait_wakeup() {
+fn sigcont_keeps_sleeping_task_asleep_until_wait_wakeup(pool: &FramePool) {
     ensure_timer_wheel();
 
-    let kernel = Kernel::new(test_frame_pool(8));
+    let kernel = Kernel::new(pool.clone());
     let task = kernel.tasks.spawn("worker").expect("spawn worker");
     task.set_sched_state(TaskRunState::Sleeping);
     task.set_job_stopped(true);
@@ -160,11 +151,10 @@ fn sigcont_keeps_sleeping_task_asleep_until_wait_wakeup() {
 
 // AGENT: QEMU syscall delivery supplies the live TrapFrame-derived context; the
 // saved signal frame must use that context instead of a stale Task::uctx copy.
-#[cfg_attr(test, test)]
-fn signal_handler_uses_supplied_interrupted_context() {
+fn signal_handler_uses_supplied_interrupted_context(pool: &FramePool) {
     ensure_timer_wheel();
 
-    let kernel = Kernel::new(test_frame_pool(8));
+    let kernel = Kernel::new(pool.clone());
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init task should be current");
     let handler = 0x5000usize;

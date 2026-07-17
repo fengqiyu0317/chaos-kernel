@@ -8,13 +8,14 @@ pub fn run_all(pool: &FramePool) {
     capset_inherit_keeps_only_allowed_bits();
     capset_raise_ambient_requires_owned_inheritable_cap();
     capset_drop_cap_clears_ambient();
-    spawn_root_creates_single_pid_one_init();
-    spawn_root_rejects_nonempty_task_table();
-    register_rejects_duplicate_pid_without_replacing_task();
-    pgid_group_keeps_zombie_members_until_reap();
-    reap_rejects_live_process();
-    clone_thread_copies_caller_context_and_shares_process();
-    reap_zombie_process_removes_thread_group_once();
+    kernel_stack_uses_and_releases_frame_pool_run(pool);
+    spawn_root_creates_single_pid_one_init(pool);
+    spawn_root_rejects_nonempty_task_table(pool);
+    register_rejects_duplicate_pid_without_replacing_task(pool);
+    pgid_group_keeps_zombie_members_until_reap(pool);
+    reap_rejects_live_process(pool);
+    clone_thread_copies_caller_context_and_shares_process(pool);
+    reap_zombie_process_removes_thread_group_once(pool);
     proc_init_push_at_writes_user_stack(pool);
     parse_elf_rejects_unsupported_or_invalid_entry();
     parse_elf_validates_program_header_layouts();
@@ -26,6 +27,23 @@ pub fn run_all(pool: &FramePool) {
     forked_writable_page_resolves_cow(pool);
     shm_segment_maps_shared_physical_page(pool);
     release_all_pages_drops_same_space_aliases(pool);
+}
+
+// AGENT: prove KStk bypasses the general heap by charging exactly four zeroed
+// direct-map pages to the supplied FramePool and returning them on Drop.
+fn kernel_stack_uses_and_releases_frame_pool_run(pool: &FramePool) {
+    let pages = KSTK_SZ / PAGE_SZ;
+    let free_before = pool.free_count();
+    let stack = KStk::new(pool).expect("kernel stack frame run should allocate");
+    let stack_base = stack.top() - KSTK_SZ;
+
+    assert_eq!(pool.free_count(), free_before - pages);
+    assert_eq!(stack_base % PAGE_SZ, 0);
+    let bytes = unsafe { core::slice::from_raw_parts(stack_base as *const u8, KSTK_SZ) };
+    assert!(bytes.iter().all(|byte| *byte == 0));
+
+    drop(stack);
+    assert_eq!(pool.free_count(), free_before);
 }
 
 // AGENT: exercise map, protection, unmap, and release transitions while
@@ -223,8 +241,8 @@ fn capset_drop_cap_clears_ambient() {
 
 // AGENT: init must be the first singleton task because pid 1 is special for
 // signal protection and orphan reparenting.
-fn spawn_root_creates_single_pid_one_init() {
-    let table = TaskTable::new();
+fn spawn_root_creates_single_pid_one_init(pool: &FramePool) {
+    let table = TaskTable::new(pool.clone());
     let init = table.spawn_root().expect("first root spawn should succeed");
 
     assert_eq!(init.id(), Pid::INIT);
@@ -236,8 +254,8 @@ fn spawn_root_creates_single_pid_one_init() {
 
 // AGENT: spawn_root must not silently overwrite root after another standalone
 // task has already consumed pid 1.
-fn spawn_root_rejects_nonempty_task_table() {
-    let table = TaskTable::new();
+fn spawn_root_rejects_nonempty_task_table(pool: &FramePool) {
+    let table = TaskTable::new(pool.clone());
     let first = table.spawn("worker").expect("standalone spawn should work");
 
     assert_eq!(first.id(), Pid::INIT);
@@ -248,10 +266,11 @@ fn spawn_root_rejects_nonempty_task_table() {
 
 // AGENT: duplicate pid registration must fail before replacing the published
 // task-table entry or corrupting process-group membership.
-fn register_rejects_duplicate_pid_without_replacing_task() {
-    let table = TaskTable::new();
+fn register_rejects_duplicate_pid_without_replacing_task(pool: &FramePool) {
+    let table = TaskTable::new(pool.clone());
     let first = table.spawn("worker").expect("standalone spawn should work");
-    let duplicate = Task::make(first.id(), "duplicate");
+    let duplicate =
+        Task::make(first.id(), "duplicate", pool).expect("duplicate task stack should allocate");
 
     assert_eq!(table.register(&duplicate, Pid(first.id())), Err("eexist"));
     assert!(Arc::ptr_eq(&table.find(first.id()).unwrap(), &first));
@@ -263,8 +282,8 @@ fn register_rejects_duplicate_pid_without_replacing_task() {
 
 // AGENT: process-group lookup reports membership, including zombies that remain
 // present until wait/reap removes them from the table.
-fn pgid_group_keeps_zombie_members_until_reap() {
-    let table = TaskTable::new();
+fn pgid_group_keeps_zombie_members_until_reap(pool: &FramePool) {
+    let table = TaskTable::new(pool.clone());
     let task = table.spawn("worker").expect("standalone spawn should work");
     let pgid = *task.process.pgid.lock().unwrap();
 
@@ -277,8 +296,8 @@ fn pgid_group_keeps_zombie_members_until_reap() {
 
 // AGENT: reap is a zombie-only operation; a mistaken live-process id must not
 // delete the task table entry.
-fn reap_rejects_live_process() {
-    let table = TaskTable::new();
+fn reap_rejects_live_process(pool: &FramePool) {
+    let table = TaskTable::new(pool.clone());
     let task = table.spawn("worker").expect("standalone spawn should work");
 
     assert_eq!(table.reap(task.id()), Err("ebusy"));
@@ -288,12 +307,12 @@ fn reap_rejects_live_process() {
 
 // AGENT: multi-threaded zombies are collected at process granularity, while all
 // same-process task-table entries disappear in the single reap step.
-fn reap_zombie_process_removes_thread_group_once() {
-    let table = TaskTable::new();
+fn reap_zombie_process_removes_thread_group_once(pool: &FramePool) {
+    let table = TaskTable::new(pool.clone());
     let parent = table.spawn_root().expect("root spawn should work");
-    let child = table.spawn("child").expect("child spawn should work");
-    child.link_parent(&parent);
-    parent.link_child(&child);
+    let child = table
+        .fork_task(&parent, pool)
+        .expect("child fork should succeed");
     let thread = table
         .clone_thread(&child, 0x8000_0000, 0, 0)
         .expect("thread clone should succeed");
@@ -309,8 +328,8 @@ fn reap_zombie_process_removes_thread_group_once() {
 
 // AGENT: clone_thread starts from the caller thread context, then applies the
 // clone-specific return value, user stack, TLS, clear-child-tid, and signal mask.
-fn clone_thread_copies_caller_context_and_shares_process() {
-    let table = TaskTable::new();
+fn clone_thread_copies_caller_context_and_shares_process(pool: &FramePool) {
+    let table = TaskTable::new(pool.clone());
     let task = table.spawn("worker").expect("standalone spawn should work");
     let stack_top = 0x8000_0000;
     let tls = 0xabc;

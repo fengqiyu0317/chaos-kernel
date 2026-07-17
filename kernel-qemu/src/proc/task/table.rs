@@ -13,18 +13,22 @@ pub struct TaskTable {
     // AGENT: reserve capacity before registration so concurrent creators cannot
     // all pass the N_PROC check at once.
     task_reservations: AtomicUsize,
+    // AGENT: share the Kernel-owned physical-frame state with every task stack
+    // allocation without introducing a global FramePool singleton.
+    pool: FramePool,
 }
 
 // AGENT: keep all task-table and process-lifecycle transitions in one module.
 impl TaskTable {
-    // AGENT: initialize task-slot reservations beside the task map they protect.
-    pub fn new() -> Self {
+    // AGENT: bind task construction to the caller-provided physical-frame pool.
+    pub fn new(pool: FramePool) -> Self {
         Self {
             map: RwLock::new(BTreeMap::new()),
             groups: Mutex::new(BTreeMap::new()),
             seq: AtomicUsize::new(1),
             root: Mutex::new(None),
             task_reservations: AtomicUsize::new(0),
+            pool,
         }
     }
 
@@ -68,6 +72,15 @@ impl TaskTable {
         if remove_group {
             groups.remove(&pgid);
         }
+    }
+
+    // AGENT: update both sides of the process-family relation under one helper
+    // so fork and reparenting cannot forget either link.
+    fn attach_child(parent: &Arc<Task>, child: &Arc<Task>) {
+        let mut child_parent = child.process.parent.lock().unwrap();
+        let mut children = parent.process.subtasks.lock().unwrap();
+        *child_parent = Some(parent.clone());
+        children.push(child.clone());
     }
 
     // AGENT: move a process between process groups as one state transition.
@@ -285,8 +298,7 @@ impl TaskTable {
         match init {
             Some(init_task) if init_task.id() != task.id() => {
                 for child in children {
-                    child.link_parent(&init_task);
-                    init_task.link_child(&child);
+                    Self::attach_child(&init_task, &child);
                 }
             }
             _ => {
@@ -304,7 +316,7 @@ impl TaskTable {
 
     // AGENT: share process construction and registration across spawn paths.
     fn insert_new_process(&self, id: usize, tag: &str) -> Result<Arc<Task>, &'static str> {
-        let task = Task::make(id, tag);
+        let task = Task::make(id, tag, &self.pool)?;
         self.register(&task, Pid(id))?;
         Ok(task)
     }
@@ -341,7 +353,7 @@ impl TaskTable {
             let forked_addr_space = AddrSpace::fork_from(&mut parent_addr_space, pool)?;
             Arc::new(Mutex::new(forked_addr_space))
         };
-        let child = Task::make_with_addr_space(child_id, &tag, child_addr_space);
+        let child = Task::make_with_addr_space(child_id, &tag, child_addr_space, &self.pool)?;
 
         let debug_fds = proc_src.process.debug_fds.lock().unwrap().clone();
         let cwd = proc_src.process.cwd.lock().unwrap().clone();
@@ -392,13 +404,7 @@ impl TaskTable {
             child_sched.slice_left = child_sched.policy.time_slice();
         }
         self.register(&child, Pid(child_id))?;
-        *child.process.parent.lock().unwrap() = Some(proc_src.clone());
-        proc_src
-            .process
-            .subtasks
-            .lock()
-            .unwrap()
-            .push(child.clone());
+        Self::attach_child(&proc_src, &child);
         task_slot.release();
         Ok(child)
     }
@@ -414,7 +420,8 @@ impl TaskTable {
         let task_slot = self.reserve_task_slot()?;
         let proc_src = self.process_of_tid(src.id()).ok_or("esrch")?;
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
-        let task = Task::make_with_process(id, &proc_src.tag(), proc_src.process.clone());
+        let task =
+            Task::make_with_process(id, &proc_src.tag(), proc_src.process.clone(), &self.pool)?;
         let mut ctx = src.thd_ctx.lock().unwrap().clone().ok_or("enoctx")?;
         ctx.uctx.set_ret(0);
         ctx.uctx.set_sp(stack_top);
