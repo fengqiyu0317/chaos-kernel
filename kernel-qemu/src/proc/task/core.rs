@@ -27,7 +27,7 @@ impl Task {
     // allocating its thread-private kernel stack from the shared frame pool.
     pub(super) fn make_with_addr_space(
         id: usize,
-        addr_space: Arc<Mutex<AddrSpace>>,
+        addr_space: AddrSpace,
         pool: &FramePool,
     ) -> Result<Arc<Self>, &'static str> {
         Self::make_with_process(id, ProcessState::new_with_addr_space(addr_space), pool)
@@ -66,16 +66,6 @@ impl Task {
     // AGENT: expose the owning process id separately from the schedulable id.
     pub fn process_pid(&self) -> usize {
         *self.process.pid.lock().unwrap()
-    }
-
-    // AGENT: expose session identity for process-group checks.
-    pub fn process_sid(&self) -> usize {
-        *self.process.sid.lock().unwrap()
-    }
-
-    // AGENT: identify session leaders for setpgid restrictions.
-    pub fn is_session_leader(&self) -> bool {
-        self.process_sid() == self.process_pid()
     }
 
     // AGENT: expose only the kernel stack top needed by trap setup.

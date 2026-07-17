@@ -142,7 +142,7 @@ impl Kernel {
         let wnohang = (options & WAIT4_WNOHANG) != 0;
 
         loop {
-            if let Some(child) = Self::find_waitable_child(&parent, target_pid)? {
+            if let Some(child) = self.find_waitable_child(&parent, target_pid)? {
                 return Ok(child);
             }
 
@@ -151,7 +151,7 @@ impl Kernel {
             }
 
             let wait = Self::prepare_child_wait(&parent);
-            if let Some(child) = Self::find_waitable_child(&parent, target_pid)? {
+            if let Some(child) = self.find_waitable_child(&parent, target_pid)? {
                 Self::cancel_child_wait(&parent, wait);
                 return Ok(child);
             }
@@ -174,6 +174,7 @@ impl Kernel {
     // AGENT: scan only the parent's current child list; blocking and reaping are
     // separate so the control flow mirrors wait4's observable phases.
     fn find_waitable_child(
+        &self,
         parent: &Arc<Task>,
         target_pid: isize,
     ) -> Result<Option<(usize, usize)>, &'static str> {
@@ -184,7 +185,7 @@ impl Kernel {
 
         let mut matched = false;
         for child in &children {
-            if !Self::child_matches_wait_target(parent, child, target_pid) {
+            if !self.child_matches_wait_target(parent, child, target_pid) {
                 continue;
             }
 
@@ -202,12 +203,18 @@ impl Kernel {
     }
 
     // AGENT: keep pid and process-group selection in one readable predicate.
-    fn child_matches_wait_target(parent: &Task, child: &Task, target_pid: isize) -> bool {
+    fn child_matches_wait_target(&self, parent: &Task, child: &Task, target_pid: isize) -> bool {
         match target_pid {
             -1 => true,
-            0 => *child.process.pgid.lock().unwrap() == *parent.process.pgid.lock().unwrap(),
+            0 => match (
+                self.tasks.process_pgid(child.process_pid()),
+                self.tasks.process_pgid(parent.process_pid()),
+            ) {
+                (Some(child_pgid), Some(parent_pgid)) => child_pgid == parent_pgid,
+                _ => false,
+            },
             pid if pid > 0 => child.process_pid() == pid as usize,
-            pgid => *child.process.pgid.lock().unwrap() == (-pgid) as Pgid,
+            pgid => self.tasks.process_pgid(child.process_pid()) == Some((-pgid) as i32),
         }
     }
 

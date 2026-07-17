@@ -15,6 +15,7 @@ pub fn run_all(pool: &FramePool) {
     spawn_root_rejects_nonempty_task_table(pool);
     register_rejects_duplicate_pid_without_replacing_task(pool);
     pgid_group_keeps_zombie_members_until_reap(pool);
+    job_control_stays_authoritative_across_process_transitions(pool);
     reap_rejects_live_process(pool);
     fork_copies_complete_user_frame(pool);
     clone_thread_copies_caller_context_and_shares_process(pool);
@@ -287,7 +288,7 @@ fn register_rejects_duplicate_pid_without_replacing_task(pool: &FramePool) {
     assert_eq!(table.register(&duplicate, first.id()), Err("eexist"));
     assert!(Arc::ptr_eq(&table.find(first.id()).unwrap(), &first));
 
-    let group = table.pgid_group(first.id() as Pgid);
+    let group = table.pgid_group(first.id() as i32);
     assert_eq!(group.len(), 1);
     assert!(Arc::ptr_eq(&group[0], &first));
 }
@@ -297,13 +298,49 @@ fn register_rejects_duplicate_pid_without_replacing_task(pool: &FramePool) {
 fn pgid_group_keeps_zombie_members_until_reap(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
     let task = table.spawn().expect("standalone spawn should work");
-    let pgid = *task.process.pgid.lock().unwrap();
+    let pgid = table
+        .process_pgid(task.process_pid())
+        .expect("spawned task should have job-control membership");
 
     assert!(task.exit_proc(ExitReason::Code(0)));
 
     let group = table.pgid_group(pgid);
     assert_eq!(group.len(), 1);
     assert!(Arc::ptr_eq(&group[0], &task));
+}
+
+// AGENT: prove fork, setpgid-style moves, setsid, and reap update the single
+// job-control registry without relying on mirrored ProcessState fields.
+fn job_control_stays_authoritative_across_process_transitions(pool: &FramePool) {
+    let table = TaskTable::new(pool.clone());
+    let parent = table.spawn_root().expect("root spawn should work");
+    let parent_pid = parent.process_pid();
+
+    let moved_child = table
+        .fork_task(&parent, pool)
+        .expect("first child fork should work");
+    let moved_pid = moved_child.process_pid();
+    assert_eq!(table.process_pgid(moved_pid), Some(parent_pid as i32));
+    assert_eq!(table.process_sid(moved_pid), Some(parent_pid));
+
+    table
+        .move_process_to_group(&moved_child, moved_pid as i32)
+        .expect("child should create a group in its inherited session");
+    assert_eq!(table.process_pgid(moved_pid), Some(moved_pid as i32));
+    assert_eq!(table.process_sid(moved_pid), Some(parent_pid));
+
+    let session_child = table
+        .fork_task(&parent, pool)
+        .expect("second child fork should work");
+    let session_pid = session_child.process_pid();
+    assert_eq!(table.start_new_session(&session_child), Ok(session_pid));
+    assert_eq!(table.process_pgid(session_pid), Some(session_pid as i32));
+    assert_eq!(table.process_sid(session_pid), Some(session_pid));
+
+    assert!(moved_child.exit_proc(ExitReason::Code(0)));
+    assert_eq!(table.reap(moved_pid), Ok(()));
+    assert_eq!(table.process_pgid(moved_pid), None);
+    assert!(table.pgid_group(moved_pid as i32).is_empty());
 }
 
 // AGENT: reap is a zombie-only operation; a mistaken live-process id must not

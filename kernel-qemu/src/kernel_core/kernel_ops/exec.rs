@@ -40,14 +40,7 @@ impl Kernel {
         // AGENT: delegate ELF mapping and stack construction to the common
         // user-image builder; exec retains only file and commit semantics.
         let image = prepare_user_image(&elf_data, args, envs, &self.pool)?;
-        let close_fds = task
-            .process
-            .files
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|(&fd, entry)| entry.is_cloexec().then_some(fd))
-            .collect();
+        let close_fds = task.cloexec_fds();
         Ok(PreparedExec {
             exec_path,
             addr_space: image.addr_space,

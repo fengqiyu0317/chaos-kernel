@@ -51,7 +51,7 @@ pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
         0 => {
             let cur = kernel.cur_task(0);
             if let Some(t) = cur {
-                let pgid = *t.process.pgid.lock().unwrap();
+                let pgid = kernel.tasks.process_pgid(t.process_pid()).ok_or("esrch")?;
                 finish_many(kernel.tasks.pgid_group(pgid))
             } else {
                 Err("esrch")
@@ -79,7 +79,7 @@ pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
             None => Err("esrch"),
         },
         p => {
-            let pgid = (-p) as Pgid;
+            let pgid = (-p) as i32;
             finish_many(kernel.tasks.pgid_group(pgid))
         }
     }

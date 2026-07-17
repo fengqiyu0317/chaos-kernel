@@ -34,9 +34,6 @@ pub struct EvBus {
     next_sub_id: usize,
 }
 impl EvBus {
-    pub fn make() -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self::default()))
-    }
     pub fn set(&mut self, s: u32) {
         self.change(0, s);
     }

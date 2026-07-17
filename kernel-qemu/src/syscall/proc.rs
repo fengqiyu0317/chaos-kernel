@@ -182,17 +182,17 @@ pub(super) fn sys_setpgid(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize
             return Err("eacces");
         }
     }
-    let caller_sid = cur.process_sid();
-    let target_sid = target.process_sid();
+    let caller_sid = kernel.tasks.process_sid(caller_pid).ok_or("esrch")?;
+    let target_sid = kernel.tasks.process_sid(target_pid).ok_or("esrch")?;
     if caller_sid != target_sid {
         return Err("eperm");
     }
-    if target.is_session_leader() {
+    if target_sid == target_pid {
         return Err("eperm");
     }
     kernel
         .tasks
-        .move_process_to_group(&target, new_pgid as Pgid)?;
+        .move_process_to_group(&target, new_pgid as i32)?;
     Ok(0)
 }
 
@@ -207,10 +207,11 @@ pub(super) fn sys_getpgid(kernel: &Kernel, a0: usize) -> Result<usize, &'static 
     if target == 0 {
         return Err("esrch");
     }
-    match kernel.tasks.find(target) {
-        Some(t) => Ok(*t.process.pgid.lock().unwrap() as usize),
-        None => Err("esrch"),
-    }
+    kernel
+        .tasks
+        .process_pgid(target)
+        .map(|pgid| pgid as usize)
+        .ok_or("esrch")
 }
 
 // AGENT: create a new session through TaskTable so sid, pgid, and group

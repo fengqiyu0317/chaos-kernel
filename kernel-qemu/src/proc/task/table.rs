@@ -3,12 +3,10 @@
 use super::*;
 use crate::trap::TrapFrame;
 
-// AGENT: track schedulable task ids and index process groups by process pid.
+// AGENT: track schedulable task ids and keep job control in one authority.
 pub struct TaskTable {
     pub map: RwLock<BTreeMap<usize, Arc<Task>>>,
-    // AGENT: process groups store process pids, not thread ids; the per-process
-    // pgid field mirrors this authoritative membership map.
-    pub groups: Mutex<BTreeMap<Pgid, Arc<ProcessGroup>>>,
+    job_control: Mutex<JobControl>,
     pub seq: AtomicUsize,
     pub root: Mutex<Option<Arc<Task>>>,
     // AGENT: reserve capacity before registration so concurrent creators cannot
@@ -25,53 +23,11 @@ impl TaskTable {
     pub fn new(pool: FramePool) -> Self {
         Self {
             map: RwLock::new(BTreeMap::new()),
-            groups: Mutex::new(BTreeMap::new()),
+            job_control: Mutex::new(JobControl::default()),
             seq: AtomicUsize::new(1),
             root: Mutex::new(None),
             task_reservations: AtomicUsize::new(0),
             pool,
-        }
-    }
-
-    // AGENT: add a process pid to a group while the groups map is already held.
-    fn add_pid_to_group_locked(
-        groups: &mut BTreeMap<Pgid, Arc<ProcessGroup>>,
-        pgid: Pgid,
-        sid: usize,
-        pid: usize,
-    ) -> Result<(), &'static str> {
-        match groups.get(&pgid) {
-            Some(group) => {
-                if group.session_id != sid {
-                    return Err("eperm");
-                }
-                group.add_member(pid);
-            }
-            None => {
-                if pgid != pid as Pgid {
-                    return Err("eperm");
-                }
-                groups.insert(pgid, Arc::new(ProcessGroup::new(pgid, pid, sid)));
-            }
-        }
-        Ok(())
-    }
-
-    // AGENT: remove stale group membership and delete empty process groups.
-    fn remove_pid_from_group_locked(
-        groups: &mut BTreeMap<Pgid, Arc<ProcessGroup>>,
-        pgid: Pgid,
-        pid: usize,
-    ) {
-        let remove_group = groups
-            .get(&pgid)
-            .map(|group| {
-                group.remove_member(pid);
-                group.is_empty()
-            })
-            .unwrap_or(false);
-        if remove_group {
-            groups.remove(&pgid);
         }
     }
 
@@ -88,46 +44,19 @@ impl TaskTable {
     pub fn move_process_to_group(
         &self,
         task: &Arc<Task>,
-        new_pgid: Pgid,
+        new_pgid: i32,
     ) -> Result<(), &'static str> {
         if new_pgid <= 0 {
             return Err("einval");
         }
         let pid = task.process_pid();
-        let sid = task.process_sid();
-        let old_pgid = *task.process.pgid.lock().unwrap();
-
-        let mut groups = self.groups.lock().unwrap();
-        Self::add_pid_to_group_locked(&mut groups, new_pgid, sid, pid)?;
-        if old_pgid == new_pgid {
-            return Ok(());
-        }
-
-        Self::remove_pid_from_group_locked(&mut groups, old_pgid, pid);
-        *task.process.pgid.lock().unwrap() = new_pgid;
-        Ok(())
+        self.job_control.lock().unwrap().move_process(pid, new_pgid)
     }
 
     // AGENT: make a process a session leader and sole member of its new group.
     pub fn start_new_session(&self, task: &Arc<Task>) -> Result<usize, &'static str> {
         let pid = task.process_pid();
-        let old_pgid = *task.process.pgid.lock().unwrap();
-        if old_pgid as usize == pid {
-            return Err("eperm");
-        }
-        let new_pgid = pid as Pgid;
-        let mut groups = self.groups.lock().unwrap();
-        if groups
-            .get(&new_pgid)
-            .is_some_and(|group| !group.is_empty() || group.session_id != pid)
-        {
-            return Err("eperm");
-        }
-
-        Self::remove_pid_from_group_locked(&mut groups, old_pgid, pid);
-        *task.process.sid.lock().unwrap() = pid;
-        *task.process.pgid.lock().unwrap() = new_pgid;
-        Self::add_pid_to_group_locked(&mut groups, new_pgid, pid, pid)?;
+        self.job_control.lock().unwrap().start_new_session(pid)?;
         Ok(pid)
     }
 
@@ -178,14 +107,8 @@ impl TaskTable {
     }
 
     // AGENT: resolve authoritative process-group membership to process leaders.
-    pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> {
-        let members = self
-            .groups
-            .lock()
-            .unwrap()
-            .get(&pgid)
-            .map(|group| group.members_snapshot())
-            .unwrap_or_default();
+    pub fn pgid_group(&self, pgid: i32) -> Vec<Arc<Task>> {
+        let members = self.job_control.lock().unwrap().members(pgid);
         let map = self.map.read().unwrap();
         members
             .into_iter()
@@ -193,36 +116,54 @@ impl TaskTable {
             .collect()
     }
 
+    // AGENT: expose the authoritative process-group id without mirrored task state.
+    pub fn process_pgid(&self, pid: usize) -> Option<i32> {
+        self.job_control
+            .lock()
+            .unwrap()
+            .membership(pid)
+            .map(|(pgid, _)| pgid)
+    }
+
+    // AGENT: derive session identity from the process's authoritative group.
+    pub fn process_sid(&self, pid: usize) -> Option<usize> {
+        self.job_control
+            .lock()
+            .unwrap()
+            .membership(pid)
+            .map(|(_, sid)| sid)
+    }
+
     // AGENT: publish a process once while synchronizing pid/group/thread indexes.
     pub fn register(&self, task: &Arc<Task>, pid: usize) -> Result<(), &'static str> {
+        self.register_process(task, pid, None)
+    }
+
+    // AGENT: publish a process and optionally inherit the parent's job-control membership.
+    fn register_process(
+        &self,
+        task: &Arc<Task>,
+        pid: usize,
+        parent_pid: Option<usize>,
+    ) -> Result<(), &'static str> {
         if pid == UNREGISTERED_PID || task.id() != pid {
             return Err("einval");
         }
 
-        let default_pgid = Pgid::try_from(pid).map_err(|_| "einval")?;
-        let pgid = match *task.process.pgid.lock().unwrap() {
-            0 => default_pgid,
-            existing if existing > 0 => existing,
-            _ => return Err("einval"),
-        };
-        let sid = match *task.process.sid.lock().unwrap() {
-            0 => pid,
-            existing => existing,
-        };
-
+        let default_pgid = i32::try_from(pid).map_err(|_| "einval")?;
+        let mut job_control = self.job_control.lock().unwrap();
         let mut map = self.map.write().unwrap();
         if map.contains_key(&pid) || *task.process.pid.lock().unwrap() != UNREGISTERED_PID {
             return Err("eexist");
         }
 
-        {
-            let mut groups = self.groups.lock().unwrap();
-            Self::add_pid_to_group_locked(&mut groups, pgid, sid, pid)?;
-        }
+        let (pgid, sid) = match parent_pid {
+            Some(parent_pid) => job_control.membership(parent_pid).ok_or("esrch")?,
+            None => (default_pgid, pid),
+        };
+        job_control.add_process(pid, pgid, sid)?;
 
         *task.process.pid.lock().unwrap() = pid;
-        *task.process.pgid.lock().unwrap() = pgid;
-        *task.process.sid.lock().unwrap() = sid;
 
         {
             let mut threads = task.process.threads.lock().unwrap();
@@ -244,7 +185,6 @@ impl TaskTable {
 
         let process = task.process.clone();
         let process_pid = task.process_pid();
-        let process_pgid = *task.process.pgid.lock().unwrap();
         if let Some(parent) = task.process.parent.lock().unwrap().clone() {
             parent
                 .process
@@ -255,10 +195,7 @@ impl TaskTable {
         }
         self.reparent_children_to_init(&task);
 
-        {
-            let mut groups = self.groups.lock().unwrap();
-            Self::remove_pid_from_group_locked(&mut groups, process_pgid, process_pid);
-        }
+        self.job_control.lock().unwrap().remove_process(process_pid);
 
         let thread_ids: Vec<usize> = task.process.threads.lock().unwrap().drain(..).collect();
         let mut map = self.map.write().unwrap();
@@ -349,27 +286,15 @@ impl TaskTable {
         let child_id = self.seq.fetch_add(1, Ordering::SeqCst);
         let child_addr_space = {
             let mut parent_addr_space = proc_src.process.addr_space.lock().unwrap();
-            let forked_addr_space = AddrSpace::fork_from(&mut parent_addr_space, pool)?;
-            Arc::new(Mutex::new(forked_addr_space))
+            AddrSpace::fork_from(&mut parent_addr_space, pool)?
         };
         let child = Task::make_with_addr_space(child_id, child_addr_space, &self.pool)?;
 
-        let debug_fds = proc_src.process.debug_fds.lock().unwrap().clone();
         let exec_path = proc_src.process.exec_path.lock().unwrap().clone();
-        *child.process.debug_fds.lock().unwrap() = debug_fds;
         *child.process.exec_path.lock().unwrap() = exec_path;
 
-        // AGENT: copy fd entries and free-slot state as one inherited snapshot.
-        {
-            let parent_files = proc_src.process.files.lock().unwrap();
-            let child_files: BTreeMap<usize, FdEntry> = parent_files
-                .iter()
-                .map(|(&fd, entry)| (fd, entry.fork_dup()))
-                .collect();
-            let child_free_fds = proc_src.process.free_fds.lock().unwrap().clone();
-            *child.process.files.lock().unwrap() = child_files;
-            *child.process.free_fds.lock().unwrap() = child_free_fds;
-        }
+        // AGENT: inherit descriptor entries through the unified table snapshot.
+        child.inherit_fds_from(&proc_src);
 
         let child_sig_frames = src.sig_frames.lock().unwrap().clone();
         *child.sig_frames.lock().unwrap() = child_sig_frames;
@@ -377,13 +302,9 @@ impl TaskTable {
         child_frame.set_return_value(0);
         child.install_user_trap_frame(child_frame)?;
 
-        // AGENT: inherit the parent group/session with a fresh pre-exec window.
-        let pgid = *proc_src.process.pgid.lock().unwrap();
-        let sid = *proc_src.process.sid.lock().unwrap();
+        // AGENT: inherit thread-local state while job control is copied at registration.
         let sig_mask = *src.sig_mask.lock().unwrap();
 
-        *child.process.pgid.lock().unwrap() = pgid;
-        *child.process.sid.lock().unwrap() = sid;
         child.process.did_exec.store(false, Ordering::SeqCst);
         *child.sig_mask.lock().unwrap() = sig_mask;
 
@@ -396,7 +317,7 @@ impl TaskTable {
             child_sched.policy = parent_policy;
             child_sched.slice_left = child_sched.policy.time_slice();
         }
-        self.register(&child, child_id)?;
+        self.register_process(&child, child_id, Some(proc_src.process_pid()))?;
         Self::attach_child(&proc_src, &child);
         task_slot.release();
         Ok(child)

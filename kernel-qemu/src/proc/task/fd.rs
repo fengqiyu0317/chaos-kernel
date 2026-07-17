@@ -2,6 +2,61 @@
 // checkpoint-fd translation from task lifecycle state.
 use super::*;
 
+// AGENT: keep descriptor entries and their allocation index behind one lock so
+// callers cannot update one side without preserving the other.
+pub(super) struct FdTable {
+    entries: BTreeMap<usize, FdEntry>,
+    free: BTreeSet<usize>,
+}
+
+// AGENT: initialize an empty descriptor table with every bounded fd available.
+impl Default for FdTable {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            free: (0..MAX_FD).collect(),
+        }
+    }
+}
+
+// AGENT: centralize fd allocation and snapshot invariants inside FdTable.
+impl FdTable {
+    fn from_entries(entries: BTreeMap<usize, FdEntry>) -> Self {
+        let mut table = Self::default();
+        for fd in entries.keys() {
+            table.free.remove(fd);
+        }
+        table.entries = entries;
+        table
+    }
+
+    fn get_free_from(&self, start: usize) -> Option<usize> {
+        self.free.range(start..).next().copied()
+    }
+
+    fn reserve_from(&mut self, start: usize) -> Result<usize, &'static str> {
+        let fd = self.get_free_from(start).ok_or("emfile")?;
+        self.free.remove(&fd);
+        Ok(fd)
+    }
+
+    fn fork_copy(&self) -> Self {
+        Self::from_entries(
+            self.entries
+                .iter()
+                .map(|(&fd, entry)| (fd, entry.fork_dup()))
+                .collect(),
+        )
+    }
+
+    fn cloexec_fds(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .filter_map(|(&fd, entry)| entry.is_cloexec().then_some(fd))
+            .collect()
+    }
+}
+
 // AGENT: collect close side effects under the fd-table lock and execute them
 // after unlocking so callbacks and Drop cannot re-enter the table.
 struct FdCloseCleanup {
@@ -83,8 +138,8 @@ fn checkpoint_stdio_instance(
     Ok((FInstance::new(path), opt))
 }
 
-// AGENT: seed stdio through the normal allocator so the table and free-fd set
-// remain consistent with all later open, dup, and close operations.
+// AGENT: seed stdio through the unified allocator used by later open, dup, and
+// close operations.
 pub(super) fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str> {
     let stdin_opt = FdOpt {
         rd: true,
@@ -121,18 +176,7 @@ impl Task {
 
     // AGENT: find a free descriptor at or above an F_DUPFD-style lower bound.
     pub fn get_free_fd_from(&self, start: usize) -> Option<usize> {
-        let free_fds = self.process.free_fds.lock().unwrap();
-        free_fds.range(start..).next().copied()
-    }
-
-    // AGENT: reserve a free descriptor while the caller holds the fd-table lock.
-    fn reserve_fd_from_locked(
-        free_fds: &mut BTreeSet<usize>,
-        start: usize,
-    ) -> Result<usize, &'static str> {
-        let fd = free_fds.range(start..).next().copied().ok_or("emfile")?;
-        free_fds.remove(&fd);
-        Ok(fd)
+        self.process.fd_table.lock().unwrap().get_free_from(start)
     }
 
     // AGENT: install a new entry with a fresh shared open-file description.
@@ -147,10 +191,9 @@ impl Task {
 
     // AGENT: install an entry and record per-descriptor close-on-exec state.
     pub fn add_file_with_cloexec(&self, fl: FLike, cloexec: bool) -> Result<usize, &'static str> {
-        let mut files = self.process.files.lock().unwrap();
-        let mut free_fds = self.process.free_fds.lock().unwrap();
-        let fd = Self::reserve_fd_from_locked(&mut free_fds, 0)?;
-        files.insert(fd, FdEntry::with_cloexec(fl, cloexec));
+        let mut table = self.process.fd_table.lock().unwrap();
+        let fd = table.reserve_from(0)?;
+        table.entries.insert(fd, FdEntry::with_cloexec(fl, cloexec));
         Ok(fd)
     }
 
@@ -161,10 +204,11 @@ impl Task {
         status: FdOpt,
         cloexec: bool,
     ) -> Result<usize, &'static str> {
-        let mut files = self.process.files.lock().unwrap();
-        let mut free_fds = self.process.free_fds.lock().unwrap();
-        let fd = Self::reserve_fd_from_locked(&mut free_fds, 0)?;
-        files.insert(fd, FdEntry::with_status(fl, status, cloexec));
+        let mut table = self.process.fd_table.lock().unwrap();
+        let fd = table.reserve_from(0)?;
+        table
+            .entries
+            .insert(fd, FdEntry::with_status(fl, status, cloexec));
         Ok(fd)
     }
 
@@ -175,42 +219,52 @@ impl Task {
         second: FLike,
         cloexec: bool,
     ) -> Result<(usize, usize), &'static str> {
-        let mut files = self.process.files.lock().unwrap();
-        let mut free_fds = self.process.free_fds.lock().unwrap();
-        let first_fd = Self::reserve_fd_from_locked(&mut free_fds, 0)?;
-        let second_fd = match Self::reserve_fd_from_locked(&mut free_fds, 0) {
+        let mut table = self.process.fd_table.lock().unwrap();
+        let first_fd = table.reserve_from(0)?;
+        let second_fd = match table.reserve_from(0) {
             Ok(fd) => fd,
             Err(err) => {
-                free_fds.insert(first_fd);
+                table.free.insert(first_fd);
                 return Err(err);
             }
         };
-        files.insert(first_fd, FdEntry::with_cloexec(first, cloexec));
-        files.insert(second_fd, FdEntry::with_cloexec(second, cloexec));
+        table
+            .entries
+            .insert(first_fd, FdEntry::with_cloexec(first, cloexec));
+        table
+            .entries
+            .insert(second_fd, FdEntry::with_cloexec(second, cloexec));
         Ok((first_fd, second_fd))
     }
 
     // AGENT: expose a compatibility FLike view without direct table mutation.
     pub fn get_file(&self, fd: usize) -> Option<FLike> {
         self.process
-            .files
+            .fd_table
             .lock()
             .unwrap()
+            .entries
             .get(&fd)
             .map(FdEntry::as_flike)
     }
 
     // AGENT: clone an entry while preserving shared open-description semantics.
     pub fn get_fd_entry(&self, fd: usize) -> Option<FdEntry> {
-        self.process.files.lock().unwrap().get(&fd).cloned()
+        self.process
+            .fd_table
+            .lock()
+            .unwrap()
+            .entries
+            .get(&fd)
+            .cloned()
     }
 
     // AGENT: snapshot stdio descriptors with cloexec, status, offset, and sharing.
     pub fn snapshot_checkpoint_fds(&self) -> Result<Vec<SavedFdEntry>, &'static str> {
-        let files = self.process.files.lock().unwrap();
+        let table = self.process.fd_table.lock().unwrap();
         let mut descriptions: Vec<(FdEntry, u32)> = Vec::new();
-        let mut saved = Vec::with_capacity(files.len());
-        for (&fd, entry) in files.iter() {
+        let mut saved = Vec::with_capacity(table.entries.len());
+        for (&fd, entry) in table.entries.iter() {
             let kind = checkpoint_fd_kind(fd)?;
             if !entry.is_regular_file() {
                 return Err("enotsup");
@@ -253,13 +307,24 @@ impl Task {
             restored.insert(fd, entry);
         }
 
-        let mut free_fds = ProcessState::initial_free_fds();
-        for fd in restored.keys() {
-            free_fds.remove(fd);
-        }
-        *self.process.files.lock().unwrap() = restored;
-        *self.process.free_fds.lock().unwrap() = free_fds;
+        let replacement = FdTable::from_entries(restored);
+        let old_table = {
+            let mut table = self.process.fd_table.lock().unwrap();
+            mem::replace(&mut *table, replacement)
+        };
+        drop(old_table);
         Ok(())
+    }
+
+    // AGENT: snapshot inherited descriptors without exposing FdTable internals.
+    pub(super) fn inherit_fds_from(&self, parent: &Task) {
+        let inherited = parent.process.fd_table.lock().unwrap().fork_copy();
+        *self.process.fd_table.lock().unwrap() = inherited;
+    }
+
+    // AGENT: collect close-on-exec descriptors under the unified fd-table lock.
+    pub(crate) fn cloexec_fds(&self) -> Vec<usize> {
+        self.process.fd_table.lock().unwrap().cloexec_fds()
     }
 
     // AGENT: remove one descriptor and collect epoll unsubscriptions for later.
@@ -306,9 +371,9 @@ impl Task {
         }
 
         let cleanup = {
-            let mut files = self.process.files.lock().unwrap();
-            let cleanup = Self::remove_fd_locked(&mut files, fd)?;
-            self.process.free_fds.lock().unwrap().insert(fd);
+            let mut table = self.process.fd_table.lock().unwrap();
+            let cleanup = Self::remove_fd_locked(&mut table.entries, fd)?;
+            table.free.insert(fd);
             cleanup
         };
 
@@ -328,12 +393,11 @@ impl Task {
         start: usize,
         cloexec: bool,
     ) -> Result<usize, &'static str> {
-        let mut files = self.process.files.lock().unwrap();
-        let entry = files.get(&old_fd).cloned().ok_or("ebadf")?;
+        let mut table = self.process.fd_table.lock().unwrap();
+        let entry = table.entries.get(&old_fd).cloned().ok_or("ebadf")?;
         let new_entry = entry.dup(cloexec);
-        let mut free_fds = self.process.free_fds.lock().unwrap();
-        let new_fd = Self::reserve_fd_from_locked(&mut free_fds, start)?;
-        files.insert(new_fd, new_entry);
+        let new_fd = table.reserve_from(start)?;
+        table.entries.insert(new_fd, new_entry);
         Ok(new_fd)
     }
 
@@ -343,18 +407,18 @@ impl Task {
             return Err("ebadf");
         }
         let cleanup = {
-            let mut files = self.process.files.lock().unwrap();
-            let entry = files.get(&old_fd).cloned().ok_or("ebadf")?;
+            let mut table = self.process.fd_table.lock().unwrap();
+            let entry = table.entries.get(&old_fd).cloned().ok_or("ebadf")?;
             if old_fd == new_fd {
                 return Ok(new_fd);
             }
-            let cleanup = if files.contains_key(&new_fd) {
-                Some(Self::remove_fd_locked(&mut files, new_fd)?)
+            let cleanup = if table.entries.contains_key(&new_fd) {
+                Some(Self::remove_fd_locked(&mut table.entries, new_fd)?)
             } else {
                 None
             };
-            files.insert(new_fd, entry.dup(false));
-            self.process.free_fds.lock().unwrap().remove(&new_fd);
+            table.entries.insert(new_fd, entry.dup(false));
+            table.free.remove(&new_fd);
             cleanup
         };
         if let Some(cleanup) = cleanup {
@@ -365,8 +429,8 @@ impl Task {
 
     // AGENT: update per-descriptor close-on-exec state without changing the OFD.
     pub fn set_cloexec(&self, fd: usize, val: bool) -> Result<(), &'static str> {
-        let mut files = self.process.files.lock().unwrap();
-        let entry = files.get_mut(&fd).ok_or("ebadf")?;
+        let mut table = self.process.fd_table.lock().unwrap();
+        let entry = table.entries.get_mut(&fd).ok_or("ebadf")?;
         entry.set_cloexec(val);
         Ok(())
     }
