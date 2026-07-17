@@ -270,10 +270,9 @@ fn signal_handler_uses_supplied_interrupted_frame(pool: &FramePool) {
     assert_ne!(*task.sig_mask.lock().unwrap() & (1u64 << SIGUSR2), 0);
 
     {
-        let thd = task.thd_ctx.lock().unwrap();
-        let ctx = thd.as_ref().expect("task metadata should exist");
-        assert_eq!(ctx.sig_frames.len(), 1);
-        assert_eq!(ctx.sig_frames[0].saved_frame, interrupted);
+        let sig_frames = task.sig_frames.lock().unwrap();
+        assert_eq!(sig_frames.len(), 1);
+        assert_eq!(sig_frames[0].saved_frame, interrupted);
     }
 
     task.install_user_trap_frame(next)

@@ -60,13 +60,13 @@ impl Kernel {
                 if thread.id() == task.id() {
                     released_requested_task = true;
                 }
-                thread.release_thread_exit_resources(&self.pool);
+                thread.release_thread_exit_resources();
                 self.run_queue.remove(thread.id());
             }
         }
 
         if !released_requested_task {
-            task.release_thread_exit_resources(&self.pool);
+            task.release_thread_exit_resources();
             self.run_queue.remove(task.id());
         }
     }

@@ -496,6 +496,7 @@ cargo test --test pressure
 
 ### M9 `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
 
+- `[M3][M9][重要] TODO`: `kernel-qemu` 当前 `SYS_EXIT` 仍通过 `exit_task()` 释放同一 `ProcessState` 的全部线程，等价于进程级退出。后续应增加只终止当前 `Task` 的单线程退出路径，维护线程组存活计数，并仅在最后一个线程退出时提交进程级资源释放、父进程通知和 zombie 状态；完成该边界后，再随 `clone` / `set_tid_address` syscall 一并迁移 `clear_child_tid` 写零与 futex 唤醒语义。
 
 ### M10 QEMU 进程级 checkpoint / restore
 

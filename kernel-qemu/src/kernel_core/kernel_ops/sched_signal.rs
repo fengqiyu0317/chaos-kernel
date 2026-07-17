@@ -350,12 +350,8 @@ fn enter_signal_handler(
     interrupted: TrapFrame,
 ) -> Option<TrapFrame> {
     let old_mask = *task.sig_mask.lock().unwrap();
-    let mut thd = task.thd_ctx.lock().unwrap();
-    let Some(ctx) = thd.as_mut() else {
-        task.requeue_signal_front(sig.signo as i32, sig.sender_tid);
-        return None;
-    };
-    ctx.sig_frames.push(SigFrame {
+    let mut sig_frames = task.sig_frames.lock().unwrap();
+    sig_frames.push(SigFrame {
         saved_frame: interrupted.clone(),
         saved_mask: old_mask,
     });
@@ -365,7 +361,7 @@ fn enter_signal_handler(
     let mut next = interrupted;
     next.regs[10] = sig.signo as usize;
     next.regs[11] = sig.sender_tid as usize;
-    next.regs[12] = ctx.sig_frames.last().unwrap().saved_frame.sepc;
+    next.regs[12] = sig_frames.last().unwrap().saved_frame.sepc;
     next.sepc = handler;
     Some(next)
 }

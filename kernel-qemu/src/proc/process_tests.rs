@@ -331,7 +331,6 @@ fn fork_copies_complete_user_frame(pool: &FramePool) {
     parent
         .install_user_trap_frame(source.clone())
         .expect("parent frame should install");
-    parent.thd_ctx.lock().unwrap().as_mut().unwrap().clear_tid = 0xdead;
 
     let child = table
         .fork_task(&parent, pool)
@@ -345,7 +344,6 @@ fn fork_copies_complete_user_frame(pool: &FramePool) {
     }
     assert_eq!(child_frame.sstatus, source.sstatus);
     assert_eq!(child_frame.sepc, source.sepc);
-    assert_eq!(child.thd_ctx.lock().unwrap().as_ref().unwrap().clear_tid, 0);
 }
 
 // AGENT: multi-threaded zombies are collected at process granularity, while all
@@ -357,7 +355,7 @@ fn reap_zombie_process_removes_thread_group_once(pool: &FramePool) {
         .fork_task(&parent, pool)
         .expect("child fork should succeed");
     let thread = table
-        .clone_thread(&child, 0x8000_0000, 0, 0)
+        .clone_thread(&child, 0x8000_0000, 0)
         .expect("thread clone should succeed");
 
     assert!(child.exit_proc(ExitReason::Code(7)));
@@ -370,13 +368,12 @@ fn reap_zombie_process_removes_thread_group_once(pool: &FramePool) {
 }
 
 // AGENT: clone_thread starts from the caller thread context, then applies the
-// clone-specific return value, user stack, TLS, clear-child-tid, and signal mask.
+// clone-specific return value, user stack, TLS, and signal mask.
 fn clone_thread_copies_caller_context_and_shares_process(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
     let task = table.spawn().expect("standalone spawn should work");
     let stack_top = 0x8000_0000;
     let tls = 0xabc;
-    let clear_tid = 0xdead;
     let sig_mask = 0x24;
 
     let mut source = TrapFrame::new();
@@ -389,11 +386,10 @@ fn clone_thread_copies_caller_context_and_shares_process(pool: &FramePool) {
     source.sepc = 0x401000;
     task.install_user_trap_frame(source.clone())
         .expect("source frame should install");
-    task.thd_ctx.lock().unwrap().as_mut().unwrap().clear_tid = 0x1111;
     *task.sig_mask.lock().unwrap() = sig_mask;
 
     let thread = table
-        .clone_thread(&task, stack_top, tls, clear_tid)
+        .clone_thread(&task, stack_top, tls)
         .expect("thread clone should succeed");
 
     assert!(Arc::ptr_eq(&task.process, &thread.process));
@@ -413,9 +409,6 @@ fn clone_thread_copies_caller_context_and_shares_process(pool: &FramePool) {
     }
     assert_eq!(cloned.sepc, source.sepc);
     assert_eq!(cloned.sstatus, source.sstatus);
-    let thd = thread.thd_ctx.lock().unwrap();
-    let ctx = thd.as_ref().expect("cloned metadata should exist");
-    assert_eq!(ctx.clear_tid, clear_tid);
 }
 
 // AGENT: construct a minimal init stack through real AddrSpace mappings and

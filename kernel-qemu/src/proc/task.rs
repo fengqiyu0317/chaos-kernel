@@ -9,7 +9,6 @@ mod pid;
 mod process_state;
 mod sched_entity;
 mod table;
-mod thread_context;
 
 pub use self::core::*;
 pub use self::exit_reason::*;
@@ -17,4 +16,3 @@ pub use self::pid::*;
 pub use self::process_state::*;
 pub use self::sched_entity::*;
 pub use self::table::*;
-pub use self::thread_context::*;

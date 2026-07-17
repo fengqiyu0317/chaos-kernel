@@ -374,11 +374,8 @@ impl TaskTable {
             *child.process.free_fds.lock().unwrap() = child_free_fds;
         }
 
-        let child_ctx = src.thd_ctx.lock().unwrap().clone().map(|mut ctx| {
-            ctx.clear_tid = 0;
-            ctx
-        });
-        *child.thd_ctx.lock().unwrap() = child_ctx;
+        let child_sig_frames = src.sig_frames.lock().unwrap().clone();
+        *child.sig_frames.lock().unwrap() = child_sig_frames;
         let mut child_frame = caller_frame.clone();
         child_frame.set_return_value(0);
         child.install_user_trap_frame(child_frame)?;
@@ -419,10 +416,9 @@ impl TaskTable {
         src: &Arc<Task>,
         stack_top: u64,
         tls: u64,
-        clear_tid: usize,
     ) -> Result<Arc<Task>, &'static str> {
         let caller_frame = src.snapshot_user_trap_frame()?;
-        self.clone_thread_from_frame(src, &caller_frame, stack_top, tls, clear_tid)
+        self.clone_thread_from_frame(src, &caller_frame, stack_top, tls)
     }
 
     // AGENT: clone one complete user frame while sharing the owning process state.
@@ -432,17 +428,15 @@ impl TaskTable {
         caller_frame: &TrapFrame,
         stack_top: u64,
         tls: u64,
-        clear_tid: usize,
     ) -> Result<Arc<Task>, &'static str> {
         let task_slot = self.reserve_task_slot()?;
         let proc_src = self.process_of_tid(src.id()).ok_or("esrch")?;
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let task = Task::make_with_process(id, proc_src.process.clone(), &self.pool)?;
-        let mut ctx = src.thd_ctx.lock().unwrap().clone().ok_or("enoctx")?;
-        ctx.clear_tid = clear_tid;
+        let sig_frames = src.sig_frames.lock().unwrap().clone();
         let caller_mask = *src.sig_mask.lock().unwrap();
         *task.sig_mask.lock().unwrap() = caller_mask;
-        *task.thd_ctx.lock().unwrap() = Some(ctx);
+        *task.sig_frames.lock().unwrap() = sig_frames;
         let mut child_frame = caller_frame.clone();
         child_frame.set_return_value(0);
         child_frame.regs[2] = stack_top as usize;

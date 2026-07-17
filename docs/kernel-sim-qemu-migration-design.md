@@ -281,7 +281,7 @@ QEMU 侧的上下文所有权按下列边界固定，不再保留从 simulator
 复制而来的 16 槽寄存器镜像：
 
 - 每个 task 的完整用户态 `TrapFrame` 固定位于 `kernel_stack_top - size_of::<TrapFrame>()`，由 `trap.S` 原地保存和恢复，并作为用户寄存器的唯一事实来源。
-- `ThdCtx` 只保留 `clear_tid` 和第一阶段的 signal-frame stack 等非寄存器线程元数据；信号屏蔽字只由 `Task::sig_mask` 持有。
+- 第一阶段的 signal-frame stack 直接由 `Task::sig_frames` 持有，信号屏蔽字只由 `Task::sig_mask` 持有，不再为单一字段保留 `ThdCtx` 包装。尚未接入 syscall 的 `clear_child_tid` 不提前保留，待单线程退出与 `clone` 语义一起迁移。
 - `fork` / `clone` 从调用者的完整 live `TrapFrame` 派生子任务现场；`exec` / `sigreturn` 通过 syscall outcome 由持有 live frame 的 trap 边界原子替换现场，避免从 `Task` 再创建第二个可变引用。
 - checkpoint 中的 `SavedTrapFrame` 只是序列化 DTO，restore 时转成运行时 `TrapFrame` 并直接安装到新 task 的内核栈顶。
 - 后续真正的 task 切换另行引入仅保存内核态 `ra` / `sp` / `s0..s11` 的 `KernelContext` 和 `__switch`；不将内核切换现场混入用户 `TrapFrame`。

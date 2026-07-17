@@ -71,7 +71,7 @@ impl Kernel {
         }
         *task.process.exec_path.lock().unwrap() = prepared.exec_path;
         task.process.did_exec.store(true, Ordering::SeqCst);
-        *task.thd_ctx.lock().unwrap() = Some(ThdCtx::default());
+        task.sig_frames.lock().unwrap().clear();
         prepared.user_entry
     }
 

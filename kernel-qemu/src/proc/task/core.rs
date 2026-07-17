@@ -9,8 +9,8 @@ pub struct Task {
     id: usize,
     pub process: Arc<ProcessState>,
     pub sig_mask: Mutex<u64>,
+    pub sig_frames: Mutex<Vec<SigFrame>>,
     pub kstk: Mutex<Option<KStk>>,
-    pub thd_ctx: Mutex<Option<ThdCtx>>,
     pub sched: Mutex<SchedEntity>,
 }
 
@@ -45,8 +45,8 @@ impl Task {
             id,
             process,
             sig_mask: Mutex::new(0),
+            sig_frames: Mutex::new(Vec::new()),
             kstk: Mutex::new(Some(kstk)),
-            thd_ctx: Mutex::new(Some(ThdCtx::default())),
             sched: Mutex::new(SchedEntity::new()),
         });
         task.install_user_trap_frame(TrapFrame::new())?;
@@ -194,33 +194,11 @@ impl Task {
         true
     }
 
-    // AGENT: clear CLONE_CHILD_CLEARTID before waking one futex waiter.
-    fn clear_child_tid_and_wake(&self, clear_tid: usize, pool: &FramePool) {
-        if clear_tid == 0 {
-            return;
-        }
-
-        let zero = 0u32.to_ne_bytes();
-        let cleared = self
-            .process
-            .addr_space
-            .lock()
-            .unwrap()
-            .write_user_bytes(clear_tid, &zero, pool)
-            .is_ok();
-        if cleared {
-            self.process.futex.wake(clear_tid, 1);
-        }
-    }
-
-    // AGENT: drop thread-private execution resources after clear-child-tid cleanup.
-    pub fn release_thread_exit_resources(&self, pool: &FramePool) {
+    // AGENT: drop the execution resources owned by one task during teardown.
+    pub fn release_thread_exit_resources(&self) {
         *self.sig_mask.lock().unwrap() = 0;
+        self.sig_frames.lock().unwrap().clear();
         self.kstk.lock().unwrap().take();
-        let old_ctx = self.thd_ctx.lock().unwrap().take();
-        if let Some(ctx) = old_ctx {
-            self.clear_child_tid_and_wake(ctx.clear_tid, pool);
-        }
         self.set_sched_state(TaskRunState::Zombie);
     }
 
