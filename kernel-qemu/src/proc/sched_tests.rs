@@ -38,11 +38,12 @@ fn signal_numbering_uses_all_linux_slots() {
     assert_eq!(signal_bit(NSIG + 1), None);
 
     assert!(!actions.set_action(0, SigAction::default_action()));
+    let caught_mask = signal_bit(SIGUSR2).expect("valid SIGUSR2");
     assert!(actions.set_action(
         1,
         SigAction {
             handler: 0x4000,
-            mask: 0,
+            mask: caught_mask,
         },
     ));
     assert!(actions.set_action(
@@ -63,14 +64,47 @@ fn signal_numbering_uses_all_linux_slots() {
     assert!(actions.get_action(0).is_none());
     assert!(actions.get_action(NSIG + 1).is_none());
 
-    actions.clear_non_caught();
+    let ignored_mask = signal_bit(SIGUSR1).expect("valid SIGUSR1");
+    assert!(actions.set_action(
+        SIGURG,
+        SigAction {
+            handler: SIG_IGN,
+            mask: ignored_mask,
+        },
+    ));
+    let default_mask = signal_bit(SIGUSR2).expect("valid SIGUSR2");
+    assert!(actions.set_action(
+        SIGWINCH,
+        SigAction {
+            handler: SIG_DFL,
+            mask: default_mask,
+        },
+    ));
+
+    actions.reset_for_exec();
     assert_eq!(
-        actions.get_action(1).map(|action| action.handler),
-        Some(SIG_DFL)
+        actions
+            .get_action(1)
+            .map(|action| (action.handler, action.mask)),
+        Some((SIG_DFL, 0))
     );
     assert_eq!(
-        actions.get_action(NSIG).map(|action| action.handler),
-        Some(SIG_DFL)
+        actions
+            .get_action(NSIG)
+            .map(|action| (action.handler, action.mask)),
+        Some((SIG_DFL, 0))
+    );
+    assert_eq!(
+        actions
+            .get_action(SIGURG)
+            .map(|action| (action.handler, action.mask)),
+        Some((SIG_IGN, 0))
+    );
+    assert_eq!(
+        actions
+            .get_action(SIGWINCH)
+            .map(|action| (action.handler, action.mask)),
+        Some((SIG_DFL, 0))
     );
 }
 

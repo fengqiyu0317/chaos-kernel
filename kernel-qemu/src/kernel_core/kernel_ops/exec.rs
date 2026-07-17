@@ -63,7 +63,7 @@ impl Kernel {
         for fd in prepared.close_fds {
             let _ = task.close_fd(fd);
         }
-        task.process.sig_state.lock().unwrap().clear_non_caught();
+        task.process.sig_state.lock().unwrap().reset_for_exec();
         {
             let mut current_addr_space = task.process.addr_space.lock().unwrap();
             current_addr_space.release_all_pages();

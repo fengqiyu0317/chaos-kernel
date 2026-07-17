@@ -136,13 +136,16 @@ impl SigSet {
             .is_some_and(|action| action.resolve(signo) == SignalDeliveryAction::Ignore)
     }
 
-    // AGENT: exec visits every compact slot, including signal 1 at index zero,
-    // and resets caught handlers while preserving ignored dispositions.
-    pub fn clear_non_caught(&mut self) {
+    // AGENT: exec visits every compact slot, resets caught handlers, preserves
+    // ignored dispositions, and clears handler-only masks from every action.
+    pub fn reset_for_exec(&mut self) {
         for action in &mut self.actions {
-            if action.handler != SIG_DFL && action.handler != SIG_IGN {
-                *action = SigAction::default_action();
-            }
+            let handler = if action.handler == SIG_IGN {
+                SIG_IGN
+            } else {
+                SIG_DFL
+            };
+            *action = SigAction { handler, mask: 0 };
         }
     }
 }
