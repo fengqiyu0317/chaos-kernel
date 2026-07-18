@@ -72,7 +72,7 @@ fn ensure_timer_wheel() {
 }
 
 // AGENT: WaitToken::current must bind to the current simulator task id and give
-// each token a distinct identity.
+// each wait distinct Arc-backed state without a separate numeric identifier.
 #[cfg_attr(test, test)]
 fn wait_token_captures_current_task() {
     reset_wait_token_state(11);
@@ -82,7 +82,6 @@ fn wait_token_captures_current_task() {
 
     assert_eq!(first.task_id(), 11);
     assert_eq!(second.task_id(), 11);
-    assert_ne!(first.id(), second.id());
     assert!(!first.same(&second));
     assert!(!first.is_woken());
 

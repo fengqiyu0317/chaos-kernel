@@ -5,9 +5,6 @@ use crate::kernel::kernel_core::kernel_base::Kernel;
 use crate::kernel::kernel_core::prelude::*;
 use crate::kernel::kernel_core::time::{duration_to_ticks, global_timer_wheel, TimerTarget};
 
-// AGENT: keep QEMU scheduler wakeups behind a token so kernel wait queues store
-// task identities instead of host std::thread handles.
-static WAIT_TOKEN_SEQ: AtomicUsize = AtomicUsize::new(1);
 // AGENT: QEMU wait tokens need a scheduler owner to move tasks between
 // Sleeping and Runnable without threading a Kernel parameter through every
 // migrated kernel-sim wait queue. The pointer must be installed from a leaked
@@ -51,9 +48,10 @@ const WAIT_EVENT: u8 = 1;
 const WAIT_TIMEOUT: u8 = 2;
 const WAIT_SIGNAL: u8 = 3;
 
+// AGENT: clones share one wait identity through the Arc-backed state; distinct
+// waits are distinguished with Arc::ptr_eq rather than a redundant numeric id.
 #[derive(Clone)]
 pub struct WaitToken {
-    id: usize,
     state: Arc<WaitState>,
 }
 
@@ -67,16 +65,11 @@ impl WaitToken {
     // thread. Kernel::set_cur() publishes this id before syscall/wait code runs.
     pub fn current() -> Self {
         Self {
-            id: WAIT_TOKEN_SEQ.fetch_add(1, Ordering::Relaxed),
             state: Arc::new(WaitState {
                 outcome: AtomicU8::new(WAIT_PENDING),
                 task_id: require_current_task_id("WaitToken"),
             }),
         }
-    }
-
-    pub fn id(&self) -> usize {
-        self.id
     }
 
     // AGENT: expose the scheduler task carried by this QEMU wait token.
