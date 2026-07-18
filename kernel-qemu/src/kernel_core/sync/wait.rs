@@ -176,9 +176,56 @@ impl WaitToken {
             .is_some_and(|kernel| kernel.task_has_interrupting_signal(self.state.task_id))
     }
 
-    // AGENT: shared wait loop for plain and signal-interruptible waits during
-    // the current spin-based QEMU scheduler bridge.
-    fn wait_inner(&self, interruptible: bool) -> WaitOutcome {
+    // AGENT: convert an optional relative timeout to the logical absolute
+    // deadline consumed by the single QEMU wait implementation.
+    pub fn wait(&self, timeout: Option<Duration>) -> WaitOutcome {
+        let deadline = timeout.map(|timeout| {
+            CLK.load(Ordering::Relaxed)
+                .saturating_add(duration_to_ticks(timeout))
+        });
+        self.wait_deadline(deadline, false)
+    }
+
+    // AGENT: syscall-facing relative waits share the same deadline engine but
+    // additionally surface pending signals as WaitOutcome::Signal.
+    pub fn wait_interruptible(&self, timeout: Option<Duration>) -> WaitOutcome {
+        let deadline = timeout.map(|timeout| {
+            CLK.load(Ordering::Relaxed)
+                .saturating_add(duration_to_ticks(timeout))
+        });
+        self.wait_deadline(deadline, true)
+    }
+
+    // AGENT: absolute-deadline variant for syscall waits that can be interrupted
+    // by signals without resetting the deadline across caller retry loops.
+    pub fn wait_until_tick_interruptible(&self, deadline: usize) -> WaitOutcome {
+        self.wait_deadline(Some(deadline), true)
+    }
+
+    // AGENT: centralize optional timer registration, signal interruption,
+    // scheduler state transitions, and early-wake timer cancellation.
+    fn wait_deadline(&self, deadline: Option<usize>, interruptible: bool) -> WaitOutcome {
+        if self.is_woken() {
+            return self.outcome();
+        }
+        let timer_id = match deadline {
+            Some(deadline) => {
+                if CLK.load(Ordering::Relaxed) >= deadline {
+                    self.wake_timeout();
+                    return self.outcome();
+                }
+                let mut wheel = global_timer_wheel().lock();
+                Some(wheel.register_timer(
+                    deadline,
+                    0,
+                    TimerTarget::WakeToken {
+                        token: self.clone(),
+                    },
+                ))
+            }
+            None => None,
+        };
+
         let mut blocked = false;
         while !self.is_woken() {
             if interruptible && self.has_interrupting_signal() {
@@ -197,79 +244,12 @@ impl WaitToken {
         if blocked {
             self.finish_waiter_task();
         }
-        self.outcome()
-    }
 
-    // AGENT: QEMU has no host Instant/park_timeout. Optional timeouts are routed
-    // through the kernel timer wheel, while indefinite waits block the current
-    // task and spin until the eventual scheduler/context-switch layer resumes it.
-    pub fn wait(&self, timeout: Option<Duration>) -> WaitOutcome {
-        if let Some(timeout) = timeout {
-            return self.wait_with_timer(timeout);
-        }
-        self.wait_inner(false)
-    }
-
-    // AGENT: syscall-facing waits use this variant when a pending signal should
-    // interrupt the wait and be delivered at the syscall return boundary.
-    pub fn wait_interruptible(&self, timeout: Option<Duration>) -> WaitOutcome {
-        if let Some(timeout) = timeout {
-            return self.wait_with_timer_inner(timeout, true);
-        }
-        self.wait_inner(true)
-    }
-
-    // AGENT: wait using the logical kernel timer wheel instead of host
-    // Instant/park_timeout.
-    pub fn wait_with_timer(&self, timeout: Duration) -> WaitOutcome {
-        self.wait_with_timer_inner(timeout, false)
-    }
-
-    // AGENT: keep timeout setup common between plain and interruptible waits.
-    fn wait_with_timer_inner(&self, timeout: Duration, interruptible: bool) -> WaitOutcome {
-        let ticks = duration_to_ticks(timeout);
-        if ticks == 0 {
-            self.wake_timeout();
-            return self.outcome();
-        }
-        let deadline = CLK.load(Ordering::Relaxed).saturating_add(ticks);
-        self.wait_until_tick_inner(deadline, interruptible)
-    }
-
-    // AGENT: wait until an absolute logical tick deadline, using the same typed
-    // timer target that QEMU timer interrupts will dispatch.
-    pub fn wait_until_tick(&self, deadline: usize) -> WaitOutcome {
-        self.wait_until_tick_inner(deadline, false)
-    }
-
-    // AGENT: absolute-deadline variant for syscall waits that can be interrupted
-    // by signals before the timer fires.
-    pub fn wait_until_tick_interruptible(&self, deadline: usize) -> WaitOutcome {
-        self.wait_until_tick_inner(deadline, true)
-    }
-
-    fn wait_until_tick_inner(&self, deadline: usize, interruptible: bool) -> WaitOutcome {
-        if self.is_woken() {
-            return self.outcome();
-        }
-        if CLK.load(Ordering::Relaxed) >= deadline {
-            self.wake_timeout();
-            return self.outcome();
-        }
-        let timers = global_timer_wheel();
-        let timer_id = {
-            let mut wheel = timers.lock();
-            wheel.register_timer(
-                deadline,
-                0,
-                TimerTarget::WakeToken {
-                    token: self.clone(),
-                },
-            )
-        };
-        let outcome = self.wait_inner(interruptible);
+        let outcome = self.outcome();
         if outcome != WaitOutcome::Timeout {
-            timers.lock().cancel(timer_id);
+            if let Some(timer_id) = timer_id {
+                global_timer_wheel().lock().cancel(timer_id);
+            }
         }
         outcome
     }

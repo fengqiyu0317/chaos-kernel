@@ -153,7 +153,7 @@ fn wait_token_expired_deadline_times_out_immediately() {
     CLK.store(7, Ordering::Relaxed);
     let token = WaitToken::current();
 
-    assert_eq!(token.wait_until_tick(7), WaitOutcome::Timeout);
+    assert_eq!(token.wait_until_tick_interruptible(7), WaitOutcome::Timeout);
     assert!(token.is_timeout());
     assert_eq!(global_timer_wheel().lock().active_count(), 0);
 
@@ -161,7 +161,7 @@ fn wait_token_expired_deadline_times_out_immediately() {
 }
 
 // AGENT: the QEMU timer wheel dispatches TimerTarget::WakeToken through the same
-// timeout marker used by WaitToken::wait_with_timer().
+// timeout marker used by WaitToken's unified deadline path.
 fn wait_token_timer_target_times_out_on_schedule_tick(pool: &FramePool) {
     reset_wait_token_state(16);
 
