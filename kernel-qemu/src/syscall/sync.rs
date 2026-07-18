@@ -24,6 +24,9 @@ pub(super) fn sys_futex(
     if uaddr % mem::size_of::<u32>() != 0 {
         return Err("einval");
     }
+    // AGENT TODO: FUTEX_PRIVATE_FLAG is currently informational because every
+    // process owns a separate FutexBucket. Route operations without this flag
+    // through a cross-process registry once shared futex keys are implemented.
     let _private = (op & 0x80) != 0;
     let futex_op = op & 0xF;
     match futex_op {

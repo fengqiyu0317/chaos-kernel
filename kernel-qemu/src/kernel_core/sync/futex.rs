@@ -23,6 +23,10 @@ impl FutexRequeueResult {
     }
 }
 
+// AGENT TODO: this process-owned bucket currently keys waiters only by their
+// user virtual address, so it supports futexes shared by threads in one process.
+// Add a shared futex key derived from the backing shared-memory object and
+// offset, plus a cross-process wait registry, before supporting shared futexes.
 pub struct FutexBucket {
     waiters: Mutex<VecDeque<FutexWaiter>>,
 }
@@ -32,24 +36,9 @@ impl FutexBucket {
             waiters: Mutex::new(VecDeque::new()),
         }
     }
-    // AGENT: read the futex word while holding the wait-queue lock so a wake
-    // cannot slip between the value check and waiter publication.
-    pub fn wait<R>(
-        &self,
-        addr: usize,
-        expected: u32,
-        timeout: Option<Duration>,
-        read_word: R,
-    ) -> Result<(), &'static str>
-    where
-        R: FnOnce() -> Result<u32, &'static str>,
-    {
-        self.wait_inner(addr, expected, timeout, read_word)
-    }
-
     // AGENT: compare and enqueue under one queue lock so a wake cannot slip
     // between seeing the expected value and publishing this waiter.
-    fn wait_inner<R>(
+    pub fn wait<R>(
         &self,
         addr: usize,
         expected: u32,
@@ -126,7 +115,7 @@ impl FutexBucket {
         Self::requeue_locked(&mut w, src, dst, wake_n, move_n).woken
     }
     // AGENT: compare the source futex word through a caller-supplied reader
-    // while holding the futex queue lock, matching wait_inner's ordering.
+    // while holding the futex queue lock, matching wait's ordering.
     pub fn cmp_requeue<R>(
         &self,
         src: usize,
