@@ -6,7 +6,7 @@ use super::*;
 // callers cannot update one side without preserving the other.
 pub(crate) struct FdTable {
     entries: BTreeMap<usize, FdEntry>,
-    free: BTreeSet<usize>,
+    allocator: AllocatorState,
 }
 
 // AGENT: initialize an empty descriptor table with every bounded fd available.
@@ -14,39 +14,43 @@ impl Default for FdTable {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
-            free: (0..MAX_FD).collect(),
+            allocator: AllocatorState::new(0, MAX_FD),
         }
     }
 }
 
 // AGENT: centralize fd allocation and snapshot invariants inside FdTable.
 impl FdTable {
-    fn from_entries(entries: BTreeMap<usize, FdEntry>) -> Self {
-        let mut table = Self::default();
+    // AGENT: rebuild the generic id allocator from validated occupied fd slots.
+    fn from_entries(entries: BTreeMap<usize, FdEntry>) -> Result<Self, &'static str> {
+        let mut allocator = AllocatorState::new(0, MAX_FD);
         for fd in entries.keys() {
-            table.free.remove(fd);
+            allocator.reserve(*fd).ok_or("ebadf")?;
         }
-        table.entries = entries;
-        table
+        Ok(Self { entries, allocator })
     }
 
+    // AGENT: expose a non-mutating lower-bound lookup for fd compatibility APIs.
     fn get_free_from(&self, start: usize) -> Option<usize> {
-        self.free.range(start..).next().copied()
+        self.allocator.peek_from(start)
     }
 
+    // AGENT: allocate the lowest descriptor at or above an ABI lower bound.
     fn reserve_from(&mut self, start: usize) -> Result<usize, &'static str> {
-        let fd = self.get_free_from(start).ok_or("emfile")?;
-        self.free.remove(&fd);
-        Ok(fd)
+        self.allocator.allocate_from(start).ok_or("emfile")
     }
 
+    // AGENT: duplicate entries while preserving an identical independent id
+    // allocator snapshot for the child process.
     fn fork_copy(&self) -> Self {
-        Self::from_entries(
-            self.entries
+        Self {
+            entries: self
+                .entries
                 .iter()
                 .map(|(&fd, entry)| (fd, entry.fork_dup()))
                 .collect(),
-        )
+            allocator: self.allocator.clone(),
+        }
     }
 
     fn cloexec_fds(&self) -> Vec<usize> {
@@ -224,7 +228,8 @@ impl Task {
         let second_fd = match table.reserve_from(0) {
             Ok(fd) => fd,
             Err(err) => {
-                table.free.insert(first_fd);
+                let released = table.allocator.release(first_fd);
+                debug_assert!(released);
                 return Err(err);
             }
         };
@@ -307,7 +312,7 @@ impl Task {
             restored.insert(fd, entry);
         }
 
-        let replacement = FdTable::from_entries(restored);
+        let replacement = FdTable::from_entries(restored)?;
         let old_table = {
             let mut table = self.process.fd_table.lock().unwrap();
             mem::replace(&mut *table, replacement)
@@ -373,7 +378,8 @@ impl Task {
         let cleanup = {
             let mut table = self.process.fd_table.lock().unwrap();
             let cleanup = Self::remove_fd_locked(&mut table.entries, fd)?;
-            table.free.insert(fd);
+            let released = table.allocator.release(fd);
+            debug_assert!(released);
             cleanup
         };
 
@@ -417,8 +423,10 @@ impl Task {
             } else {
                 None
             };
+            if cleanup.is_none() && table.allocator.reserve(new_fd).is_none() {
+                return Err("ebadf");
+            }
             table.entries.insert(new_fd, entry.dup(false));
-            table.free.remove(&new_fd);
             cleanup
         };
         if let Some(cleanup) = cleanup {

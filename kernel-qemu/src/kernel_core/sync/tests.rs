@@ -12,8 +12,8 @@ use crate::kernel::{
     TaskRunState, CLK, SIGUSR1,
 };
 
-// AGENT: include BlockCache fixed-payload regressions and use the boot-discovered
-// physical pool for tests that now allocate real task kernel-stack pages.
+// AGENT: include storage/fd allocator regressions and use the boot-discovered
+// physical pool for tests that allocate real task kernel-stack pages.
 pub fn run_all(pool: &FramePool) {
     #[cfg(feature = "qemu-sync-selftest")]
     crate::kernel::fs::block_device::tests::run_all();
@@ -42,6 +42,7 @@ pub fn run_all(pool: &FramePool) {
     pipe_uses_bounded_ring_buffer_and_reports_writable();
     pipe_rejects_wrong_direction_direct_io();
     pipe_epoll_closed_status_reports_hup_and_err();
+    fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool);
     fd_close_detaches_epoll_subscription_before_reuse(pool);
     epoll_ready_list_deduplicates_and_requeues();
 }
@@ -413,6 +414,39 @@ fn futex_requeue_skips_completed_waiters_when_moving() {
     assert!(waiters[0].token.same(&live));
 
     clear_wait_token_state();
+}
+
+// AGENT: exercise the generic id allocator through fd lower-bound allocation,
+// dup2 exact placement/replacement, and close-driven reuse under one FdTable.
+fn fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool: &FramePool) {
+    let kernel = Kernel::new(pool.clone());
+    let task = kernel.tasks.spawn_root().expect("spawn fd allocator task");
+    let source_fd = task
+        .add_file(FLike::Ep(EpInst::new()))
+        .expect("initial fd allocation should succeed");
+    assert_eq!(source_fd, 0);
+
+    let high_fd = task
+        .dup_fd_from(source_fd, 5, false)
+        .expect("lower-bound fd allocation should succeed");
+    assert_eq!(high_fd, 5);
+    assert_eq!(task.get_free_fd(), Some(1));
+    assert_eq!(task.get_free_fd_from(5), Some(6));
+
+    let exact_fd = task
+        .dup2_fd(source_fd, 2)
+        .expect("dup2 exact fd allocation should succeed");
+    assert_eq!(exact_fd, 2);
+    assert_eq!(task.get_free_fd_from(2), Some(3));
+
+    assert_eq!(task.dup2_fd(source_fd, high_fd), Ok(high_fd));
+    task.close_fd(high_fd)
+        .expect("closing the replaced fd should succeed");
+    assert_eq!(task.dup_fd_from(source_fd, high_fd, false), Ok(high_fd));
+
+    let _ = task.close_fd(source_fd);
+    let _ = task.close_fd(exact_fd);
+    let _ = task.close_fd(high_fd);
 }
 
 // AGENT: closing a watched fd must remove the old epoll interest and cancel its

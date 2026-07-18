@@ -4,6 +4,7 @@ use alloc::collections::BTreeSet;
 
 // AGENT: keep the exclusive resource limit beside the bump cursor and returned
 // ids so one allocator cannot be called with inconsistent bounds.
+#[derive(Clone)]
 pub(crate) struct AllocatorState {
     next: usize,
     limit: usize,
@@ -23,22 +24,36 @@ impl AllocatorState {
         }
     }
 
-    // AGENT: prefer the lowest recycled id, then advance into never-used ids.
+    // AGENT: prefer the lowest available id across recycled and never-used ids.
     pub(crate) fn allocate(&mut self) -> Option<usize> {
-        let recycled = self.free.iter().next().copied();
-        let fresh = (self.next < self.limit).then_some(self.next);
+        self.allocate_from(0)
+    }
+
+    // AGENT: inspect the lowest available id at or above a caller-supplied
+    // lower bound without changing allocator ownership.
+    pub(crate) fn peek_from(&self, start: usize) -> Option<usize> {
+        let recycled = self.free.range(start..).next().copied();
+        let fresh = self.next.max(start);
+        let fresh = (fresh < self.limit).then_some(fresh);
         let id = match (recycled, fresh) {
             (Some(recycled), Some(fresh)) => recycled.min(fresh),
             (Some(recycled), None) => recycled,
             (None, Some(fresh)) => fresh,
             _ => return None,
         };
-        self.allocate_id(id)
+        Some(id)
     }
 
-    // AGENT: reserve a requested id and preserve skipped never-used ids as
-    // immediately reusable resources.
-    fn allocate_id(&mut self, id: usize) -> Option<usize> {
+    // AGENT: allocate the lowest available id at or above a caller-supplied
+    // lower bound, as required by bounded fd allocators such as F_DUPFD.
+    pub(crate) fn allocate_from(&mut self, start: usize) -> Option<usize> {
+        let id = self.peek_from(start)?;
+        self.reserve(id)
+    }
+
+    // AGENT: reserve one exact id and preserve skipped never-used ids as
+    // immediately reusable resources for dup2-style fixed-id allocation.
+    pub(crate) fn reserve(&mut self, id: usize) -> Option<usize> {
         if !self.is_free(id) {
             return None;
         }
