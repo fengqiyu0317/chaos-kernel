@@ -247,11 +247,6 @@ impl FdEntry {
         }
     }
 
-    // AGENT: fork preserves each fd entry's own FD_CLOEXEC flag.
-    pub fn fork_dup(&self) -> Self {
-        self.dup(self.cloexec)
-    }
-
     pub fn is_cloexec(&self) -> bool {
         self.cloexec
     }

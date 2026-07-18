@@ -430,14 +430,23 @@ fn fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool: &FramePool) 
         .dup_fd_from(source_fd, 5, false)
         .expect("lower-bound fd allocation should succeed");
     assert_eq!(high_fd, 5);
-    assert_eq!(task.get_free_fd(), Some(1));
-    assert_eq!(task.get_free_fd_from(5), Some(6));
+    let low_fd = task
+        .dup_fd(source_fd, false)
+        .expect("skipped low fd should remain allocatable");
+    assert_eq!(low_fd, 1);
+    let next_high_fd = task
+        .dup_fd_from(source_fd, 5, false)
+        .expect("next lower-bound fd allocation should succeed");
+    assert_eq!(next_high_fd, 6);
 
     let exact_fd = task
         .dup2_fd(source_fd, 2)
         .expect("dup2 exact fd allocation should succeed");
     assert_eq!(exact_fd, 2);
-    assert_eq!(task.get_free_fd_from(2), Some(3));
+    let next_exact_fd = task
+        .dup_fd_from(source_fd, 2, false)
+        .expect("next exact-range fd allocation should succeed");
+    assert_eq!(next_exact_fd, 3);
 
     assert_eq!(task.dup2_fd(source_fd, high_fd), Ok(high_fd));
     task.close_fd(high_fd)
@@ -445,8 +454,11 @@ fn fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool: &FramePool) 
     assert_eq!(task.dup_fd_from(source_fd, high_fd, false), Ok(high_fd));
 
     let _ = task.close_fd(source_fd);
+    let _ = task.close_fd(low_fd);
     let _ = task.close_fd(exact_fd);
+    let _ = task.close_fd(next_exact_fd);
     let _ = task.close_fd(high_fd);
+    let _ = task.close_fd(next_high_fd);
 }
 
 // AGENT: closing a watched fd must remove the old epoll interest and cancel its

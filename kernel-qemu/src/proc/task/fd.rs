@@ -30,11 +30,6 @@ impl FdTable {
         Ok(Self { entries, allocator })
     }
 
-    // AGENT: expose a non-mutating lower-bound lookup for fd compatibility APIs.
-    fn get_free_from(&self, start: usize) -> Option<usize> {
-        self.allocator.peek_from(start)
-    }
-
     // AGENT: allocate the lowest descriptor at or above an ABI lower bound.
     fn reserve_from(&mut self, start: usize) -> Result<usize, &'static str> {
         self.allocator.allocate_from(start).ok_or("emfile")
@@ -44,11 +39,7 @@ impl FdTable {
     // allocator snapshot for the child process.
     fn fork_copy(&self) -> Self {
         Self {
-            entries: self
-                .entries
-                .iter()
-                .map(|(&fd, entry)| (fd, entry.fork_dup()))
-                .collect(),
+            entries: self.entries.clone(),
             allocator: self.allocator.clone(),
         }
     }
@@ -173,16 +164,6 @@ pub(super) fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str
 
 // AGENT: implement the complete Task fd-table surface in the descriptor module.
 impl Task {
-    // AGENT: peek at the lowest free descriptor without scanning occupied slots.
-    pub fn get_free_fd(&self) -> Option<usize> {
-        self.get_free_fd_from(0)
-    }
-
-    // AGENT: find a free descriptor at or above an F_DUPFD-style lower bound.
-    pub fn get_free_fd_from(&self, start: usize) -> Option<usize> {
-        self.process.fd_table.lock().unwrap().get_free_from(start)
-    }
-
     // AGENT: install a new entry with a fresh shared open-file description.
     pub fn add_file(&self, fl: FLike) -> Result<usize, &'static str> {
         self.add_file_with_cloexec(fl, false)
