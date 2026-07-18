@@ -226,7 +226,6 @@ fn wait_token_block_current_keeps_placeholder_stack(pool: &FramePool) {
     assert_eq!(task.sched_state(), TaskRunState::Sleeping);
     assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(task.id()));
     assert_eq!(kernel.run_queue.pick_next(), Some(peer.id()));
-    assert!(!kernel.run_queue.yield_current(task.sched_policy()));
 
     clear_wait_token_state();
 }
@@ -264,7 +263,6 @@ fn wait_token_tick_leaves_sleeping_current_parked(pool: &FramePool) {
     let task = kernel.cur_task(0).expect("init task should be current");
     let peer = kernel.tasks.spawn().expect("spawn peer task");
     task.set_sched_state(TaskRunState::Sleeping);
-    kernel.run_queue.clear_current();
     peer.set_sched_state(TaskRunState::Runnable);
     kernel.run_queue.enqueue(peer.id(), peer.sched_policy());
 

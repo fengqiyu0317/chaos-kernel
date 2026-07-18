@@ -25,17 +25,17 @@ impl SchedulePolicy {
     }
 }
 
-// AGENT: RunQueue keeps only runnable/current task state.
+// AGENT: keep only runnable task ids and their scheduling-policy snapshots;
+// Kernel::cpus is the single authority for the currently executing task.
 pub struct RunQueue {
     pub queue: Mutex<Vec<(usize, SchedulePolicy)>>,
-    pub current: Mutex<Option<usize>>,
 }
 
 impl RunQueue {
+    // AGENT: initialize an empty runnable set without mirroring Kernel::cpus.
     pub fn new() -> Self {
         Self {
             queue: Mutex::new(Vec::new()),
-            current: Mutex::new(None),
         }
     }
 
@@ -90,14 +90,6 @@ impl RunQueue {
         q.sort_by(|a, b| Self::cmp_priority(&a.1, &b.1));
     }
 
-    pub fn set_current(&self, id: usize) {
-        *self.current.lock().unwrap() = Some(id);
-    }
-
-    pub fn clear_current(&self) {
-        *self.current.lock().unwrap() = None;
-    }
-
     pub fn len(&self) -> usize {
         self.queue.lock().unwrap().len()
     }
@@ -114,17 +106,6 @@ impl RunQueue {
             }
         }
         q.len() < before
-    }
-
-    pub fn yield_current(&self, policy: SchedulePolicy) -> bool {
-        let cur = self.current.lock().unwrap().take();
-        match cur {
-            Some(id) => {
-                self.enqueue(id, policy);
-                true
-            }
-            None => false,
-        }
     }
 }
 

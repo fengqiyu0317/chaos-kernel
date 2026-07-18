@@ -10,11 +10,9 @@ impl Kernel {
             .tasks
             .spawn_root()
             .expect("proc_init should create the single init task");
-        let rid = root.id();
         root.set_sched_state(TaskRunState::Running);
         root.reset_slice();
         self.set_cur(0, Some(root));
-        self.run_queue.set_current(rid);
     }
 
     pub fn do_exit_current(&self, cpu: usize, code: usize) -> Result<(), &'static str> {
@@ -85,7 +83,6 @@ impl Kernel {
                 .as_ref()
                 .is_some_and(|current| current.id() == task_id)
         {
-            self.run_queue.clear_current();
             self.set_cur(cpu, None);
             self.schedule_next_runnable(cpu);
         }

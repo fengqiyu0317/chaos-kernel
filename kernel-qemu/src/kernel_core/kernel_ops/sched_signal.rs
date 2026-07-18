@@ -64,9 +64,8 @@ impl Kernel {
     }
 
     // AGENT: common QEMU wait-token block path. This records the task as
-    // sleeping and removes it from runnable/current scheduler state; the later
-    // context-switch milestone will make this transition actually suspend the
-    // current kernel stack.
+    // sleeping and removes it from the runnable queue; the temporary spin bridge
+    // deliberately leaves Kernel::cpus pointing at the still-executing stack.
     pub(crate) fn block_task_for_wait(&self, task_id: usize) -> bool {
         let Some(task) = self.tasks.find(task_id) else {
             return false;
@@ -82,9 +81,6 @@ impl Kernel {
         }
         task.set_sched_state(TaskRunState::Sleeping);
         self.run_queue.remove(task_id);
-        if self.is_current_task_on_cpu0(task_id) {
-            self.run_queue.clear_current();
-        }
         true
     }
 
@@ -105,7 +101,6 @@ impl Kernel {
             self.run_queue.remove(task_id);
             task.set_sched_state(TaskRunState::Running);
             task.reset_slice();
-            self.run_queue.set_current(task_id);
             return true;
         }
 
@@ -231,7 +226,6 @@ impl Kernel {
                 SignalDeliveryAction::Stop => {
                     task.set_sched_state(TaskRunState::Runnable);
                     self.set_process_job_stopped(&task, true);
-                    self.run_queue.clear_current();
                     self.set_cur(cpu, None);
                     self.schedule_next_runnable(cpu);
                     break;
@@ -317,12 +311,10 @@ impl Kernel {
                     if self.run_queue.len() == 0 {
                         t.reset_slice();
                     } else {
-                        // AGENT: A ready peer gets the CPU at slice expiry;
-                        // reuse the run-queue current marker for the requeue.
+                        // AGENT: A ready peer gets the CPU at slice expiry; the
+                        // live Task already supplies the id needed for requeue.
                         t.set_sched_state(TaskRunState::Runnable);
-                        if !self.run_queue.yield_current(t.sched_policy()) {
-                            self.run_queue.enqueue(t.id(), t.sched_policy());
-                        }
+                        self.run_queue.enqueue(t.id(), t.sched_policy());
                         self.schedule_next_runnable(cpu);
                     }
                 }
@@ -334,6 +326,8 @@ impl Kernel {
         }
     }
 
+    // AGENT: select from the runnable set and publish the winner only through
+    // Kernel::set_cur(), avoiding a second current-task marker in RunQueue.
     pub(crate) fn schedule_next_runnable(&self, cpu: usize) -> bool {
         if cpu != 0 {
             return false;
@@ -348,7 +342,6 @@ impl Kernel {
                     task.set_sched_state(TaskRunState::Running);
                     task.reset_slice();
                     self.set_cur(cpu, Some(task));
-                    self.run_queue.set_current(id);
                     self.deliver_pending_signals(cpu);
                     return true;
                 }
@@ -359,7 +352,6 @@ impl Kernel {
             }
         }
         self.set_cur(cpu, None);
-        self.run_queue.clear_current();
         false
     }
 }
