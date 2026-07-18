@@ -27,7 +27,7 @@
 //   and SpinLock<T> are available for short non-blocking critical sections.
 // - EvFlag::WRITABLE/ERROR.
 // - ConditionWait's generic condition-check helpers.
-// - WaitToken::id() and SocketState.
+// - SocketState.
 // AGENT TODO: KernLock is still a simulator recursive spin lock, not full
 // real-kernel locking: it lacks fairness, blocking wait, preemption control,
 // and interrupt masking semantics.
