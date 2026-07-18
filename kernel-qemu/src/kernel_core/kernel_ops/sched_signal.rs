@@ -27,6 +27,26 @@ impl Kernel {
         self.enqueue_task_if_ready(task);
     }
 
+    // AGENT: apply one job-control transition to the whole thread group while
+    // keeping each thread's live scheduler state as the resume source of truth.
+    fn set_process_job_stopped(&self, task: &Arc<Task>, stopped: bool) {
+        task.set_job_stopped(stopped);
+        let thread_ids = task.process.threads.lock().unwrap().clone();
+        for thread_id in thread_ids {
+            let Some(thread) = self.tasks.find(thread_id) else {
+                continue;
+            };
+            if !Arc::ptr_eq(&thread.process, &task.process) {
+                continue;
+            }
+            if stopped {
+                self.run_queue.remove(thread_id);
+            } else if !thread.done() {
+                self.enqueue_task_if_ready(&thread);
+            }
+        }
+    }
+
     // AGENT: common QEMU wait-token wake path. Event, futex, epoll, and timer
     // wakeups should make a sleeping task runnable through the run queue instead
     // of unparking a host thread.
@@ -126,15 +146,12 @@ impl Kernel {
         }
         match signo {
             SIGCONT => {
-                task.set_job_stopped(false);
-                self.enqueue_task_if_ready(task);
+                self.set_process_job_stopped(task, false);
             }
             SIGKILL => {
-                task.set_job_stopped(false);
+                self.set_process_job_stopped(task, false);
                 if task.sched_state() == TaskRunState::Sleeping {
                     self.make_task_runnable(task);
-                } else {
-                    self.enqueue_task_if_ready(task);
                 }
             }
             _ if task.is_job_stopped() => {}
@@ -178,6 +195,8 @@ impl Kernel {
         self.deliver_pending_signals_inner(cpu, Some(interrupted)).1
     }
 
+    // AGENT: deliver default stop actions as process-wide run-queue barriers
+    // without overwriting the other threads' underlying scheduler states.
     fn deliver_pending_signals_inner(
         &self,
         cpu: usize,
@@ -197,9 +216,8 @@ impl Kernel {
             match sig.action.resolve(sig.signo) {
                 SignalDeliveryAction::Ignore | SignalDeliveryAction::Continue => continue,
                 SignalDeliveryAction::Stop => {
-                    task.set_job_stopped(true);
                     task.set_sched_state(TaskRunState::Runnable);
-                    self.run_queue.remove(task.id());
+                    self.set_process_job_stopped(&task, true);
                     self.run_queue.clear_current();
                     self.set_cur(cpu, None);
                     self.schedule_next_runnable(cpu);

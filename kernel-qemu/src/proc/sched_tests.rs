@@ -20,7 +20,7 @@ pub fn run_all(pool: &FramePool) {
     default_signal_actions_follow_linux_classes();
     ignored_signal_is_neither_queued_nor_woken(pool);
     changing_to_ignored_action_discards_pending_signal(pool);
-    signal_stop_uses_job_stopped_flag(pool);
+    signal_stop_and_sigcont_cover_thread_group(pool);
     sigcont_resumes_stopped_task_without_resuming_for_plain_signal(pool);
     sigcont_keeps_sleeping_task_asleep_until_wait_wakeup(pool);
     signal_handler_uses_supplied_interrupted_frame(pool);
@@ -274,22 +274,44 @@ fn kernel_boost_updates_task_policy_and_queue_cache(pool: &FramePool) {
     assert_eq!(kernel.run_queue.pick_next(), Some(first.id()));
 }
 
-// AGENT: SIGSTOP is process-level job-control state, not a scheduler run-state
-// variant; the stopped task stays runnable but cannot be queued.
-fn signal_stop_uses_job_stopped_flag(pool: &FramePool) {
+// AGENT: SIGSTOP removes every thread in the process from the run queue, while
+// SIGCONT requeues every still-runnable thread rather than only its signal target.
+fn signal_stop_and_sigcont_cover_thread_group(pool: &FramePool) {
     ensure_timer_wheel();
 
     let kernel = Kernel::new(pool.clone());
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init task should be current");
+    let thread = kernel
+        .tasks
+        .clone_thread(&task, 0x8000_0000, 0)
+        .expect("thread clone should succeed");
+    thread.set_sched_state(TaskRunState::Runnable);
+    kernel.run_queue.enqueue(thread.id(), thread.sched_policy());
 
     kernel.send_signal_to_task(&task, SIGSTOP as i32, -1);
 
     assert_eq!(kernel.deliver_pending_signals(0), 1);
     assert!(task.is_job_stopped());
+    assert!(thread.is_job_stopped());
     assert_eq!(task.sched_state(), TaskRunState::Runnable);
+    assert_eq!(thread.sched_state(), TaskRunState::Runnable);
     assert!(kernel.cur_task(0).is_none());
     assert_eq!(kernel.run_queue.pick_next(), None);
+
+    kernel.send_signal_to_task(&task, SIGCONT as i32, -1);
+
+    assert!(!task.is_job_stopped());
+    assert!(!thread.is_job_stopped());
+    let mut resumed = [
+        kernel.run_queue.dequeue().expect("first resumed task").0,
+        kernel.run_queue.dequeue().expect("second resumed task").0,
+    ];
+    resumed.sort_unstable();
+    let mut expected = [task.id(), thread.id()];
+    expected.sort_unstable();
+    assert_eq!(resumed, expected);
+    assert!(kernel.run_queue.dequeue().is_none());
 }
 
 // AGENT: ordinary pending signals stay queued for a stopped task; SIGCONT is
