@@ -290,7 +290,7 @@ impl Kernel {
         }
     }
 
-    // AGENT: CPU0 owns logical timer progression; other CPUs only update CLK_ALL.
+    // AGENT: CPU0 owns global logical-clock and timer-wheel progression.
     pub fn schedule_tick(&self, cpu: usize) {
         dtk(cpu);
         if cpu == 0 {

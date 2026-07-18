@@ -42,7 +42,6 @@ pub const MAX_CPU: usize = 8;
 pub const KSTK_SZ: usize = 0x4000;
 pub const USR_STK_OFF: usize = 0x7FFF_0000;
 pub const USR_STK_SZ: usize = 0x10000;
-pub const USEC_TICK: usize = 10_000; // AGENT: 100Hz logical clock, one tick is 10ms.
 pub const FOLLOW_LIM: usize = 3;
 
 pub const F_DUPFD: usize = 0;

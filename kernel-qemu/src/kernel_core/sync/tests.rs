@@ -9,7 +9,7 @@ use crate::kernel::kernel_core::{
 };
 use crate::kernel::{
     epoll_ready_events, EpCtlOp, EpData, EpEvent, EpInst, FLike, FramePool, Kernel, PipeNode,
-    TaskRunState, CLK, CLK_ALL, SIGUSR1,
+    TaskRunState, CLK, SIGUSR1,
 };
 
 // AGENT: include BlockCache fixed-payload regressions and use the boot-discovered
@@ -52,7 +52,6 @@ fn reset_wait_token_state(task_id: usize) {
     WAIT_KERNEL.store(0, Ordering::Release);
     set_current_task_id(Some(task_id));
     CLK.store(0, Ordering::Relaxed);
-    CLK_ALL.store(0, Ordering::Relaxed);
     ensure_timer_wheel();
     *global_timer_wheel().lock() = TimerWheel::new();
 }
