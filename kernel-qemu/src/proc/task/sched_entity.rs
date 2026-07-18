@@ -2,7 +2,7 @@
 use super::*;
 
 // AGENT: keep this enum limited to scheduler placement; job-control stop state
-// lives separately on ProcessState so signal semantics do not pollute run state.
+// lives separately on Process so signal semantics do not pollute run state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskRunState {
     Runnable,

@@ -326,7 +326,7 @@ QEMU 侧的上下文所有权按下列边界固定，不再保留从 simulator
 
 - 用户地址空间已经由真实物理页和 Sv39 页表承载。
 - QEMU 侧已经能启动用户 init，并能通过 trap frame / `sret` 返回用户态。
-- `Task` / `ProcessState`、run queue、当前 task、`exit` / `wait4` 基础路径已经迁入。
+- QEMU 侧一等 `Process` / `Task`、run queue、当前 task、`exit` / `wait4` 基础路径已经迁入；其中 `Process` 承载 `kernel-sim::ProcessState` 的进程级语义，`Task` 只承载线程执行状态。
 - fd table、open-file-description、基础 `read` / `write` 后端和用户缓冲区复制已经稳定。
 - timer / wait 后端已经能由真实 timer interrupt 推进，阻塞与超时边界可观察。
 
@@ -349,7 +349,7 @@ QEMU 侧的上下文所有权按下列边界固定，不再保留从 simulator
 
 1. 先在 `kernel-sim` 定义 checkpoint / restore 的可观察语义和 smoke 回归。
 2. 抽取 image header、section tag、错误码、对齐 helper 等纯数据结构到 `kernel-common/` 或迁移模块，保持 `no_std` / `alloc` 可用。
-3. 在 `kernel-qemu` 中新增 checkpoint 模块时，从已迁入的 `Task`、`ProcessState`、`AddrSpace`、fd table 和 timer state 读取状态，不绕过这些语义源另写平行状态。
+3. 在 `kernel-qemu` 中新增 checkpoint 模块时，从已迁入的 `Task`、`Process`、`AddrSpace`、fd table 和 timer state 读取状态，不绕过这些语义源另写平行状态。
 4. restore 先允许创建新 pid 和新地址空间，重放用户页、VMA、trap frame 和基础 fd 状态后放回 run queue。
 5. 验收同时保留 `kernel-sim` smoke 和 QEMU smoke：QEMU 侧至少覆盖 init 触发 checkpoint、修改用户内存或 fd offset 后 restore、恢复态继续执行并输出预期日志。
 
@@ -362,7 +362,7 @@ QEMU 侧的上下文所有权按下列边界固定，不再保留从 simulator
 - 本设计文档。
 - `TASK.md` 保留 M9 TODO。
 - 不改 `kernel-sim` 行为。
-- 列出第一批直接迁入对象及对应源码/测试：syscall 最小集、`Task`/`ProcessState`、`AddrSpace`/ELF/user stack、fd table、timer tick。
+- 列出第一批直接迁入对象及对应源码/测试：syscall 最小集、`kernel-sim` 的 `Task`/`ProcessState` 语义及 QEMU 侧 `Task`/`Process` 承载、`AddrSpace`/ELF/user stack、fd table、timer tick。
 - 为每个对象记录复制目标路径、暂时不能编译的 host 依赖、第一轮替换方案。
 
 验证：
@@ -483,7 +483,7 @@ cargo test
 
 - `kernel-sim` 中的 checkpoint / restore 语义入口和 smoke 回归。
 - 可审查的 checkpoint image 格式：header、section、版本号、地址空间段、寄存器段、fd 段和 timer 段。
-- `kernel-qemu` 中从迁移后的 `Task` / `ProcessState` / `AddrSpace` / fd table 导出 image 的路径。
+- `kernel-qemu` 中从迁移后的 `Task` / `Process` / `AddrSpace` / fd table 导出 image 的路径。
 - `kernel-qemu` 中 restore 到新 task / 新地址空间 / 新 run queue entry 的路径。
 - 明确拒绝不支持状态的错误返回，例如多线程、正在阻塞的 futex / epoll、不可序列化设备 fd。
 

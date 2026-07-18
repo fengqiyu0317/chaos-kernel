@@ -10,8 +10,7 @@ impl Kernel {
         trap_frame: SavedTrapFrame,
     ) -> Result<CheckpointImage, &'static str> {
         let task = self.cur_task(cpu).ok_or("esrch")?;
-        let thread_count =
-            u32::try_from(task.process.threads.lock().unwrap().len()).map_err(|_| "enotsup")?;
+        let thread_count = u32::try_from(task.process.thread_count()).map_err(|_| "enotsup")?;
         if thread_count != 1 {
             return Err("enotsup");
         }

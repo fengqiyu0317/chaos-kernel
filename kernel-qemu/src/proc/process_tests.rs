@@ -13,11 +13,13 @@ pub fn run_all(pool: &FramePool) {
     task_spawn_reports_kernel_stack_exhaustion();
     spawn_root_creates_single_pid_one_init(pool);
     spawn_root_rejects_nonempty_task_table(pool);
-    register_rejects_duplicate_pid_without_replacing_task(pool);
+    process_index_keeps_task_and_process_identity_separate(pool);
     pgid_group_keeps_zombie_members_until_reap(pool);
     job_control_stays_authoritative_across_process_transitions(pool);
     reap_rejects_live_process(pool);
     fork_copies_complete_user_frame(pool);
+    fork_from_nonleader_attaches_process_parent(pool);
+    reparent_children_uses_init_process(pool);
     clone_thread_copies_caller_context_and_shares_process(pool);
     reap_zombie_process_removes_thread_group_once(pool);
     proc_init_push_at_writes_user_stack(pool);
@@ -260,10 +262,14 @@ fn spawn_root_creates_single_pid_one_init(pool: &FramePool) {
     let init = table.spawn_root().expect("first root spawn should succeed");
 
     assert_eq!(init.id(), INIT_PID);
-    assert_eq!(init.process_pid(), INIT_PID);
-    assert_eq!(table.root.lock().unwrap().as_ref().map(|t| t.id()), Some(1));
+    assert_eq!(init.process.pid(), INIT_PID);
+    assert_eq!(
+        table.init_process().as_ref().map(|process| process.pid()),
+        Some(INIT_PID)
+    );
     assert_eq!(table.spawn_root().err(), Some("eexist"));
     assert_eq!(table.count(), 1);
+    assert_eq!(table.process_count(), 1);
 }
 
 // AGENT: spawn_root must not silently overwrite root after another standalone
@@ -274,23 +280,29 @@ fn spawn_root_rejects_nonempty_task_table(pool: &FramePool) {
 
     assert_eq!(first.id(), INIT_PID);
     assert_eq!(table.spawn_root().err(), Some("ebusy"));
-    assert!(table.root.lock().unwrap().is_none());
+    assert!(table.init_process().is_none());
     assert_eq!(table.count(), 1);
+    assert_eq!(table.process_count(), 1);
 }
 
-// AGENT: duplicate pid registration must fail before replacing the published
-// task-table entry or corrupting process-group membership.
-fn register_rejects_duplicate_pid_without_replacing_task(pool: &FramePool) {
+// AGENT: prove tid and pid indexes resolve distinct entity types while sharing
+// the exact Process allocation owned by the registered Task.
+fn process_index_keeps_task_and_process_identity_separate(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
     let first = table.spawn().expect("standalone spawn should work");
-    let duplicate = Task::make(first.id(), pool).expect("duplicate task stack should allocate");
-
-    assert_eq!(table.register(&duplicate, first.id()), Err("eexist"));
     assert!(Arc::ptr_eq(&table.find(first.id()).unwrap(), &first));
+    assert!(Arc::ptr_eq(
+        &table.find_process(first.process.pid()).unwrap(),
+        &first.process
+    ));
+    assert!(Arc::ptr_eq(
+        &table.process_of_tid(first.id()).unwrap(),
+        &first.process
+    ));
 
     let group = table.pgid_group(first.id() as i32);
     assert_eq!(group.len(), 1);
-    assert!(Arc::ptr_eq(&group[0], &first));
+    assert!(Arc::ptr_eq(&group[0], &first.process));
 }
 
 // AGENT: process-group lookup reports membership, including zombies that remain
@@ -299,32 +311,32 @@ fn pgid_group_keeps_zombie_members_until_reap(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
     let task = table.spawn().expect("standalone spawn should work");
     let pgid = table
-        .process_pgid(task.process_pid())
+        .process_pgid(task.process.pid())
         .expect("spawned task should have job-control membership");
 
-    assert!(task.exit_proc(ExitReason::Code(0)));
+    assert!(task.process.exit_once(ExitReason::Code(0)));
 
     let group = table.pgid_group(pgid);
     assert_eq!(group.len(), 1);
-    assert!(Arc::ptr_eq(&group[0], &task));
+    assert!(Arc::ptr_eq(&group[0], &task.process));
 }
 
 // AGENT: prove fork, setpgid-style moves, setsid, and reap update the single
-// job-control registry without relying on mirrored ProcessState fields.
+// job-control registry without relying on mirrored Process fields.
 fn job_control_stays_authoritative_across_process_transitions(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
     let parent = table.spawn_root().expect("root spawn should work");
-    let parent_pid = parent.process_pid();
+    let parent_pid = parent.process.pid();
 
     let moved_child = table
         .fork_task(&parent, pool)
         .expect("first child fork should work");
-    let moved_pid = moved_child.process_pid();
+    let moved_pid = moved_child.process.pid();
     assert_eq!(table.process_pgid(moved_pid), Some(parent_pid as i32));
     assert_eq!(table.process_sid(moved_pid), Some(parent_pid));
 
     table
-        .move_process_to_group(&moved_child, moved_pid as i32)
+        .move_process_to_group(&moved_child.process, moved_pid as i32)
         .expect("child should create a group in its inherited session");
     assert_eq!(table.process_pgid(moved_pid), Some(moved_pid as i32));
     assert_eq!(table.process_sid(moved_pid), Some(parent_pid));
@@ -332,12 +344,15 @@ fn job_control_stays_authoritative_across_process_transitions(pool: &FramePool) 
     let session_child = table
         .fork_task(&parent, pool)
         .expect("second child fork should work");
-    let session_pid = session_child.process_pid();
-    assert_eq!(table.start_new_session(&session_child), Ok(session_pid));
+    let session_pid = session_child.process.pid();
+    assert_eq!(
+        table.start_new_session(&session_child.process),
+        Ok(session_pid)
+    );
     assert_eq!(table.process_pgid(session_pid), Some(session_pid as i32));
     assert_eq!(table.process_sid(session_pid), Some(session_pid));
 
-    assert!(moved_child.exit_proc(ExitReason::Code(0)));
+    assert!(moved_child.process.exit_once(ExitReason::Code(0)));
     assert_eq!(table.reap(moved_pid), Ok(()));
     assert_eq!(table.process_pgid(moved_pid), None);
     assert!(table.pgid_group(moved_pid as i32).is_empty());
@@ -349,8 +364,9 @@ fn reap_rejects_live_process(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
     let task = table.spawn().expect("standalone spawn should work");
 
-    assert_eq!(table.reap(task.id()), Err("ebusy"));
+    assert_eq!(table.reap(task.process.pid()), Err("ebusy"));
     assert!(table.find(task.id()).is_some());
+    assert!(table.find_process(task.process.pid()).is_some());
     assert_eq!(table.count(), 1);
 }
 
@@ -383,6 +399,59 @@ fn fork_copies_complete_user_frame(pool: &FramePool) {
     assert_eq!(child_frame.sepc, source.sepc);
 }
 
+// AGENT: fork from a cloned thread must attach the child Process to the shared
+// parent Process, never to the calling thread as a family identity.
+fn fork_from_nonleader_attaches_process_parent(pool: &FramePool) {
+    let table = TaskTable::new(pool.clone());
+    let parent = table.spawn_root().expect("root spawn should work");
+    let thread = table
+        .clone_thread(&parent, 0x8000_0000, 0x123)
+        .expect("thread clone should succeed");
+    let child = table
+        .fork_task(&thread, pool)
+        .expect("fork from nonleader should succeed");
+
+    let linked_parent = child
+        .process
+        .parent()
+        .expect("child process should retain a live parent link");
+    assert!(Arc::ptr_eq(&linked_parent, &parent.process));
+    assert!(Arc::ptr_eq(&thread.process, &parent.process));
+    assert!(!Arc::ptr_eq(&child.process, &parent.process));
+    let children = parent.process.children_snapshot();
+    assert_eq!(children.len(), 1);
+    assert!(Arc::ptr_eq(&children[0], &child.process));
+}
+
+// AGENT: orphan adoption must move Process children to init and replace their
+// weak parent links without retaining the exiting process as an owner.
+fn reparent_children_uses_init_process(pool: &FramePool) {
+    let table = TaskTable::new(pool.clone());
+    let init = table.spawn_root().expect("root spawn should work");
+    let parent = table
+        .fork_task(&init, pool)
+        .expect("parent process fork should work");
+    let child = table
+        .fork_task(&parent, pool)
+        .expect("child process fork should work");
+
+    table.reparent_children_to_init(&parent.process);
+
+    assert!(parent.process.has_no_children());
+    let adopted_parent = child
+        .process
+        .parent()
+        .expect("orphan should be adopted by init");
+    assert!(Arc::ptr_eq(&adopted_parent, &init.process));
+    let init_children = init.process.children_snapshot();
+    assert!(init_children
+        .iter()
+        .any(|process| Arc::ptr_eq(process, &parent.process)));
+    assert!(init_children
+        .iter()
+        .any(|process| Arc::ptr_eq(process, &child.process)));
+}
+
 // AGENT: multi-threaded zombies are collected at process granularity, while all
 // same-process task-table entries disappear in the single reap step.
 fn reap_zombie_process_removes_thread_group_once(pool: &FramePool) {
@@ -395,13 +464,20 @@ fn reap_zombie_process_removes_thread_group_once(pool: &FramePool) {
         .clone_thread(&child, 0x8000_0000, 0)
         .expect("thread clone should succeed");
 
-    assert!(child.exit_proc(ExitReason::Code(7)));
-    assert_eq!(table.zombie_tasks(), vec![child.id()]);
-    assert_eq!(table.reap(thread.id()), Ok(()));
+    let child_pid = child.process.pid();
+    let child_process = Arc::downgrade(&child.process);
+    assert!(child.process.exit_once(ExitReason::Code(7)));
+    assert_eq!(table.zombie_processes(), vec![child_pid]);
+    assert_eq!(table.reap(thread.id()), Err("esrch"));
+    assert_eq!(table.reap(child_pid), Ok(()));
 
     assert!(table.find(child.id()).is_none());
     assert!(table.find(thread.id()).is_none());
-    assert!(parent.process.subtasks.lock().unwrap().is_empty());
+    assert!(table.find_process(child_pid).is_none());
+    assert!(parent.process.has_no_children());
+    drop(thread);
+    drop(child);
+    assert!(child_process.upgrade().is_none());
 }
 
 // AGENT: clone_thread starts from the caller thread context, then applies the
@@ -430,7 +506,7 @@ fn clone_thread_copies_caller_context_and_shares_process(pool: &FramePool) {
         .expect("thread clone should succeed");
 
     assert!(Arc::ptr_eq(&task.process, &thread.process));
-    assert!(task.process.threads.lock().unwrap().contains(&thread.id()));
+    assert!(task.process.has_thread(thread.id()));
     assert_eq!(*thread.sig_mask.lock().unwrap(), sig_mask);
     let cloned = thread
         .snapshot_user_trap_frame()

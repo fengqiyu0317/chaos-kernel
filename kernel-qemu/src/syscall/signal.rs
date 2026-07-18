@@ -21,23 +21,23 @@ pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
     }
 
     let protected =
-        |tid: usize| (sig == SIGKILL as usize || sig == SIGSTOP as usize) && tid <= INIT_PID;
-    let send_one = |t: &Arc<Task>| -> bool {
-        if protected(t.id()) {
+        |pid: usize| (sig == SIGKILL as usize || sig == SIGSTOP as usize) && pid <= INIT_PID;
+    let send_one = |process: &Arc<Process>| -> bool {
+        if protected(process.pid()) {
             return false;
         }
-        if !t.done() && sig != 0 {
-            kernel.send_signal_to_task(t, sig as i32, -1);
+        if !process.is_exited() && sig != 0 {
+            kernel.send_signal_to_process(process, sig as i32, -1);
         }
         true
     };
-    let finish_many = |targets: Vec<Arc<Task>>| -> Result<usize, &'static str> {
+    let finish_many = |targets: Vec<Arc<Process>>| -> Result<usize, &'static str> {
         if targets.is_empty() {
             return Err("esrch");
         }
-        let sent = targets.iter().filter(|t| send_one(t)).count();
+        let sent = targets.iter().filter(|process| send_one(process)).count();
         if sent == 0 {
-            if targets.iter().any(|t| protected(t.id())) {
+            if targets.iter().any(|process| protected(process.pid())) {
                 Err("eperm")
             } else {
                 Err("esrch")
@@ -51,26 +51,25 @@ pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
         0 => {
             let cur = kernel.cur_task(0);
             if let Some(t) = cur {
-                let pgid = kernel.tasks.process_pgid(t.process_pid()).ok_or("esrch")?;
+                let pgid = kernel.tasks.process_pgid(t.process.pid()).ok_or("esrch")?;
                 finish_many(kernel.tasks.pgid_group(pgid))
             } else {
                 Err("esrch")
             }
         }
         -1 => {
-            let cur_id = kernel.cur_task(0).map(|t| t.id());
+            let cur_pid = kernel.cur_task(0).map(|task| task.process.pid());
             let targets = kernel
                 .tasks
-                .active_tasks()
+                .active_processes()
                 .into_iter()
-                .filter(|tid| Some(*tid) != cur_id)
-                .filter_map(|tid| kernel.tasks.find(tid))
+                .filter(|process| Some(process.pid()) != cur_pid)
                 .collect();
             finish_many(targets)
         }
-        p if p > 0 => match kernel.tasks.find(p as usize) {
-            Some(t) => {
-                if send_one(&t) {
+        p if p > 0 => match kernel.tasks.find_process(p as usize) {
+            Some(process) => {
+                if send_one(&process) {
                     Ok(0)
                 } else {
                     Err("eperm")

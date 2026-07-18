@@ -17,7 +17,7 @@ impl ProcessGroup {
     }
 }
 
-// AGENT: index both directions of job control under one lock so ProcessState no
+// AGENT: index both directions of job control under one lock so Process no
 // longer mirrors pgid and sid fields that can diverge from group membership.
 #[derive(Default)]
 pub(super) struct JobControl {

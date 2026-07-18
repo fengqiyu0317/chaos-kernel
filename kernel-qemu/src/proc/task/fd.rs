@@ -4,7 +4,7 @@ use super::*;
 
 // AGENT: keep descriptor entries and their allocation index behind one lock so
 // callers cannot update one side without preserving the other.
-pub(super) struct FdTable {
+pub(crate) struct FdTable {
     entries: BTreeMap<usize, FdEntry>,
     free: BTreeSet<usize>,
 }

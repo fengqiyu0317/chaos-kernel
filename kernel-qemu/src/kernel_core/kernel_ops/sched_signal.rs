@@ -31,7 +31,7 @@ impl Kernel {
     // keeping each thread's live scheduler state as the resume source of truth.
     fn set_process_job_stopped(&self, task: &Arc<Task>, stopped: bool) {
         task.set_job_stopped(stopped);
-        let thread_ids = task.process.threads.lock().unwrap().clone();
+        let thread_ids = task.process.thread_ids();
         for thread_id in thread_ids {
             let Some(thread) = self.tasks.find(thread_id) else {
                 continue;
@@ -133,8 +133,21 @@ impl Kernel {
         true
     }
 
-    // AGENT: central signal send path so pending-signal enqueue and scheduler
-    // wakeup stay together.
+    // AGENT: route process-directed signals through the process thread set so
+    // family and pid callers never need to store or rediscover a leader Task.
+    pub fn send_signal_to_process(&self, process: &Arc<Process>, signo: i32, sender_pid: isize) {
+        let target = process
+            .thread_ids()
+            .into_iter()
+            .filter_map(|tid| self.tasks.find(tid))
+            .find(|task| !task.done());
+        if let Some(target) = target {
+            self.send_signal_to_task(&target, signo, sender_pid);
+        }
+    }
+
+    // AGENT: keep thread-target selection, pending-signal enqueue, and scheduler
+    // wakeup together after a target Task has been selected.
     pub fn send_signal_to_task(&self, task: &Arc<Task>, signo: i32, sender_tid: isize) {
         if signo <= 0 || signo as u32 > NSIG {
             return;

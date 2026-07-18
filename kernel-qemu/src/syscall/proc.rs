@@ -133,24 +133,20 @@ pub(super) fn sys_wait4(
     Ok(pid)
 }
 
+// AGENT: return immutable Process identity rather than a leader-task id.
 pub(super) fn sys_getpid(kernel: &Kernel) -> Result<usize, &'static str> {
     let cur = kernel.cur_task(0);
     match cur {
-        Some(t) => Ok(t.process_pid()),
+        Some(t) => Ok(t.process.pid()),
         None => Ok(1),
     }
 }
 
+// AGENT: follow the weak process-family link without depending on a parent Task.
 pub(super) fn sys_getppid(kernel: &Kernel) -> Result<usize, &'static str> {
     let cur = kernel.cur_task(0);
     match cur {
-        Some(t) => {
-            let parent = t.process.parent.lock().unwrap();
-            match parent.as_ref() {
-                Some(p) => Ok(p.process_pid()),
-                None => Ok(0),
-            }
-        }
+        Some(t) => Ok(t.process.parent().map(|parent| parent.pid()).unwrap_or(0)),
         None => Ok(0),
     }
 }
@@ -161,24 +157,22 @@ pub(super) fn sys_setpgid(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize
     let pid = a0;
     let pgid = a1;
     let cur = kernel.cur_task(0).ok_or("esrch")?;
-    let caller_pid = cur.process_pid();
+    let caller_pid = cur.process.pid();
     let target_pid = if pid == 0 { caller_pid } else { pid };
     let new_pgid = if pgid == 0 { target_pid } else { pgid };
     if new_pgid > i32::MAX as usize {
         return Err("einval");
     }
-    let target = kernel.tasks.find(target_pid).ok_or("esrch")?;
+    let target = kernel.tasks.find_process(target_pid).ok_or("esrch")?;
     if target_pid != caller_pid {
-        let parent = target.process.parent.lock().unwrap();
-        let is_child = parent
-            .as_ref()
-            .map(|p| p.process_pid() == caller_pid)
+        let is_child = target
+            .parent()
+            .map(|parent| parent.pid() == caller_pid)
             .unwrap_or(false);
-        drop(parent);
         if !is_child {
             return Err("esrch");
         }
-        if target.process.did_exec.load(Ordering::SeqCst) {
+        if target.did_exec.load(Ordering::SeqCst) {
             return Err("eacces");
         }
     }
@@ -200,7 +194,7 @@ pub(super) fn sys_getpgid(kernel: &Kernel, a0: usize) -> Result<usize, &'static 
     let pid = a0;
     let cur = kernel.cur_task(0);
     let target = if pid == 0 {
-        cur.as_ref().map(|t| t.process_pid()).unwrap_or(0)
+        cur.as_ref().map(|t| t.process.pid()).unwrap_or(0)
     } else {
         pid
     };
@@ -219,7 +213,7 @@ pub(super) fn sys_getpgid(kernel: &Kernel, a0: usize) -> Result<usize, &'static 
 pub(super) fn sys_setsid(kernel: &Kernel) -> Result<usize, &'static str> {
     let cur = kernel.cur_task(0);
     if let Some(t) = cur {
-        kernel.tasks.start_new_session(&t)
+        kernel.tasks.start_new_session(&t.process)
     } else {
         Err("esrch")
     }

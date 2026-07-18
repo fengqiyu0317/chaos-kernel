@@ -27,34 +27,39 @@ impl Kernel {
     // thread/process resources, switch away from the dead current task, and
     // notify the parent with the child process id.
     pub(crate) fn exit_task(&self, cpu: usize, task: &Arc<Task>, reason: ExitReason) {
-        let thread_ids = task.process.threads.lock().unwrap().clone();
-        if !task.exit_proc(reason) {
+        let process = task.process.clone();
+        let thread_ids = process.thread_ids();
+        if !process.exit_once(reason) {
             return;
         }
 
-        let parent = task.process.parent.lock().unwrap().clone();
-        let child_pid = task.process_pid();
+        let parent = process.parent();
+        let child_pid = process.pid();
 
-        self.release_exit_thread_resources(task, thread_ids);
-        task.process.release_exit_resources();
-        self.tasks.reparent_children_to_init(task);
+        self.release_exit_thread_resources(task, &process, thread_ids);
+        process.release_exit_resources();
+        self.tasks.reparent_children_to_init(&process);
         self.switch_away_from_exited_current(cpu, task.id());
 
         if let Some(parent) = parent {
-            self.send_signal_to_task(&parent, SIGCHLD as i32, child_pid as isize);
+            self.send_signal_to_process(&parent, SIGCHLD as i32, child_pid as isize);
         }
     }
 
     // AGENT: release each same-process thread exactly once and detach it from
     // runnable scheduler state; the requested task is handled even if the thread
     // list was stale or incomplete.
-    fn release_exit_thread_resources(&self, task: &Arc<Task>, thread_ids: Vec<usize>) {
-        let process = task.process.clone();
+    fn release_exit_thread_resources(
+        &self,
+        task: &Arc<Task>,
+        process: &Arc<Process>,
+        thread_ids: Vec<usize>,
+    ) {
         let mut released_requested_task = false;
 
         for tid in thread_ids {
             if let Some(thread) = self.tasks.find(tid) {
-                if !Arc::ptr_eq(&thread.process, &process) {
+                if !Arc::ptr_eq(&thread.process, process) {
                     continue;
                 }
                 if thread.id() == task.id() {
@@ -89,7 +94,7 @@ impl Kernel {
     // AGENT: force-reap zombies for maintenance paths; normal wait4 handling
     // still goes through do_wait so parents can observe the wait status first.
     pub fn reclaim_zombies(&self) -> usize {
-        let zombies = self.tasks.zombie_tasks();
+        let zombies = self.tasks.zombie_processes();
         let mut count = 0;
         for id in zombies {
             self.run_queue.remove(id);
@@ -138,7 +143,7 @@ impl Kernel {
         target_pid: isize,
         options: usize,
     ) -> Result<(usize, usize), &'static str> {
-        let parent = self.tasks.find(parent_id).ok_or("esrch")?;
+        let parent = self.tasks.process_of_tid(parent_id).ok_or("esrch")?;
         let wnohang = (options & WAIT4_WNOHANG) != 0;
 
         loop {
@@ -175,10 +180,10 @@ impl Kernel {
     // separate so the control flow mirrors wait4's observable phases.
     fn find_waitable_child(
         &self,
-        parent: &Arc<Task>,
+        parent: &Arc<Process>,
         target_pid: isize,
     ) -> Result<Option<(usize, usize)>, &'static str> {
-        let children: Vec<Arc<Task>> = parent.process.subtasks.lock().unwrap().clone();
+        let children = parent.children_snapshot();
         if children.is_empty() {
             return Err("echild");
         }
@@ -190,8 +195,8 @@ impl Kernel {
             }
 
             matched = true;
-            if child.done() {
-                return Ok(Some((child.process_pid(), child.wait_status())));
+            if child.is_exited() {
+                return Ok(Some((child.pid(), child.wait_status())));
             }
         }
 
@@ -203,28 +208,33 @@ impl Kernel {
     }
 
     // AGENT: keep pid and process-group selection in one readable predicate.
-    fn child_matches_wait_target(&self, parent: &Task, child: &Task, target_pid: isize) -> bool {
+    fn child_matches_wait_target(
+        &self,
+        parent: &Process,
+        child: &Process,
+        target_pid: isize,
+    ) -> bool {
         match target_pid {
             -1 => true,
             0 => match (
-                self.tasks.process_pgid(child.process_pid()),
-                self.tasks.process_pgid(parent.process_pid()),
+                self.tasks.process_pgid(child.pid()),
+                self.tasks.process_pgid(parent.pid()),
             ) {
                 (Some(child_pgid), Some(parent_pgid)) => child_pgid == parent_pgid,
                 _ => false,
             },
-            pid if pid > 0 => child.process_pid() == pid as usize,
-            pgid => self.tasks.process_pgid(child.process_pid()) == Some((-pgid) as i32),
+            pid if pid > 0 => child.pid() == pid as usize,
+            pgid => self.tasks.process_pgid(child.pid()) == Some((-pgid) as i32),
         }
     }
 
     // AGENT: clear stale child-exit readiness before subscribing so a later
     // child exit changes the event bits and wakes this one-shot waiter.
-    fn prepare_child_wait(parent: &Arc<Task>) -> (WaitToken, usize) {
+    fn prepare_child_wait(parent: &Arc<Process>) -> (WaitToken, usize) {
         let token = WaitToken::current();
         let wake_token = token.clone();
         let sub_id = {
-            let mut ev = parent.process.ev.lock().unwrap();
+            let mut ev = parent.ev.lock().unwrap();
             ev.clear(EvFlag::CHILD_QUIT);
             ev.sub(
                 EvFlag::CHILD_QUIT,
@@ -239,7 +249,7 @@ impl Kernel {
 
     // AGENT: remove the one-shot subscription when wait4 returns or is
     // interrupted before the child-exit event fires.
-    fn cancel_child_wait(parent: &Arc<Task>, (_token, sub_id): (WaitToken, usize)) {
-        parent.process.ev.lock().unwrap().unsub(sub_id);
+    fn cancel_child_wait(parent: &Arc<Process>, (_token, sub_id): (WaitToken, usize)) {
+        parent.ev.lock().unwrap().unsub(sub_id);
     }
 }

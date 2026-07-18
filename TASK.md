@@ -43,6 +43,7 @@
 - 2026-06-27：`kernel-sim/src/kernel/core/sync.rs` 的 `KernLock` 已改为 owner-checked `leave(id)`，新增 `KernLockGuard` RAII 释放路径并收紧 `flag` / `holder` / `depth` 字段可见性；`Kernel::tick()` 和 `BlockCache::sync_all()` 已统一改走 `GKL.guard(id)`，新增 smoke 回归覆盖递归深度、非 owner 释放、未持锁释放和 `try_guard()`。
 - 2026-06-27：`kernel-sim/src/kernel/core/sync.rs` 的 `Spin` 已从裸 `AtomicBool` 改为私有 ticket-lock 状态，新增 `SpinGuard` RAII 释放、owner/depth 检查和 `SpinLock<T>`；`kernel-sim/src/kernel/core/current.rs` 负责维护由 `Kernel::set_cur()` 安装的 CPU-local current task id，避免 `Spin` 直接依赖全局 `Kernel`；`BlockCache`、`Channel`、runtime tick、`sys_close()` 已移除 `Spin.v` 直接访问，`BlockCache::fetch()` 不再持 chain 自旋锁执行 `thread::sleep()`，`Channel::recv()` 不再持自旋锁执行 `WaitToken::wait()`。
 - 2026-06-27：`kernel-sim/src/kernel/core/current.rs` 的 current-task TLS 存储从 `Cell<usize>` 调整为 `AtomicUsize` relaxed load/store，保持 host-thread 本地隔离；`kernel-sim/tests/smoke.rs` 为直接设置 current-task 的 Spin/SpinLock/BlockCache 低层测试增加串行锁，避免默认并行测试下固定 task id 与 helper thread 假设互相干扰。
+- 2026-07-18：`kernel-qemu` 已把共享 `ProcessState` 升格为一等 `Process`：PID 从构造时起不可变，`TaskTable` 分别维护 TID→`Task` 与 PID→`Process` 索引，父进程使用 `Weak<Process>`、子进程按 PID 强持有到 wait/reap；fork/clone/exit/wait/reap、进程组信号和孤儿接管均改走进程对象，`Task` 只保留线程现场、内核栈、信号 mask/frame 与调度状态。QEMU `proc`、`sched`、`sync` 自测均通过。
 - 2026-06-27：`kernel-sim/src/kernel/core/sync.rs` 的 `EvBus` 已新增基于 `WaitToken` 的等待者队列；顶层 `wait_ev()` 现在在持有 `EvBus` 锁时检查事件位并原子入队，`EvBus::change()` 在事件位变化后唤醒 mask 匹配的等待者，去掉了原先的 `thread::yield_now()` 忙等路径；新增 `ev_bus_wait_ev_returns_existing_event` / `ev_bus_wait_ev_wakes_on_matching_event` smoke 回归。剩余事件模型、epoll 接线和 callback 锁外分发债务见相邻 M8 TODO。
 - 2026-06-27：`kernel-sim` 的 pipe readiness 已接入 `EvBus::sub()` -> `EpInst::mark_ready()` 路径：`EvBus::sub()` 返回可取消订阅 id，`epoll_ctl(ADD/MOD/DEL)` 会为 pipe fd 注册/取消 readiness callback，`sys_epoll_wait()` 在无 ready fd 时睡入 `EpInst.waiters`，由 pipe 写入/关闭等状态变化唤醒；`PipeNode::poll()` 去掉重复锁定同一 mutex 的自锁风险。新增 `epoll_wait_wakes_when_pipe_becomes_readable` smoke 回归。
 - 2026-06-28：新增 `kernel-qemu/` 最小 QEMU 裸机承载层：独立 `riscv64gc-unknown-none-elf` crate、linker script、`entry.S`、`#![no_std]` / `#![no_main]`、panic handler、SBI console、SBI shutdown，以及 `tools/qemu-smoke.sh` 启动/关机输出检查；该阶段只提供运行环境，不引入 `kernel-sim` 业务语义。
@@ -496,15 +497,15 @@ cargo test --test pressure
 
 ### M9 `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
 
-- `[M3][M9][重要] TODO`: `kernel-qemu` 当前 `SYS_EXIT` 仍通过 `exit_task()` 释放同一 `ProcessState` 的全部线程，等价于进程级退出。后续应增加只终止当前 `Task` 的单线程退出路径，维护线程组存活计数，并仅在最后一个线程退出时提交进程级资源释放、父进程通知和 zombie 状态；完成该边界后，再随 `clone` / `set_tid_address` syscall 一并迁移 `clear_child_tid` 写零与 futex 唤醒语义。
-- `[M5][M9][重要] TODO`: 在 `kernel-qemu` 重新引入 `ProcessState.cwd` 前，先迁移完整的每进程工作目录语义：实现 `getcwd` / `chdir`，让 `openat`、`exec` 及其他路径 syscall 按 cwd 解析相对路径，并明确 fork 继承、exec 保留、挂载点与路径规范化边界；在这些语义接入前，不保留始终为 `/` 且无消费者的占位字段。
-- `[M6][M9][重要] TODO`: 在 `kernel-qemu` 重新引入 `ProcessState.sem_ctx` 前，先接入 System V semaphore syscall 与进程级 semid 句柄表；保持 fork 继承 semaphore set 引用但不继承 `SEM_UNDO` 累积量，exit 时应用 undo 并释放本地句柄，同时与 `Kernel.sem_store` 的全局对象生命周期对齐。
-- `[M6][M9][重要] TODO`: 在 `kernel-qemu` 重新引入 `ProcessState.shm_ctx` 前，先实现 `shmget` / `shmat` / `shmdt` / `shmctl` 及进程级附着表；记录 shm id、附着虚拟地址与全局 `Kernel.shm_store` segment 的关系，让 fork 继承附着、exit 解除附着，并通过 `AddrSpace` 的共享页映射保证多进程可见性。
+- `[M3][M9][重要] TODO`: `kernel-qemu` 当前 `SYS_EXIT` 仍通过 `exit_task()` 释放同一 `Process` 的全部线程，等价于进程级退出。后续应增加只终止当前 `Task` 的单线程退出路径，维护线程组存活计数，并仅在最后一个线程退出时提交进程级资源释放、父进程通知和 zombie 状态；完成该边界后，再随 `clone` / `set_tid_address` syscall 一并迁移 `clear_child_tid` 写零与 futex 唤醒语义。
+- `[M5][M9][重要] TODO`: 在 `kernel-qemu` 的 `Process` 中引入 `cwd` 前，先迁移完整的每进程工作目录语义：实现 `getcwd` / `chdir`，让 `openat`、`exec` 及其他路径 syscall 按 cwd 解析相对路径，并明确 fork 继承、exec 保留、挂载点与路径规范化边界；在这些语义接入前，不保留始终为 `/` 且无消费者的占位字段。
+- `[M6][M9][重要] TODO`: 在 `kernel-qemu` 的 `Process` 中引入 `sem_ctx` 前，先接入 System V semaphore syscall 与进程级 semid 句柄表；保持 fork 继承 semaphore set 引用但不继承 `SEM_UNDO` 累积量，exit 时应用 undo 并释放本地句柄，同时与 `Kernel.sem_store` 的全局对象生命周期对齐。
+- `[M6][M9][重要] TODO`: 在 `kernel-qemu` 的 `Process` 中引入 `shm_ctx` 前，先实现 `shmget` / `shmat` / `shmdt` / `shmctl` 及进程级附着表；记录 shm id、附着虚拟地址与全局 `Kernel.shm_store` segment 的关系，让 fork 继承附着、exit 解除附着，并通过 `AddrSpace` 的共享页映射保证多进程可见性。
 
 ### M10 QEMU 进程级 checkpoint / restore
 
 - `[M10][重要] TODO`: 在未来 QEMU 项目中设计并实现类似 CRIU 的进程级 checkpoint / restore；该能力应定义为 guest 内核中的 task/process 状态保存与恢复，不等同于 QEMU `savevm` / `loadvm` 这类整机虚拟机快照。
-- `[M10][重要] TODO`: checkpoint / restore 必须排在 M9 核心迁移之后推进；前置条件包括真实用户地址空间和 Sv39 页表、用户 trap frame / `sret` 返回路径、`Task` / `ProcessState` / run queue、fd table / open-file-description、基础 timer / wait 后端已经在 `kernel-qemu` 中稳定。
+- `[M10][重要] TODO`: checkpoint / restore 必须排在 M9 核心迁移之后推进；前置条件包括真实用户地址空间和 Sv39 页表、用户 trap frame / `sret` 返回路径、`Task` / `Process` / run queue、fd table / open-file-description、基础 timer / wait 后端已经在 `kernel-qemu` 中稳定。
 - `[M10][重要] TODO`: 第一版范围限制为单进程、单线程、syscall 安全点或显式 quiescent point checkpoint；保存 trap frame、用户寄存器、`sepc` / `sp`、VMA 列表、匿名用户页内容、brk / stack、基础 fd entry、open-file-description offset / flags，以及必要的 timer deadline。
 - `[M10][普通] TODO`: 第一版 restore 可以创建新 pid，不强求原 pid 复用；复杂 pid namespace、父子关系重建、跨线程组恢复、阻塞中的 futex / epoll wait、socket、TTY、namespace、cgroup、seccomp、ptrace、credential / capability 完整恢复全部后置。
 - `[M10][普通] TODO`: checkpoint image 格式应优先抽成 `kernel-common/` 可复用的 `no_std` / `alloc` 纯数据结构和序列化常量；不得把 host thread、host lock、host filesystem、`Arc<Mutex<Vec<u8>>>` 模拟页面或 QEMU trap live state 抽进共享层。

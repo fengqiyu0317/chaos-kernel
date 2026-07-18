@@ -4,7 +4,7 @@ use super::*;
 use crate::trap::TrapFrame;
 
 // AGENT: centralize signal operations whose mutable state belongs to one Task
-// or its shared ProcessState rather than to the Kernel scheduler.
+// or its shared Process rather than to the Kernel scheduler.
 impl Task {
     // AGENT: enqueue a non-duplicated standard pending signal for this process.
     pub(crate) fn enqueue_signal(&self, signo: i32, sender_tid: isize) -> bool {

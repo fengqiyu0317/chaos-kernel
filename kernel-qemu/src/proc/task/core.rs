@@ -4,10 +4,10 @@ use super::*;
 use crate::trap::TrapFrame;
 
 // AGENT: represent one schedulable thread with an immutable id and link it to
-// process-wide state; executable identity lives in ProcessState::exec_path.
+// a first-class Process; executable identity lives in Process::exec_path.
 pub struct Task {
     id: usize,
-    pub process: Arc<ProcessState>,
+    pub process: Arc<Process>,
     pub sig_mask: Mutex<u64>,
     pub sig_frames: Mutex<Vec<SigFrame>>,
     pub kstk: Mutex<Option<KStk>>,
@@ -17,27 +17,11 @@ pub struct Task {
 // AGENT: implement task identity, scheduling, exit teardown, and signal queues;
 // descriptor-specific methods live in task/fd.rs.
 impl Task {
-    // AGENT: construct a standalone task with a fresh process and a fallible
-    // FramePool-backed kernel stack.
-    pub fn make(id: usize, pool: &FramePool) -> Result<Arc<Self>, &'static str> {
-        Self::make_with_addr_space(id, AddrSpace::new(), pool)
-    }
-
-    // AGENT: construct a new process task around a prepared address space while
-    // allocating its thread-private kernel stack from the shared frame pool.
-    pub(super) fn make_with_addr_space(
+    // AGENT: construct only thread-local state around an already-created
+    // Process so task construction never implicitly invents process identity.
+    pub(super) fn make(
         id: usize,
-        addr_space: AddrSpace,
-        pool: &FramePool,
-    ) -> Result<Arc<Self>, &'static str> {
-        Self::make_with_process(id, Arc::new(ProcessState::new(addr_space)), pool)
-    }
-
-    // AGENT: give every schedulable task a directly frame-backed kernel stack
-    // and propagate physical-memory exhaustion to the task-creation boundary.
-    pub(super) fn make_with_process(
-        id: usize,
-        process: Arc<ProcessState>,
+        process: Arc<Process>,
         pool: &FramePool,
     ) -> Result<Arc<Self>, &'static str> {
         let kstk = KStk::new(pool)?;
@@ -61,11 +45,6 @@ impl Task {
     // AGENT: report the shared address-space switch token for trap handling.
     pub fn vm_token(&self) -> Result<usize, &'static str> {
         self.process.addr_space.lock().unwrap().vm_token()
-    }
-
-    // AGENT: expose the owning process id separately from the schedulable id.
-    pub fn process_pid(&self) -> usize {
-        *self.process.pid.lock().unwrap()
     }
 
     // AGENT: expose only the kernel stack top needed by trap setup.
@@ -114,7 +93,7 @@ impl Task {
 
     // AGENT: report process death from the shared exit reason.
     pub fn done(&self) -> bool {
-        self.process.exit_reason.lock().unwrap().is_some()
+        self.process.is_exited()
     }
 
     // AGENT: read this task's scheduler placement state.
@@ -129,12 +108,12 @@ impl Task {
 
     // AGENT: expose process job-control stop without overloading run-queue state.
     pub fn is_job_stopped(&self) -> bool {
-        self.process.job_stopped.load(Ordering::Relaxed)
+        self.process.is_job_stopped()
     }
 
     // AGENT: update process job-control stop independently of scheduler placement.
     pub fn set_job_stopped(&self, stopped: bool) {
-        self.process.job_stopped.store(stopped, Ordering::Relaxed);
+        self.process.set_job_stopped(stopped);
     }
 
     // AGENT: clone the task-owned scheduling policy for queue operations.
@@ -167,37 +146,12 @@ impl Task {
         sched.slice_left == 0
     }
 
-    // AGENT: record process death once and notify process/parent waiters.
-    pub(crate) fn exit_proc(&self, reason: ExitReason) -> bool {
-        let mut exit_reason = self.process.exit_reason.lock().unwrap();
-        if exit_reason.is_some() {
-            return false;
-        }
-        *exit_reason = Some(reason);
-        drop(exit_reason);
-
-        self.process.ev.lock().unwrap().set(EvFlag::PROC_QUIT);
-        if let Some(parent) = self.process.parent.lock().unwrap().clone() {
-            parent.process.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
-        }
-        self.set_sched_state(TaskRunState::Zombie);
-        true
-    }
-
     // AGENT: drop the execution resources owned by one task during teardown.
     pub fn release_thread_exit_resources(&self) {
         *self.sig_mask.lock().unwrap() = 0;
         self.sig_frames.lock().unwrap().clear();
         self.kstk.lock().unwrap().take();
         self.set_sched_state(TaskRunState::Zombie);
-    }
-
-    // AGENT: expose the encoded process exit status to wait paths.
-    pub fn wait_status(&self) -> usize {
-        match *self.process.exit_reason.lock().unwrap() {
-            Some(reason) => reason.wait_status(),
-            None => 0,
-        }
     }
 }
 

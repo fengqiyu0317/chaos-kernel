@@ -87,7 +87,7 @@ pub struct PendingSignal {
 }
 
 // AGENT: current QEMU signal state keeps dispositions only; pending signals
-// live in ProcessState::sig_queue and blocked masks live in Task::sig_mask.
+// live in Process::sig_queue and blocked masks live in Task::sig_mask.
 #[derive(Clone)]
 pub struct SigSet {
     pub actions: Vec<SigAction>,
