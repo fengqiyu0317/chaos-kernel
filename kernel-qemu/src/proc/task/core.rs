@@ -1,6 +1,7 @@
 // AGENT: define the schedulable Task and its task-local lifecycle behavior
 // separately from the state types it composes.
 use super::*;
+use crate::context::{KernelContext, KernelContextCell};
 use crate::trap::TrapFrame;
 
 // AGENT: represent one schedulable thread with an immutable id and link it to
@@ -11,6 +12,9 @@ pub struct Task {
     pub sig_mask: Mutex<u64>,
     pub sig_frames: Mutex<Vec<SigFrame>>,
     pub kstk: Mutex<Option<KStk>>,
+    // AGENT: keep the switch context at a stable address outside every lock so
+    // the single-hart scheduler never carries a MutexGuard across __switch.
+    kernel_context: KernelContextCell,
     pub sched: Mutex<SchedEntity>,
 }
 
@@ -25,12 +29,14 @@ impl Task {
         pool: &FramePool,
     ) -> Result<Arc<Self>, &'static str> {
         let kstk = KStk::new(pool)?;
+        let kernel_context = KernelContext::for_new_task(kstk.top())?;
         let task = Arc::new(Self {
             id,
             process,
             sig_mask: Mutex::new(0),
             sig_frames: Mutex::new(Vec::new()),
             kstk: Mutex::new(Some(kstk)),
+            kernel_context: KernelContextCell::new(kernel_context),
             sched: Mutex::new(SchedEntity::new()),
         });
         task.install_user_trap_frame(TrapFrame::new())?;
@@ -50,6 +56,26 @@ impl Task {
     // AGENT: expose only the kernel stack top needed by trap setup.
     pub fn kernel_stack_top(&self) -> Option<usize> {
         self.kstk.lock().unwrap().as_ref().map(KStk::top)
+    }
+
+    // AGENT: give the scheduler direct access to this stable context cell so no
+    // lock guard can accidentally survive while execution runs on another task.
+    // Safety: the caller must uphold the single-hart rules documented on Task.
+    pub(crate) fn kernel_context_ptr(&self) -> *mut KernelContext {
+        self.kernel_context.get()
+    }
+
+    // AGENT: cross the architecture switch boundary using only stable raw
+    // context pointers, after every scheduler lock guard has been dropped.
+    // Safety: CPU0 must be executing `self`, `next` must be off-CPU, the two
+    // tasks must differ, and both Arc<Task> owners must outlive the suspended call.
+    pub(crate) unsafe fn switch_kernel_context_to(&self, next: &Task) {
+        unsafe {
+            crate::context::switch_kernel_context(
+                self.kernel_context_ptr(),
+                next.kernel_context_ptr(),
+            )
+        }
     }
 
     // AGENT: compute the fixed trap-frame slot while its owning stack is still

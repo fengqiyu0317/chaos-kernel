@@ -11,6 +11,9 @@ SECTIONS
     stext = .;
     .text : {
         *(.text.entry)
+        /* AGENT: retain the context-switch entry before the Rust scheduler has
+           a fully runnable user-task path that references it at boot. */
+        KEEP(*(.text.context))
         *(.text .text.*)
     }
     . = ALIGN(4K);

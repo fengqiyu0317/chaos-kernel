@@ -284,7 +284,8 @@ QEMU 侧的上下文所有权按下列边界固定，不再保留从 simulator
 - 第一阶段的 signal-frame stack 直接由 `Task::sig_frames` 持有，信号屏蔽字只由 `Task::sig_mask` 持有，不再为单一字段保留 `ThdCtx` 包装。尚未接入 syscall 的 `clear_child_tid` 不提前保留，待单线程退出与 `clone` 语义一起迁移。
 - `fork` / `clone` 从调用者的完整 live `TrapFrame` 派生子任务现场；`exec` / `sigreturn` 通过 syscall outcome 由持有 live frame 的 trap 边界原子替换现场，避免从 `Task` 再创建第二个可变引用。
 - checkpoint 中的 `SavedTrapFrame` 只是序列化 DTO，restore 时转成运行时 `TrapFrame` 并直接安装到新 task 的内核栈顶。
-- 后续真正的 task 切换另行引入仅保存内核态 `ra` / `sp` / `s0..s11` 的 `KernelContext` 和 `__switch`；不将内核切换现场混入用户 `TrapFrame`。
+- task 切换使用仅保存内核态 `ra` / `sp` / `s0..s11` 的 `KernelContext` 和 `__switch`；不将内核切换现场混入用户 `TrapFrame`。
+- 单 hart 阶段的 `KernelContext` 由 `Task` 内稳定地址的 `UnsafeCell` 持有，只有 CPU0 调度路径可读写；`Arc<Task>` 保证切换端点在挂起期间地址和生命周期稳定。任何 `MutexGuard`、`RwLockGuard` 或其他临界区借用都不得跨越 `__switch`，引入多 hart 前必须把这条独占约束替换为 per-hart 所有权协议。
 
 后续按 `kernel-sim` 现有能力逐步迁移：
 

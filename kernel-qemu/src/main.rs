@@ -15,6 +15,7 @@ use core::sync::atomic::Ordering;
 use crate::irq_lock::IrqOnceCell;
 
 mod console;
+mod context;
 mod csr;
 mod heap;
 mod irq_lock;
@@ -90,6 +91,9 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     // QEMU boot self-test path.
     #[cfg(feature = "qemu-sched-selftest")]
     {
+        println!("[kernel-qemu] context selftest start");
+        context::tests::run_all();
+        println!("[kernel-qemu] context selftest passed");
         println!("[kernel-qemu] sched selftest start");
         kernel::proc::sched::tests::run_all(frame_pool.as_ref());
         println!("[kernel-qemu] sched selftest passed");
