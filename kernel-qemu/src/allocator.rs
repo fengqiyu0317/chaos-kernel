@@ -14,24 +14,18 @@ pub(crate) struct AllocatorState {
 // AGENT: restore the bounded BTreeSet allocator used by upper-layer ids such as
 // file-backed blocks; FramePool no longer depends on this implementation.
 impl AllocatorState {
-    // AGENT: begin sequential allocation across one validated half-open range.
-    pub(crate) fn new(next: usize, limit: usize) -> Self {
-        debug_assert!(next <= limit);
+    // AGENT: begin sequential allocation at zero within one exclusive limit.
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
-            next,
+            next: 0,
             limit,
             free: BTreeSet::new(),
         }
     }
 
-    // AGENT: prefer the lowest available id across recycled and never-used ids.
-    pub(crate) fn allocate(&mut self) -> Option<usize> {
-        self.allocate_from(0)
-    }
-
-    // AGENT: inspect the lowest available id at or above a caller-supplied
-    // lower bound without changing allocator ownership.
-    pub(crate) fn peek_from(&self, start: usize) -> Option<usize> {
+    // AGENT: allocate the lowest available id at or above a caller-supplied
+    // lower bound, as required by bounded fd allocators such as F_DUPFD.
+    pub(crate) fn allocate_from(&mut self, start: usize) -> Option<usize> {
         let recycled = self.free.range(start..).next().copied();
         let fresh = self.next.max(start);
         let fresh = (fresh < self.limit).then_some(fresh);
@@ -41,13 +35,6 @@ impl AllocatorState {
             (None, Some(fresh)) => fresh,
             _ => return None,
         };
-        Some(id)
-    }
-
-    // AGENT: allocate the lowest available id at or above a caller-supplied
-    // lower bound, as required by bounded fd allocators such as F_DUPFD.
-    pub(crate) fn allocate_from(&mut self, start: usize) -> Option<usize> {
-        let id = self.peek_from(start)?;
         self.reserve(id)
     }
 

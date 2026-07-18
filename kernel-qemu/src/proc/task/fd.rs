@@ -14,7 +14,7 @@ impl Default for FdTable {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
-            allocator: AllocatorState::new(0, MAX_FD),
+            allocator: AllocatorState::new(MAX_FD),
         }
     }
 }
@@ -23,7 +23,7 @@ impl Default for FdTable {
 impl FdTable {
     // AGENT: rebuild the generic id allocator from validated occupied fd slots.
     fn from_entries(entries: BTreeMap<usize, FdEntry>) -> Result<Self, &'static str> {
-        let mut allocator = AllocatorState::new(0, MAX_FD);
+        let mut allocator = AllocatorState::new(MAX_FD);
         for fd in entries.keys() {
             allocator.reserve(*fd).ok_or("ebadf")?;
         }

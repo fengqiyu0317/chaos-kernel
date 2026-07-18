@@ -27,14 +27,14 @@ impl FileBlockAllocator {
     // AGENT: bind the sequential block allocator to its device capacity once.
     pub fn new(limit: usize) -> Self {
         Self {
-            state: Mutex::new(AllocatorState::new(0, limit)),
+            state: Mutex::new(AllocatorState::new(limit)),
         }
     }
 
     // AGENT: prefer cleared blocks returned by FileBlock RAII drops, falling
     // back to the next never-used block inside the fixed RAM-device capacity.
     fn allocate_id(&self) -> Result<usize, &'static str> {
-        self.state.lock().unwrap().allocate().ok_or("enospc")
+        self.state.lock().unwrap().allocate_from(0).ok_or("enospc")
     }
 
     // AGENT: FileBlock::drop returns already-cleared blocks here; duplicate
