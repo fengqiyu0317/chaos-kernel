@@ -4,10 +4,9 @@ use super::*;
 // AGENT: the fd table is the single source of truth for epoll instances, so
 // close/dup/dup2/exec lifecycle rules do not need a second parallel map.
 fn epoll_instance(task: &Task, epfd: usize) -> Result<EpInst, &'static str> {
-    match task.get_file(epfd) {
-        Some(FLike::Ep(inst)) => Ok(inst),
-        Some(_) | None => Err("eperm"),
-    }
+    task.get_fd_entry(epfd)
+        .and_then(|entry| entry.epoll_instance())
+        .ok_or("eperm")
 }
 
 pub(super) fn sys_epoll_create(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
@@ -57,10 +56,10 @@ pub(super) fn sys_epoll_ctl(
     if fd == epfd {
         return Err("einval");
     }
-    let file = task.get_file(fd).ok_or("eperm")?;
+    let entry = task.get_fd_entry(fd).ok_or("eperm")?;
     // AGENT: nested epoll needs cycle detection plus a real source wakeup path;
     // reject ADD/MOD explicitly instead of pretending level polling is enough.
-    if updates_interest && matches!(file, FLike::Ep(_)) {
+    if updates_interest && entry.epoll_instance().is_some() {
         return Err("einval");
     }
 
@@ -85,7 +84,7 @@ pub(super) fn sys_epoll_ctl(
     inst.control(op, fd, &ev)?;
     match op {
         EpCtlOp::ADD => {
-            if let Some(sub_id) = file.register_epoll(fd, inst.clone(), &ev) {
+            if let Some(sub_id) = entry.register_epoll_source(fd, inst.clone(), &ev) {
                 inst.set_source_sub(fd, sub_id);
             } else {
                 mark_if_currently_ready(&task, &inst, fd, ev.events);
@@ -93,9 +92,9 @@ pub(super) fn sys_epoll_ctl(
         }
         EpCtlOp::MOD => {
             if let Some(sub_id) = inst.take_source_sub(fd) {
-                file.unregister_epoll(sub_id);
+                entry.unregister_epoll_source(sub_id);
             }
-            if let Some(sub_id) = file.register_epoll(fd, inst.clone(), &ev) {
+            if let Some(sub_id) = entry.register_epoll_source(fd, inst.clone(), &ev) {
                 inst.set_source_sub(fd, sub_id);
             } else {
                 mark_if_currently_ready(&task, &inst, fd, ev.events);
@@ -103,7 +102,7 @@ pub(super) fn sys_epoll_ctl(
         }
         EpCtlOp::DEL => {
             if let Some(sub_id) = del_sub_id {
-                file.unregister_epoll(sub_id);
+                entry.unregister_epoll_source(sub_id);
             }
         }
         _ => {}

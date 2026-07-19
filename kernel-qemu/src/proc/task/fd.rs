@@ -221,17 +221,6 @@ impl Task {
         Ok((first_fd, second_fd))
     }
 
-    // AGENT: expose a compatibility FLike view without direct table mutation.
-    pub fn get_file(&self, fd: usize) -> Option<FLike> {
-        self.process
-            .fd_table
-            .lock()
-            .unwrap()
-            .entries
-            .get(&fd)
-            .map(FdEntry::as_flike)
-    }
-
     // AGENT: clone an entry while preserving shared open-description semantics.
     pub fn get_fd_entry(&self, fd: usize) -> Option<FdEntry> {
         self.process

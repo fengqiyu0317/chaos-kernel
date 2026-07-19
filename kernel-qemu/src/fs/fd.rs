@@ -270,6 +270,12 @@ impl FdEntry {
         Arc::ptr_eq(&self.desc, &other.desc)
     }
 
+    // AGENT: install a source-backed epoll subscription through the descriptor
+    // entry so callers do not need a compatibility FLike clone.
+    pub fn register_epoll_source(&self, fd: usize, ep: EpInst, ev: &EpEvent) -> Option<usize> {
+        self.desc.file().register_epoll(fd, ep, ev)
+    }
+
     // AGENT: remove a source-backed epoll subscription from this file object.
     pub fn unregister_epoll_source(&self, sub_id: usize) -> bool {
         self.desc.file().unregister_epoll(sub_id)
@@ -337,11 +343,6 @@ impl FdEntry {
     // raw instances, preserving shared status and offset semantics.
     pub fn splice_to(&self, dst: &FdEntry, count: usize) -> Result<usize, &'static str> {
         self.desc.splice_to(dst.desc.as_ref(), count)
-    }
-
-    // AGENT: compatibility view for older tests and helpers that inspect FLike.
-    pub fn as_flike(&self) -> FLike {
-        self.desc.file().clone()
     }
 }
 

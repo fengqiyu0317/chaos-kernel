@@ -485,9 +485,9 @@ fn fd_close_detaches_epoll_subscription_before_reuse(pool: &FramePool) {
         .control(EpCtlOp::ADD, read_fd, &event)
         .expect("initial epoll add should succeed");
     let sub_id = {
-        let source = task.get_file(read_fd).expect("watched fd should exist");
+        let source = task.get_fd_entry(read_fd).expect("watched fd should exist");
         source
-            .register_epoll(read_fd, epoll.clone(), &event)
+            .register_epoll_source(read_fd, epoll.clone(), &event)
             .expect("pipe registration should install a source subscription")
     };
     epoll.set_source_sub(read_fd, sub_id);
@@ -512,10 +512,10 @@ fn fd_close_detaches_epoll_subscription_before_reuse(pool: &FramePool) {
         .expect("reused fd should not collide with a stale epoll interest");
     let new_sub_id = {
         let source = task
-            .get_file(new_read_fd)
+            .get_fd_entry(new_read_fd)
             .expect("reused watched fd should exist");
         source
-            .register_epoll(new_read_fd, epoll.clone(), &new_event)
+            .register_epoll_source(new_read_fd, epoll.clone(), &new_event)
             .expect("reused pipe registration should install a source subscription")
     };
     epoll.set_source_sub(new_read_fd, new_sub_id);
