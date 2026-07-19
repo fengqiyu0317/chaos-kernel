@@ -4,7 +4,7 @@ use super::*;
 
 mod core;
 mod exit_reason;
-pub(super) mod fd;
+pub(crate) mod fd;
 mod sched_entity;
 mod signal;
 mod table;

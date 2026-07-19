@@ -65,17 +65,19 @@ impl Task {
         self.kernel_context.get()
     }
 
-    // AGENT: cross the architecture switch boundary using only stable raw
-    // context pointers, after every scheduler lock guard has been dropped.
-    // Safety: CPU0 must be executing `self`, `next` must be off-CPU, the two
-    // tasks must differ, and both Arc<Task> owners must outlive the suspended call.
-    pub(crate) unsafe fn switch_kernel_context_to(&self, next: &Task) {
+    // AGENT: replace an off-CPU task's first kernel entry only for the focused
+    // QEMU scheduler round-trip test.
+    #[cfg(any(test, feature = "qemu-sched-selftest"))]
+    pub(crate) fn install_test_kernel_entry(
+        &self,
+        entry: extern "C" fn() -> !,
+    ) -> Result<(), &'static str> {
+        let stack_top = self.kernel_stack_top().ok_or("ekstk")?;
+        let context = KernelContext::for_test_task(stack_top, entry)?;
         unsafe {
-            crate::context::switch_kernel_context(
-                self.kernel_context_ptr(),
-                next.kernel_context_ptr(),
-            )
+            self.kernel_context_ptr().write(context);
         }
+        Ok(())
     }
 
     // AGENT: compute the fixed trap-frame slot while its owning stack is still
@@ -174,10 +176,22 @@ impl Task {
 
     // AGENT: drop the execution resources owned by one task during teardown.
     pub fn release_thread_exit_resources(&self) {
+        self.mark_thread_exited();
+        self.release_kernel_stack();
+    }
+
+    // AGENT: publish exit state while retaining a currently executing kernel
+    // stack until the CPU0 scheduler has switched back to its idle context.
+    pub(crate) fn mark_thread_exited(&self) {
         *self.sig_mask.lock().unwrap() = 0;
         self.sig_frames.lock().unwrap().clear();
-        self.kstk.lock().unwrap().take();
         self.set_sched_state(TaskRunState::Zombie);
+    }
+
+    // AGENT: release an exited task's stack only after __switch has returned to
+    // the idle stack; dropping the currently executing stack is never allowed.
+    pub(crate) fn release_kernel_stack(&self) {
+        self.kstk.lock().unwrap().take();
     }
 }
 

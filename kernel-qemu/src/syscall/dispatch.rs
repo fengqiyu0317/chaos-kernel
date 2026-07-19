@@ -24,13 +24,10 @@ impl Kernel {
         let _ts_enter = CLK.load(Ordering::Relaxed);
         // AGENT: caller_token mirrors the current address-space token for syscall
         // entry bookkeeping; user-memory access is routed through Task.addr_space.
-        let _caller_token = {
-            let cpus = self.cpus.lock().unwrap();
-            cpus.iter()
-                .enumerate()
-                .find_map(|(i, slot)| slot.as_ref().and_then(|t| t.vm_token().ok()))
-                .unwrap_or(0)
-        };
+        let _caller_token = self
+            .cur_task(0)
+            .and_then(|task| task.vm_token().ok())
+            .unwrap_or(0);
         match nr {
             SYS_READ => returning(sys_read(self, a0, a1, a2)),
             SYS_WRITE => returning(sys_write(self, a0, a1, a2)),

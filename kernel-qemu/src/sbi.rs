@@ -18,6 +18,14 @@ pub fn set_timer(stime_value: u64) {
     }
 }
 
+// AGENT: sleep on the boot/idle stack until an enabled interrupt arrives;
+// callers own the interrupt-enable ordering around this instruction.
+pub fn wait_for_interrupt() {
+    unsafe {
+        asm!("wfi", options(nomem, nostack));
+    }
+}
+
 // AGENT: Ask OpenSBI to terminate the QEMU machine, then idle if it returns.
 pub fn shutdown() -> ! {
     unsafe {

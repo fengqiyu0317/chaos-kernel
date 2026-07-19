@@ -209,8 +209,8 @@ fn wait_token_event_wake_uses_installed_scheduler_backend(pool: &FramePool) {
     clear_wait_token_state();
 }
 
-// AGENT: the current bridge records the current task as sleeping without
-// pretending that its kernel stack has really switched away.
+// AGENT: before the scheduler loop is activated, the compatibility bridge
+// records Sleeping without attempting to use an uninitialized idle context.
 fn wait_token_block_current_keeps_placeholder_stack(pool: &FramePool) {
     reset_wait_token_state(24);
 
@@ -252,8 +252,8 @@ fn wait_token_current_wake_finishes_without_requeue(pool: &FramePool) {
     clear_wait_token_state();
 }
 
-// AGENT: timer ticks must not time-slice the temporary sleeping-current state
-// used by the spin wait bridge.
+// AGENT: timer ticks must not time-slice the pre-scheduler compatibility state
+// whose sleeping task still occupies Processor.current.
 fn wait_token_tick_leaves_sleeping_current_parked(pool: &FramePool) {
     reset_wait_token_state(26);
 

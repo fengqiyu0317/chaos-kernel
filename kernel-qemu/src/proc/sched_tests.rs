@@ -3,11 +3,14 @@
 use super::*;
 use crate::kernel::kernel_core::{init_timer_wheel, TIMER_WHEEL};
 use crate::kernel::{
-    signal_bit, FramePool, Kernel, SigAction, SigSet, SignalDeliveryAction, TaskRunState, NSIG,
-    PRIO_MIN, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2,
-    SIGWINCH, SIG_DFL, SIG_IGN, SYS_SIGRETURN,
+    install_qemu_wait_kernel, qemu_wait_kernel, signal_bit, FramePool, Kernel, SigAction, SigSet,
+    SignalDeliveryAction, TaskRunState, NSIG, PRIO_MIN, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP,
+    SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGWINCH, SIG_DFL, SIG_IGN, SYS_SIGRETURN,
 };
 use crate::trap::TrapFrame;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static PROCESSOR_CONTEXT_TEST_RAN: AtomicBool = AtomicBool::new(false);
 
 // AGENT: expose focused scheduler queue checks to the optional QEMU boot
 // selftest path and use its discovered RAM pool for real task kernel stacks.
@@ -24,6 +27,42 @@ pub fn run_all(pool: &FramePool) {
     sigcont_resumes_stopped_task_without_resuming_for_plain_signal(pool);
     sigcont_keeps_sleeping_task_asleep_until_wait_wakeup(pool);
     signal_handler_uses_supplied_interrupted_frame(pool);
+    processor_switches_task_back_to_idle_context(pool);
+}
+
+// AGENT: execute the real Processor idle -> task -> idle path once, proving
+// current publication, task-stack execution, and task detachment as one unit.
+fn processor_switches_task_back_to_idle_context(pool: &FramePool) {
+    ensure_timer_wheel();
+    PROCESSOR_CONTEXT_TEST_RAN.store(false, Ordering::Relaxed);
+
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init task should be current");
+    task.install_test_kernel_entry(processor_context_test_task)
+        .expect("test task should receive kernel entry");
+    install_qemu_wait_kernel(kernel);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert!(PROCESSOR_CONTEXT_TEST_RAN.load(Ordering::Relaxed));
+    assert!(kernel.cur_task(0).is_none());
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+}
+
+// AGENT: run on the selected Task kernel stack, publish Sleeping, and return to
+// the scheduler's saved idle context through the production handoff helper.
+extern "C" fn processor_context_test_task() -> ! {
+    PROCESSOR_CONTEXT_TEST_RAN.store(true, Ordering::Relaxed);
+    let kernel = qemu_wait_kernel().expect("scheduler test kernel should be installed");
+    let task = kernel
+        .cur_task(0)
+        .expect("scheduler test task should be current");
+    task.set_sched_state(TaskRunState::Sleeping);
+    drop(task);
+    assert!(kernel.switch_current_to_idle(0));
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 // AGENT: pin the Linux/RISC-V 1..=64 ABI to compact table slots and sigset_t

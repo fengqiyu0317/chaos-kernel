@@ -286,6 +286,9 @@ QEMU 侧的上下文所有权按下列边界固定，不再保留从 simulator
 - checkpoint 中的 `SavedTrapFrame` 只是序列化 DTO，restore 时转成运行时 `TrapFrame` 并直接安装到新 task 的内核栈顶。
 - task 切换使用仅保存内核态 `ra` / `sp` / `s0..s11` 的 `KernelContext` 和 `__switch`；不将内核切换现场混入用户 `TrapFrame`。
 - 单 hart 阶段的 `KernelContext` 由 `Task` 内稳定地址的 `UnsafeCell` 持有，只有 CPU0 调度路径可读写；`Arc<Task>` 保证切换端点在挂起期间地址和生命周期稳定。任何 `MutexGuard`、`RwLockGuard` 或其他临界区借用都不得跨越 `__switch`，引入多 hart 前必须把这条独占约束替换为 per-hart 所有权协议。
+- `Kernel` 为每个 hart 保留 `Processor`，其中 `current` 是当前 task 的唯一 CPU 归属标记，`idle_context` 保存 boot/idle stack 的内核上下文；第一阶段只允许 CPU0 进入真实调度循环。
+- CPU0 scheduler 在 boot stack 上关中断选取 runnable task，先发布 `Running` 和 `current`，再从 `idle_context` 切换到 task context；task 阻塞、时间片用尽或退出时先发布状态，然后切回 idle context。无 runnable task 时必须清空 `current`，打开中断并在 idle stack 上执行 `wfi`。
+- 正在运行的退出 task 只先标记 zombie 并保留内核栈；只有 `__switch` 已经回到 idle stack 后，scheduler 才能释放该栈。
 
 后续按 `kernel-sim` 现有能力逐步迁移：
 

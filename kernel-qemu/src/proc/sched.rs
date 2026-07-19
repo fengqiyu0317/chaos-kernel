@@ -26,13 +26,13 @@ impl SchedulePolicy {
 }
 
 // AGENT: keep only runnable task ids and their scheduling-policy snapshots;
-// Kernel::cpus is the single authority for the currently executing task.
+// Processor.current is the single authority for the currently executing task.
 pub struct RunQueue {
     pub queue: Mutex<Vec<(usize, SchedulePolicy)>>,
 }
 
 impl RunQueue {
-    // AGENT: initialize an empty runnable set without mirroring Kernel::cpus.
+    // AGENT: initialize an empty runnable set without mirroring Processor.current.
     pub fn new() -> Self {
         Self {
             queue: Mutex::new(Vec::new()),

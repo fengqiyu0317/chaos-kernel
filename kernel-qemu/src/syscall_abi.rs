@@ -104,6 +104,11 @@ fn dispatch_installed_kernel(
         }
         crate::kernel::SyscallOutcome::NoReturn => {
             if nr == INTERNAL_SYS_EXIT {
+                // AGENT: SYS_EXIT abandons the dead task's trap stack only
+                // after process teardown has returned and dropped its Arc locals.
+                if kernel.switch_current_to_idle(0) {
+                    unreachable!("an exited task was scheduled again");
+                }
                 crate::sbi::shutdown();
             }
         }
@@ -115,6 +120,12 @@ fn dispatch_installed_kernel(
 fn deliver_pending_signal(kernel: &crate::kernel::Kernel, frame: &mut TrapFrame) {
     if let Some(next) = kernel.deliver_pending_signals_from_frame(0, frame.clone()) {
         *frame = next;
+    }
+    // AGENT: a default-terminating signal uses the same task -> idle handoff as
+    // SYS_EXIT instead of returning a zombie frame to user mode.
+    let current_done = kernel.cur_task(0).is_some_and(|task| task.done());
+    if current_done && kernel.switch_current_to_idle(0) {
+        unreachable!("a signal-terminated task was scheduled again");
     }
 }
 

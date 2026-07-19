@@ -98,7 +98,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         kernel::proc::sched::tests::run_all(frame_pool.as_ref());
         println!("[kernel-qemu] sched selftest passed");
     }
-    let kernel = init_qemu_kernel_backend(frame_pool.as_ref().clone());
+    let (kernel, init_ready) = init_qemu_kernel_backend(frame_pool.as_ref().clone());
     // AGENT: run ProcInit stack-writing checks only after the real QEMU frame
     // pool and direct map are installed.
     #[cfg(feature = "qemu-proc-selftest")]
@@ -136,6 +136,10 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     timer::init();
     wait_for_first_timer_tick();
     wait_for_timer_wheel_probe(&timer_probe);
+    if init_ready {
+        println!("[kernel-qemu] CPU0 scheduler start");
+        kernel.run_cpu0();
+    }
     println!("[kernel-qemu] minimal carrier only; kernel-sim semantics not loaded");
     println!("[kernel-qemu] shutdown");
 
@@ -144,24 +148,55 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
 
 // AGENT: Install a leaked Kernel as the QEMU scheduler/timer backend so real
 // timer interrupts can drive migrated Kernel::schedule_tick() state.
-fn init_qemu_kernel_backend(frame_pool: kernel::FramePool) -> &'static kernel::Kernel {
+fn init_qemu_kernel_backend(frame_pool: kernel::FramePool) -> (&'static kernel::Kernel, bool) {
     let root_block = Arc::new(kernel::RamBlockDevice::empty());
     let kernel = Box::leak(Box::new(kernel::Kernel::new_with_block_device(
         frame_pool, root_block,
     )));
-    match install_embedded_root_init(kernel, ROOT_INIT_ELF) {
-        Ok(true) => println!("[kernel-qemu] installed embedded /bin/init"),
-        Ok(false) => println!("[kernel-qemu] no embedded /bin/init"),
-        Err(err) => println!("[kernel-qemu] failed to install /bin/init: {}", err),
-    }
+    let init_installed = match install_embedded_root_init(kernel, ROOT_INIT_ELF) {
+        Ok(true) => {
+            println!("[kernel-qemu] installed embedded /bin/init");
+            true
+        }
+        Ok(false) => {
+            println!("[kernel-qemu] no embedded /bin/init");
+            false
+        }
+        Err(err) => {
+            println!("[kernel-qemu] failed to install /bin/init: {}", err);
+            false
+        }
+    };
     kernel.proc_init();
+    let init_ready = init_installed
+        && match kernel.cur_task(0) {
+            Some(init) => {
+                let prepared = crate::kernel::proc::task::fd::install_initial_stdio(&init)
+                    .and_then(|()| {
+                        kernel.do_exec(
+                            kernel::INIT_PID,
+                            "/bin/init",
+                            alloc::vec![alloc::string::String::from("/bin/init")],
+                            Vec::new(),
+                        )
+                    });
+                match prepared {
+                    Ok(()) => true,
+                    Err(err) => {
+                        println!("[kernel-qemu] failed to prepare init task: {}", err);
+                        false
+                    }
+                }
+            }
+            None => false,
+        };
     kernel::install_qemu_wait_kernel(kernel);
     let current = kernel.cur_task(0).map(|task| task.id()).unwrap_or(0);
     println!(
         "[kernel-qemu] kernel timer backend installed current_task={}",
         current
     );
-    kernel
+    (kernel, init_ready)
 }
 
 // AGENT: install the linked init payload through the same path-backed file store

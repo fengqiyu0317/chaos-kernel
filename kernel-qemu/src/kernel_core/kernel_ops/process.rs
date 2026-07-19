@@ -34,10 +34,12 @@ impl Kernel {
         let parent = process.parent();
         let child_pid = process.pid();
 
-        self.release_exit_thread_resources(task, &process, thread_ids);
+        self.release_exit_thread_resources(cpu, task, &process, thread_ids);
         process.release_exit_resources();
         self.tasks.reparent_children_to_init(&process);
-        self.switch_away_from_exited_current(cpu, task.id());
+        if !self.scheduler_active(cpu) {
+            self.switch_away_from_exited_current(cpu, task.id());
+        }
 
         if let Some(parent) = parent {
             self.send_signal_to_process(&parent, SIGCHLD as i32, child_pid as isize);
@@ -49,10 +51,16 @@ impl Kernel {
     // list was stale or incomplete.
     fn release_exit_thread_resources(
         &self,
+        cpu: usize,
         task: &Arc<Task>,
         process: &Arc<Process>,
         thread_ids: Vec<usize>,
     ) {
+        let running_task_id = if self.scheduler_active(cpu) {
+            self.cur_task(cpu).map(|current| current.id())
+        } else {
+            None
+        };
         let mut released_requested_task = false;
 
         for tid in thread_ids {
@@ -63,13 +71,21 @@ impl Kernel {
                 if thread.id() == task.id() {
                     released_requested_task = true;
                 }
-                thread.release_thread_exit_resources();
+                if running_task_id == Some(thread.id()) {
+                    thread.mark_thread_exited();
+                } else {
+                    thread.release_thread_exit_resources();
+                }
                 self.run_queue.remove(thread.id());
             }
         }
 
         if !released_requested_task {
-            task.release_thread_exit_resources();
+            if running_task_id == Some(task.id()) {
+                task.mark_thread_exited();
+            } else {
+                task.release_thread_exit_resources();
+            }
             self.run_queue.remove(task.id());
         }
     }

@@ -9,6 +9,7 @@ pub mod current;
 pub mod kernel_base;
 pub mod kernel_ops;
 pub mod prelude;
+pub mod processor;
 pub mod sync;
 pub mod time;
 
@@ -17,5 +18,6 @@ pub use self::current::*;
 pub use self::kernel_base::*;
 pub use self::kernel_ops::*;
 pub use self::prelude::*;
+pub use self::processor::*;
 pub use self::sync::*;
 pub use self::time::*;

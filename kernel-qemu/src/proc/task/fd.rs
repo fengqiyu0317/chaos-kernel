@@ -135,7 +135,7 @@ fn checkpoint_stdio_instance(
 
 // AGENT: seed stdio through the unified allocator used by later open, dup, and
 // close operations.
-pub(super) fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str> {
+pub(crate) fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str> {
     let stdin_opt = FdOpt {
         rd: true,
         wr: false,

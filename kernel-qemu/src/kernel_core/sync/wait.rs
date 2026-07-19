@@ -152,17 +152,16 @@ impl WaitToken {
         }
     }
 
-    // AGENT: park the owning task in scheduler state. The full context switch is
-    // supplied by a later QEMU scheduler milestone; until then this function
-    // records the semantic state transition and the loop below spins.
+    // AGENT: park the owning task in scheduler state; with CPU0 scheduling
+    // active, this returns only after a wakeup requeues and resumes the task.
     fn block_waiter_task(&self) {
         if let Some(kernel) = qemu_wait_kernel() {
             kernel.block_task_for_wait(self.state.task_id);
         }
     }
 
-    // AGENT: repair the current task state after the temporary spin wait bridge
-    // sees completion but before callers continue on the same kernel stack.
+    // AGENT: normalize the resumed task state before callers continue; this
+    // also preserves focused selftests that do not start the scheduler loop.
     fn finish_waiter_task(&self) {
         if let Some(kernel) = qemu_wait_kernel() {
             kernel.finish_task_wait(self.state.task_id);
@@ -239,6 +238,8 @@ impl WaitToken {
                     break;
                 }
             }
+            // AGENT: this loop is reached only by pre-scheduler compatibility
+            // paths; an active scheduler suspends inside block_waiter_task().
             ::core::hint::spin_loop();
         }
         if blocked {

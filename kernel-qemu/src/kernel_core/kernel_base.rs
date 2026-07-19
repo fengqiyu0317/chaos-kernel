@@ -43,7 +43,9 @@ pub struct Kernel {
     pub block_device: Arc<RamBlockDevice>,
     file_blocks: Arc<FileBlockAllocator>,
     pub pool: FramePool,
-    pub cpus: Mutex<[Option<Arc<Task>>; MAX_CPU]>,
+    // AGENT: keep current-task and idle-context ownership together per hart;
+    // only processors[0] is allowed to enter the scheduler in this milestone.
+    pub processors: [Mutex<Processor>; MAX_CPU],
     pub mnt: MountTable,
     // AGENT: handle to the QEMU timer wheel driven from real timer interrupts.
     pub timers: &'static Mutex<TimerWheel>,
@@ -90,7 +92,7 @@ impl Kernel {
             block_device,
             file_blocks,
             pool,
-            cpus: Mutex::new([None, None, None, None, None, None, None, None]),
+            processors: core::array::from_fn(|_| Mutex::new(Processor::new())),
             mnt: MountTable::new(),
             timers: global_timer_wheel(),
             file_nodes: RwLock::new(BTreeMap::new()),

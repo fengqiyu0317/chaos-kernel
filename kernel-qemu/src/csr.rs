@@ -82,6 +82,24 @@ pub unsafe fn clear_sstatus_bits(bits: usize) {
     }
 }
 
+// AGENT: mask local S-mode interrupts around CPU0 scheduler selection and
+// context publication.
+#[inline]
+pub fn disable_interrupts() {
+    unsafe {
+        clear_sstatus_bits(SSTATUS_SIE);
+    }
+}
+
+// AGENT: let the idle CPU receive timer wakeups only after it has published
+// current=None and left all scheduler locks.
+#[inline]
+pub fn enable_interrupts() {
+    unsafe {
+        set_sstatus_bits(SSTATUS_SIE);
+    }
+}
+
 // AGENT: Read the raw trap cause register for Rust-side trap dispatch.
 #[inline]
 pub fn read_scause() -> usize {

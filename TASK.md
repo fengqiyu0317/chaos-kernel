@@ -497,6 +497,16 @@ cargo test --test pressure
 
 ### M9 `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
 
+#### 2026-07-18：CPU0 idle / scheduler context
+
+- 目标：把 `kernel-sim` 已有的 task 运行状态、阻塞/唤醒和时间片语义接到 QEMU 真实上下文切换；QEMU 侧用 boot/idle stack、`KernelContext` 和 timer interrupt 替换 host thread 承载，本轮没有可抽入 `kernel-common/` 的新逻辑。
+- 已完成：`Kernel` 的 CPU 当前 task 数组改为 per-hart `Processor { current, idle_context, ... }`，并实现 CPU0 boot-stack scheduler loop；无 runnable task 时清空 current、打开中断并执行 `wfi`。
+- 已接线：wait block、主动 yield、timer slice 抢占和 `SYS_EXIT`/默认终止信号都先发布 task 状态，再从 task kernel context 切回 idle context；运行中 task 的内核栈延迟到 idle 侧释放。
+- 启动边界：嵌入并成功准备 `/bin/init` 时，`main.rs` 会进入 `Kernel::run_cpu0()`；当前 `ROOT_INIT_ELF` 仍为空，所以普通 carrier smoke 仍在 timer 验证后明确 shutdown，不会尝试返回空用户现场。
+- 回归：`cargo check --target riscv64gc-unknown-none-elf --all-features` 通过；`qemu-sched-selftest` 的真实 `idle -> task -> idle` 往返通过；`qemu-selftest` 中 mm/sync/context/sched/proc/fs/checkpoint 全部通过；`bash tools/qemu-smoke.sh` 通过。
+- host 语义基准：使用 `CARGO_TARGET_DIR=/tmp/chaos-kernel-sim-target cargo test` 重建后通过，其中 `smoke` 为 `84 passed; 0 failed`。原 `kernel-sim/target` 内旧测试 ELF 为 `0644`，直接 `cargo test` 会因 `Permission denied` 无法执行，本轮没有清理或覆盖该用户构建产物。
+- 后续：多 hart 的 per-hart 独占协议、IPI 和跨 CPU wakeup 仍未实现；RISC-V `sched_yield` syscall 尚未映射，但底层 `Kernel::yield_current()` 已提供同一 idle handoff 边界。
+
 - `[M3][M9][重要] TODO`: `kernel-qemu` 当前 `SYS_EXIT` 仍通过 `exit_task()` 释放同一 `Process` 的全部线程，等价于进程级退出。后续应增加只终止当前 `Task` 的单线程退出路径，维护线程组存活计数，并仅在最后一个线程退出时提交进程级资源释放、父进程通知和 zombie 状态；完成该边界后，再随 `clone` / `set_tid_address` syscall 一并迁移 `clear_child_tid` 写零与 futex 唤醒语义。
 - `[M5][M9][重要] TODO`: 在 `kernel-qemu` 的 `Process` 中引入 `cwd` 前，先迁移完整的每进程工作目录语义：实现 `getcwd` / `chdir`，让 `openat`、`exec` 及其他路径 syscall 按 cwd 解析相对路径，并明确 fork 继承、exec 保留、挂载点与路径规范化边界；在这些语义接入前，不保留始终为 `/` 且无消费者的占位字段。
 - `[M6][M9][重要] TODO`: 在 `kernel-qemu` 的 `Process` 中引入 `sem_ctx` 前，先接入 System V semaphore syscall 与进程级 semid 句柄表；保持 fork 继承 semaphore set 引用但不继承 `SEM_UNDO` 累积量，exit 时应用 undo 并释放本地句柄，同时与 `Kernel.sem_store` 的全局对象生命周期对齐。
