@@ -25,6 +25,7 @@ pub fn run_all(pool: &FramePool) {
     proc_init_push_at_writes_user_stack(pool);
     parse_elf_rejects_unsupported_or_invalid_entry();
     parse_elf_validates_program_header_layouts();
+    prepared_user_image_normalizes_invalid_elf_to_enoexec(pool);
     prepared_user_image_loads_elf_segment_and_stack(pool);
     prepared_user_image_loads_segments_sharing_a_page(pool);
     prepared_user_image_loads_out_of_order_segments(pool);
@@ -33,6 +34,15 @@ pub fn run_all(pool: &FramePool) {
     forked_writable_page_resolves_cow(pool);
     shm_segment_maps_shared_physical_page(pool);
     release_all_pages_drops_same_space_aliases(pool);
+}
+
+// AGENT: preserve detailed parser diagnostics for focused parser tests while
+// exposing malformed executable images to callers as Linux ENOEXEC.
+fn prepared_user_image_normalizes_invalid_elf_to_enoexec(pool: &FramePool) {
+    assert_eq!(
+        prepare_user_image(b"not an ELF", Vec::new(), Vec::new(), pool).err(),
+        Some("enoexec")
+    );
 }
 
 // AGENT: prove KStk bypasses the general heap by charging exactly four zeroed

@@ -132,7 +132,7 @@ impl PipeBuf {
     }
 
     // AGENT: keep pipe read-side buffer mutation and readiness publication
-    // inside PipeBuf; PipeNode only decides whether the endpoint may read.
+    // inside PipeBuf and report an empty live pipe with standard EAGAIN.
     fn read_into(&mut self, out: &mut [u8]) -> Result<usize, &'static str> {
         if out.is_empty() {
             return Ok(0);
@@ -141,7 +141,7 @@ impl PipeBuf {
             return if self.writers == 0 {
                 Ok(0)
             } else {
-                Err("again")
+                Err("eagain")
             };
         }
 
@@ -153,17 +153,17 @@ impl PipeBuf {
         Ok(n)
     }
 
-    // AGENT: keep write-side capacity checks, broken-pipe state, and EvBus
+    // AGENT: keep write-side capacity checks, EPIPE peer-close state, and EvBus
     // publication with the buffer state they mutate.
     fn write_from(&mut self, input: &[u8]) -> Result<usize, &'static str> {
         if input.is_empty() {
             return Ok(0);
         }
         if self.readers == 0 {
-            return Err("broken");
+            return Err("epipe");
         }
         if self.buf.remaining() == 0 {
-            return Err("again");
+            return Err("eagain");
         }
 
         let written = self.buf.fill_from(input);

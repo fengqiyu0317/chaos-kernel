@@ -16,15 +16,15 @@ pub(crate) struct UserEntry {
     pub stack_pointer: usize,
 }
 
-// AGENT: parse an ELF and construct one complete user image so initial task
-// creation and exec share mapping, segment-copy, bss, stack, and brk semantics.
+// AGENT: parse an ELF, normalize format failures to ENOEXEC, and construct one
+// complete user image shared by initial task creation and exec.
 pub(crate) fn prepare_user_image(
     elf_data: &[u8],
     args: Vec<String>,
     envs: Vec<String>,
     pool: &FramePool,
 ) -> Result<PreparedUserImage, &'static str> {
-    let elf = parse_elf(elf_data)?;
+    let elf = parse_elf(elf_data).map_err(normalize_user_image_error)?;
     let mut addr_space = AddrSpace::new();
     match populate_user_image(&mut addr_space, elf_data, elf, args, envs, pool) {
         Ok(user_entry) => Ok(PreparedUserImage {
@@ -33,8 +33,19 @@ pub(crate) fn prepare_user_image(
         }),
         Err(err) => {
             addr_space.release_all_pages();
-            Err(err)
+            Err(normalize_user_image_error(err))
         }
+    }
+}
+
+// AGENT: keep parser diagnostics private while presenting Linux exec semantics;
+// resource, permission, size, and explicitly unsupported errors remain intact.
+fn normalize_user_image_error(err: &'static str) -> &'static str {
+    match err {
+        "too_short" | "bad_magic" | "not_64bit" | "not_le" | "bad_version" | "not_exec"
+        | "bad_machine" | "no_phdrs" | "bad_phent" | "ph_overflow" | "bad_phdr" | "no_load"
+        | "bad_entry" => "enoexec",
+        _ => err,
     }
 }
 

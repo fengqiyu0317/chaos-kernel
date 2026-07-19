@@ -107,11 +107,12 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         kernel::proc::process_tests::run_all(&kernel.pool);
         println!("[kernel-qemu] proc selftest passed");
     }
-    // AGENT: filesystem syscall selftests need the installed Kernel, current
-    // task, frame pool, Sv39 mappings, and usercopy path.
+    // AGENT: filesystem syscall selftests cover ABI errno encoding before using
+    // the installed Kernel, current task, frame pool, Sv39 mappings, and usercopy.
     #[cfg(feature = "qemu-fs-selftest")]
     {
         println!("[kernel-qemu] fs syscall selftest start");
+        syscall_abi::tests::run_all();
         kernel::syscall::tests::run_all(kernel);
         println!("[kernel-qemu] fs syscall selftest passed");
     }

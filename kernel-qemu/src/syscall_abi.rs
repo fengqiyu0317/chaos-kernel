@@ -129,8 +129,8 @@ fn deliver_pending_signal(kernel: &crate::kernel::Kernel, frame: &mut TrapFrame)
     }
 }
 
-// AGENT: translate the migrated kernel-sim string errors into Linux-style
-// negative syscall return values for the RISC-V ABI boundary.
+// AGENT: translate migrated kernel-sim errno names and intentional internal
+// aliases into exact Linux asm-generic negative RISC-V syscall return values.
 fn errno_ret(err: &'static str) -> usize {
     let errno = match err {
         "eperm" => 1,
@@ -139,6 +139,8 @@ fn errno_ret(err: &'static str) -> usize {
         "eintr" => 4,
         "eio" => 5,
         "e2big" => 7,
+        "enoexec" => 8,
+        "ebadf" => 9,
         "echild" => 10,
         "eagain" | "changed" => 11,
         "enomem" | "oom" => 12,
@@ -151,10 +153,15 @@ fn errno_ret(err: &'static str) -> usize {
         "eisdir" => 21,
         "einval" | "ph_overflow" => 22,
         "emfile" => 24,
+        "enotty" => 25,
+        "efbig" => 27,
         "enospc" => 28,
+        "espipe" => 29,
+        "epipe" => 32,
         "enametoolong" => 36,
         "enosys" => 38,
         "removed" => 43,
+        "eoverflow" => 75,
         "enotsup" => 95,
         "timeout" => 110,
         _ => 22,
@@ -165,4 +172,32 @@ fn errno_ret(err: &'static str) -> usize {
 // AGENT: Store the architecture-level syscall return value in a0.
 pub fn write_return(frame: &mut TrapFrame, value: usize) {
     frame.set_return_value(value);
+}
+
+// AGENT: expose focused errno-encoding regressions to Rust tests and the QEMU
+// filesystem selftest without widening the private ABI conversion interface.
+#[cfg(any(test, feature = "qemu-fs-selftest"))]
+pub mod tests {
+    use super::errno_ret;
+
+    pub fn run_all() {
+        standard_errno_names_use_linux_riscv_numbers();
+    }
+
+    // AGENT: keep every audited file/exec errno distinguishable from EINVAL at
+    // the final userspace-visible syscall ABI boundary.
+    #[cfg_attr(test, test)]
+    fn standard_errno_names_use_linux_riscv_numbers() {
+        for (name, errno) in [
+            ("enoexec", 8),
+            ("ebadf", 9),
+            ("enotty", 25),
+            ("efbig", 27),
+            ("espipe", 29),
+            ("epipe", 32),
+            ("eoverflow", 75),
+        ] {
+            assert_eq!(errno_ret(name), (-(errno as isize)) as usize);
+        }
+    }
 }

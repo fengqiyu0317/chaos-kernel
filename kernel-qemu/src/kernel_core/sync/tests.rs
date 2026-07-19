@@ -527,7 +527,7 @@ fn fd_close_detaches_epoll_subscription_before_reuse(pool: &FramePool) {
         old_writer
             .write(b"x")
             .expect_err("old pipe should be broken"),
-        "broken"
+        "epipe"
     );
     assert_eq!(
         epoll.ready_len(),
@@ -588,7 +588,7 @@ fn pipe_uses_bounded_ring_buffer_and_reports_writable() {
     assert!(write_end.poll().writable);
     assert_eq!(write_end.write_at(&payload), Ok(payload.len()));
     assert!(!write_end.poll().writable);
-    assert_eq!(write_end.write_at(b"x"), Err("again"));
+    assert_eq!(write_end.write_at(b"x"), Err("eagain"));
     assert_eq!(read_end.readable_len(), payload.len());
 
     let mut out = [0u8; 4];
