@@ -35,6 +35,42 @@ impl FdTable {
         self.allocator.allocate_from(start).ok_or("emfile")
     }
 
+    // AGENT: remove one descriptor from the locked table and collect epoll
+    // unsubscriptions for the caller to execute after releasing the lock.
+    fn remove_fd_locked(&mut self, fd: usize) -> Result<FdCloseCleanup, &'static str> {
+        let closed_entry = self.entries.remove(&fd).ok_or("ebadf")?;
+
+        let mut closed_fd_source_subs = Vec::new();
+        for entry in self.entries.values() {
+            if let Some(epoll) = entry.epoll_instance() {
+                if let Some(sub_id) = epoll.remove_closed_fd(fd) {
+                    closed_fd_source_subs.push(sub_id);
+                }
+            }
+        }
+
+        let mut epoll_source_subs = Vec::new();
+        let still_open = self
+            .entries
+            .values()
+            .any(|entry| entry.same_open_description(&closed_entry));
+        if !still_open {
+            if let Some(epoll) = closed_entry.epoll_instance() {
+                for (watched_fd, sub_id) in epoll.drain_source_subs_on_close() {
+                    if let Some(source) = self.entries.get(&watched_fd).cloned() {
+                        epoll_source_subs.push((source, sub_id));
+                    }
+                }
+            }
+        }
+
+        Ok(FdCloseCleanup {
+            closed_entry,
+            closed_fd_source_subs,
+            epoll_source_subs,
+        })
+    }
+
     // AGENT: duplicate entries while preserving an identical independent id
     // allocator snapshot for the child process.
     fn fork_copy(&self) -> Self {
@@ -300,43 +336,6 @@ impl Task {
         self.process.fd_table.lock().unwrap().cloexec_fds()
     }
 
-    // AGENT: remove one descriptor and collect epoll unsubscriptions for later.
-    fn remove_fd_locked(
-        files: &mut BTreeMap<usize, FdEntry>,
-        fd: usize,
-    ) -> Result<FdCloseCleanup, &'static str> {
-        let closed_entry = files.remove(&fd).ok_or("ebadf")?;
-
-        let mut closed_fd_source_subs = Vec::new();
-        for entry in files.values() {
-            if let Some(epoll) = entry.epoll_instance() {
-                if let Some(sub_id) = epoll.remove_closed_fd(fd) {
-                    closed_fd_source_subs.push(sub_id);
-                }
-            }
-        }
-
-        let mut epoll_source_subs = Vec::new();
-        let still_open = files
-            .values()
-            .any(|entry| entry.same_open_description(&closed_entry));
-        if !still_open {
-            if let Some(epoll) = closed_entry.epoll_instance() {
-                for (watched_fd, sub_id) in epoll.drain_source_subs_on_close() {
-                    if let Some(source) = files.get(&watched_fd).cloned() {
-                        epoll_source_subs.push((source, sub_id));
-                    }
-                }
-            }
-        }
-
-        Ok(FdCloseCleanup {
-            closed_entry,
-            closed_fd_source_subs,
-            epoll_source_subs,
-        })
-    }
-
     // AGENT: close an fd, detach epoll registrations, and drop it after unlock.
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
         if fd >= MAX_FD {
@@ -345,7 +344,7 @@ impl Task {
 
         let cleanup = {
             let mut table = self.process.fd_table.lock().unwrap();
-            let cleanup = Self::remove_fd_locked(&mut table.entries, fd)?;
+            let cleanup = table.remove_fd_locked(fd)?;
             let released = table.allocator.release(fd);
             debug_assert!(released);
             cleanup
@@ -387,7 +386,7 @@ impl Task {
                 return Ok(new_fd);
             }
             let cleanup = if table.entries.contains_key(&new_fd) {
-                Some(Self::remove_fd_locked(&mut table.entries, new_fd)?)
+                Some(table.remove_fd_locked(new_fd)?)
             } else {
                 None
             };
