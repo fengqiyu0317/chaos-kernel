@@ -151,11 +151,18 @@ pub(crate) fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str
     let stdin_instance = FInstance::new("/dev/tty");
     let stdout_instance = FInstance::new("/dev/tty");
     let stderr_instance = stdout_instance.dup();
-    let stdin = task.add_file_with_status(FLike::File(FHandle::new(stdin_instance)), stdin_opt)?;
-    let stdout =
-        task.add_file_with_status(FLike::File(FHandle::new(stdout_instance)), stdout_opt)?;
-    let stderr =
-        task.add_file_with_status(FLike::File(FHandle::new(stderr_instance)), stdout_opt)?;
+    let stdin =
+        task.add_file_with_status(FLike::File(FHandle::new(stdin_instance)), stdin_opt, false)?;
+    let stdout = task.add_file_with_status(
+        FLike::File(FHandle::new(stdout_instance)),
+        stdout_opt,
+        false,
+    )?;
+    let stderr = task.add_file_with_status(
+        FLike::File(FHandle::new(stderr_instance)),
+        stdout_opt,
+        false,
+    )?;
     if (stdin, stdout, stderr) != (0, 1, 2) {
         return Err("ebadf");
     }
@@ -166,24 +173,15 @@ pub(crate) fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str
 impl Task {
     // AGENT: install a new entry with a fresh shared open-file description.
     pub fn add_file(&self, fl: FLike) -> Result<usize, &'static str> {
-        self.add_file_with_cloexec(fl, false)
-    }
-
-    // AGENT: install an entry with explicit open-file-description status.
-    pub fn add_file_with_status(&self, fl: FLike, status: FdOpt) -> Result<usize, &'static str> {
-        self.add_file_with_cloexec_and_status(fl, status, false)
-    }
-
-    // AGENT: install an entry and record per-descriptor close-on-exec state.
-    pub fn add_file_with_cloexec(&self, fl: FLike, cloexec: bool) -> Result<usize, &'static str> {
         let mut table = self.process.fd_table.lock().unwrap();
         let fd = table.reserve_from(0)?;
-        table.entries.insert(fd, FdEntry::with_cloexec(fl, cloexec));
+        table.entries.insert(fd, FdEntry::new(fl));
         Ok(fd)
     }
 
-    // AGENT: install an entry with explicit status and close-on-exec state.
-    pub fn add_file_with_cloexec_and_status(
+    // AGENT: install an entry with explicit open-file-description status and
+    // per-descriptor close-on-exec state without combinatorial helper variants.
+    pub fn add_file_with_status(
         &self,
         fl: FLike,
         status: FdOpt,
