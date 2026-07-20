@@ -16,6 +16,24 @@ pub(crate) struct UserEntry {
     pub stack_pointer: usize,
 }
 
+// AGENT: represent one maximal page-aligned ELF mapping run after combining
+// the permissions of every PT_LOAD segment that covers the same pages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ElfLoadRegion {
+    pub base: usize,
+    pub len: usize,
+    pub flags: u32,
+}
+
+// AGENT: keep one start/end event per PT_LOAD instead of materializing one
+// parser-owned record for every covered virtual page.
+#[derive(Clone, Copy)]
+struct ElfLoadBoundary {
+    addr: usize,
+    flags: u32,
+    entering: bool,
+}
+
 // AGENT: parse an ELF, normalize format failures to ENOEXEC, and construct one
 // complete user image shared by initial task creation and exec.
 pub(crate) fn prepare_user_image(
@@ -50,7 +68,7 @@ fn normalize_user_image_error(err: &'static str) -> &'static str {
 }
 
 // AGENT: translate aggregated ELF permission bits into the VM flags used by
-// one page-granular AddrSpace mapping.
+// one normalized AddrSpace mapping region.
 fn elf_vm_flags(elf_flags: u32) -> u32 {
     let mut flags = 0;
     if elf_flags & 0x4 != 0 {
@@ -69,6 +87,116 @@ fn elf_vm_flags(elf_flags: u32) -> u32 {
     }
 }
 
+// AGENT: keep page-aligned ELF mapping policy beside user-image construction
+// while reusing the parser's checked raw PT_LOAD memory-range validation.
+fn load_segment_page_range(vaddr: usize, mem_size: usize) -> Result<(usize, usize), &'static str> {
+    let mem_end = validate_load_segment_memory_range(vaddr, mem_size)?;
+    let page_start = align_down(vaddr, PAGE_SZ);
+    let page_end = checked_align_up(mem_end, PAGE_SZ).ok_or("bad_phdr")?;
+    if page_start >= page_end {
+        return Err("bad_phdr");
+    }
+    Ok((page_start, page_end))
+}
+
+// AGENT: sweep PT_LOAD page boundaries into sorted, disjoint mapping runs;
+// adjacent runs with the same permission union are coalesced before AddrSpace
+// mapping and protection work begins.
+pub(crate) fn normalize_elf_load_regions(
+    segments: &[ElfLoadSegment],
+) -> Result<Vec<ElfLoadRegion>, &'static str> {
+    let event_capacity = segments.len().checked_mul(2).ok_or("ph_overflow")?;
+    let mut events = Vec::with_capacity(event_capacity);
+    for segment in segments {
+        let (page_start, page_end) = load_segment_page_range(segment.vaddr, segment.mem_size)?;
+        events.push(ElfLoadBoundary {
+            addr: page_start,
+            flags: segment.flags,
+            entering: true,
+        });
+        events.push(ElfLoadBoundary {
+            addr: page_end,
+            flags: segment.flags,
+            entering: false,
+        });
+    }
+    if events.is_empty() {
+        return Err("no_load");
+    }
+    events.sort_unstable_by_key(|event| event.addr);
+
+    const PERMISSION_BITS: [u32; 3] = [0x1, 0x2, 0x4];
+    let mut active_segments = 0usize;
+    let mut active_permissions = [0usize; PERMISSION_BITS.len()];
+    let mut regions = Vec::<ElfLoadRegion>::new();
+    let mut cursor = events[0].addr;
+    let mut index = 0usize;
+
+    while index < events.len() {
+        let boundary = events[index].addr;
+        if cursor < boundary && active_segments != 0 {
+            let mut flags = 0u32;
+            for (bit, count) in PERMISSION_BITS.iter().zip(active_permissions.iter()) {
+                if *count != 0 {
+                    flags |= *bit;
+                }
+            }
+            let len = boundary.checked_sub(cursor).ok_or("bad_phdr")?;
+            if let Some(previous) = regions.last_mut() {
+                let previous_end = previous
+                    .base
+                    .checked_add(previous.len)
+                    .ok_or("ph_overflow")?;
+                if previous_end == cursor && previous.flags == flags {
+                    previous.len = previous.len.checked_add(len).ok_or("ph_overflow")?;
+                } else {
+                    regions.push(ElfLoadRegion {
+                        base: cursor,
+                        len,
+                        flags,
+                    });
+                }
+            } else {
+                regions.push(ElfLoadRegion {
+                    base: cursor,
+                    len,
+                    flags,
+                });
+            }
+        }
+
+        while index < events.len() && events[index].addr == boundary {
+            let event = events[index];
+            if event.entering {
+                active_segments = active_segments.checked_add(1).ok_or("ph_overflow")?;
+            } else {
+                active_segments = active_segments.checked_sub(1).ok_or("bad_phdr")?;
+            }
+            for (permission_index, bit) in PERMISSION_BITS.iter().enumerate() {
+                if event.flags & *bit == 0 {
+                    continue;
+                }
+                active_permissions[permission_index] = if event.entering {
+                    active_permissions[permission_index]
+                        .checked_add(1)
+                        .ok_or("ph_overflow")?
+                } else {
+                    active_permissions[permission_index]
+                        .checked_sub(1)
+                        .ok_or("bad_phdr")?
+                };
+            }
+            index += 1;
+        }
+        cursor = boundary;
+    }
+
+    if active_segments != 0 || active_permissions.iter().any(|count| *count != 0) {
+        return Err("bad_phdr");
+    }
+    Ok(regions)
+}
+
 // AGENT: populate a fresh address space from parsed ELF segments, then build
 // the initial userspace stack and thread entry context.
 fn populate_user_image(
@@ -82,13 +210,17 @@ fn populate_user_image(
     let ParsedElf {
         entry,
         load_segments,
-        load_pages,
     } = elf;
+    let load_regions = normalize_elf_load_regions(&load_segments)?;
 
-    // AGENT: map the union of all PT_LOAD pages exactly once with temporary
-    // write permission; final per-page permissions are installed after copying.
-    for page in &load_pages {
-        addr_space.map_region(VmRegion::new(page.vaddr, PAGE_SZ, VM_READ | VM_WRITE), pool)?;
+    // AGENT: map each maximal permission run once with temporary write access;
+    // shared boundary pages retain the union of all covering segment flags.
+    for region in &load_regions {
+        let temporary_flags = elf_vm_flags(region.flags) | VM_WRITE;
+        addr_space.map_region(
+            VmRegion::new(region.base, region.len, temporary_flags),
+            pool,
+        )?;
     }
 
     let zeroes = vec![0u8; PAGE_SZ];
@@ -120,14 +252,17 @@ fn populate_user_image(
         }
     }
 
-    // AGENT: shared pages receive the union of all covering segment flags;
-    // protect only after file and BSS writes no longer need temporary access.
-    for page in &load_pages {
-        addr_space.protect(page.vaddr, PAGE_SZ, elf_vm_flags(page.flags))?;
+    // AGENT: remove temporary write access once per normalized run instead of
+    // splitting and protecting every page independently.
+    for region in &load_regions {
+        let final_flags = elf_vm_flags(region.flags);
+        if final_flags & VM_WRITE == 0 {
+            addr_space.protect(region.base, region.len, final_flags)?;
+        }
     }
-    let image_end = load_pages
+    let image_end = load_regions
         .last()
-        .and_then(|page| page.vaddr.checked_add(PAGE_SZ))
+        .and_then(|region| region.base.checked_add(region.len))
         .ok_or("ph_overflow")?;
 
     let init = ProcInit {

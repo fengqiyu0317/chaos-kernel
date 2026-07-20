@@ -1,6 +1,6 @@
 # Chaos AI 工作日志
 
-更新时间：2026-07-13
+更新时间：2026-07-20
 
 ## 维护约定
 
@@ -11,6 +11,50 @@
   - `/home/huawei/.codex/sessions/2026/06/18/rollout-2026-06-18T23-57-15-019edb73-6ad9-7b23-8162-c76a589a57a9.jsonl`
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
+
+## 2026-07-20：kernel-qemu ELF 装载区域归一化
+
+目标：保留多个 `PT_LOAD` 共享页边界的兼容性，同时消除 `parse_elf()` 逐页构造 `BTreeMap` 和装载器逐页 `map_region()` / `protect()` 带来的时间、内存与 VMA 碎片开销。
+
+已完成修改：
+
+- `ParsedElf` 删除冗余的 `load_pages`，ELF 解析层只返回 entry 和验证后的 `ElfLoadSegment` 列表。
+- 段内存区间校验拆为 `validate_load_segment_memory_range()`：`parse_elf()` 直接使用其返回的 `mem_end`；只有布局层使用的 `load_segment_page_range()` 移入 `user_image.rs` 并收紧为私有函数，复用原始区间校验后再负责页对齐。
+- `parse_elf()` 对非空 `PT_LOAD` 的真实 `[p_vaddr, p_vaddr + p_memsz)` 区间排序检查；允许页对齐范围共享边界页，但拒绝会使文件复制或 BSS 清零相互覆盖的字节区间重叠。
+- `normalize_elf_load_regions()` 使用每段两个页边界事件扫描权限，输出按地址排序、互不重叠且已合并相邻同权限范围的 `ElfLoadRegion`；输出规模由段边界数决定，不再由覆盖页数决定。
+- `populate_user_image()` 按归一化区域一次映射和恢复权限，仍先完成所有段的文件字节复制与 BSS 清零。共享页权限继续取 `PF_R/PF_W/PF_X` 并集，因此 RX/RW 共享页仍可显式形成 RWX。
+- QEMU proc selftest 增加字节区间重叠拒绝和长段/相邻同权限段压缩为单一区域的回归，并保留共享页文件内容、BSS 和 RWX 权限验证。
+
+关键文件：
+
+- `kernel-qemu/src/proc/elf.rs`
+- `kernel-qemu/src/proc/user_image.rs`
+- `kernel-qemu/src/proc/process_tests.rs`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo check --target riscv64gc-unknown-none-elf --all-features
+CARGO_TARGET_DIR=/tmp/chaos-elf-proc-target cargo build --release --features qemu-proc-selftest
+timeout 15s qemu-system-riscv64 -machine virt -m 128M -nographic -bios default \
+  -kernel /tmp/chaos-elf-proc-target/riscv64gc-unknown-none-elf/release/kernel-qemu
+CARGO_TARGET_DIR=/tmp/chaos-elf-all-target cargo build --release --features qemu-selftest
+timeout 15s qemu-system-riscv64 -machine virt -m 128M -nographic -bios default \
+  -kernel /tmp/chaos-elf-all-target/riscv64gc-unknown-none-elf/release/kernel-qemu
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check
+```
+
+结果：RISC-V all-features check、proc selftest 和组合 selftest release build 通过；QEMU proc 路径输出 `[kernel-qemu] proc selftest passed`，组合路径的 MM/sync/context/sched/proc/fs/checkpoint 全部通过并正常 shutdown；普通 smoke 也通过 timer tick、timer wheel 与 shutdown 检查。`cargo test --no-run` 不作为 no_std RISC-V crate 的验收路径，它会因目标缺少 `test` crate 以及启动型 selftest 函数带参而失败。
+
+当前边界：
+
+- 本轮保留了既有共享页权限并集语义；W^X 强制仍是后续独立策略，本轮不改变兼容性。
+- 未修改 `kernel-sim/` 和禁止修改的 `kernel/src/kernel.rs`。
 
 ## 2026-07-13：kernel-qemu 可回收页级内核堆
 

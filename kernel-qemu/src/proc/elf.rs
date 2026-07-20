@@ -12,21 +12,12 @@ pub struct ElfLoadSegment {
     pub flags: u32,
 }
 
-// AGENT: retain one page-granular PT_LOAD mapping with the union of every
-// segment permission that covers it, so shared boundary pages are mapped once.
-#[derive(Clone, Debug)]
-pub struct ElfLoadPage {
-    pub vaddr: usize,
-    pub flags: u32,
-}
-
 // AGENT: give callers a named parsed image instead of passing an entry point
 // and load-segment vector as an anonymous tuple.
 #[derive(Clone, Debug)]
 pub struct ParsedElf {
     pub entry: usize,
     pub load_segments: Vec<ElfLoadSegment>,
-    pub load_pages: Vec<ElfLoadPage>,
 }
 
 // AGENT: preserve the header-validation API while routing all validation
@@ -86,8 +77,8 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, &'static str> {
     if ph_end > data.len() {
         return Err("ph_overflow");
     }
-    let mut load_segments = Vec::new();
-    let mut load_pages = BTreeMap::<usize, u32>::new();
+    let mut load_segments = Vec::<ElfLoadSegment>::new();
+    let mut load_memory_ranges = Vec::<(usize, usize)>::new();
     for idx in 0..e_phnum as usize {
         // AGENT: derive every table entry with checked arithmetic and reject a
         // malformed table instead of silently returning a partial parse.
@@ -127,15 +118,8 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, &'static str> {
             continue;
         }
 
-        let (page_start, page_end) = load_segment_page_range(vaddr, mem_size)?;
-        // AGENT: aggregate page ownership and permissions during parsing;
-        // multiple PT_LOAD segments may legally share a boundary page.
-        for page_vaddr in (page_start..page_end).step_by(PAGE_SZ) {
-            load_pages
-                .entry(page_vaddr)
-                .and_modify(|page_flags| *page_flags |= flags)
-                .or_insert(flags);
-        }
+        let mem_end = validate_load_segment_memory_range(vaddr, mem_size)?;
+        load_memory_ranges.push((vaddr, mem_end));
         load_segments.push(ElfLoadSegment {
             offset,
             vaddr,
@@ -146,6 +130,15 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, &'static str> {
     }
     if load_segments.is_empty() {
         return Err("no_load");
+    }
+    // AGENT: page-aligned mappings may share a boundary page, but actual
+    // PT_LOAD byte ranges must stay disjoint so file copy and BSS clearing
+    // cannot overwrite another segment according to header order.
+    load_memory_ranges.sort_unstable_by_key(|range| range.0);
+    for ranges in load_memory_ranges.windows(2) {
+        if ranges[1].0 < ranges[0].1 {
+            return Err("bad_phdr");
+        }
     }
     // AGENT: the initial PC must name an instruction inside a mapped,
     // executable PT_LOAD segment rather than an arbitrary ELF-provided address.
@@ -162,26 +155,20 @@ pub fn parse_elf(data: &[u8]) -> Result<ParsedElf, &'static str> {
     Ok(ParsedElf {
         entry: e_entry,
         load_segments,
-        load_pages: load_pages
-            .into_iter()
-            .map(|(vaddr, flags)| ElfLoadPage { vaddr, flags })
-            .collect(),
     })
 }
 
-// AGENT: validate one nonempty load segment against the canonical Sv39 user
-// range and return the exact page interval consumed by AddrSpace::map_region.
-fn load_segment_page_range(vaddr: usize, mem_size: usize) -> Result<(usize, usize), &'static str> {
+// AGENT: validate one PT_LOAD memory interval once and return its checked end
+// to both the pure parser and the later page-layout normalizer.
+pub(crate) fn validate_load_segment_memory_range(
+    vaddr: usize,
+    mem_size: usize,
+) -> Result<usize, &'static str> {
     let mem_end = vaddr.checked_add(mem_size).ok_or("bad_phdr")?;
     if vaddr >= USER_TOP || mem_end > USER_TOP {
         return Err("bad_phdr");
     }
-    let page_start = align_down(vaddr, PAGE_SZ);
-    let page_end = checked_align_up(mem_end, PAGE_SZ).ok_or("bad_phdr")?;
-    if page_start >= page_end {
-        return Err("bad_phdr");
-    }
-    Ok((page_start, page_end))
+    Ok(mem_end)
 }
 
 // AGENT: validate PT_LOAD alignment before process image construction maps

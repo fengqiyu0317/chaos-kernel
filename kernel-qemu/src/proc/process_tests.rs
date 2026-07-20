@@ -25,6 +25,7 @@ pub fn run_all(pool: &FramePool) {
     proc_init_push_at_writes_user_stack(pool);
     parse_elf_rejects_unsupported_or_invalid_entry();
     parse_elf_validates_program_header_layouts();
+    elf_load_regions_coalesce_contiguous_permissions();
     prepared_user_image_normalizes_invalid_elf_to_enoexec(pool);
     prepared_user_image_loads_elf_segment_and_stack(pool);
     prepared_user_image_loads_segments_sharing_a_page(pool);
@@ -682,6 +683,46 @@ fn parse_elf_validates_program_header_layouts() {
     let mut truncated_table = test_elf_with_load_segment(PAGE_SZ, 0x0040_0000, b"code", 4);
     write_test_u64(&mut truncated_table, 32, u64::MAX);
     assert_eq!(parse_elf(&truncated_table).unwrap_err(), "ph_overflow");
+
+    let mut overlapping = test_elf_with_load_segment(PAGE_SZ + 0x100, 0x0040_0100, b"left", 0x300);
+    append_test_load_segment(
+        &mut overlapping,
+        PAGE_SZ * 2 + 0x200,
+        0x0040_0200,
+        b"right",
+        0x100,
+        0x6,
+    );
+    assert_eq!(parse_elf(&overlapping).unwrap_err(), "bad_phdr");
+}
+
+// AGENT: keep long and adjacent same-permission PT_LOAD mappings compact so
+// normalization cost and output size depend on segment boundaries, not pages.
+fn elf_load_regions_coalesce_contiguous_permissions() {
+    let base = 0x0040_0000;
+    let first_pages = 8;
+    let second_pages = 4;
+    let mut elf = test_elf_with_load_segment(PAGE_SZ, base, b"code", first_pages * PAGE_SZ);
+    append_test_load_segment(
+        &mut elf,
+        PAGE_SZ * 2,
+        base + first_pages * PAGE_SZ,
+        b"tail",
+        second_pages * PAGE_SZ,
+        0x5,
+    );
+
+    let parsed = parse_elf(&elf).expect("adjacent PT_LOAD segments should parse");
+    let regions = normalize_elf_load_regions(&parsed.load_segments)
+        .expect("adjacent same-permission segments should normalize");
+    assert_eq!(
+        regions,
+        vec![ElfLoadRegion {
+            base,
+            len: (first_pages + second_pages) * PAGE_SZ,
+            flags: 0x5,
+        }]
+    );
 }
 
 // AGENT: allow two PT_LOAD segments to share one virtual page, load both byte
@@ -702,9 +743,12 @@ fn prepared_user_image_loads_segments_sharing_a_page(pool: &FramePool) {
 
     let parsed = parse_elf(&elf).expect("shared-page PT_LOAD segments should parse");
     assert_eq!(parsed.load_segments.len(), 2);
-    assert_eq!(parsed.load_pages.len(), 1);
-    assert_eq!(parsed.load_pages[0].vaddr, page_vaddr);
-    assert_eq!(parsed.load_pages[0].flags, 0x7);
+    let regions = normalize_elf_load_regions(&parsed.load_segments)
+        .expect("shared-page PT_LOAD segments should normalize");
+    assert_eq!(regions.len(), 1);
+    assert_eq!(regions[0].base, page_vaddr);
+    assert_eq!(regions[0].len, PAGE_SZ);
+    assert_eq!(regions[0].flags, 0x7);
 
     let mut image = prepare_user_image(&elf, Vec::new(), Vec::new(), pool)
         .expect("shared-page PT_LOAD segments should load");

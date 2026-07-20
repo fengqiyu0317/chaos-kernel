@@ -1,6 +1,6 @@
 # Chaos 项目交接状态
 
-更新日期：2026-07-13
+更新日期：2026-07-20
 
 ## 目标
 
@@ -44,6 +44,7 @@
 - 2026-06-27：`kernel-sim/src/kernel/core/sync.rs` 的 `Spin` 已从裸 `AtomicBool` 改为私有 ticket-lock 状态，新增 `SpinGuard` RAII 释放、owner/depth 检查和 `SpinLock<T>`；`kernel-sim/src/kernel/core/current.rs` 负责维护由 `Kernel::set_cur()` 安装的 CPU-local current task id，避免 `Spin` 直接依赖全局 `Kernel`；`BlockCache`、`Channel`、runtime tick、`sys_close()` 已移除 `Spin.v` 直接访问，`BlockCache::fetch()` 不再持 chain 自旋锁执行 `thread::sleep()`，`Channel::recv()` 不再持自旋锁执行 `WaitToken::wait()`。
 - 2026-06-27：`kernel-sim/src/kernel/core/current.rs` 的 current-task TLS 存储从 `Cell<usize>` 调整为 `AtomicUsize` relaxed load/store，保持 host-thread 本地隔离；`kernel-sim/tests/smoke.rs` 为直接设置 current-task 的 Spin/SpinLock/BlockCache 低层测试增加串行锁，避免默认并行测试下固定 task id 与 helper thread 假设互相干扰。
 - 2026-07-18：`kernel-qemu` 已把共享 `ProcessState` 升格为一等 `Process`：PID 从构造时起不可变，`TaskTable` 分别维护 TID→`Task` 与 PID→`Process` 索引，父进程使用 `Weak<Process>`、子进程按 PID 强持有到 wait/reap；fork/clone/exit/wait/reap、进程组信号和孤儿接管均改走进程对象，`Task` 只保留线程现场、内核栈、信号 mask/frame 与调度状态。QEMU `proc`、`sched`、`sync` 自测均通过。
+- 2026-07-20：`kernel-qemu` ELF 装载器已移除 `ParsedElf.load_pages` 的逐页展开；`parse_elf()` 只保留验证后的 `PT_LOAD` 段元数据并拒绝真实字节区间重叠，通过 `validate_load_segment_memory_range()` 直接取得已校验的 `mem_end`；页对齐的 `load_segment_page_range()` 已移入 `user_image.rs` 并收紧为私有函数，再由段边界扫描生成连续、互不重叠的权限区域，按区域而非按页执行 map/protect。共享边界页仍保留权限并集策略，QEMU proc selftest、组合 selftest 与普通 smoke 均通过。
 - 2026-06-27：`kernel-sim/src/kernel/core/sync.rs` 的 `EvBus` 已新增基于 `WaitToken` 的等待者队列；顶层 `wait_ev()` 现在在持有 `EvBus` 锁时检查事件位并原子入队，`EvBus::change()` 在事件位变化后唤醒 mask 匹配的等待者，去掉了原先的 `thread::yield_now()` 忙等路径；新增 `ev_bus_wait_ev_returns_existing_event` / `ev_bus_wait_ev_wakes_on_matching_event` smoke 回归。剩余事件模型、epoll 接线和 callback 锁外分发债务见相邻 M8 TODO。
 - 2026-06-27：`kernel-sim` 的 pipe readiness 已接入 `EvBus::sub()` -> `EpInst::mark_ready()` 路径：`EvBus::sub()` 返回可取消订阅 id，`epoll_ctl(ADD/MOD/DEL)` 会为 pipe fd 注册/取消 readiness callback，`sys_epoll_wait()` 在无 ready fd 时睡入 `EpInst.waiters`，由 pipe 写入/关闭等状态变化唤醒；`PipeNode::poll()` 去掉重复锁定同一 mutex 的自锁风险。新增 `epoll_wait_wakes_when_pipe_becomes_readable` smoke 回归。
 - 2026-06-28：新增 `kernel-qemu/` 最小 QEMU 裸机承载层：独立 `riscv64gc-unknown-none-elf` crate、linker script、`entry.S`、`#![no_std]` / `#![no_main]`、panic handler、SBI console、SBI shutdown，以及 `tools/qemu-smoke.sh` 启动/关机输出检查；该阶段只提供运行环境，不引入 `kernel-sim` 业务语义。
