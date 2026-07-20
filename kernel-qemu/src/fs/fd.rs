@@ -33,6 +33,12 @@ impl FdOpt {
 pub struct OpenFileDesc {
     file: FLike,
     status: RwLock<FdOpt>,
+    // AGENT: count only installed fd-table slots; transient Arc clones held by
+    // syscall helpers and epoll registrations must not delay last-fd cleanup.
+    fd_slots: AtomicUsize,
+    // AGENT: keep weak reverse links so the last fd slot for this OFD can
+    // remove registrations from every epoll instance, including across fork.
+    epoll_watchers: Mutex<Vec<EpInstWeak>>,
 }
 
 impl OpenFileDesc {
@@ -48,6 +54,8 @@ impl OpenFileDesc {
         Self {
             file,
             status: RwLock::new(status),
+            fd_slots: AtomicUsize::new(0),
+            epoll_watchers: Mutex::new(Vec::new()),
         }
     }
 
@@ -208,6 +216,139 @@ impl OpenFileDesc {
     }
 }
 
+// AGENT: own one open-file-description Arc while comparing and ordering it by
+// allocation identity, matching Linux's (fd number, open file description)
+// epoll key without exposing a stale integer-only id.
+#[derive(Clone)]
+pub(crate) struct OpenFileRef(Arc<OpenFileDesc>);
+
+// AGENT: preserve pointer identity for equality even when OFD status changes.
+impl PartialEq for OpenFileRef {
+    // AGENT: compare OFD allocations rather than mutable file/status contents.
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+// AGENT: complete identity equality for Arc-backed OFD keys.
+impl Eq for OpenFileRef {}
+
+// AGENT: give BTreeMap a stable identity order while both Arc-backed
+// allocations remain alive through the keys being compared.
+impl PartialOrd for OpenFileRef {
+    // AGENT: delegate partial ordering to the total pointer-identity order.
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrd> {
+        Some(self.cmp(other))
+    }
+}
+
+// AGENT: order live Arc allocations by address for BTreeMap key placement.
+impl Ord for OpenFileRef {
+    // AGENT: keep ordering stable because both compared Arcs retain allocations.
+    fn cmp(&self, other: &Self) -> CmpOrd {
+        let lhs = Arc::as_ptr(&self.0) as usize;
+        let rhs = Arc::as_ptr(&other.0) as usize;
+        lhs.cmp(&rhs)
+    }
+}
+
+// AGENT: keep weak source identity in readiness callbacks so a Pipe EvBus does
+// not retain its own OpenFileDesc through an EpKey reference cycle.
+#[derive(Clone)]
+pub(crate) struct OpenFileWeak(Weak<OpenFileDesc>);
+
+// AGENT: centralize OFD identity, readiness, subscription, and fd-slot lifetime
+// operations behind the Arc wrapper used by epoll.
+impl OpenFileRef {
+    // AGENT: create a non-owning source reference for readiness callbacks.
+    pub(crate) fn downgrade(&self) -> OpenFileWeak {
+        OpenFileWeak(Arc::downgrade(&self.0))
+    }
+
+    // AGENT: poll the exact registered OFD even after its fd number is reused.
+    pub(crate) fn poll(&self) -> PollStatus {
+        self.0.poll()
+    }
+
+    // AGENT: install a source callback keyed by the full (fd, OFD) identity.
+    pub(crate) fn register_epoll_source(
+        &self,
+        key: &EpKey,
+        ep: &EpInst,
+        ev: &EpEvent,
+    ) -> Option<usize> {
+        self.0.file().register_epoll(key, ep, ev)
+    }
+
+    // AGENT: detach one callback from the concrete source object.
+    pub(crate) fn unregister_epoll_source(&self, sub_id: usize) -> bool {
+        self.0.file().unregister_epoll(sub_id)
+    }
+
+    // AGENT: expose a shared epoll object only when this OFD contains one.
+    pub(crate) fn epoll_instance(&self) -> Option<EpInst> {
+        match self.0.file() {
+            FLike::Ep(inst) => Some(inst.clone()),
+            _ => None,
+        }
+    }
+
+    // AGENT: record one newly installed fd-table slot independently of Arc refs.
+    pub(crate) fn acquire_fd_slot(&self) {
+        self.0.fd_slots.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // AGENT: report whether a removed slot was the last global descriptor slot.
+    pub(crate) fn release_fd_slot(&self) -> bool {
+        let previous = self.0.fd_slots.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+        previous == 1
+    }
+
+    // AGENT: remember one epoll registration through a weak reverse link.
+    pub(crate) fn add_epoll_watcher(&self, epoll: &EpInst) {
+        self.0
+            .epoll_watchers
+            .lock()
+            .unwrap()
+            .push(epoll.downgrade());
+    }
+
+    // AGENT: remove exactly one reverse link when one registration is deleted.
+    pub(crate) fn remove_epoll_watcher(&self, epoll: &EpInst) {
+        let mut watchers = self.0.epoll_watchers.lock().unwrap();
+        if let Some(index) = watchers
+            .iter()
+            .position(|watcher| watcher.same_instance(epoll))
+        {
+            watchers.swap_remove(index);
+        }
+    }
+
+    // AGENT: remove watched-source registrations globally and drain epoll-owned
+    // subscriptions only when the final real fd-table slot disappears.
+    pub(crate) fn close_last_fd_slot(&self) {
+        let watchers = mem::take(&mut *self.0.epoll_watchers.lock().unwrap());
+        for watcher in watchers {
+            if let Some(epoll) = watcher.upgrade() {
+                epoll.remove_source_on_last_close(self);
+            }
+        }
+        if let Some(epoll) = self.epoll_instance() {
+            epoll.close_last_fd_slot();
+        }
+    }
+}
+
+// AGENT: upgrade callback-held weak OFD identity only while delivering a live
+// readiness notification.
+impl OpenFileWeak {
+    // AGENT: regain a short-lived OFD owner only while a callback is delivered.
+    pub(crate) fn upgrade(&self) -> Option<OpenFileRef> {
+        self.0.upgrade().map(OpenFileRef)
+    }
+}
+
 // AGENT: fd flags that belong to one descriptor entry, not to the shared open
 // file description.
 #[derive(Clone)]
@@ -247,6 +388,11 @@ impl FdEntry {
         }
     }
 
+    // AGENT: expose an Arc-owning OFD identity without copying per-fd flags.
+    pub(crate) fn open_file_ref(&self) -> OpenFileRef {
+        OpenFileRef(self.desc.clone())
+    }
+
     pub fn is_cloexec(&self) -> bool {
         self.cloexec
     }
@@ -258,22 +404,19 @@ impl FdEntry {
     // AGENT: expose epoll instances to fd-table lifecycle cleanup without
     // leaking the open-file-description internals.
     pub fn epoll_instance(&self) -> Option<EpInst> {
-        match self.desc.file() {
-            FLike::Ep(inst) => Some(inst.clone()),
-            _ => None,
-        }
+        self.open_file_ref().epoll_instance()
     }
 
     // AGENT: compare open-file-description identity so close can distinguish the
     // last fd-table reference from temporary cloned FdEntry handles.
     pub fn same_open_description(&self, other: &FdEntry) -> bool {
-        Arc::ptr_eq(&self.desc, &other.desc)
+        self.open_file_ref() == other.open_file_ref()
     }
 
     // AGENT: install a source-backed epoll subscription through the descriptor
     // entry so callers do not need a compatibility FLike clone.
-    pub fn register_epoll_source(&self, fd: usize, ep: EpInst, ev: &EpEvent) -> Option<usize> {
-        self.desc.file().register_epoll(fd, ep, ev)
+    pub fn register_epoll_source(&self, key: &EpKey, ep: &EpInst, ev: &EpEvent) -> Option<usize> {
+        self.open_file_ref().register_epoll_source(key, ep, ev)
     }
 
     // AGENT: remove a source-backed epoll subscription from this file object.

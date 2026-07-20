@@ -30,9 +30,9 @@ impl FLike {
 
     // AGENT: register an epoll readiness callback when this file-like object
     // exposes a cancellable source; regular files remain level-polled.
-    pub fn register_epoll(&self, fd: usize, ep: EpInst, ev: &EpEvent) -> Option<usize> {
+    pub fn register_epoll(&self, key: &EpKey, ep: &EpInst, ev: &EpEvent) -> Option<usize> {
         match self {
-            FLike::Pipe(p) => p.register_epoll(fd, ep, ev),
+            FLike::Pipe(p) => p.register_epoll(key, ep, ev),
             _ => None,
         }
     }

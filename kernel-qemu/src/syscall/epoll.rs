@@ -73,36 +73,37 @@ pub(super) fn sys_epoll_ctl(
         unsafe { ::core::ptr::read_unaligned(ev_addr as *const EpEvent) }
     };
 
-    // AGENT: mutate the registered epoll instance first, then mirror ADD/MOD/DEL
-    // into the source object's cancellable readiness subscription when present.
+    // AGENT: key every control operation by the current fd and its Arc-owned OFD
+    // so fd-number reuse cannot alias an older surviving registration.
     let inst = epoll_instance(&task, epfd)?;
-    let del_sub_id = if op == EpCtlOp::DEL && inst.has_interest(fd) {
-        inst.take_source_sub(fd)
-    } else {
-        None
-    };
-    inst.control(op, fd, &ev)?;
+    let key = EpKey::from_entry(fd, &entry);
     match op {
         EpCtlOp::ADD => {
-            if let Some(sub_id) = entry.register_epoll_source(fd, inst.clone(), &ev) {
-                inst.set_source_sub(fd, sub_id);
+            inst.control(op, key.clone(), &ev)?;
+            key.source().add_epoll_watcher(&inst);
+            if let Some(sub_id) = key.source().register_epoll_source(&key, &inst, &ev) {
+                inst.set_source_sub(&key, sub_id);
             } else {
-                mark_if_currently_ready(&task, &inst, fd, ev.events);
+                mark_if_currently_ready(&inst, &key, ev.events);
             }
         }
         EpCtlOp::MOD => {
-            if let Some(sub_id) = inst.take_source_sub(fd) {
-                entry.unregister_epoll_source(sub_id);
+            inst.control(op, key.clone(), &ev)?;
+            if let Some(sub_id) = inst.take_source_sub(&key) {
+                key.source().unregister_epoll_source(sub_id);
             }
-            if let Some(sub_id) = entry.register_epoll_source(fd, inst.clone(), &ev) {
-                inst.set_source_sub(fd, sub_id);
+            if let Some(sub_id) = key.source().register_epoll_source(&key, &inst, &ev) {
+                inst.set_source_sub(&key, sub_id);
             } else {
-                mark_if_currently_ready(&task, &inst, fd, ev.events);
+                mark_if_currently_ready(&inst, &key, ev.events);
             }
         }
         EpCtlOp::DEL => {
-            if let Some(sub_id) = del_sub_id {
-                entry.unregister_epoll_source(sub_id);
+            let sub_id = inst.take_source_sub(&key);
+            inst.control(op, key.clone(), &ev)?;
+            key.source().remove_epoll_watcher(&inst);
+            if let Some(sub_id) = sub_id {
+                key.source().unregister_epoll_source(sub_id);
             }
         }
         _ => {}
@@ -132,16 +133,14 @@ pub(crate) fn epoll_ready_events(status: PollStatus, interest: u32) -> u32 {
 
 // AGENT: non-source-backed files do not install EvBus callbacks, so epoll_ctl
 // seeds the ready list once from their current level-triggered poll state.
-fn mark_if_currently_ready(task: &Task, inst: &EpInst, fd: usize, interest: u32) {
-    if let Some(entry) = task.get_fd_entry(fd) {
-        if epoll_ready_events(entry.poll(), interest) != 0 {
-            inst.mark_ready(fd);
-        }
+fn mark_if_currently_ready(inst: &EpInst, key: &EpKey, interest: u32) {
+    if epoll_ready_events(key.source().poll(), interest) != 0 {
+        inst.mark_ready(key);
     }
 }
 
-// AGENT: epoll_wait consumes EpInst's ready list and only polls fd entries that
-// were delivered by source callbacks or initial level-triggered registration.
+// AGENT: epoll_wait consumes EpInst's ready list and polls the Arc-owned OFD
+// captured at registration, never a possibly reused current fd-table slot.
 // QEMU timeouts use the logical timer wheel instead of host Instant/park_timeout.
 pub(super) fn sys_epoll_wait(
     kernel: &Kernel,
@@ -176,13 +175,10 @@ pub(super) fn sys_epoll_wait(
         let inst = epoll_instance(&task, epfd)?;
         let mut nready = 0usize;
         while nready < max_events {
-            let Some((fd, ev)) = inst.pop_ready() else {
+            let Some((key, ev)) = inst.pop_ready() else {
                 break;
             };
-            let Some(entry) = task.get_fd_entry(fd) else {
-                continue;
-            };
-            let ready = epoll_ready_events(entry.poll(), ev.events);
+            let ready = epoll_ready_events(key.source().poll(), ev.events);
             if ready == 0 {
                 continue;
             }
@@ -198,7 +194,7 @@ pub(super) fn sys_epoll_wait(
             }
             nready += 1;
             if !ev.has(EpEvent::ET) {
-                inst.requeue_ready(fd);
+                inst.requeue_ready(&key);
             }
         }
 

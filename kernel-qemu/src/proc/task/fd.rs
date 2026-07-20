@@ -23,11 +23,12 @@ impl Default for FdTable {
 impl FdTable {
     // AGENT: rebuild the generic id allocator from validated occupied fd slots.
     fn from_entries(entries: BTreeMap<usize, FdEntry>) -> Result<Self, &'static str> {
-        let mut allocator = AllocatorState::new(MAX_FD);
-        for fd in entries.keys() {
-            allocator.reserve(*fd).ok_or("ebadf")?;
+        let mut table = Self::default();
+        for (fd, entry) in entries {
+            table.allocator.reserve(fd).ok_or("ebadf")?;
+            table.install_entry(fd, entry);
         }
-        Ok(Self { entries, allocator })
+        Ok(table)
     }
 
     // AGENT: allocate the lowest descriptor at or above an ABI lower bound.
@@ -35,49 +36,32 @@ impl FdTable {
         self.allocator.allocate_from(start).ok_or("emfile")
     }
 
-    // AGENT: remove one descriptor from the locked table and collect epoll
-    // unsubscriptions for the caller to execute after releasing the lock.
+    // AGENT: count only actual map slots as user-visible descriptor references;
+    // FdEntry clones used by I/O and epoll remain transient Arc owners.
+    fn install_entry(&mut self, fd: usize, entry: FdEntry) {
+        assert!(!self.entries.contains_key(&fd));
+        entry.open_file_ref().acquire_fd_slot();
+        self.entries.insert(fd, entry);
+    }
+
+    // AGENT: remove one descriptor and defer final-OFD epoll cleanup until the
+    // caller releases the process fd-table lock.
     fn remove_fd_locked(&mut self, fd: usize) -> Result<FdCloseCleanup, &'static str> {
         let closed_entry = self.entries.remove(&fd).ok_or("ebadf")?;
-
-        let mut closed_fd_source_subs = Vec::new();
-        for entry in self.entries.values() {
-            if let Some(epoll) = entry.epoll_instance() {
-                if let Some(sub_id) = epoll.remove_closed_fd(fd) {
-                    closed_fd_source_subs.push(sub_id);
-                }
-            }
-        }
-
-        let mut epoll_source_subs = Vec::new();
-        let still_open = self
-            .entries
-            .values()
-            .any(|entry| entry.same_open_description(&closed_entry));
-        if !still_open {
-            if let Some(epoll) = closed_entry.epoll_instance() {
-                for (watched_fd, sub_id) in epoll.drain_source_subs_on_close() {
-                    if let Some(source) = self.entries.get(&watched_fd).cloned() {
-                        epoll_source_subs.push((source, sub_id));
-                    }
-                }
-            }
-        }
-
-        Ok(FdCloseCleanup {
-            closed_entry,
-            closed_fd_source_subs,
-            epoll_source_subs,
-        })
+        Ok(FdCloseCleanup::new(closed_entry))
     }
 
     // AGENT: duplicate entries while preserving an identical independent id
     // allocator snapshot for the child process.
     fn fork_copy(&self) -> Self {
-        Self {
-            entries: self.entries.clone(),
+        let mut copied = Self {
+            entries: BTreeMap::new(),
             allocator: self.allocator.clone(),
+        };
+        for (&fd, entry) in self.entries.iter() {
+            copied.install_entry(fd, entry.clone());
         }
+        copied
     }
 
     fn cloexec_fds(&self) -> Vec<usize> {
@@ -88,23 +72,41 @@ impl FdTable {
     }
 }
 
+// AGENT: release every remaining fd slot outside process locks during exit,
+// checkpoint replacement, or other whole-table teardown paths.
+impl Drop for FdTable {
+    // AGENT: translate whole-table destruction into one slot release per entry.
+    fn drop(&mut self) {
+        let entries = mem::take(&mut self.entries);
+        for (_, entry) in entries {
+            FdCloseCleanup::new(entry).run();
+        }
+    }
+}
+
 // AGENT: collect close side effects under the fd-table lock and execute them
 // after unlocking so callbacks and Drop cannot re-enter the table.
 struct FdCloseCleanup {
     closed_entry: FdEntry,
-    closed_fd_source_subs: Vec<usize>,
-    epoll_source_subs: Vec<(FdEntry, usize)>,
+    last_fd_slot: bool,
 }
 
 // AGENT: detach all epoll source callbacks before dropping a closed entry.
 impl FdCloseCleanup {
+    // AGENT: decrement the explicit fd-slot count while retaining the OFD Arc
+    // needed to perform final epoll teardown after unlocking the table.
+    fn new(closed_entry: FdEntry) -> Self {
+        let last_fd_slot = closed_entry.open_file_ref().release_fd_slot();
+        Self {
+            closed_entry,
+            last_fd_slot,
+        }
+    }
+
     // AGENT: run deferred unsubscriptions outside the fd-table lock.
     fn run(self) {
-        for sub_id in self.closed_fd_source_subs {
-            self.closed_entry.unregister_epoll_source(sub_id);
-        }
-        for (source, sub_id) in self.epoll_source_subs {
-            source.unregister_epoll_source(sub_id);
+        if self.last_fd_slot {
+            self.closed_entry.open_file_ref().close_last_fd_slot();
         }
         drop(self.closed_entry);
     }
@@ -211,7 +213,7 @@ impl Task {
     pub fn add_file(&self, fl: FLike) -> Result<usize, &'static str> {
         let mut table = self.process.fd_table.lock().unwrap();
         let fd = table.reserve_from(0)?;
-        table.entries.insert(fd, FdEntry::new(fl));
+        table.install_entry(fd, FdEntry::new(fl));
         Ok(fd)
     }
 
@@ -225,9 +227,7 @@ impl Task {
     ) -> Result<usize, &'static str> {
         let mut table = self.process.fd_table.lock().unwrap();
         let fd = table.reserve_from(0)?;
-        table
-            .entries
-            .insert(fd, FdEntry::with_status(fl, status, cloexec));
+        table.install_entry(fd, FdEntry::with_status(fl, status, cloexec));
         Ok(fd)
     }
 
@@ -248,12 +248,8 @@ impl Task {
                 return Err(err);
             }
         };
-        table
-            .entries
-            .insert(first_fd, FdEntry::with_cloexec(first, cloexec));
-        table
-            .entries
-            .insert(second_fd, FdEntry::with_cloexec(second, cloexec));
+        table.install_entry(first_fd, FdEntry::with_cloexec(first, cloexec));
+        table.install_entry(second_fd, FdEntry::with_cloexec(second, cloexec));
         Ok((first_fd, second_fd))
     }
 
@@ -328,7 +324,11 @@ impl Task {
     // AGENT: snapshot inherited descriptors without exposing FdTable internals.
     pub(super) fn inherit_fds_from(&self, parent: &Task) {
         let inherited = parent.process.fd_table.lock().unwrap().fork_copy();
-        *self.process.fd_table.lock().unwrap() = inherited;
+        let previous = {
+            let mut table = self.process.fd_table.lock().unwrap();
+            mem::replace(&mut *table, inherited)
+        };
+        drop(previous);
     }
 
     // AGENT: collect close-on-exec descriptors under the unified fd-table lock.
@@ -370,7 +370,7 @@ impl Task {
         let entry = table.entries.get(&old_fd).cloned().ok_or("ebadf")?;
         let new_entry = entry.dup(cloexec);
         let new_fd = table.reserve_from(start)?;
-        table.entries.insert(new_fd, new_entry);
+        table.install_entry(new_fd, new_entry);
         Ok(new_fd)
     }
 
@@ -393,7 +393,7 @@ impl Task {
             if cleanup.is_none() && table.allocator.reserve(new_fd).is_none() {
                 return Err("ebadf");
             }
-            table.entries.insert(new_fd, entry.dup(false));
+            table.install_entry(new_fd, entry.dup(false));
             cleanup
         };
         if let Some(cleanup) = cleanup {

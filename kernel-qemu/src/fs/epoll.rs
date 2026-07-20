@@ -41,6 +41,62 @@ impl EpCtlOp {
     pub const MOD: i32 = 3;
 }
 
+// AGENT: identify one Linux-style epoll registration by both the userspace fd
+// number and the Arc-owned open-file description installed at ADD time.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct EpKey {
+    fd: usize,
+    source: OpenFileRef,
+}
+
+// AGENT: build and inspect epoll keys without exposing OpenFileDesc internals.
+impl EpKey {
+    // AGENT: bind an fd number to the OFD installed in that slot at ctl time.
+    pub(crate) fn from_entry(fd: usize, entry: &FdEntry) -> Self {
+        Self {
+            fd,
+            source: entry.open_file_ref(),
+        }
+    }
+
+    // AGENT: expose the userspace number carried by this exact registration.
+    pub(crate) fn fd(&self) -> usize {
+        self.fd
+    }
+
+    // AGENT: expose the Arc-owned source used for poll and callback cleanup.
+    pub(crate) fn source(&self) -> &OpenFileRef {
+        &self.source
+    }
+
+    // AGENT: remove strong source ownership before storing a key in its EvBus.
+    pub(crate) fn downgrade(&self) -> EpWakeKey {
+        EpWakeKey {
+            fd: self.fd,
+            source: self.source.downgrade(),
+        }
+    }
+}
+
+// AGENT: let source-owned EvBus callbacks name a registration without strongly
+// retaining the source OFD that owns the callback.
+#[derive(Clone)]
+pub(crate) struct EpWakeKey {
+    fd: usize,
+    source: OpenFileWeak,
+}
+
+// AGENT: reconstruct a strong EpKey only for the duration of callback delivery.
+impl EpWakeKey {
+    // AGENT: rebuild a live exact key or discard a stale callback safely.
+    pub(crate) fn upgrade(&self) -> Option<EpKey> {
+        Some(EpKey {
+            fd: self.fd,
+            source: self.source.upgrade()?,
+        })
+    }
+}
+
 // AGENT: one watched fd inside an epoll instance. queued mirrors Linux epitem
 // membership in the ready list so repeated source callbacks do not duplicate fd
 // entries before epoll_wait consumes them.
@@ -50,31 +106,73 @@ struct EpItem {
     queued: bool,
 }
 
+// AGENT: key both interest and ready state by (fd, OFD) identity.
 #[derive(Default)]
 struct EpInstInner {
-    interests: BTreeMap<usize, EpItem>,
-    ready_list: VecDeque<usize>,
+    interests: BTreeMap<EpKey, EpItem>,
+    ready_list: VecDeque<EpKey>,
 }
 
+// AGENT: keep ready-list membership and interest removal keyed by the exact
+// (fd, OFD) registration rather than by a reusable integer fd alone.
 impl EpInstInner {
-    fn queue_ready(&mut self, fd: usize) -> bool {
-        let Some(item) = self.interests.get_mut(&fd) else {
+    // AGENT: enqueue one exact registration at most once until consumption.
+    fn queue_ready(&mut self, key: &EpKey) -> bool {
+        let Some(item) = self.interests.get_mut(key) else {
             return false;
         };
         if item.queued {
             return false;
         }
         item.queued = true;
-        self.ready_list.push_back(fd);
+        self.ready_list.push_back(key.clone());
         true
     }
 
-    fn remove_ready(&mut self, fd: usize) {
-        if let Some(item) = self.interests.get_mut(&fd) {
+    // AGENT: remove all queued occurrences for one exact registration.
+    fn remove_ready(&mut self, key: &EpKey) {
+        if let Some(item) = self.interests.get_mut(key) {
             item.queued = false;
         }
-        self.ready_list.retain(|queued_fd| *queued_fd != fd);
+        self.ready_list.retain(|queued_key| queued_key != key);
     }
+
+    // AGENT: detach one interest while preserving cleanup data for the caller.
+    fn remove_interest(&mut self, key: &EpKey) -> Option<RemovedEpItem> {
+        self.remove_ready(key);
+        self.interests.remove(key).map(|item| RemovedEpItem {
+            key: key.clone(),
+            source_sub: item.source_sub,
+        })
+    }
+
+    // AGENT: detach every fd-number registration that shares one source OFD.
+    fn remove_source(&mut self, source: &OpenFileRef) -> Vec<RemovedEpItem> {
+        let keys: Vec<EpKey> = self
+            .interests
+            .keys()
+            .filter(|key| key.source() == source)
+            .cloned()
+            .collect();
+        keys.iter()
+            .filter_map(|key| self.remove_interest(key))
+            .collect()
+    }
+
+    // AGENT: detach all registrations when the epoll OFD loses its final slot.
+    fn drain_interests(&mut self) -> Vec<RemovedEpItem> {
+        let keys: Vec<EpKey> = self.interests.keys().cloned().collect();
+        keys.iter()
+            .filter_map(|key| self.remove_interest(key))
+            .collect()
+    }
+}
+
+// AGENT: carry enough source identity out of the EpInst lock to unsubscribe
+// callbacks and reverse links without lock re-entry.
+struct RemovedEpItem {
+    key: EpKey,
+    source_sub: Option<usize>,
 }
 
 // AGENT: epoll instances now hold an interest table plus a Linux-style ready
@@ -87,6 +185,33 @@ pub struct EpInst {
     // wake it when a registered fd becomes ready.
     waiters: Arc<WaitQueue>,
 }
+
+// AGENT: weak epoll handle used by OFD reverse links and source callbacks so
+// registrations cannot keep a closed epoll instance alive by themselves.
+#[derive(Clone)]
+pub(crate) struct EpInstWeak {
+    inner: Weak<Mutex<EpInstInner>>,
+    waiters: Weak<WaitQueue>,
+}
+
+// AGENT: upgrade and compare epoll instances by their shared inner allocation.
+impl EpInstWeak {
+    // AGENT: recover both shared epoll components only while they remain live.
+    pub(crate) fn upgrade(&self) -> Option<EpInst> {
+        Some(EpInst {
+            inner: self.inner.upgrade()?,
+            waiters: self.waiters.upgrade()?,
+        })
+    }
+
+    // AGENT: compare weak reverse links with a live epoll allocation by identity.
+    pub(crate) fn same_instance(&self, epoll: &EpInst) -> bool {
+        Weak::ptr_eq(&self.inner, &Arc::downgrade(&epoll.inner))
+    }
+}
+
+// AGENT: drive exact-key readiness, OFD last-close removal, and epoll-instance
+// teardown through one shared EpInst implementation.
 impl EpInst {
     pub fn new() -> Self {
         EpInst {
@@ -94,10 +219,19 @@ impl EpInst {
             waiters: Arc::new(WaitQueue::new()),
         }
     }
-    // AGENT: source callbacks queue one watched fd onto the ready list. Stale
-    // callbacks are ignored if the fd is no longer registered in this instance.
-    pub fn mark_ready(&self, fd: usize) {
-        let queued = self.inner.lock().unwrap().queue_ready(fd);
+
+    // AGENT: create a non-owning epoll handle for OFD backlinks and callbacks.
+    pub(crate) fn downgrade(&self) -> EpInstWeak {
+        EpInstWeak {
+            inner: Arc::downgrade(&self.inner),
+            waiters: Arc::downgrade(&self.waiters),
+        }
+    }
+
+    // AGENT: source callbacks queue one exact watched registration. Stale
+    // callbacks are ignored if that (fd, OFD) key has been removed.
+    pub(crate) fn mark_ready(&self, key: &EpKey) {
+        let queued = self.inner.lock().unwrap().queue_ready(key);
         if queued {
             self.wake_all_waiters();
         }
@@ -105,27 +239,28 @@ impl EpInst {
 
     // AGENT: level-triggered epoll_wait puts still-ready items back on the
     // ready list so later waits can observe them without rescanning all fds.
-    pub fn requeue_ready(&self, fd: usize) {
-        self.inner.lock().unwrap().queue_ready(fd);
+    pub(crate) fn requeue_ready(&self, key: &EpKey) {
+        self.inner.lock().unwrap().queue_ready(key);
     }
 
     // AGENT: pop the next possibly-ready watched fd. The caller must poll the
-    // current fd state before returning it to userspace because readiness can
-    // become stale between callback delivery and epoll_wait.
-    pub fn pop_ready(&self) -> Option<(usize, EpEvent)> {
+    // registered source state before returning it because readiness can become
+    // stale between callback delivery and epoll_wait.
+    pub(crate) fn pop_ready(&self) -> Option<(EpKey, EpEvent)> {
         let mut inner = self.inner.lock().unwrap();
-        while let Some(fd) = inner.ready_list.pop_front() {
-            let Some(item) = inner.interests.get_mut(&fd) else {
+        while let Some(key) = inner.ready_list.pop_front() {
+            let Some(item) = inner.interests.get_mut(&key) else {
                 continue;
             };
             item.queued = false;
-            return Some((fd, item.event.clone()));
+            return Some((key, item.event.clone()));
         }
         None
     }
 
-    pub fn has_interest(&self, fd: usize) -> bool {
-        self.inner.lock().unwrap().interests.contains_key(&fd)
+    // AGENT: query one exact registration instead of an ambiguous fd number.
+    pub(crate) fn has_interest(&self, key: &EpKey) -> bool {
+        self.inner.lock().unwrap().interests.contains_key(key)
     }
 
     pub fn ready_len(&self) -> usize {
@@ -158,52 +293,44 @@ impl EpInst {
         self.waiters.remove_waiter(token);
     }
     // AGENT: remember which EvBus callback backs a watched fd.
-    pub fn set_source_sub(&self, fd: usize, sub_id: usize) {
-        if let Some(item) = self.inner.lock().unwrap().interests.get_mut(&fd) {
+    pub(crate) fn set_source_sub(&self, key: &EpKey, sub_id: usize) {
+        if let Some(item) = self.inner.lock().unwrap().interests.get_mut(key) {
             item.source_sub = Some(sub_id);
         }
     }
     // AGENT: take the callback id so the caller can unregister it from the
     // concrete source while processing epoll_ctl(DEL/MOD).
-    pub fn take_source_sub(&self, fd: usize) -> Option<usize> {
+    pub(crate) fn take_source_sub(&self, key: &EpKey) -> Option<usize> {
         self.inner
             .lock()
             .unwrap()
             .interests
-            .get_mut(&fd)
+            .get_mut(key)
             .and_then(|item| item.source_sub.take())
     }
 
-    // AGENT: closing a watched fd removes its registration and returns the
-    // source subscription id that must be cancelled on the watched file object.
-    pub fn remove_closed_fd(&self, fd: usize) -> Option<usize> {
-        self.remove_interest(fd).and_then(|item| item.source_sub)
+    // AGENT: remove every registration for an OFD only after its final real fd
+    // slot closes; duplicate/fork aliases keep these interests alive.
+    pub(crate) fn remove_source_on_last_close(&self, source: &OpenFileRef) {
+        let removed = self.inner.lock().unwrap().remove_source(source);
+        for item in removed {
+            if let Some(sub_id) = item.source_sub {
+                item.key.source().unregister_epoll_source(sub_id);
+            }
+        }
     }
 
-    // AGENT: closing the last descriptor for an epoll instance detaches every
-    // source callback and wakes waiters so they can observe the closed fd.
-    pub fn drain_source_subs_on_close(&self) -> Vec<(usize, usize)> {
-        let subs = {
-            let mut inner = self.inner.lock().unwrap();
-            let drained = inner
-                .interests
-                .iter()
-                .filter_map(|(&fd, item)| item.source_sub.map(|sub_id| (fd, sub_id)))
-                .collect();
-            inner.interests.clear();
-            inner.ready_list.clear();
-            drained
-        };
+    // AGENT: closing the last fd slot for an epoll instance detaches all source
+    // callbacks and OFD reverse links outside the EpInst lock.
+    pub(crate) fn close_last_fd_slot(&self) {
+        let removed = self.inner.lock().unwrap().drain_interests();
+        for item in removed {
+            item.key.source().remove_epoll_watcher(self);
+            if let Some(sub_id) = item.source_sub {
+                item.key.source().unregister_epoll_source(sub_id);
+            }
+        }
         self.wake_all_waiters();
-
-        subs
-    }
-
-    // AGENT: remove the epoll-visible part of one watched fd registration.
-    fn remove_interest(&self, fd: usize) -> Option<EpItem> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.remove_ready(fd);
-        inner.interests.remove(&fd)
     }
 
     // AGENT: finish all waiters that are sleeping on this epoll instance.
@@ -213,15 +340,15 @@ impl EpInst {
 
     // AGENT: EpInst clones share their tables through Arc<Mutex<_>>, so control
     // only needs &self and works for duplicated epoll fds.
-    pub fn control(&self, op: i32, fd: usize, ev: &EpEvent) -> Result<(), &'static str> {
+    pub(crate) fn control(&self, op: i32, key: EpKey, ev: &EpEvent) -> Result<(), &'static str> {
         match op {
             EpCtlOp::ADD => {
                 let mut inner = self.inner.lock().unwrap();
-                if inner.interests.contains_key(&fd) {
+                if inner.interests.contains_key(&key) {
                     return Err("eexist");
                 }
                 inner.interests.insert(
-                    fd,
+                    key,
                     EpItem {
                         event: ev.clone(),
                         source_sub: None,
@@ -232,8 +359,8 @@ impl EpInst {
             }
             EpCtlOp::MOD => {
                 let mut inner = self.inner.lock().unwrap();
-                inner.remove_ready(fd);
-                match inner.interests.get_mut(&fd) {
+                inner.remove_ready(&key);
+                match inner.interests.get_mut(&key) {
                     Some(item) => {
                         item.event = ev.clone();
                         Ok(())
@@ -242,7 +369,7 @@ impl EpInst {
                 }
             }
             EpCtlOp::DEL => {
-                if self.remove_interest(fd).is_none() {
+                if self.inner.lock().unwrap().remove_interest(&key).is_none() {
                     return Err("enoent");
                 }
                 Ok(())

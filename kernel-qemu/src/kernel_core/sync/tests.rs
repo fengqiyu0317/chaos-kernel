@@ -8,8 +8,8 @@ use crate::kernel::kernel_core::{
     global_timer_wheel, init_timer_wheel, set_current_task_id, TimerTarget, TimerWheel, TIMER_WHEEL,
 };
 use crate::kernel::{
-    epoll_ready_events, EpCtlOp, EpData, EpEvent, EpInst, FLike, FramePool, Kernel, PipeNode,
-    TaskRunState, CLK, SIGUSR1,
+    epoll_ready_events, EpCtlOp, EpData, EpEvent, EpInst, EpKey, FLike, FdEntry, FramePool, Kernel,
+    PipeNode, TaskRunState, CLK, SIGUSR1,
 };
 
 // AGENT: include storage/fd allocator regressions and use the boot-discovered
@@ -44,6 +44,8 @@ pub fn run_all(pool: &FramePool) {
     pipe_epoll_closed_status_reports_hup_and_err();
     fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool);
     fd_close_detaches_epoll_subscription_before_reuse(pool);
+    fd_alias_keeps_epoll_source_across_number_reuse(pool);
+    forked_fd_slot_keeps_epoll_source_until_child_close(pool);
     epoll_ready_list_deduplicates_and_requeues();
 }
 
@@ -443,12 +445,39 @@ fn fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool: &FramePool) 
         .dup2_fd(source_fd, 2)
         .expect("dup2 exact fd allocation should succeed");
     assert_eq!(exact_fd, 2);
+    task.set_cloexec(source_fd, true)
+        .expect("source cloexec update should succeed");
+    assert_eq!(task.dup2_fd(source_fd, source_fd), Ok(source_fd));
+    assert!(task
+        .get_fd_entry(source_fd)
+        .expect("same-fd dup2 source should remain open")
+        .is_cloexec());
     let next_exact_fd = task
         .dup_fd_from(source_fd, 2, false)
         .expect("next exact-range fd allocation should succeed");
     assert_eq!(next_exact_fd, 3);
 
+    task.set_cloexec(high_fd, true)
+        .expect("target cloexec update should succeed");
+    let previous_target = task
+        .get_fd_entry(high_fd)
+        .expect("dup2 target should be open");
+    assert_eq!(task.dup2_fd(MAX_FD - 1, high_fd), Err("ebadf"));
+    assert!(task
+        .get_fd_entry(high_fd)
+        .expect("invalid source must not close dup2 target")
+        .same_open_description(&previous_target));
+
     assert_eq!(task.dup2_fd(source_fd, high_fd), Ok(high_fd));
+    let replaced = task
+        .get_fd_entry(high_fd)
+        .expect("dup2 target should hold the source OFD");
+    assert!(replaced.same_open_description(
+        &task
+            .get_fd_entry(source_fd)
+            .expect("dup2 source should remain open")
+    ));
+    assert!(!replaced.is_cloexec());
     task.close_fd(high_fd)
         .expect("closing the replaced fd should succeed");
     assert_eq!(task.dup_fd_from(source_fd, high_fd, false), Ok(high_fd));
@@ -481,21 +510,25 @@ fn fd_close_detaches_epoll_subscription_before_reuse(pool: &FramePool) {
         events: EpEvent::IN,
         data: EpData { ptr: 1 },
     };
+    let source = task.get_fd_entry(read_fd).expect("watched fd should exist");
+    let key = EpKey::from_entry(read_fd, &source);
     epoll
-        .control(EpCtlOp::ADD, read_fd, &event)
+        .control(EpCtlOp::ADD, key.clone(), &event)
         .expect("initial epoll add should succeed");
-    let sub_id = {
-        let source = task.get_fd_entry(read_fd).expect("watched fd should exist");
-        source
-            .register_epoll_source(read_fd, epoll.clone(), &event)
-            .expect("pipe registration should install a source subscription")
-    };
-    epoll.set_source_sub(read_fd, sub_id);
+    key.source().add_epoll_watcher(&epoll);
+    let sub_id = source
+        .register_epoll_source(&key, &epoll, &event)
+        .expect("pipe registration should install a source subscription");
+    epoll.set_source_sub(&key, sub_id);
 
     task.close_fd(read_fd)
         .expect("closing watched fd should succeed");
-    assert!(!epoll.has_interest(read_fd));
+    assert!(!epoll.has_interest(&key));
     assert_eq!(epoll.ready_len(), 0);
+    // AGENT: release test-only kernel handles so pipe endpoint lifetime reflects
+    // the now-empty fd table and epoll registration set.
+    drop(key);
+    drop(source);
 
     let (new_read, new_write) = PipeNode::pair();
     let (new_read_fd, new_write_fd) = task
@@ -507,18 +540,18 @@ fn fd_close_detaches_epoll_subscription_before_reuse(pool: &FramePool) {
         events: EpEvent::IN,
         data: EpData { ptr: 2 },
     };
+    let new_source = task
+        .get_fd_entry(new_read_fd)
+        .expect("reused watched fd should exist");
+    let new_key = EpKey::from_entry(new_read_fd, &new_source);
     epoll
-        .control(EpCtlOp::ADD, new_read_fd, &new_event)
+        .control(EpCtlOp::ADD, new_key.clone(), &new_event)
         .expect("reused fd should not collide with a stale epoll interest");
-    let new_sub_id = {
-        let source = task
-            .get_fd_entry(new_read_fd)
-            .expect("reused watched fd should exist");
-        source
-            .register_epoll_source(new_read_fd, epoll.clone(), &new_event)
-            .expect("reused pipe registration should install a source subscription")
-    };
-    epoll.set_source_sub(new_read_fd, new_sub_id);
+    new_key.source().add_epoll_watcher(&epoll);
+    let new_sub_id = new_source
+        .register_epoll_source(&new_key, &epoll, &new_event)
+        .expect("reused pipe registration should install a source subscription");
+    epoll.set_source_sub(&new_key, new_sub_id);
 
     let old_writer = task
         .get_fd_entry(write_fd)
@@ -542,6 +575,146 @@ fn fd_close_detaches_epoll_subscription_before_reuse(pool: &FramePool) {
     clear_wait_token_state();
 }
 
+// AGENT: preserve a watched OFD while a dup alias exists, allow the same fd
+// number to register a replacement OFD, and retire only the old key on last close.
+fn fd_alias_keeps_epoll_source_across_number_reuse(pool: &FramePool) {
+    reset_wait_token_state(25);
+
+    let kernel = Kernel::new(pool.clone());
+    let task = kernel.tasks.spawn_root().expect("spawn epoll alias task");
+    let (old_read, old_write) = PipeNode::pair();
+    let (old_read_fd, old_write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(old_read), FLike::Pipe(old_write), false)
+        .expect("old pipe allocation should succeed");
+    let alias_fd = task
+        .dup_fd(old_read_fd, false)
+        .expect("watched OFD alias should succeed");
+    let epoll = EpInst::new();
+    let epfd = task
+        .add_file(FLike::Ep(epoll.clone()))
+        .expect("epoll allocation should succeed");
+
+    let old_event = EpEvent {
+        events: EpEvent::IN,
+        data: EpData { ptr: 11 },
+    };
+    let old_source = task
+        .get_fd_entry(old_read_fd)
+        .expect("old watched fd should exist");
+    let old_key = EpKey::from_entry(old_read_fd, &old_source);
+    epoll
+        .control(EpCtlOp::ADD, old_key.clone(), &old_event)
+        .expect("old OFD registration should succeed");
+    old_key.source().add_epoll_watcher(&epoll);
+    let old_sub = old_source
+        .register_epoll_source(&old_key, &epoll, &old_event)
+        .expect("old pipe should install a source subscription");
+    epoll.set_source_sub(&old_key, old_sub);
+
+    task.close_fd(old_read_fd)
+        .expect("closing one OFD alias should succeed");
+    assert!(epoll.has_interest(&old_key));
+
+    let (new_read, new_write) = PipeNode::pair();
+    let (new_read_fd, new_write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(new_read), FLike::Pipe(new_write), false)
+        .expect("replacement pipe allocation should succeed");
+    assert_eq!(new_read_fd, old_read_fd);
+
+    let new_event = EpEvent {
+        events: EpEvent::IN,
+        data: EpData { ptr: 22 },
+    };
+    let new_source = task
+        .get_fd_entry(new_read_fd)
+        .expect("replacement watched fd should exist");
+    let new_key = EpKey::from_entry(new_read_fd, &new_source);
+    assert!(new_key != old_key);
+    epoll
+        .control(EpCtlOp::ADD, new_key.clone(), &new_event)
+        .expect("same fd with a new OFD should be a distinct registration");
+    new_key.source().add_epoll_watcher(&epoll);
+    let new_sub = new_source
+        .register_epoll_source(&new_key, &epoll, &new_event)
+        .expect("replacement pipe should install a source subscription");
+    epoll.set_source_sub(&new_key, new_sub);
+
+    task.get_fd_entry(old_write_fd)
+        .expect("old writer should remain open")
+        .write(b"x")
+        .expect("old writer should wake the old OFD registration");
+    let (ready_key, ready_event) = epoll
+        .pop_ready()
+        .expect("old OFD readiness should reach epoll");
+    assert!(ready_key == old_key);
+    assert_eq!(ready_event.data.ptr, 11);
+    assert!(epoll_ready_events(ready_key.source().poll(), ready_event.events) != 0);
+
+    task.close_fd(alias_fd)
+        .expect("closing the last old OFD slot should succeed");
+    assert!(!epoll.has_interest(&old_key));
+    assert!(epoll.has_interest(&new_key));
+
+    let _ = task.close_fd(new_read_fd);
+    let _ = task.close_fd(new_write_fd);
+    let _ = task.close_fd(old_write_fd);
+    let _ = task.close_fd(epfd);
+    clear_wait_token_state();
+}
+
+// AGENT: count fd-table slots across forked Process tables so closing the
+// parent's watched descriptor cannot retire an OFD still installed in the child.
+fn forked_fd_slot_keeps_epoll_source_until_child_close(pool: &FramePool) {
+    reset_wait_token_state(26);
+
+    let kernel = Kernel::new(pool.clone());
+    let parent = kernel.tasks.spawn_root().expect("spawn epoll fork parent");
+    let (read_end, write_end) = PipeNode::pair();
+    let (read_fd, write_fd) = parent
+        .add_file_pair_with_cloexec(FLike::Pipe(read_end), FLike::Pipe(write_end), false)
+        .expect("fork source pipe allocation should succeed");
+    let epoll = EpInst::new();
+    let epfd = parent
+        .add_file(FLike::Ep(epoll.clone()))
+        .expect("fork epoll allocation should succeed");
+    let event = EpEvent {
+        events: EpEvent::IN,
+        data: EpData { ptr: 33 },
+    };
+    let source = parent
+        .get_fd_entry(read_fd)
+        .expect("fork watched source should exist");
+    let key = EpKey::from_entry(read_fd, &source);
+    epoll
+        .control(EpCtlOp::ADD, key.clone(), &event)
+        .expect("fork watched source registration should succeed");
+    key.source().add_epoll_watcher(&epoll);
+    let sub_id = source
+        .register_epoll_source(&key, &epoll, &event)
+        .expect("fork watched pipe should install a source subscription");
+    epoll.set_source_sub(&key, sub_id);
+
+    let child = kernel
+        .tasks
+        .fork_task(&parent, pool)
+        .expect("fork should copy fd-table slots");
+    parent
+        .close_fd(read_fd)
+        .expect("parent watched fd close should succeed");
+    assert!(epoll.has_interest(&key));
+
+    child
+        .close_fd(read_fd)
+        .expect("child last watched fd close should succeed");
+    assert!(!epoll.has_interest(&key));
+
+    let _ = parent.close_fd(write_fd);
+    let _ = parent.close_fd(epfd);
+    let _ = child.close_fd(write_fd);
+    let _ = child.close_fd(epfd);
+    clear_wait_token_state();
+}
+
 // AGENT: EpInst's ready list models Linux epitem queueing: source callbacks
 // deduplicate a watched fd until epoll_wait consumes it, and LT delivery can
 // requeue the same still-ready fd.
@@ -550,28 +723,31 @@ fn epoll_ready_list_deduplicates_and_requeues() {
     reset_wait_token_state(24);
 
     let epoll = EpInst::new();
+    let (read_end, _write_end) = PipeNode::pair();
+    let source = FdEntry::new(FLike::Pipe(read_end));
+    let key = EpKey::from_entry(3, &source);
     let event = EpEvent {
         events: EpEvent::IN,
         data: EpData { ptr: 7 },
     };
     epoll
-        .control(EpCtlOp::ADD, 3, &event)
+        .control(EpCtlOp::ADD, key.clone(), &event)
         .expect("epoll add should succeed");
 
-    epoll.mark_ready(3);
-    epoll.mark_ready(3);
+    epoll.mark_ready(&key);
+    epoll.mark_ready(&key);
     assert_eq!(epoll.ready_len(), 1);
 
-    let (fd, queued) = epoll.pop_ready().expect("ready fd should be queued");
-    assert_eq!(fd, 3);
+    let (queued_key, queued) = epoll.pop_ready().expect("ready fd should be queued");
+    assert_eq!(queued_key.fd(), 3);
     assert_eq!(queued.data.ptr, 7);
     assert_eq!(epoll.ready_len(), 0);
 
-    epoll.requeue_ready(3);
+    epoll.requeue_ready(&key);
     assert_eq!(epoll.ready_len(), 1);
 
     epoll
-        .control(EpCtlOp::DEL, 3, &event)
+        .control(EpCtlOp::DEL, key, &event)
         .expect("epoll delete should succeed");
     assert_eq!(epoll.ready_len(), 0);
     assert!(epoll.pop_ready().is_none());

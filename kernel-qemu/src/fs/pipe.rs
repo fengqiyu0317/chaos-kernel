@@ -111,15 +111,22 @@ impl PipeBuf {
         &mut self,
         dir: PipeDir,
         wake_mask: u32,
-        fd: usize,
+        key: &EpKey,
         ep: &EpInst,
     ) -> (usize, bool) {
         let ready = self.readiness(dir);
-        let target_epoll = ep.clone();
+        let target_epoll = ep.downgrade();
+        let wake_key = key.downgrade();
         let sub_id = self.bus.sub(
             wake_mask,
             Box::new(move |_bus_ev| {
-                target_epoll.mark_ready(fd);
+                let Some(target_epoll) = target_epoll.upgrade() else {
+                    return true;
+                };
+                let Some(key) = wake_key.upgrade() else {
+                    return true;
+                };
+                target_epoll.mark_ready(&key);
                 false
             }),
         );
@@ -259,14 +266,14 @@ impl PipeNode {
     }
     // AGENT: connect pipe readiness changes to an epoll instance through the
     // pipe's EvBus, while returning a cancellable subscription id.
-    pub fn register_epoll(&self, fd: usize, ep: EpInst, ev: &EpEvent) -> Option<usize> {
+    pub fn register_epoll(&self, key: &EpKey, ep: &EpInst, ev: &EpEvent) -> Option<usize> {
         let wake_mask = self.epoll_wake_mask(ev.events);
         let (sub_id, ready_now) = {
             let mut pipe = self.data.lock().unwrap();
-            pipe.subscribe_epoll(self.dir, wake_mask, fd, &ep)
+            pipe.subscribe_epoll(self.dir, wake_mask, key, ep)
         };
         if ready_now {
-            ep.mark_ready(fd);
+            ep.mark_ready(key);
         }
         Some(sub_id)
     }
