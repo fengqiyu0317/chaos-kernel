@@ -16,7 +16,7 @@ impl Kernel {
             && !task.is_job_stopped()
             && !self.is_current_task_on_cpu0(task.id())
         {
-            self.run_queue.enqueue(task.id(), task.sched_policy());
+            self.run_queue.enqueue(task);
         }
     }
 
@@ -126,15 +126,15 @@ impl Kernel {
             return false;
         }
         task.set_sched_state(TaskRunState::Runnable);
-        self.run_queue.enqueue(task.id(), task.sched_policy());
+        self.run_queue.enqueue(&task);
         if !self.switch_current_to_idle(cpu) {
             self.schedule_next_runnable(cpu);
         }
         true
     }
 
-    // AGENT: update the task-owned priority and refresh the run queue only for
-    // tasks that are already runnable.
+    // AGENT: update the task-owned priority; queued Arc<Task> entries observe
+    // the authoritative policy directly, so no run-queue refresh is required.
     pub fn boost_task_priority(&self, task_id: usize, amount: i32) -> bool {
         let Some(task) = self.tasks.find(task_id) else {
             return false;
@@ -143,10 +143,7 @@ impl Kernel {
             return false;
         }
 
-        let policy = task.boost_priority(amount);
-        if task.sched_state() == TaskRunState::Runnable && !task.is_job_stopped() {
-            self.run_queue.enqueue(task_id, policy);
-        }
+        task.boost_priority(amount);
         true
     }
 
@@ -381,7 +378,7 @@ impl Kernel {
         if let Some(current) = self.cur_task(0) {
             if !current.done() {
                 current.set_sched_state(TaskRunState::Runnable);
-                self.run_queue.enqueue(current.id(), current.sched_policy());
+                self.run_queue.enqueue(&current);
             }
         }
         self.set_cur(0, None);
@@ -416,21 +413,17 @@ impl Kernel {
     // AGENT: select one runnable CPU0 task without publishing it as current;
     // the idle loop and metadata-only helper share this stale-entry filtering.
     fn dequeue_runnable_task(&self) -> Option<Arc<Task>> {
-        while let Some((id, _policy)) = self.run_queue.dequeue() {
-            match self.tasks.find(id) {
-                Some(task)
-                    if !task.done()
-                        && !task.is_job_stopped()
-                        && task.sched_state() == TaskRunState::Runnable =>
-                {
-                    task.set_sched_state(TaskRunState::Running);
-                    task.reset_slice();
-                    return Some(task);
-                }
-                Some(task) if task.done() => {
-                    task.set_sched_state(TaskRunState::Zombie);
-                }
-                _ => {}
+        while let Some(task) = self.run_queue.dequeue() {
+            if !task.done()
+                && !task.is_job_stopped()
+                && task.sched_state() == TaskRunState::Runnable
+            {
+                task.set_sched_state(TaskRunState::Running);
+                task.reset_slice();
+                return Some(task);
+            }
+            if task.done() {
+                task.set_sched_state(TaskRunState::Zombie);
             }
         }
         None

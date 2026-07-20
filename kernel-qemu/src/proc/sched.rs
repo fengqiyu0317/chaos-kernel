@@ -57,10 +57,10 @@ impl SchedEntity {
     }
 }
 
-// AGENT: keep only runnable task ids and their scheduling-policy snapshots;
-// Processor.current is the single authority for the currently executing task.
+// AGENT: keep runnable task ownership without copying each task's scheduling
+// policy; Processor.current remains the authority for the executing task.
 pub struct RunQueue {
-    pub queue: Mutex<Vec<(usize, SchedulePolicy)>>,
+    queue: Mutex<Vec<Arc<Task>>>,
 }
 
 impl RunQueue {
@@ -71,20 +71,19 @@ impl RunQueue {
         }
     }
 
-    // AGENT: Keep a queued task's policy fresh instead of silently dropping
-    // priority changes made while the task is already runnable.
-    pub fn enqueue(&self, task_id: usize, policy: SchedulePolicy) {
+    // AGENT: retain each runnable task once; priority changes stay visible
+    // through the task-owned SchedEntity instead of refreshing a queue cache.
+    pub fn enqueue(&self, task: &Arc<Task>) {
         let mut q = self.queue.lock().unwrap();
-        if let Some((_, queued_policy)) = q.iter_mut().find(|(id, _)| *id == task_id) {
-            *queued_policy = policy;
+        if q.iter().any(|queued| queued.id() == task.id()) {
             return;
         }
-        q.push((task_id, policy));
+        q.push(task.clone());
     }
 
     // AGENT: Dequeue through the shared best-index helper so it preserves the
     // same priority and FIFO tie-break rules as pick_next().
-    pub fn dequeue(&self) -> Option<(usize, SchedulePolicy)> {
+    pub fn dequeue(&self) -> Option<Arc<Task>> {
         let mut q = self.queue.lock().unwrap();
         let best_idx = Self::best_idx(&q)?;
         Some(q.remove(best_idx))
@@ -95,31 +94,31 @@ impl RunQueue {
     pub fn pick_next(&self) -> Option<usize> {
         let q = self.queue.lock().unwrap();
         let best_idx = Self::best_idx(&q)?;
-        Some(q[best_idx].0)
+        Some(q[best_idx].id())
     }
 
     // AGENT: Share priority selection between peek and dequeue so same-priority
     // FIFO behavior stays identical in both paths.
-    fn best_idx(q: &[(usize, SchedulePolicy)]) -> Option<usize> {
+    fn best_idx(q: &[Arc<Task>]) -> Option<usize> {
         if q.is_empty() {
             return None;
         }
         let mut best_idx = 0;
         for idx in 1..q.len() {
-            if Self::cmp_priority(&q[idx].1, &q[best_idx].1) == CmpOrd::Less {
+            if Self::cmp_priority(&q[idx], &q[best_idx]) == CmpOrd::Less {
                 best_idx = idx;
             }
         }
         Some(best_idx)
     }
 
-    fn cmp_priority(a: &SchedulePolicy, b: &SchedulePolicy) -> CmpOrd {
-        a.prio.cmp(&b.prio)
+    fn cmp_priority(a: &Arc<Task>, b: &Arc<Task>) -> CmpOrd {
+        a.sched_policy().prio.cmp(&b.sched_policy().prio)
     }
 
     pub fn rebalance(&self) {
         let mut q = self.queue.lock().unwrap();
-        q.sort_by(|a, b| Self::cmp_priority(&a.1, &b.1));
+        q.sort_by(Self::cmp_priority);
     }
 
     pub fn len(&self) -> usize {
@@ -131,7 +130,7 @@ impl RunQueue {
         let before = q.len();
         let mut i = 0;
         while i < q.len() {
-            if q[i].0 == task_id {
+            if q[i].id() == task_id {
                 q.remove(i);
             } else {
                 i += 1;

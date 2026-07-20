@@ -84,7 +84,7 @@ impl Kernel {
         task.set_sched_state(TaskRunState::Runnable);
         task.reset_slice();
         let task_id = task.id();
-        self.run_queue.enqueue(task_id, task.sched_policy());
+        self.run_queue.enqueue(&task);
         Ok(task_id)
     }
 

@@ -149,14 +149,14 @@ impl Task {
         self.sched.lock().unwrap().policy.clone()
     }
 
-    // AGENT: update task priority so boosts survive later requeue transitions.
-    pub fn boost_priority(&self, amount: i32) -> SchedulePolicy {
+    // AGENT: update the task-owned priority in place so every queued reference
+    // observes the change without copying or returning a policy snapshot.
+    pub fn boost_priority(&self, amount: i32) {
         let mut sched = self.sched.lock().unwrap();
         let amount = amount.max(0);
         let prio = sched.policy.prio.saturating_sub(amount);
         sched.policy = SchedulePolicy::with_prio(prio);
         sched.slice_left = sched.slice_left.min(sched.policy.time_slice());
-        sched.policy.clone()
     }
 
     // AGENT: reset the runtime slice from the current priority-derived policy.

@@ -144,7 +144,7 @@ impl Kernel {
         let child_id = child.id();
         child.set_sched_state(TaskRunState::Runnable);
         child.reset_slice();
-        self.run_queue.enqueue(child_id, child.sched_policy());
+        self.run_queue.enqueue(&child);
         Ok(child_id)
     }
 
