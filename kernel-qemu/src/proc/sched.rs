@@ -116,27 +116,19 @@ impl RunQueue {
         a.sched_policy().prio.cmp(&b.sched_policy().prio)
     }
 
-    pub fn rebalance(&self) {
-        let mut q = self.queue.lock().unwrap();
-        q.sort_by(Self::cmp_priority);
-    }
-
     pub fn len(&self) -> usize {
         self.queue.lock().unwrap().len()
     }
 
+    // AGENT: enqueue keeps task IDs unique, so remove only the single matching
+    // runnable entry instead of scanning for impossible duplicates.
     pub fn remove(&self, task_id: usize) -> bool {
         let mut q = self.queue.lock().unwrap();
-        let before = q.len();
-        let mut i = 0;
-        while i < q.len() {
-            if q[i].id() == task_id {
-                q.remove(i);
-            } else {
-                i += 1;
-            }
-        }
-        q.len() < before
+        let Some(idx) = q.iter().position(|task| task.id() == task_id) else {
+            return false;
+        };
+        q.remove(idx);
+        true
     }
 }
 
