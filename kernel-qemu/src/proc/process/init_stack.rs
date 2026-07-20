@@ -92,12 +92,6 @@ impl ProcInit {
         sz.checked_add(15).map(|size| size & !15).ok_or("e2big")
     }
 
-    // AGENT: keep the old infallible helper as a saturating compatibility view;
-    // new exec paths should use checked_total_size() for error reporting.
-    pub fn total_size(&self) -> usize {
-        self.checked_total_size().unwrap_or(usize::MAX)
-    }
-
     // AGENT: account for argc, argv/envp null sentinels, auxv key/value pairs,
     // and the final AT_NULL pair without relying on unchecked usize arithmetic.
     fn checked_ptr_bytes(&self, word: usize) -> Result<usize, &'static str> {
