@@ -28,6 +28,7 @@ pub fn run_all(pool: &FramePool) {
     elf_load_regions_coalesce_contiguous_permissions();
     prepared_user_image_normalizes_invalid_elf_to_enoexec(pool);
     prepared_user_image_loads_elf_segment_and_stack(pool);
+    prepared_user_image_preserves_no_access_segment(pool);
     prepared_user_image_loads_segments_sharing_a_page(pool);
     prepared_user_image_loads_out_of_order_segments(pool);
     resident_and_sv39_stay_consistent_across_transitions(pool);
@@ -629,6 +630,38 @@ fn prepared_user_image_loads_elf_segment_and_stack(pool: &FramePool) {
         .unwrap();
     assert_user_cstr(&image.addr_space, argv0, "init");
     assert_eq!(image.addr_space.brk(), 0x0040_2000);
+
+    image.addr_space.release_all_pages();
+}
+
+// AGENT: keep a PT_LOAD with no PF_R/PF_W/PF_X bits inaccessible after its
+// payload is copied through the loader's temporary writable mapping.
+fn prepared_user_image_preserves_no_access_segment(pool: &FramePool) {
+    let code_vaddr = 0x0040_0000;
+    let no_access_vaddr = 0x0060_0000;
+    let mut elf = test_elf_with_load_segment(PAGE_SZ, code_vaddr, b"code", 4);
+    append_test_load_segment(&mut elf, PAGE_SZ * 2, no_access_vaddr, b"secret", 16, 0);
+
+    let mut image = prepare_user_image(&elf, Vec::new(), Vec::new(), pool)
+        .expect("loader should populate a no-access PT_LOAD before protecting it");
+    assert_eq!(
+        image
+            .addr_space
+            .mapped_region(no_access_vaddr)
+            .expect("no-access PT_LOAD should remain mapped")
+            .flags,
+        0
+    );
+
+    let mut byte = [0u8; 1];
+    assert!(image
+        .addr_space
+        .read_user_bytes(no_access_vaddr, &mut byte)
+        .is_err());
+    assert!(image
+        .addr_space
+        .write_user_bytes(no_access_vaddr, b"x", pool)
+        .is_err());
 
     image.addr_space.release_all_pages();
 }

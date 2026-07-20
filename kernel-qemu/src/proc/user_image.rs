@@ -67,8 +67,8 @@ fn normalize_user_image_error(err: &'static str) -> &'static str {
     }
 }
 
-// AGENT: translate aggregated ELF permission bits into the VM flags used by
-// one normalized AddrSpace mapping region.
+// AGENT: translate only the ELF PF_R/PF_W/PF_X bits into VM permissions so a
+// segment with no access bits remains inaccessible after loader writes finish.
 fn elf_vm_flags(elf_flags: u32) -> u32 {
     let mut flags = 0;
     if elf_flags & 0x4 != 0 {
@@ -80,11 +80,7 @@ fn elf_vm_flags(elf_flags: u32) -> u32 {
     if elf_flags & 0x1 != 0 {
         flags |= VM_EXEC;
     }
-    if flags == 0 {
-        VM_READ
-    } else {
-        flags
-    }
+    flags
 }
 
 // AGENT: keep page-aligned ELF mapping policy beside user-image construction
