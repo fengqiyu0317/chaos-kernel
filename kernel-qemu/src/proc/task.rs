@@ -3,7 +3,6 @@
 use super::*;
 
 mod core;
-mod exit_reason;
 pub(crate) mod fd;
 mod signal;
 mod table;
@@ -12,5 +11,4 @@ mod table;
 pub const INIT_PID: usize = 1;
 
 pub use self::core::*;
-pub use self::exit_reason::*;
 pub use self::table::*;
