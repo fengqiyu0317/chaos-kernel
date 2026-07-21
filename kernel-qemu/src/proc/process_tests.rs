@@ -538,8 +538,9 @@ fn exiting_phase_blocks_clone_wait_and_reap(pool: &FramePool) {
     assert_eq!(table.reap(pid), Ok(()));
 }
 
-// AGENT: exercise nonleader SYS_EXIT followed by final-thread exit: shared fd
-// and address-space state plus parent notifications survive only the first step.
+// AGENT: exercise nonleader SYS_EXIT followed by final-thread exit: shared
+// resources survive only the first step, while final exit releases zombie-only
+// redundant paths, subscriptions, and saved signal-frame backing storage.
 fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     let kernel = Kernel::new(pool.clone());
     kernel.proc_init();
@@ -561,6 +562,17 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
         .expect("child thread should clone");
     let child_pid = leader.process.pid();
     let mapped_addr = 0x1900_0000;
+    *leader.process.exec_path.lock().unwrap() = "/thread-exit".to_string();
+    leader
+        .process
+        .ev
+        .lock()
+        .unwrap()
+        .sub(EvFlag::CHILD_QUIT, Box::new(|_| false));
+    leader.sig_frames.lock().unwrap().push(SigFrame {
+        saved_frame: TrapFrame::new(),
+        saved_mask: 1,
+    });
     leader
         .process
         .addr_space
@@ -593,6 +605,12 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     assert!(kernel.tasks.find_process(child_pid).is_some());
     assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(leader.id()));
     assert!(leader.get_fd_entry(fd).is_some());
+    assert_eq!(
+        leader.process.exec_path.lock().unwrap().as_str(),
+        "/thread-exit"
+    );
+    assert_eq!(leader.process.ev.lock().unwrap().cb_len(), 1);
+    assert_eq!(leader.sig_frames.lock().unwrap().len(), 1);
     assert!(leader
         .process
         .addr_space
@@ -615,6 +633,14 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     assert!(leader.done());
     assert!(leader.process.is_zombie());
     assert!(leader.get_fd_entry(fd).is_none());
+    assert!(leader.process.exec_path.lock().unwrap().is_empty());
+    assert_eq!(leader.process.ev.lock().unwrap().cb_len(), 0);
+    assert_ne!(leader.process.ev.lock().unwrap().ev & EvFlag::PROC_QUIT, 0);
+    assert_eq!(
+        leader.process.sig_state.lock().unwrap().actions.capacity(),
+        0
+    );
+    assert_eq!(leader.sig_frames.lock().unwrap().capacity(), 0);
     assert!(leader
         .process
         .addr_space

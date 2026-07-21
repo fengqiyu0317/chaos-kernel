@@ -68,6 +68,14 @@ impl EvBus {
     pub fn unsub(&mut self, id: usize) -> bool {
         self.entries.remove(&id).is_some()
     }
+    // AGENT: detach every callback after a terminal event while preserving its
+    // observable bits; callers can drop the returned bus outside their lock.
+    pub fn detach_subscriptions(&mut self) -> Self {
+        let event_bits = self.ev;
+        let detached = mem::take(self);
+        self.ev = event_bits;
+        detached
+    }
     // AGENT: subscription-only EvBus keeps callback count as entry count.
     pub fn cb_len(&self) -> usize {
         self.entries.len()

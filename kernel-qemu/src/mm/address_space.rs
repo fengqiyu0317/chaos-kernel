@@ -4,6 +4,10 @@ use super::*;
 // file only coordinates address-space operations.
 use super::page_table::{pte_flags_without_write, vm_flags_to_pte_flags, ResidentPages};
 
+// AGENT: keep the empty-image program break shared by construction and teardown
+// so a released address space returns to the same metadata state as a new one.
+const INITIAL_BRK: usize = 0x0040_0000;
+
 // AGENT: own address-space-wide layout metadata and coordinate VmMap, resident
 // page metadata, and the Sv39 page table at their shared consistency boundary.
 pub struct AddrSpace {
@@ -35,7 +39,7 @@ impl AddrSpace {
     pub fn new() -> Self {
         Self {
             vm_map: VmMap::new(),
-            brk: 0x0040_0000,
+            brk: INITIAL_BRK,
             resident_pages: ResidentPages::new(),
             sv39: PageTable::new(),
         }
@@ -449,8 +453,8 @@ impl AddrSpace {
     }
 
     // AGENT: process teardown removes hardware leaves before resident frames
-    // drop through RAII, then releases Sv39 frames without reporting an
-    // ambiguous count for aliased resident pages and internal table pages.
+    // drop through RAII, then releases Sv39 frames and dynamic metadata backing
+    // allocations without reporting an ambiguous aliased-page count.
     pub fn release_all_pages(&mut self) {
         self.check_page_table_consistency()
             .expect("address space should be consistent before release");
@@ -465,7 +469,8 @@ impl AddrSpace {
         self.sv39.deactivate_if_current();
         drop(self.resident_pages.take_all());
         self.sv39.clear();
-        self.vm_map.regions.clear();
+        self.vm_map.regions = Vec::new();
+        self.brk = INITIAL_BRK;
         crate::csr::sfence_vma();
     }
 

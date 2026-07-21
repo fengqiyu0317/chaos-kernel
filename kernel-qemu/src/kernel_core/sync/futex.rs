@@ -83,11 +83,15 @@ impl FutexBucket {
         let mut w = self.waiters.lock().unwrap();
         Self::wake_locked(&mut w, addr, count)
     }
-    // AGENT: process exit wakes and removes every futex waiter owned by this bucket.
+    // AGENT: process exit detaches the complete queue under its lock, then wakes
+    // waiters unlocked and releases the old VecDeque allocation with the entries.
     pub fn wake_all(&self) -> usize {
-        let mut w = self.waiters.lock().unwrap();
-        let count = w.len();
-        for waiter in w.drain(..) {
+        let waiters = {
+            let mut waiters = self.waiters.lock().unwrap();
+            mem::take(&mut *waiters)
+        };
+        let count = waiters.len();
+        for waiter in waiters {
             waiter.token.wake();
         }
         count

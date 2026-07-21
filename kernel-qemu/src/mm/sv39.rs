@@ -482,9 +482,10 @@ impl PageTable {
         Ok(())
     }
 
-    // AGENT: drop all hardware page-table frames during exec or process teardown.
+    // AGENT: drop all hardware page-table frames and the Vec backing allocation
+    // during exec or process teardown instead of retaining empty capacity.
     pub fn clear(&mut self) {
-        self.table_frames.clear();
+        self.table_frames = Vec::new();
         self.root_frame = None;
         self.root_paddr = 0;
     }

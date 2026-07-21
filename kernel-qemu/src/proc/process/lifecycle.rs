@@ -34,8 +34,8 @@ impl Process {
         Some(lifecycle.threads.iter().copied().collect())
     }
 
-    // AGENT: publish Zombie only after the kernel has completed every process-
-    // level teardown action, then wake process and parent observers.
+    // AGENT: publish Zombie only after process-level teardown, dispatch the final
+    // process event once, and discard subscriptions that no zombie can service.
     pub fn finish_process_exit(&self) {
         let became_zombie = {
             let mut lifecycle = self.lifecycle.lock().unwrap();
@@ -51,7 +51,12 @@ impl Process {
             return;
         }
 
-        self.ev.lock().unwrap().set(EvFlag::PROC_QUIT);
+        let old_event_subscriptions = {
+            let mut ev = self.ev.lock().unwrap();
+            ev.set(EvFlag::PROC_QUIT);
+            ev.detach_subscriptions()
+        };
+        drop(old_event_subscriptions);
         if let Some(parent) = self.parent() {
             parent.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
         }
@@ -99,13 +104,15 @@ impl Process {
         true
     }
 
-    // AGENT: move droppable resources out of locks before process teardown and
-    // reclaim address-space frames without forwarding a meaningless count.
+    // AGENT: move droppable process resources out of locks before teardown,
+    // reclaim address-space storage, and retain only zombie/reap metadata.
     pub fn release_exit_resources(&self) {
+        let old_signal_actions = self.sig_state.lock().unwrap().release_for_exit();
         let old_resources = (
             take_mutex_default(&self.fd_table),
+            take_mutex_default(&self.exec_path),
             take_mutex_default(&self.sig_queue),
-            replace_mutex_value(&self.sig_state, SigSet::new()),
+            old_signal_actions,
         );
         let _woken_futex_waiters = self.futex.wake_all();
         self.addr_space.lock().unwrap().release_all_pages();
@@ -117,10 +124,4 @@ impl Process {
 fn take_mutex_default<T: Default>(slot: &Mutex<T>) -> T {
     let mut guard = slot.lock().unwrap();
     mem::take(&mut *guard)
-}
-
-// AGENT: replace a non-Default mutex value and drop the old value unlocked.
-fn replace_mutex_value<T>(slot: &Mutex<T>, value: T) -> T {
-    let mut guard = slot.lock().unwrap();
-    mem::replace(&mut *guard, value)
 }

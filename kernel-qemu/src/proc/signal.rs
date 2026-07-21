@@ -104,8 +104,8 @@ impl SigSet {
         Self { actions }
     }
 
-    // AGENT: reject invalid or uncatchable signals before translating the
-    // public one-based signal number to its compact action-table index.
+    // AGENT: reject invalid, uncatchable, or terminally released disposition
+    // slots without indexing an empty zombie signal table.
     pub fn set_action(&mut self, signo: u32, action: SigAction) -> bool {
         let Some(index) = signal_index(signo) else {
             return false;
@@ -113,8 +113,17 @@ impl SigSet {
         if signo == SIGKILL || signo == SIGSTOP {
             return false;
         }
-        self.actions[index] = action;
+        let Some(slot) = self.actions.get_mut(index) else {
+            return false;
+        };
+        *slot = action;
         true
+    }
+
+    // AGENT: move the fixed-size disposition allocation out at process exit;
+    // safe indexed access treats the resulting empty table as terminal state.
+    pub(in crate::kernel::proc) fn release_for_exit(&mut self) -> Vec<SigAction> {
+        mem::take(&mut self.actions)
     }
 
     // AGENT: make an invalid signal lookup explicit instead of aliasing it to

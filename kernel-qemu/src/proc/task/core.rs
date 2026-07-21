@@ -181,11 +181,15 @@ impl Task {
         self.release_kernel_stack();
     }
 
-    // AGENT: publish exit state while retaining a currently executing kernel
-    // stack until the CPU0 scheduler has switched back to its idle context.
+    // AGENT: publish exit state, release saved signal-frame backing storage, and
+    // retain a live kernel stack only until CPU0 switches back to idle.
     pub(crate) fn mark_thread_exited(&self) {
         *self.sig_mask.lock().unwrap() = 0;
-        self.sig_frames.lock().unwrap().clear();
+        let old_sig_frames = {
+            let mut sig_frames = self.sig_frames.lock().unwrap();
+            mem::take(&mut *sig_frames)
+        };
+        drop(old_sig_frames);
         self.set_sched_state(TaskRunState::Zombie);
     }
 
