@@ -3,7 +3,7 @@
 use super::*;
 use crate::kernel::{
     check_access, check_access_rw, hash_combine, BuddyAllocator, FramePool, VmMap, VmRegion,
-    MEM_OFF, PAGE_SZ, USER_TOP, VM_READ, VM_WRITE,
+    MEM_OFF, PAGE_SZ, TRAMPOLINE, TRAP_CONTEXT, USER_TOP, VM_READ, VM_WRITE,
 };
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -18,11 +18,12 @@ pub fn run_all() {
     frame_pool_tracks_total_and_free_pages();
     frame_pool_bitmap_handles_partial_final_word();
     frame_pool_reclaims_dynamic_heap_pages();
+    frame_pool_returns_contiguous_pgframe_owners();
     vm_region_and_map_preserve_range_semantics();
     vm_region_merge_rejects_invalid_endpoints();
     vm_map_insert_coalesces_both_neighbors();
     vm_map_insert_rejects_invalid_ranges_and_overlaps();
-    user_range_checks_use_sv39_lower_half();
+    user_range_checks_reserve_trap_pages();
     vm_map_find_free_rejects_non_page_granular_lengths();
     buddy_allocator_alloc_free_smoke();
     buddy_free_merges_with_nonzero_base();
@@ -160,15 +161,19 @@ fn vm_map_insert_rejects_invalid_ranges_and_overlaps() {
     assert!(boundary.find(USER_TOP - 1).is_some());
 }
 
-// AGENT: enforce the shared exclusive USER_TOP boundary in coarse user-access
-// guards, including the legal final page and the first byte above it.
+// AGENT: enforce the shared exclusive USER_TOP boundary below both supervisor
+// trap pages, including the legal final user page and each reserved address.
 #[cfg_attr(test, test)]
-fn user_range_checks_use_sv39_lower_half() {
+fn user_range_checks_reserve_trap_pages() {
+    assert_eq!(USER_TOP, TRAP_CONTEXT);
+    assert_eq!(TRAP_CONTEXT + PAGE_SZ, TRAMPOLINE);
     assert!(check_access(USER_TOP - PAGE_SZ, PAGE_SZ));
     assert!(check_access_rw(USER_TOP - PAGE_SZ, PAGE_SZ, true));
     assert!(!check_access(USER_TOP - PAGE_SZ, PAGE_SZ + 1));
     assert!(!check_access_rw(USER_TOP - PAGE_SZ, PAGE_SZ + 1, true));
     assert!(!check_access(USER_TOP, 1));
+    assert!(!check_access(TRAP_CONTEXT, PAGE_SZ));
+    assert!(!check_access(TRAMPOLINE, PAGE_SZ));
 }
 
 // AGENT: keep free-range selection consistent with VmMap::insert so it never
@@ -293,6 +298,26 @@ fn frame_pool_reclaims_dynamic_heap_pages() {
     drop(frame);
     assert_eq!(pool.free_count(), 6);
     assert!(pool.release_contiguous_pages(heap, 2));
+    assert_eq!(pool.free_count(), 8);
+}
+
+// AGENT: require contiguous consumers to receive ordinary PgFrame owners whose
+// Drop path returns every claimed page without a separate raw-run release.
+#[cfg_attr(test, test)]
+fn frame_pool_returns_contiguous_pgframe_owners() {
+    let pool = FramePool::new(8, MEM_OFF);
+    let first = pool.get_pg_frame(0).unwrap();
+    let frames = pool.alloc_contiguous_pg_frames(3, 2).unwrap();
+
+    assert_eq!(
+        frames.iter().map(|frame| frame.id()).collect::<Vec<_>>(),
+        [2, 3, 4]
+    );
+    assert_eq!(pool.free_count(), 4);
+
+    drop(frames);
+    assert_eq!(pool.free_count(), 7);
+    drop(first);
     assert_eq!(pool.free_count(), 8);
 }
 

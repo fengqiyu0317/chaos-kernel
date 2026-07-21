@@ -1,6 +1,6 @@
 # Chaos 项目交接状态
 
-更新日期：2026-07-20
+更新日期：2026-07-21
 
 ## 目标
 
@@ -45,6 +45,7 @@
 - 2026-06-27：`kernel-sim/src/kernel/core/current.rs` 的 current-task TLS 存储从 `Cell<usize>` 调整为 `AtomicUsize` relaxed load/store，保持 host-thread 本地隔离；`kernel-sim/tests/smoke.rs` 为直接设置 current-task 的 Spin/SpinLock/BlockCache 低层测试增加串行锁，避免默认并行测试下固定 task id 与 helper thread 假设互相干扰。
 - 2026-07-18：`kernel-qemu` 已把共享 `ProcessState` 升格为一等 `Process`：PID 从构造时起不可变，`TaskTable` 分别维护 TID→`Task` 与 PID→`Process` 索引，父进程使用 `Weak<Process>`、子进程按 PID 强持有到 wait/reap；fork/clone/exit/wait/reap、进程组信号和孤儿接管均改走进程对象，`Task` 只保留线程现场、内核栈、信号 mask/frame 与调度状态。QEMU `proc`、`sched`、`sync` 自测均通过。
 - 2026-07-20：`kernel-qemu` ELF 装载器已移除 `ParsedElf.load_pages` 的逐页展开；`parse_elf()` 只保留验证后的 `PT_LOAD` 段元数据并拒绝真实字节区间重叠，通过 `validate_load_segment_memory_range()` 直接取得已校验的 `mem_end`；页对齐的 `load_segment_page_range()` 已移入 `user_image.rs` 并收紧为私有函数，再由段边界扫描生成连续、互不重叠的权限区域，按区域而非按页执行 map/protect。共享边界页仍保留权限并集策略，QEMU proc selftest、组合 selftest 与普通 smoke 均通过。
+- 2026-07-21：`kernel-qemu` 已接通真实的 kernel-satp / user-satp 切换：linker 将 user trap entry/return 固定在单页 trampoline，内核根和每个 `AddrSpace` 在同一 `TRAMPOLINE` 虚拟地址映射该物理页；CPU0 返回用户态前把当前任务栈顶 TrapFrame 物理页绑定到 supervisor-only `TRAP_CONTEXT`，trampoline 在用户 trap 时保存现场后切回 kernel satp，再进入 Rust handler。`KernelContext.ra = task_bootstrap` 继续只在内核页表下运行。新增 QEMU 自测实际在用户页表执行 `getpid(172)` 并返回 U-mode，再执行 `exit(93)`，经第二次 `ecall`、trap、`NoReturn` 和 idle handoff 返回内核页表并释放任务内核栈。
 - 2026-06-27：`kernel-sim/src/kernel/core/sync.rs` 的 `EvBus` 已新增基于 `WaitToken` 的等待者队列；顶层 `wait_ev()` 现在在持有 `EvBus` 锁时检查事件位并原子入队，`EvBus::change()` 在事件位变化后唤醒 mask 匹配的等待者，去掉了原先的 `thread::yield_now()` 忙等路径；新增 `ev_bus_wait_ev_returns_existing_event` / `ev_bus_wait_ev_wakes_on_matching_event` smoke 回归。剩余事件模型、epoll 接线和 callback 锁外分发债务见相邻 M8 TODO。
 - 2026-06-27：`kernel-sim` 的 pipe readiness 已接入 `EvBus::sub()` -> `EpInst::mark_ready()` 路径：`EvBus::sub()` 返回可取消订阅 id，`epoll_ctl(ADD/MOD/DEL)` 会为 pipe fd 注册/取消 readiness callback，`sys_epoll_wait()` 在无 ready fd 时睡入 `EpInst.waiters`，由 pipe 写入/关闭等状态变化唤醒；`PipeNode::poll()` 去掉重复锁定同一 mutex 的自锁风险。新增 `epoll_wait_wakes_when_pipe_becomes_readable` smoke 回归。
 - 2026-06-28：新增 `kernel-qemu/` 最小 QEMU 裸机承载层：独立 `riscv64gc-unknown-none-elf` crate、linker script、`entry.S`、`#![no_std]` / `#![no_main]`、panic handler、SBI console、SBI shutdown，以及 `tools/qemu-smoke.sh` 启动/关机输出检查；该阶段只提供运行环境，不引入 `kernel-sim` 业务语义。
@@ -92,6 +93,26 @@
 - `chaos/kernel/src/kernel.rs`：禁止修改的原始内核文件。
 
 ## 测试结果
+
+本次 M9 trampoline / 用户 satp 切换修改后执行过：
+
+```bash
+cd kernel-qemu
+cargo fmt --all --check
+cargo check --all-features
+cargo build --release --features qemu-selftest
+timeout 45s qemu-system-riscv64 -machine virt -m 128M -nographic \
+  -bios default -kernel target/riscv64gc-unknown-none-elf/release/kernel-qemu
+
+cd ..
+bash tools/qemu-smoke.sh
+cd kernel-sim
+CARGO_TARGET_DIR=/tmp/chaos-kernel-sim-target.u5PvA4 cargo test
+cd ..
+git diff --check
+```
+
+结果：格式化、全 feature target check 和 release link 均通过；组合 QEMU selftest 依次通过 MM、sync、context、sched、proc、fs syscall、checkpoint，并输出 `user satp selftest passed`，证明真实 U-mode 取指、`getpid` trap 后返回 U-mode、再次 `exit` trap、user→kernel satp 切换、`NoReturn`→idle 和内核栈延迟释放闭环；普通 `tools/qemu-smoke.sh` 继续通过。`kernel-sim` host 回归在 `/tmp` 可执行 target 下通过：unit `1 passed`、ELF `3 passed`、smoke `84 passed`。仓库内 `kernel-sim/target` 位于不可执行挂载，直接运行测试二进制会报 `Permission denied`，因此使用独立 `/tmp` target；该错误不是代码或测试失败。
 
 本次 M9 动态内核堆修改后执行过：
 

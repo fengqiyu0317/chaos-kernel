@@ -287,6 +287,15 @@ QEMU 侧的上下文所有权按下列边界固定，不再保留从 simulator
 - task 切换使用仅保存内核态 `ra` / `sp` / `s0..s11` 的 `KernelContext` 和 `__switch`；不将内核切换现场混入用户 `TrapFrame`。
 - 单 hart 阶段的 `KernelContext` 由 `Task` 内稳定地址的 `UnsafeCell` 持有，只有 CPU0 调度路径可读写；`Arc<Task>` 保证切换端点在挂起期间地址和生命周期稳定。任何 `MutexGuard`、`RwLockGuard` 或其他临界区借用都不得跨越 `__switch`，引入多 hart 前必须把这条独占约束替换为 per-hart 所有权协议。
 - `Kernel` 为每个 hart 保留 `Processor`，其中 `current` 是当前 task 的唯一 CPU 归属标记，`idle_context` 保存 boot/idle stack 的内核上下文；第一阶段只允许 CPU0 进入真实调度循环。
+
+当前 CPU0 的页表切换边界固定如下：
+
+- idle、`__switch`、`task_bootstrap`、Rust trap handler 和 task→idle handoff 始终运行在 kernel satp 下；`KernelContext.ra` 不保存用户地址，也不在用户页表下解释。
+- Sv39 低半区顶部两页分别保留为 supervisor-only `TRAMPOLINE` 和 `TRAP_CONTEXT`，普通 `VmMap` / usercopy / ELF / mmap 范围以 `TRAP_CONTEXT` 为 exclusive `USER_TOP`，不得覆盖这两个架构页。
+- linker 把 user trap entry/return 限制在一个物理页；内核根与每个用户根把该页映射到相同 `TRAMPOLINE` 虚拟地址，只允许 trampoline 在切换 `satp` 后继续取指。
+- 每次 CPU0 返回某个任务用户态前，将固定 `TRAP_CONTEXT` 重新绑定到该任务内核栈顶 TrapFrame 所在物理页；该映射无 `PTE_U`，不进入用户 VMA、COW、checkpoint 或 resident-page 语义。用户 trap 先通过该别名保存完整现场，再切回 kernel satp 和 high-half 内核栈。
+- `exec`、`sigreturn` 或重新调度后必须在每次用户返回边界刷新 user satp、kernel satp、内核 TrapFrame 指针和 trampoline 地址，不能复用旧地址空间的运行时元数据。
+- 固定单个 `TRAP_CONTEXT` 别名依赖“只有 CPU0 执行真实用户任务”的现阶段约束；引入多 hart 前必须改为 per-hart trap context 槽位或其他不会并发重绑定同一用户根的协议。
 - CPU0 scheduler 在 boot stack 上关中断选取 runnable task，先发布 `Running` 和 `current`，再从 `idle_context` 切换到 task context；task 阻塞、时间片用尽或退出时先发布状态，然后切回 idle context。无 runnable task 时必须清空 `current`，打开中断并在 idle stack 上执行 `wfi`。
 - 正在运行的退出 task 只先标记 zombie 并保留内核栈；只有 `__switch` 已经回到 idle stack 后，scheduler 才能释放该栈。
 - `Task::done()` 只读取线程局部的 `TaskRunState::Zombie`。`Process` 用同一生命周期锁维护 `ProcessPhase::{Running, Exiting, Zombie}` 和线程 TID 集合，使最后线程判断与禁止退出期 clone 成为一个原子状态转换。

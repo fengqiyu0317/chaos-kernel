@@ -497,6 +497,7 @@ pub fn build_kernel_page_table(
     pool: &FramePool,
     ram_start: usize,
     ram_end: usize,
+    trampoline_paddr: usize,
 ) -> Result<PageTable, &'static str> {
     if ram_start % PAGE_SZ != 0 || ram_end % PAGE_SZ != 0 || ram_end <= ram_start {
         return Err("einval");
@@ -509,6 +510,14 @@ pub fn build_kernel_page_table(
     let flags = PTE_R | PTE_W | PTE_X | PTE_G | PTE_A | PTE_D;
     page_table.map_linear(ram_start, ram_start, len, flags, pool)?;
     page_table.map_linear(p2v(ram_start), ram_start, len, flags, pool)?;
+    // AGENT: give the satp-switching trampoline the same virtual address in
+    // the kernel root that each user AddrSpace installs before its first sret.
+    page_table.map_leaf(
+        TRAMPOLINE,
+        trampoline_paddr,
+        PTE_R | PTE_X | PTE_G | PTE_A,
+        pool,
+    )?;
     Ok(page_table)
 }
 

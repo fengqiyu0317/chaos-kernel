@@ -260,6 +260,28 @@ impl FramePool {
         }
     }
 
+    // AGENT: preserve the physical contiguity required by direct-mapped kernel
+    // stacks while returning ordinary PgFrame owners instead of a raw run.
+    pub fn alloc_contiguous_pg_frames(
+        &self,
+        count: usize,
+        align_pages: usize,
+    ) -> Option<Vec<PgFrame>> {
+        let first = self
+            .state
+            .lock()
+            .unwrap()
+            .claim_contiguous(count, align_pages)?;
+        let end = first
+            .checked_add(count)
+            .expect("claimed contiguous frame range should not overflow");
+        Some(
+            (first..end)
+                .map(|id| self.pg_frame_from_allocated(id))
+                .collect(),
+        )
+    }
+
     // AGENT: attach RAII ownership to a frame that is already marked allocated.
     fn pg_frame_from_allocated(&self, id: usize) -> PgFrame {
         PgFrame::from_allocated(id, self.state.clone(), self.base_paddr)

@@ -1,15 +1,13 @@
     .section .text.trap
     .globl __kernel_trap_entry
-    .globl __user_trap_entry
-    .globl __user_trap_return
     .align 2
 
 __kernel_trap_entry:
-    addi sp, sp, -272
+    addi sp, sp, -320
     sd zero, 0(sp)
     sd x1, 8(sp)
     sd x5, 40(sp)
-    addi t0, sp, 272
+    addi t0, sp, 320
     sd t0, 16(sp)
     sd x3, 24(sp)
     sd x4, 32(sp)
@@ -44,6 +42,11 @@ __kernel_trap_entry:
     sd t0, 256(sp)
     csrr t0, sepc
     sd t0, 264(sp)
+    sd zero, 272(sp)
+    sd zero, 280(sp)
+    sd zero, 288(sp)
+    sd zero, 296(sp)
+    sd zero, 304(sp)
 
     mv a0, sp
     call rust_kernel_trap
@@ -86,9 +89,17 @@ __kernel_trap_entry:
     ld x2, 16(sp)
     sret
 
+    # AGENT: execute the user satp transition only from this one dual-mapped
+    # page; no low-linked kernel code or high-half stack is touched while the
+    # process root is active.
+    .section .text.trampoline, "ax"
+    .globl __user_trap_entry
+    .globl __user_trap_return
+    .align 2
+
 __user_trap_entry:
     csrrw sp, sscratch, sp
-    addi sp, sp, -272
+    addi sp, sp, -320
     sd zero, 0(sp)
     sd x1, 8(sp)
     sd x5, 40(sp)
@@ -128,8 +139,22 @@ __user_trap_entry:
     csrr t0, sepc
     sd t0, 264(sp)
 
+    # AGENT: all three values are read through the supervisor-only TRAP_CONTEXT alias
+    # before installing kernel_satp; the next stack access uses kernel_frame.
+    ld t0, 272(sp)
+    ld t1, 288(sp)
+    ld t2, 304(sp)
+    csrw satp, t0
+    sfence.vma
+    mv sp, t1
     mv a0, sp
-    call rust_user_trap
+    jalr ra, t2, 0
+
+    # AGENT: Rust may have replaced the address space during exec, so consume
+    # the freshly prepared alias and token before the page-local return jump.
+    ld a0, 296(sp)
+    ld a1, 280(sp)
+    j __user_trap_return
 
 __restore_user_trap_frame:
     ld t0, 264(sp)
@@ -137,7 +162,7 @@ __restore_user_trap_frame:
     ld t0, 256(sp)
     csrw sstatus, t0
 
-    addi t0, sp, 272
+    addi t0, sp, 320
     csrw sscratch, t0
 
     ld x1, 8(sp)
@@ -174,5 +199,7 @@ __restore_user_trap_frame:
     sret
 
 __user_trap_return:
+    csrw satp, a1
+    sfence.vma
     mv sp, a0
     j __restore_user_trap_frame

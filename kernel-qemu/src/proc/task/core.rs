@@ -101,6 +101,13 @@ impl Task {
         Self::trap_frame_ptr_in(kstk.as_ref().ok_or("ekstk")?)
     }
 
+    // AGENT: return the physical page backing the authoritative TrapFrame so
+    // CPU0 can rebind the fixed supervisor-only TRAP_CONTEXT alias before sret.
+    pub(crate) fn user_trap_frame_page_paddr(&self) -> Result<usize, &'static str> {
+        let kstk = self.kstk.lock().unwrap();
+        Ok(kstk.as_ref().ok_or("ekstk")?.top_page_paddr())
+    }
+
     // AGENT: initialize or replace an off-CPU task's complete user return frame.
     pub fn install_user_trap_frame(&self, frame: TrapFrame) -> Result<(), &'static str> {
         let kstk = self.kstk.lock().unwrap();

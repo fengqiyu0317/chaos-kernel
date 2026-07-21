@@ -9,11 +9,24 @@ SECTIONS
     skernel = .;
 
     stext = .;
-    .text : {
+    .text.entry : {
         *(.text.entry)
         /* AGENT: retain the context-switch entry before the Rust scheduler has
            a fully runnable user-task path that references it at boot. */
         KEEP(*(.text.context))
+    }
+
+    /* AGENT: keep the satp-switching user trap code inside one page so the
+       kernel and every user page table can map it at the same virtual address. */
+    . = ALIGN(4K);
+    strampoline = .;
+    .text.trampoline : {
+        KEEP(*(.text.trampoline))
+    }
+    etrampoline = .;
+    ASSERT(etrampoline - strampoline <= 4K, "user trampoline exceeds one page")
+
+    .text : {
         *(.text .text.*)
     }
     . = ALIGN(4K);

@@ -124,6 +124,19 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         kernel::kernel_core::checkpoint_tests::run_all(kernel);
         println!("[kernel-qemu] checkpoint selftest passed");
     }
+    // AGENT: validate the complete kernel-satp -> user-satp -> kernel-satp
+    // trampoline path only after other installed-kernel state tests finish.
+    #[cfg(feature = "qemu-sched-selftest")]
+    {
+        println!("[kernel-qemu] user satp selftest start");
+        trap::tests::user_satp_exit_round_trip(frame_pool.as_ref());
+        kernel::install_qemu_wait_kernel(kernel);
+        // AGENT: the disposable selftest kernel returned with no CPU0 task;
+        // republish the production init task to the low-level wait owner bridge.
+        let current = kernel.cur_task(0);
+        kernel.set_cur(0, current);
+        println!("[kernel-qemu] user satp selftest passed");
+    }
     // AGENT: keep the ordinary boot path warning-free while proc selftests are
     // feature-gated out.
     #[cfg(not(feature = "qemu-proc-selftest"))]
@@ -216,9 +229,13 @@ fn install_embedded_root_init(
 // AGENT: switch from bare addressing to an Sv39 root that keeps the current
 // low-linked kernel alive while adding the high-half physical direct map.
 fn install_kernel_page_table(frame_pool: &kernel::FramePool) {
-    let page_table =
-        kernel::build_kernel_page_table(frame_pool, QEMU_VIRT_RAM_START, QEMU_VIRT_RAM_END)
-            .expect("kernel Sv39 page table should build");
+    let page_table = kernel::build_kernel_page_table(
+        frame_pool,
+        QEMU_VIRT_RAM_START,
+        QEMU_VIRT_RAM_END,
+        trap::trampoline_paddr(),
+    )
+    .expect("kernel Sv39 page table should build");
     page_table
         .activate_kernel_direct_map()
         .expect("kernel Sv39 page table should activate");

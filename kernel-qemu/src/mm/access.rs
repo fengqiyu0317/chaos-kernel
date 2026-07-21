@@ -3,7 +3,8 @@ use core::mem;
 
 use super::{align_down, checked_align_up, KHEAP_SZ, PAGE_SZ, USER_TOP};
 
-// AGENT: reject ranges that overflow or leave the canonical low Sv39 user half.
+// AGENT: reject ranges that overflow or enter the supervisor-only trap pages
+// reserved at the top of the canonical low Sv39 half.
 pub fn check_access(addr: usize, len: usize) -> bool {
     match addr.checked_add(len) {
         Some(end) => end <= USER_TOP,

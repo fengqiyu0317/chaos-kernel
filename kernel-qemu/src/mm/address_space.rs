@@ -8,13 +8,57 @@ use super::page_table::{pte_flags_without_write, vm_flags_to_pte_flags, Resident
 // so a released address space returns to the same metadata state as a new one.
 const INITIAL_BRK: usize = 0x0040_0000;
 
+const TRAMPOLINE_FLAGS: usize = PTE_R | PTE_X | PTE_A;
+const TRAP_CONTEXT_FLAGS: usize = PTE_R | PTE_W | PTE_A | PTE_D;
+
+// AGENT: track supervisor-only leaves separately from VmMap/resident_pages so
+// trap transport does not become user-visible VMA, COW, or checkpoint state.
+struct ArchMappings {
+    trampoline_paddr: Option<usize>,
+    trap_context_paddr: Option<usize>,
+}
+
+// AGENT: centralize the two architecture-leaf invariants used by binding,
+// reverse page-table validation, and address-space teardown.
+impl ArchMappings {
+    // AGENT: start without architecture leaves so ordinary semantic-only
+    // address-space construction remains allocation-free.
+    const fn new() -> Self {
+        Self {
+            trampoline_paddr: None,
+            trap_context_paddr: None,
+        }
+    }
+
+    // AGENT: resolve only the two reserved supervisor virtual addresses to the
+    // physical identity and exact permissions owned by this architecture state.
+    fn expected_leaf(&self, vaddr: usize) -> Option<(usize, usize)> {
+        match vaddr {
+            TRAMPOLINE => self.trampoline_paddr.map(|paddr| (paddr, TRAMPOLINE_FLAGS)),
+            TRAP_CONTEXT => self
+                .trap_context_paddr
+                .map(|paddr| (paddr, TRAP_CONTEXT_FLAGS)),
+            _ => None,
+        }
+    }
+
+    // AGENT: include installed architecture leaves in the reverse Sv39 owner
+    // count without treating absent lazy mappings as resident pages.
+    fn leaf_count(&self) -> usize {
+        usize::from(self.trampoline_paddr.is_some())
+            + usize::from(self.trap_context_paddr.is_some())
+    }
+}
+
 // AGENT: own address-space-wide layout metadata and coordinate VmMap, resident
-// page metadata, and the Sv39 page table at their shared consistency boundary.
+// page metadata, architecture leaves, and the Sv39 page table at their shared
+// consistency boundary.
 pub struct AddrSpace {
     vm_map: VmMap,
     brk: usize,
     resident_pages: ResidentPages,
     sv39: PageTable,
+    arch: ArchMappings,
 }
 
 // AGENT: carry the resolved state for one bounded user-memory write so the
@@ -42,6 +86,7 @@ impl AddrSpace {
             brk: INITIAL_BRK,
             resident_pages: ResidentPages::new(),
             sv39: PageTable::new(),
+            arch: ArchMappings::new(),
         }
     }
 
@@ -49,6 +94,43 @@ impl AddrSpace {
     // a simulator-only vm_token_id.
     pub fn vm_token(&self) -> Result<usize, &'static str> {
         self.sv39.root_paddr().map(crate::csr::make_satp_sv39)
+    }
+
+    // AGENT: lazily install the shared trampoline and rebind CPU0's fixed trap
+    // alias to the selected task stack while the kernel page table is active.
+    pub(crate) fn bind_cpu0_user_trap(
+        &mut self,
+        trampoline_paddr: usize,
+        trap_context_paddr: usize,
+        pool: &FramePool,
+    ) -> Result<usize, &'static str> {
+        match self.arch.trampoline_paddr {
+            Some(existing) if existing != trampoline_paddr => return Err("etrampoline"),
+            Some(_) => {}
+            None => {
+                self.sv39
+                    .map_leaf(TRAMPOLINE, trampoline_paddr, TRAMPOLINE_FLAGS, pool)?;
+                self.arch.trampoline_paddr = Some(trampoline_paddr);
+            }
+        }
+
+        match self.arch.trap_context_paddr {
+            Some(existing) if existing == trap_context_paddr => {}
+            Some(_) => {
+                self.sv39
+                    .update_leaf(TRAP_CONTEXT, trap_context_paddr, TRAP_CONTEXT_FLAGS)?;
+                self.arch.trap_context_paddr = Some(trap_context_paddr);
+            }
+            None => {
+                self.sv39
+                    .map_leaf(TRAP_CONTEXT, trap_context_paddr, TRAP_CONTEXT_FLAGS, pool)?;
+                self.arch.trap_context_paddr = Some(trap_context_paddr);
+            }
+        }
+
+        self.check_page_table_consistency()?;
+        crate::csr::sfence_vma();
+        self.vm_token()
     }
 
     // AGENT: expose VMA lookup without allowing callers to mutate policy behind
@@ -106,12 +188,18 @@ impl AddrSpace {
         }
 
         let leaf_count = self.sv39.for_each_leaf(|leaf| {
-            if !self.resident_pages.entries.contains_key(&leaf.vaddr) {
-                return Err("Sv39 leaf missing resident page");
+            if self.resident_pages.entries.contains_key(&leaf.vaddr) {
+                return Ok(());
+            }
+            let Some((expected_paddr, expected_flags)) = self.arch.expected_leaf(leaf.vaddr) else {
+                return Err("Sv39 leaf missing resident or architecture owner");
+            };
+            if leaf.paddr != expected_paddr || leaf.flags != expected_flags {
+                return Err("Sv39 architecture leaf disagrees with trap mapping");
             }
             Ok(())
         })?;
-        if leaf_count != self.resident_pages.entries.len() {
+        if leaf_count != self.resident_pages.entries.len() + self.arch.leaf_count() {
             return Err("resident and Sv39 leaf counts disagree");
         }
         Ok(())
@@ -469,6 +557,7 @@ impl AddrSpace {
         self.sv39.deactivate_if_current();
         drop(self.resident_pages.take_all());
         self.sv39.clear();
+        self.arch = ArchMappings::new();
         self.vm_map.regions = Vec::new();
         self.brk = INITIAL_BRK;
         crate::csr::sfence_vma();
