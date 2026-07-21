@@ -3,6 +3,30 @@
 use super::super::task::fd::FdTable;
 use super::*;
 
+// AGENT: distinguish process-wide exit phases without overloading any thread's
+// scheduler state; only Zombie is observable by wait/reap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessPhase {
+    Running,
+    Exiting(ExitReason),
+    Zombie(ExitReason),
+}
+
+// AGENT: keep process phase and thread membership under one lock so the last
+// thread decision is atomic with clone admission and group-exit exclusion.
+pub(super) struct ProcessLifecycle {
+    pub(super) phase: ProcessPhase,
+    pub(super) threads: BTreeSet<Tid>,
+}
+
+// AGENT: tell the kernel whether one SYS_EXIT retires only its caller or must
+// complete the shared process-exit path for the final thread.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadExitDecision {
+    NonLast,
+    Last,
+}
+
 // AGENT: represent one process independently from any schedulable thread;
 // Task owns thread-local execution state and points at this shared entity.
 pub struct Process {
@@ -17,9 +41,8 @@ pub struct Process {
     pub did_exec: AtomicBool,
     // AGENT: keep process-wide job-control stop separate from run-queue state.
     job_stopped: AtomicBool,
-    threads: Mutex<BTreeSet<Tid>>,
+    pub(super) lifecycle: Mutex<ProcessLifecycle>,
     pub ev: Mutex<EvBus>,
-    pub(super) exit_reason: Mutex<Option<ExitReason>>,
     pub sig_queue: Mutex<VecDeque<(i32, isize)>>,
     pub sig_state: Mutex<SigSet>,
     pub addr_space: Mutex<AddrSpace>,
@@ -40,9 +63,11 @@ impl Process {
             futex: Arc::new(FutexBucket::new()),
             did_exec: AtomicBool::new(false),
             job_stopped: AtomicBool::new(false),
-            threads: Mutex::new(BTreeSet::new()),
+            lifecycle: Mutex::new(ProcessLifecycle {
+                phase: ProcessPhase::Running,
+                threads: BTreeSet::new(),
+            }),
             ev: Mutex::new(EvBus::default()),
-            exit_reason: Mutex::new(None),
             sig_queue: Mutex::new(VecDeque::new()),
             sig_state: Mutex::new(SigSet::new()),
             addr_space: Mutex::new(addr_space),
@@ -91,31 +116,43 @@ impl Process {
             .collect()
     }
 
-    // AGENT: add one schedulable thread id without duplicating membership.
+    // AGENT: admit one schedulable thread only while the process is Running;
+    // the shared lifecycle lock closes the clone-vs-exit race.
     pub(in crate::kernel::proc) fn add_thread(&self, tid: Tid) -> bool {
-        self.threads.lock().unwrap().insert(tid)
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        if lifecycle.phase != ProcessPhase::Running {
+            return false;
+        }
+        lifecycle.threads.insert(tid)
     }
 
     // AGENT: snapshot thread membership for process-wide exit cleanup.
     pub fn thread_ids(&self) -> Vec<Tid> {
-        self.threads.lock().unwrap().iter().copied().collect()
+        self.lifecycle
+            .lock()
+            .unwrap()
+            .threads
+            .iter()
+            .copied()
+            .collect()
     }
 
     // AGENT: expose thread count to checkpoint validation without leaking the set.
     pub fn thread_count(&self) -> usize {
-        self.threads.lock().unwrap().len()
+        self.lifecycle.lock().unwrap().threads.len()
     }
 
     // AGENT: report exact thread membership for focused lifecycle tests.
     pub fn has_thread(&self, tid: Tid) -> bool {
-        self.threads.lock().unwrap().contains(&tid)
+        self.lifecycle.lock().unwrap().threads.contains(&tid)
     }
 
-    // AGENT: drain every thread id exactly once during process reap.
+    // AGENT: drain every retained thread id exactly once after Zombie has made
+    // the process reapable; non-last exited threads were removed immediately.
     pub(in crate::kernel::proc) fn take_threads(&self) -> Vec<Tid> {
-        mem::take(&mut *self.threads.lock().unwrap())
-            .into_iter()
-            .collect()
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        debug_assert!(matches!(lifecycle.phase, ProcessPhase::Zombie(_)));
+        mem::take(&mut lifecycle.threads).into_iter().collect()
     }
 
     // AGENT: expose process-wide job-control stop independently of Task state.

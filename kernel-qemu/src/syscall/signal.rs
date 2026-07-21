@@ -26,7 +26,7 @@ pub(super) fn sys_kill(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
         if protected(process.pid()) {
             return false;
         }
-        if !process.is_exited() && sig != 0 {
+        if !process.is_terminating() && !process.is_zombie() && sig != 0 {
             kernel.send_signal_to_process(process, sig as i32, -1);
         }
         true

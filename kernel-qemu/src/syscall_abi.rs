@@ -11,12 +11,14 @@ pub const RISCV_SYS_READ: usize = 63;
 pub const RISCV_SYS_WRITE: usize = 64;
 pub const RISCV_SYS_BRK: usize = 214;
 pub const RISCV_SYS_EXIT: usize = 93;
+pub const RISCV_SYS_EXIT_GROUP: usize = 94;
 pub const RISCV_SYS_GETPID: usize = 172;
 
 pub const INTERNAL_SYS_READ: usize = 0;
 pub const INTERNAL_SYS_WRITE: usize = 1;
 pub const INTERNAL_SYS_BRK: usize = 12;
 pub const INTERNAL_SYS_EXIT: usize = 60;
+pub const INTERNAL_SYS_EXIT_GROUP: usize = 231;
 pub const INTERNAL_SYS_GETPID: usize = 39;
 pub const INTERNAL_SYS_MOUNT: usize = 165;
 pub const INTERNAL_SYS_UMOUNT2: usize = 166;
@@ -38,6 +40,7 @@ pub fn map_riscv_nr(nr: usize) -> Option<usize> {
         RISCV_SYS_WRITE => Some(INTERNAL_SYS_WRITE),
         RISCV_SYS_BRK => Some(INTERNAL_SYS_BRK),
         RISCV_SYS_EXIT => Some(INTERNAL_SYS_EXIT),
+        RISCV_SYS_EXIT_GROUP => Some(INTERNAL_SYS_EXIT_GROUP),
         RISCV_SYS_GETPID => Some(INTERNAL_SYS_GETPID),
         _ => None,
     }
@@ -103,14 +106,12 @@ fn dispatch_installed_kernel(
             *frame = restored;
         }
         crate::kernel::SyscallOutcome::NoReturn => {
-            if nr == INTERNAL_SYS_EXIT {
-                // AGENT: SYS_EXIT abandons the dead task's trap stack only
-                // after process teardown has returned and dropped its Arc locals.
-                if kernel.switch_current_to_idle(0) {
-                    unreachable!("an exited task was scheduled again");
-                }
-                crate::sbi::shutdown();
+            // AGENT: every non-returning syscall abandons the exited task's trap
+            // stack through idle; the outcome, not one hard-coded nr, owns flow.
+            if kernel.switch_current_to_idle(0) {
+                unreachable!("a no-return syscall task was scheduled again");
             }
+            crate::sbi::shutdown();
         }
     }
 }

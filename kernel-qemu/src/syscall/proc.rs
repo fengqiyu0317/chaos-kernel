@@ -92,8 +92,17 @@ fn read_user_string_array(
     Err("e2big")
 }
 
+// AGENT: terminate only the calling Task, allowing the final-thread lifecycle
+// decision to promote this syscall into process teardown when necessary.
 pub(super) fn sys_exit(kernel: &Kernel, a0: usize) -> Result<SyscallOutcome, &'static str> {
-    kernel.do_exit_current(0, a0)?;
+    kernel.do_exit_current_thread(0, a0)?;
+    Ok(SyscallOutcome::NoReturn)
+}
+
+// AGENT: terminate every Task in the caller's Process while preserving the
+// common NoReturn handoff contract with thread-local SYS_EXIT.
+pub(super) fn sys_exit_group(kernel: &Kernel, a0: usize) -> Result<SyscallOutcome, &'static str> {
+    kernel.do_exit_group_current(0, a0)?;
     Ok(SyscallOutcome::NoReturn)
 }
 

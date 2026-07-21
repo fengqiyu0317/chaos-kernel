@@ -15,35 +15,95 @@ impl Kernel {
         self.set_cur(0, Some(root));
     }
 
-    pub fn do_exit_current(&self, cpu: usize, code: usize) -> Result<(), &'static str> {
+    // AGENT: route SYS_EXIT through the thread-local path; only the final member
+    // is allowed to commit process-level teardown and parent notification.
+    pub fn do_exit_current_thread(&self, cpu: usize, code: usize) -> Result<(), &'static str> {
         let task = self.cur_task(cpu).ok_or("esrch")?;
-        self.exit_task(cpu, &task, ExitReason::Code((code & 0xFF) as u8));
+        self.exit_current_thread(cpu, &task, ExitReason::Code((code & 0xFF) as u8))
+    }
+
+    // AGENT: route SYS_EXIT_GROUP through the process-wide path and retain one
+    // NoReturn control-flow result for the trap owner.
+    pub fn do_exit_group_current(&self, cpu: usize, code: usize) -> Result<(), &'static str> {
+        let task = self.cur_task(cpu).ok_or("esrch")?;
+        self.exit_thread_group(cpu, &task, ExitReason::Code((code & 0xFF) as u8));
         Ok(())
     }
 
-    // AGENT: keep process-exit teardown centralized: record death once, drop
-    // thread/process resources, switch away from the dead current task, and
-    // notify the parent with the child process id.
-    pub(crate) fn exit_task(&self, cpu: usize, task: &Arc<Task>, reason: ExitReason) {
+    // AGENT: retire one Task without touching shared resources unless the
+    // lifecycle lock proves that this caller is the process's final thread.
+    pub(crate) fn exit_current_thread(
+        &self,
+        cpu: usize,
+        task: &Arc<Task>,
+        reason: ExitReason,
+    ) -> Result<(), &'static str> {
         let process = task.process.clone();
-        let thread_ids = process.thread_ids();
-        if !process.exit_once(reason) {
-            return;
+        match process.begin_thread_exit(task.id(), reason)? {
+            ThreadExitDecision::NonLast => {
+                self.release_exited_thread(cpu, task);
+                let removed = self.tasks.remove_exited_thread(task.id(), &process);
+                debug_assert!(removed);
+                if !self.scheduler_active(cpu) {
+                    self.switch_away_from_exited_current(cpu, task.id());
+                }
+            }
+            ThreadExitDecision::Last => {
+                self.finish_process_exit(cpu, task, &process, vec![task.id()]);
+            }
         }
+        Ok(())
+    }
 
+    // AGENT: make exit_group and default-fatal signals share the exact same
+    // Running -> Exiting transition and all-thread teardown sequence.
+    pub(crate) fn exit_thread_group(&self, cpu: usize, task: &Arc<Task>, reason: ExitReason) {
+        let process = task.process.clone();
+        let Some(thread_ids) = process.begin_group_exit(reason) else {
+            return;
+        };
+        self.finish_process_exit(cpu, task, &process, thread_ids);
+    }
+
+    // AGENT: own the process-level half of exit after an atomic lifecycle gate:
+    // retire every Task, release shared state, reparent, publish Zombie, notify.
+    fn finish_process_exit(
+        &self,
+        cpu: usize,
+        task: &Arc<Task>,
+        process: &Arc<Process>,
+        thread_ids: Vec<Tid>,
+    ) {
         let parent = process.parent();
         let child_pid = process.pid();
 
-        self.release_exit_thread_resources(cpu, task, &process, thread_ids);
+        self.release_exit_thread_resources(cpu, task, process, thread_ids);
         process.release_exit_resources();
         self.tasks.reparent_children_to_init(&process);
-        if !self.scheduler_active(cpu) {
-            self.switch_away_from_exited_current(cpu, task.id());
-        }
+        process.finish_process_exit();
 
         if let Some(parent) = parent {
             self.send_signal_to_process(&parent, SIGCHLD as i32, child_pid as isize);
         }
+        if !self.scheduler_active(cpu) {
+            self.switch_away_from_exited_current(cpu, task.id());
+        }
+    }
+
+    // AGENT: publish one thread's Zombie state and free its private resources,
+    // deferring a live scheduler-owned kernel stack until idle resumes.
+    fn release_exited_thread(&self, cpu: usize, task: &Arc<Task>) {
+        let running_task_id = if self.scheduler_active(cpu) {
+            self.cur_task(cpu).map(|current| current.id())
+        } else {
+            None
+        };
+        if running_task_id == Some(task.id()) {
+            task.mark_thread_exited();
+        } else {
+            task.release_thread_exit_resources();
+        }
+        self.run_queue.remove(task.id());
     }
 
     // AGENT: release each same-process thread exactly once and detach it from
@@ -54,13 +114,8 @@ impl Kernel {
         cpu: usize,
         task: &Arc<Task>,
         process: &Arc<Process>,
-        thread_ids: Vec<usize>,
+        thread_ids: Vec<Tid>,
     ) {
-        let running_task_id = if self.scheduler_active(cpu) {
-            self.cur_task(cpu).map(|current| current.id())
-        } else {
-            None
-        };
         let mut released_requested_task = false;
 
         for tid in thread_ids {
@@ -71,22 +126,12 @@ impl Kernel {
                 if thread.id() == task.id() {
                     released_requested_task = true;
                 }
-                if running_task_id == Some(thread.id()) {
-                    thread.mark_thread_exited();
-                } else {
-                    thread.release_thread_exit_resources();
-                }
-                self.run_queue.remove(thread.id());
+                self.release_exited_thread(cpu, &thread);
             }
         }
 
         if !released_requested_task {
-            if running_task_id == Some(task.id()) {
-                task.mark_thread_exited();
-            } else {
-                task.release_thread_exit_resources();
-            }
-            self.run_queue.remove(task.id());
+            self.release_exited_thread(cpu, task);
         }
     }
 
@@ -208,8 +253,8 @@ impl Kernel {
             }
 
             matched = true;
-            if child.is_exited() {
-                return Ok(Some((child.pid(), child.wait_status())));
+            if let Some(status) = child.zombie_wait_status() {
+                return Ok(Some((child.pid(), status)));
             }
         }
 

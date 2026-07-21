@@ -275,13 +275,13 @@ RISC-V trap frame
 - run queue。
 - 当前 task 指针。
 - trap 返回用户态。
-- `exit` 将当前 task 置为 exited。
+- `exit` 只终止当前 task；仅最后一个线程退出时提交进程级 zombie。
 
 QEMU 侧的上下文所有权按下列边界固定，不再保留从 simulator
 复制而来的 16 槽寄存器镜像：
 
 - 每个 task 的完整用户态 `TrapFrame` 固定位于 `kernel_stack_top - size_of::<TrapFrame>()`，由 `trap.S` 原地保存和恢复，并作为用户寄存器的唯一事实来源。
-- 第一阶段的 signal-frame stack 直接由 `Task::sig_frames` 持有，信号屏蔽字只由 `Task::sig_mask` 持有，不再为单一字段保留 `ThdCtx` 包装。尚未接入 syscall 的 `clear_child_tid` 不提前保留，待单线程退出与 `clone` 语义一起迁移。
+- 第一阶段的 signal-frame stack 直接由 `Task::sig_frames` 持有，信号屏蔽字只由 `Task::sig_mask` 持有，不再为单一字段保留 `ThdCtx` 包装。单线程退出核心路径已经接入；尚未接入 syscall 的 `clear_child_tid` 不提前保留，待 `clone` / `set_tid_address` ABI 接入后在线程资源和地址空间释放前补写零与 futex wake。
 - `fork` / `clone` 从调用者的完整 live `TrapFrame` 派生子任务现场；`exec` / `sigreturn` 通过 syscall outcome 由持有 live frame 的 trap 边界原子替换现场，避免从 `Task` 再创建第二个可变引用。
 - checkpoint 中的 `SavedTrapFrame` 只是序列化 DTO，restore 时转成运行时 `TrapFrame` 并直接安装到新 task 的内核栈顶。
 - task 切换使用仅保存内核态 `ra` / `sp` / `s0..s11` 的 `KernelContext` 和 `__switch`；不将内核切换现场混入用户 `TrapFrame`。
@@ -289,6 +289,9 @@ QEMU 侧的上下文所有权按下列边界固定，不再保留从 simulator
 - `Kernel` 为每个 hart 保留 `Processor`，其中 `current` 是当前 task 的唯一 CPU 归属标记，`idle_context` 保存 boot/idle stack 的内核上下文；第一阶段只允许 CPU0 进入真实调度循环。
 - CPU0 scheduler 在 boot stack 上关中断选取 runnable task，先发布 `Running` 和 `current`，再从 `idle_context` 切换到 task context；task 阻塞、时间片用尽或退出时先发布状态，然后切回 idle context。无 runnable task 时必须清空 `current`，打开中断并在 idle stack 上执行 `wfi`。
 - 正在运行的退出 task 只先标记 zombie 并保留内核栈；只有 `__switch` 已经回到 idle stack 后，scheduler 才能释放该栈。
+- `Task::done()` 只读取线程局部的 `TaskRunState::Zombie`。`Process` 用同一生命周期锁维护 `ProcessPhase::{Running, Exiting, Zombie}` 和线程 TID 集合，使最后线程判断与禁止退出期 clone 成为一个原子状态转换。
+- RISC-V `exit(93)` 进入单线程退出；`exit_group(94)` 和默认终止信号进入线程组退出。非最后线程不得释放 fd、地址空间或 futex waiters，也不得重定向子进程、发布 `CHILD_QUIT` 或发送 `SIGCHLD`。
+- `wait4` / reap 只能观察 `ProcessPhase::Zombie`；`Exiting` 表示资源清理尚未完成，不能提前暴露给父进程。
 
 后续按 `kernel-sim` 现有能力逐步迁移：
 

@@ -10,7 +10,7 @@ use crate::kernel::{
 use crate::trap::TrapFrame;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-static PROCESSOR_CONTEXT_TEST_RAN: AtomicBool = AtomicBool::new(false);
+static PROCESSOR_EXIT_TEST_RAN: AtomicBool = AtomicBool::new(false);
 
 // AGENT: expose focused scheduler queue checks to the optional QEMU boot
 // selftest path and use its discovered RAM pool for real task kernel stacks.
@@ -27,37 +27,41 @@ pub fn run_all(pool: &FramePool) {
     sigcont_resumes_stopped_task_without_resuming_for_plain_signal(pool);
     sigcont_keeps_sleeping_task_asleep_until_wait_wakeup(pool);
     signal_handler_uses_supplied_interrupted_frame(pool);
-    processor_switches_task_back_to_idle_context(pool);
+    processor_releases_exited_stack_after_idle_handoff(pool);
 }
 
-// AGENT: execute the real Processor idle -> task -> idle path once, proving
-// current publication, task-stack execution, and task detachment as one unit.
-fn processor_switches_task_back_to_idle_context(pool: &FramePool) {
+// AGENT: execute the real Processor idle -> task -> idle path once and prove an
+// exiting task's live kernel stack is released only after idle regains control.
+fn processor_releases_exited_stack_after_idle_handoff(pool: &FramePool) {
     ensure_timer_wheel();
-    PROCESSOR_CONTEXT_TEST_RAN.store(false, Ordering::Relaxed);
+    PROCESSOR_EXIT_TEST_RAN.store(false, Ordering::Relaxed);
 
     let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     kernel.proc_init();
     let task = kernel.cur_task(0).expect("init task should be current");
-    task.install_test_kernel_entry(processor_context_test_task)
+    task.install_test_kernel_entry(processor_exit_test_task)
         .expect("test task should receive kernel entry");
+    assert!(task.kernel_stack_top().is_some());
     install_qemu_wait_kernel(kernel);
 
     assert!(kernel.run_one_cpu0_task_for_test());
-    assert!(PROCESSOR_CONTEXT_TEST_RAN.load(Ordering::Relaxed));
+    assert!(PROCESSOR_EXIT_TEST_RAN.load(Ordering::Relaxed));
     assert!(kernel.cur_task(0).is_none());
-    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    assert!(task.done());
+    assert!(task.kernel_stack_top().is_none());
 }
 
-// AGENT: run on the selected Task kernel stack, publish Sleeping, and return to
-// the scheduler's saved idle context through the production handoff helper.
-extern "C" fn processor_context_test_task() -> ! {
-    PROCESSOR_CONTEXT_TEST_RAN.store(true, Ordering::Relaxed);
+// AGENT: run SYS_EXIT on the selected Task stack, verify teardown retained that
+// live stack, then use the production handoff so the idle side can release it.
+extern "C" fn processor_exit_test_task() -> ! {
+    PROCESSOR_EXIT_TEST_RAN.store(true, Ordering::Relaxed);
     let kernel = qemu_wait_kernel().expect("scheduler test kernel should be installed");
     let task = kernel
         .cur_task(0)
         .expect("scheduler test task should be current");
-    task.set_sched_state(TaskRunState::Sleeping);
+    assert_eq!(kernel.do_exit_current_thread(0, 0), Ok(()));
+    assert!(task.done());
+    assert!(task.kernel_stack_top().is_some());
     drop(task);
     assert!(kernel.switch_current_to_idle(0));
     loop {

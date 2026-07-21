@@ -4,32 +4,82 @@ use super::*;
 
 // AGENT: implement process-wide lifecycle transitions on the shared Process.
 impl Process {
-    // AGENT: report process death from the authoritative shared exit reason.
-    pub fn is_exited(&self) -> bool {
-        self.exit_reason.lock().unwrap().is_some()
+    // AGENT: atomically remove a non-last exiting thread, or reserve the final
+    // thread while moving the whole process from Running to Exiting.
+    pub fn begin_thread_exit(
+        &self,
+        tid: Tid,
+        reason: ExitReason,
+    ) -> Result<ThreadExitDecision, &'static str> {
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        if lifecycle.phase != ProcessPhase::Running || !lifecycle.threads.contains(&tid) {
+            return Err("esrch");
+        }
+        if lifecycle.threads.len() == 1 {
+            lifecycle.phase = ProcessPhase::Exiting(reason);
+            return Ok(ThreadExitDecision::Last);
+        }
+        lifecycle.threads.remove(&tid);
+        Ok(ThreadExitDecision::NonLast)
     }
 
-    // AGENT: record process death once and notify process and parent waiters.
-    pub(crate) fn exit_once(&self, reason: ExitReason) -> bool {
-        let mut exit_reason = self.exit_reason.lock().unwrap();
-        if exit_reason.is_some() {
-            return false;
+    // AGENT: start one process-wide exit exactly once and snapshot every retained
+    // TID while the same lock prevents any later thread clone from joining.
+    pub fn begin_group_exit(&self, reason: ExitReason) -> Option<Vec<Tid>> {
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        if lifecycle.phase != ProcessPhase::Running {
+            return None;
         }
-        *exit_reason = Some(reason);
-        drop(exit_reason);
+        lifecycle.phase = ProcessPhase::Exiting(reason);
+        Some(lifecycle.threads.iter().copied().collect())
+    }
+
+    // AGENT: publish Zombie only after the kernel has completed every process-
+    // level teardown action, then wake process and parent observers.
+    pub fn finish_process_exit(&self) {
+        let became_zombie = {
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            match lifecycle.phase {
+                ProcessPhase::Exiting(reason) => {
+                    lifecycle.phase = ProcessPhase::Zombie(reason);
+                    true
+                }
+                ProcessPhase::Running | ProcessPhase::Zombie(_) => false,
+            }
+        };
+        if !became_zombie {
+            return;
+        }
 
         self.ev.lock().unwrap().set(EvFlag::PROC_QUIT);
         if let Some(parent) = self.parent() {
             parent.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
         }
-        true
     }
 
-    // AGENT: expose the encoded process exit status directly to wait paths.
-    pub fn wait_status(&self) -> usize {
-        match *self.exit_reason.lock().unwrap() {
-            Some(reason) => reason.wait_status(),
-            None => 0,
+    // AGENT: expose only the in-progress teardown phase; Zombie remains a
+    // separate wait/reap-visible state instead of being folded into this query.
+    pub fn is_terminating(&self) -> bool {
+        matches!(
+            self.lifecycle.lock().unwrap().phase,
+            ProcessPhase::Exiting(_)
+        )
+    }
+
+    // AGENT: expose the only process phase wait4 and reap may observe as dead.
+    pub fn is_zombie(&self) -> bool {
+        matches!(
+            self.lifecycle.lock().unwrap().phase,
+            ProcessPhase::Zombie(_)
+        )
+    }
+
+    // AGENT: return a wait status only after process teardown has committed the
+    // Zombie transition; Exiting is deliberately invisible to wait4.
+    pub fn zombie_wait_status(&self) -> Option<usize> {
+        match self.lifecycle.lock().unwrap().phase {
+            ProcessPhase::Zombie(reason) => Some(reason.wait_status()),
+            ProcessPhase::Running | ProcessPhase::Exiting(_) => None,
         }
     }
 

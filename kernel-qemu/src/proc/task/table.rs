@@ -112,6 +112,21 @@ impl TaskTable {
         self.find(tid).map(|task| task.process.clone())
     }
 
+    // AGENT: delete one non-last exited thread immediately without touching its
+    // still-running Process or any sibling task-table entries.
+    pub(crate) fn remove_exited_thread(&self, tid: Tid, process: &Arc<Process>) -> bool {
+        let mut tasks = self.tasks.write().unwrap();
+        if tasks
+            .get(&tid)
+            .is_some_and(|task| Arc::ptr_eq(&task.process, process))
+        {
+            tasks.remove(&tid);
+            true
+        } else {
+            false
+        }
+    }
+
     // AGENT: expose init as a Process for orphan adoption and focused tests.
     pub fn init_process(&self) -> Option<Arc<Process>> {
         self.init.lock().unwrap().clone()
@@ -185,7 +200,7 @@ impl TaskTable {
     // thread indexes; callers must explicitly resolve tids before this boundary.
     pub fn reap(&self, pid: usize) -> Result<(), &'static str> {
         let process = self.find_process(pid).ok_or("esrch")?;
-        if !process.is_exited() {
+        if !process.is_zombie() {
             return Err("ebusy");
         }
 
@@ -415,7 +430,7 @@ impl TaskTable {
             .read()
             .unwrap()
             .values()
-            .filter(|process| !process.is_exited())
+            .filter(|process| !process.is_terminating() && !process.is_zombie())
             .cloned()
             .collect()
     }
@@ -426,7 +441,7 @@ impl TaskTable {
             .read()
             .unwrap()
             .iter()
-            .filter_map(|(&pid, process)| process.is_exited().then_some(pid))
+            .filter_map(|(&pid, process)| process.is_zombie().then_some(pid))
             .collect()
     }
 }

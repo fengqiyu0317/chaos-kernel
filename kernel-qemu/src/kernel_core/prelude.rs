@@ -194,6 +194,7 @@ pub const SYS_DUP2: usize = 33;
 pub const SYS_FORK: usize = 57;
 pub const SYS_EXEC: usize = 59;
 pub const SYS_EXIT: usize = 60;
+pub const SYS_EXIT_GROUP: usize = 231;
 pub const SYS_WAIT4: usize = 61;
 pub const SYS_KILL: usize = 62;
 pub const SYS_FCNTL: usize = 72;

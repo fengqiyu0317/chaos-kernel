@@ -254,7 +254,7 @@ impl Kernel {
                     break;
                 }
                 SignalDeliveryAction::Terminate => {
-                    self.exit_task(cpu, &task, ExitReason::Signal(sig.signo as u8));
+                    self.exit_thread_group(cpu, &task, ExitReason::Signal(sig.signo as u8));
                     break;
                 }
                 SignalDeliveryAction::Handler(handler) => {

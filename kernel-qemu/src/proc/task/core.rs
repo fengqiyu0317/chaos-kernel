@@ -119,9 +119,10 @@ impl Task {
         Ok(unsafe { (&*ptr).clone() })
     }
 
-    // AGENT: report process death from the shared exit reason.
+    // AGENT: report only this thread's terminal scheduler state; one sibling's
+    // SYS_EXIT must never make every Task in the Process appear dead.
     pub fn done(&self) -> bool {
-        self.process.is_exited()
+        self.sched_state() == TaskRunState::Zombie
     }
 
     // AGENT: read this task's scheduler placement state.

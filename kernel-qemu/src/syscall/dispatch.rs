@@ -46,6 +46,7 @@ impl Kernel {
             SYS_FORK => returning(sys_fork(self, _caller_token, caller_frame)),
             SYS_EXEC => sys_exec(self, a0, a1, a2),
             SYS_EXIT => sys_exit(self, a0),
+            SYS_EXIT_GROUP => sys_exit_group(self, a0),
             SYS_WAIT4 => returning(sys_wait4(self, a0, a1, a2, a3)),
             SYS_KILL => returning(sys_kill(self, a0, a1)),
             SYS_FCNTL => returning(sys_fcntl(self, a0, a1, a2)),
@@ -68,8 +69,13 @@ impl Kernel {
     }
 
     // AGENT: keep the task-owned-frame, no-signal-delivery adapter confined to
-    // the direct filesystem and scheduler semantic selftests that need it.
-    #[cfg(any(test, feature = "qemu-fs-selftest", feature = "qemu-sched-selftest"))]
+    // direct filesystem, process, and scheduler semantic selftests that need it.
+    #[cfg(any(
+        test,
+        feature = "qemu-fs-selftest",
+        feature = "qemu-proc-selftest",
+        feature = "qemu-sched-selftest"
+    ))]
     pub(crate) fn dispatch_syscall_without_signal_delivery(
         &self,
         nr: usize,
