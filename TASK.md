@@ -518,6 +518,9 @@ cargo test --test pressure
 - host 语义基准：`CARGO_TARGET_DIR=/tmp/chaos-kernel-sim-target cargo test` 通过，其中 `smoke` 为 `84 passed; 0 failed`。
 - 语义来源说明：本项由明确的 QEMU 迁移任务先行补齐；`kernel-sim` 仍保留下方 M3 单线程 `exit` / `exit_group` TODO，后续应把同一生命周期模型回迁为 host 语义源，避免两侧长期漂移。
 - `[M3][M9][重要] TODO`: `clear_child_tid` 仍未接入；待 `clone` / `set_tid_address` syscall 可设置该地址后，在线程退出且地址空间尚未释放时写零，并对同一地址执行 futex wake。不要把该项退化为当前核心退出路径中的占位字段。
+- `[M3][M9][普通] TODO`: `kernel-qemu::ExitReason::Signal(u8)` 目前依赖信号入队路径保证 `1..=NSIG`，类型自身仍可构造 `Signal(0)` 或越界值并被 `wait_status()` 的 `& 0x7f` 静默折叠；后续应引入经过校验的终止信号表示。若接入真实 core-image 生成路径，还应记录是否实际产生 core dump，并按 Linux wait status ABI 写入 `0x80` 标志。
+- `[M3][M9][重要] TODO`: `kernel-qemu::wait4` 当前只观察 `Zombie`，不能报告 job-control stop / continue 事件；后续应建立独立于终止原因 `ExitReason` 的 child wait-event 模型，接入 `WUNTRACED` / `WCONTINUED`，分别编码 `(stop_signal << 8) | 0x7f` 和 `0xffff`，并定义事件消费与重复报告规则。
+- `[M3][M9][普通] TODO`: `kernel-qemu::ExitReason::wait_status()` 当前返回 `usize`，到 `sys_wait4()` 写回用户态时才收窄为 `u32`；后续应把进程终止状态、`do_wait()` 返回值和 syscall copyout 统一为明确的 32 位 wait-status 类型，避免把机器字宽误当成 ABI 宽度。
 - `[M5][M9][重要] TODO`: 在 `kernel-qemu` 的 `Process` 中引入 `cwd` 前，先迁移完整的每进程工作目录语义：实现 `getcwd` / `chdir`，让 `openat`、`exec` 及其他路径 syscall 按 cwd 解析相对路径，并明确 fork 继承、exec 保留、挂载点与路径规范化边界；在这些语义接入前，不保留始终为 `/` 且无消费者的占位字段。
 - `[M6][M9][重要] TODO`: 在 `kernel-qemu` 的 `Process` 中引入 `sem_ctx` 前，先接入 System V semaphore syscall 与进程级 semid 句柄表；保持 fork 继承 semaphore set 引用但不继承 `SEM_UNDO` 累积量，exit 时应用 undo 并释放本地句柄，同时与 `Kernel.sem_store` 的全局对象生命周期对齐。
 - `[M6][M9][重要] TODO`: 在 `kernel-qemu` 的 `Process` 中引入 `shm_ctx` 前，先实现 `shmget` / `shmat` / `shmdt` / `shmctl` 及进程级附着表；记录 shm id、附着虚拟地址与全局 `Kernel.shm_store` segment 的关系，让 fork 继承附着、exit 解除附着，并通过 `AddrSpace` 的共享页映射保证多进程可见性。
