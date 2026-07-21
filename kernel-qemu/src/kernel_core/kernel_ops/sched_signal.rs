@@ -281,7 +281,7 @@ impl Kernel {
     // AGENT: advance global timers after CPU0 has advanced the logical clock.
     pub(crate) fn advance_timers(&self) {
         let fired = {
-            let mut timers = self.timers.lock();
+            let mut timers = global_timer_wheel().lock();
             timers.advance()
         };
 

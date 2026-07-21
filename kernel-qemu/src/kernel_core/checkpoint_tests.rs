@@ -102,7 +102,7 @@ fn checkpoint_round_trip_restores_task_timer(kernel: &Kernel) {
 
     let deadline = CLK.load(Ordering::Relaxed).saturating_add(2);
     let original_timer_id = {
-        let mut timers = kernel.timers.lock();
+        let mut timers = global_timer_wheel().lock();
         timers.register_timer(
             deadline,
             0,
@@ -132,7 +132,7 @@ fn checkpoint_round_trip_restores_task_timer(kernel: &Kernel) {
     );
     assert_eq!(image.timers[0].deadline_ticks, deadline as u64);
 
-    assert!(kernel.timers.lock().cancel(original_timer_id));
+    assert!(global_timer_wheel().lock().cancel(original_timer_id));
     let restored_id = kernel
         .restore_process_from_image(image)
         .expect("checkpoint timer should restore");
@@ -141,8 +141,7 @@ fn checkpoint_round_trip_restores_task_timer(kernel: &Kernel) {
         .find(restored_id)
         .expect("restored timer target should exist");
 
-    let restored_timers = kernel
-        .timers
+    let restored_timers = global_timer_wheel()
         .lock()
         .snapshot_checkpoint_timers(restored_id)
         .expect("restored timer should be serializable");

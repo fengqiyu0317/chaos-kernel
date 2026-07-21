@@ -39,16 +39,14 @@ fn boot_kernel_block_cache_chains() -> usize {
 pub struct Kernel {
     pub tasks: TaskTable,
     pub run_queue: RunQueue,
-    pub cache: Arc<BlockCache>,
-    pub block_device: Arc<RamBlockDevice>,
-    file_blocks: Arc<FileBlockAllocator>,
+    // AGENT: keep the cache, root block device, and file-block allocator in
+    // their existing cloneable storage handle instead of mirroring them here.
+    file_storage: FileStorage,
     pub pool: FramePool,
     // AGENT: keep current-task and idle-context ownership together per hart;
     // only processors[0] is allowed to enter the scheduler in this milestone.
     pub processors: [Mutex<Processor>; MAX_CPU],
     pub mnt: MountTable,
-    // AGENT: handle to the QEMU timer wheel driven from real timer interrupts.
-    pub timers: &'static Mutex<TimerWheel>,
     // AGENT: unified path-backed file table shared by open-like handles and exec.
     pub file_nodes: RwLock<BTreeMap<String, Arc<FileNode>>>,
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
@@ -84,17 +82,19 @@ impl Kernel {
         cache_chains: usize,
     ) -> Self {
         let file_blocks = Arc::new(FileBlockAllocator::new(block_device.block_count()));
+        let file_storage = FileStorage::new(
+            Arc::new(BlockCache::new(cache_chains)),
+            block_device,
+            file_blocks,
+        );
         let tasks = TaskTable::new(pool.clone());
         Self {
             tasks,
             run_queue: RunQueue::new(),
-            cache: Arc::new(BlockCache::new(cache_chains)),
-            block_device,
-            file_blocks,
+            file_storage,
             pool,
             processors: core::array::from_fn(|_| Mutex::new(Processor::new())),
             mnt: MountTable::new(),
-            timers: global_timer_wheel(),
             file_nodes: RwLock::new(BTreeMap::new()),
             sem_store: RwLock::new(BTreeMap::new()),
             shm_store: RwLock::new(BTreeMap::new()),
@@ -102,13 +102,9 @@ impl Kernel {
         }
     }
 
-    // AGENT: build the shared FileNode backend from the Kernel-owned RAM block
-    // device and cache instead of storing file bytes inside each FileNode.
+    // AGENT: clone the one Kernel-owned storage handle so every FileNode and
+    // file descriptor shares the same cache, device, and block allocator.
     pub fn file_storage(&self) -> FileStorage {
-        FileStorage::new(
-            self.cache.clone(),
-            self.block_device.clone(),
-            self.file_blocks.clone(),
-        )
+        self.file_storage.clone()
     }
 }

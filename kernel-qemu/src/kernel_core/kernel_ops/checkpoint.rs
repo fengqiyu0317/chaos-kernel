@@ -31,7 +31,9 @@ impl Kernel {
         image.vmas = vmas;
         image.pages = pages;
         image.fds = task.snapshot_checkpoint_fds()?;
-        image.timers = self.timers.lock().snapshot_checkpoint_timers(task.id())?;
+        image.timers = global_timer_wheel()
+            .lock()
+            .snapshot_checkpoint_timers(task.id())?;
         image
             .validate_first_version()
             .map_err(checkpoint_error_to_errno)?;
@@ -77,7 +79,7 @@ impl Kernel {
             *current_addr_space = addr_space;
         }
         task.restore_checkpoint_fds(&image.fds)?;
-        self.timers
+        global_timer_wheel()
             .lock()
             .restore_checkpoint_timers(&image.timers, task.id())?;
         task.install_user_trap_frame(TrapFrame::from_saved_checkpoint_frame(&trap_frame))?;
