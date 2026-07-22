@@ -33,7 +33,7 @@ impl Kernel {
         task.set_job_stopped(stopped);
         let thread_ids = task.process.thread_ids();
         for thread_id in thread_ids {
-            let Some(thread) = self.tasks.find(thread_id) else {
+            let Some(thread) = self.tasks.find_task(thread_id) else {
                 continue;
             };
             if !Arc::ptr_eq(&thread.process, &task.process) {
@@ -51,7 +51,7 @@ impl Kernel {
     // wakeups should make a sleeping task runnable through the run queue instead
     // of unparking a host thread.
     pub(crate) fn wake_task_for_wait(&self, task_id: usize) -> bool {
-        let Some(task) = self.tasks.find(task_id) else {
+        let Some(task) = self.tasks.find_task(task_id) else {
             return false;
         };
         if task.done() {
@@ -67,7 +67,7 @@ impl Kernel {
     // the current task returns to the idle context after publishing Sleeping;
     // metadata-only selftests retain the earlier no-switch compatibility path.
     pub(crate) fn block_task_for_wait(&self, task_id: usize) -> bool {
-        let Some(task) = self.tasks.find(task_id) else {
+        let Some(task) = self.tasks.find_task(task_id) else {
             return false;
         };
         if task.done() {
@@ -90,7 +90,7 @@ impl Kernel {
     // AGENT: normalize a completed wait after either a real idle round trip or
     // the metadata-only compatibility bridge used before scheduler activation.
     pub(crate) fn finish_task_wait(&self, task_id: usize) -> bool {
-        let Some(task) = self.tasks.find(task_id) else {
+        let Some(task) = self.tasks.find_task(task_id) else {
             return false;
         };
         if task.done() {
@@ -136,7 +136,7 @@ impl Kernel {
     // AGENT: update the task-owned priority; queued Arc<Task> entries observe
     // the authoritative policy directly, so no run-queue refresh is required.
     pub fn boost_task_priority(&self, task_id: usize, amount: i32) -> bool {
-        let Some(task) = self.tasks.find(task_id) else {
+        let Some(task) = self.tasks.find_task(task_id) else {
             return false;
         };
         if task.done() {
@@ -153,7 +153,7 @@ impl Kernel {
         let target = process
             .thread_ids()
             .into_iter()
-            .filter_map(|tid| self.tasks.find(tid))
+            .filter_map(|tid| self.tasks.find_task(tid))
             .find(|task| !task.done());
         if let Some(target) = target {
             self.send_signal_to_task(&target, signo, sender_pid);
@@ -193,7 +193,7 @@ impl Kernel {
     // signal; actual delivery still belongs to the syscall/schedule boundary.
     pub(crate) fn task_has_interrupting_signal(&self, task_id: usize) -> bool {
         self.tasks
-            .find(task_id)
+            .find_task(task_id)
             .is_some_and(|task| !task.done() && task.has_interrupting_signal())
     }
 
@@ -306,7 +306,7 @@ impl Kernel {
                 signo,
                 sender_tid,
             } => {
-                if let Some(task) = self.tasks.find(task_id) {
+                if let Some(task) = self.tasks.find_task(task_id) {
                     self.send_signal_to_task(&task, signo, sender_tid);
                 }
             }

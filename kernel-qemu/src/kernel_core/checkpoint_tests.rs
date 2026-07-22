@@ -94,7 +94,7 @@ fn checkpoint_round_trip_restores_memory_and_trap_frame(kernel: &Kernel) {
 
     let restored = kernel
         .tasks
-        .find(restored_id)
+        .find_task(restored_id)
         .expect("restored task should be registered");
     let mut restored_pattern = [0u8; 8];
     restored
@@ -164,7 +164,7 @@ fn checkpoint_round_trip_restores_task_timer(kernel: &Kernel) {
         .expect("checkpoint timer should restore");
     let restored = kernel
         .tasks
-        .find(restored_id)
+        .find_task(restored_id)
         .expect("restored timer target should exist");
 
     let restored_timers = global_timer_wheel()

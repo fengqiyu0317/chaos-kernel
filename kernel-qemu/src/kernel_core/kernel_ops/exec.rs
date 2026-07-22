@@ -77,7 +77,7 @@ impl Kernel {
         args: Vec<String>,
         envs: Vec<String>,
     ) -> Result<UserEntry, &'static str> {
-        let task = self.tasks.find(task_id).ok_or("esrch")?;
+        let task = self.tasks.find_task(task_id).ok_or("esrch")?;
         task.kernel_stack_top().ok_or("ekstk")?;
         let prepared = self.prepare_exec_image(&task, path, args, envs)?;
         Ok(self.commit_exec(&task, prepared))
@@ -93,7 +93,7 @@ impl Kernel {
         envs: Vec<String>,
     ) -> Result<(), &'static str> {
         let user_entry = self.do_exec_for_trap(task_id, path, args, envs)?;
-        let task = self.tasks.find(task_id).ok_or("esrch")?;
+        let task = self.tasks.find_task(task_id).ok_or("esrch")?;
         task.install_user_trap_frame(TrapFrame::for_user_entry(
             user_entry.entry,
             user_entry.stack_pointer,

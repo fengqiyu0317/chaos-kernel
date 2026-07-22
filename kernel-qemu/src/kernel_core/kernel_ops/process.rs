@@ -119,7 +119,7 @@ impl Kernel {
         let mut released_requested_task = false;
 
         for tid in thread_ids {
-            if let Some(thread) = self.tasks.find(tid) {
+            if let Some(thread) = self.tasks.find_task(tid) {
                 if !Arc::ptr_eq(&thread.process, process) {
                     continue;
                 }
@@ -152,7 +152,7 @@ impl Kernel {
     // AGENT: keep fork as a small orchestration layer; TaskTable owns process
     // construction/publication, while Kernel only publishes it to the scheduler.
     pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> {
-        let parent = self.tasks.find(parent_id).ok_or("esrch")?;
+        let parent = self.tasks.find_task(parent_id).ok_or("esrch")?;
         let caller_frame = parent.snapshot_user_trap_frame()?;
         self.do_fork_from_frame(parent_id, &caller_frame)
     }
@@ -164,7 +164,7 @@ impl Kernel {
         parent_id: usize,
         caller_frame: &TrapFrame,
     ) -> Result<usize, &'static str> {
-        let parent = self.tasks.find(parent_id).ok_or("esrch")?;
+        let parent = self.tasks.find_task(parent_id).ok_or("esrch")?;
         if parent.done() {
             return Err("esrch");
         }

@@ -85,7 +85,7 @@ fn task_spawn_reports_kernel_stack_exhaustion() {
     for _ in 0..=N_PROC {
         assert_eq!(table.spawn().err(), Some("enomem"));
     }
-    assert_eq!(table.count(), 0);
+    assert_eq!(table.task_count(), 0);
 }
 
 // AGENT: keep pid 1, init identity, and task-table capacity uncommitted when
@@ -96,7 +96,7 @@ fn spawn_root_failure_does_not_consume_init_pid() {
 
     assert_eq!(table.spawn_root().err(), Some("enomem"));
     assert_eq!(table.seq.load(Ordering::SeqCst), INIT_PID);
-    assert_eq!(table.count(), 0);
+    assert_eq!(table.task_count(), 0);
     assert_eq!(table.process_count(), 0);
     assert!(table.init_process().is_none());
 }
@@ -110,7 +110,7 @@ fn task_slot_limit_reopens_only_after_reap(pool: &FramePool) {
         tasks.push(table.spawn().expect("task table should fill to its limit"));
     }
 
-    assert_eq!(table.count(), N_PROC);
+    assert_eq!(table.task_count(), N_PROC);
     assert_eq!(table.spawn().err(), Some("eagain"));
 
     let reaped = tasks.pop().expect("full task table should have a victim");
@@ -121,13 +121,13 @@ fn task_slot_limit_reopens_only_after_reap(pool: &FramePool) {
         .is_some());
     reaped.process.finish_process_exit();
     assert_eq!(table.reap(reaped_pid), Ok(()));
-    assert_eq!(table.count(), N_PROC - 1);
+    assert_eq!(table.task_count(), N_PROC - 1);
 
     let replacement = table
         .spawn()
         .expect("reaping one task should reopen exactly one slot");
     assert!(replacement.id() > reaped.id());
-    assert_eq!(table.count(), N_PROC);
+    assert_eq!(table.task_count(), N_PROC);
     assert_eq!(table.spawn().err(), Some("eagain"));
 }
 
@@ -337,7 +337,7 @@ fn spawn_root_creates_single_pid_one_init(pool: &FramePool) {
         Some(INIT_PID)
     );
     assert_eq!(table.spawn_root().err(), Some("eexist"));
-    assert_eq!(table.count(), 1);
+    assert_eq!(table.task_count(), 1);
     assert_eq!(table.process_count(), 1);
 }
 
@@ -350,7 +350,7 @@ fn spawn_root_rejects_nonempty_task_table(pool: &FramePool) {
     assert_eq!(first.id(), INIT_PID);
     assert_eq!(table.spawn_root().err(), Some("ebusy"));
     assert!(table.init_process().is_none());
-    assert_eq!(table.count(), 1);
+    assert_eq!(table.task_count(), 1);
     assert_eq!(table.process_count(), 1);
 }
 
@@ -375,7 +375,7 @@ fn init_process_resolves_through_process_index(pool: &FramePool) {
 fn process_index_keeps_task_and_process_identity_separate(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
     let first = table.spawn().expect("standalone spawn should work");
-    assert!(Arc::ptr_eq(&table.find(first.id()).unwrap(), &first));
+    assert!(Arc::ptr_eq(&table.find_task(first.id()).unwrap(), &first));
     assert!(Arc::ptr_eq(
         &table.find_process(first.process.pid()).unwrap(),
         &first.process
@@ -557,9 +557,9 @@ fn reap_rejects_live_process(pool: &FramePool) {
     let task = table.spawn().expect("standalone spawn should work");
 
     assert_eq!(table.reap(task.process.pid()), Err("ebusy"));
-    assert!(table.find(task.id()).is_some());
+    assert!(table.find_task(task.id()).is_some());
     assert!(table.find_process(task.process.pid()).is_some());
-    assert_eq!(table.count(), 1);
+    assert_eq!(table.task_count(), 1);
 }
 
 // AGENT: fork copies every architectural user register and return CSR from the
@@ -732,8 +732,8 @@ fn reap_zombie_process_removes_thread_group_once(pool: &FramePool) {
     assert_eq!(table.reap(thread.id()), Err("esrch"));
     assert_eq!(table.reap(child_pid), Ok(()));
 
-    assert!(table.find(child.id()).is_none());
-    assert!(table.find(thread.id()).is_none());
+    assert!(table.find_task(child.id()).is_none());
+    assert!(table.find_task(thread.id()).is_none());
     assert!(table.find_process(child_pid).is_none());
     assert!(parent.process.has_no_children());
     drop(thread);
@@ -830,8 +830,8 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     assert!(!leader.done());
     assert!(!leader.process.is_terminating());
     assert_eq!(leader.process.thread_ids(), vec![leader.id()]);
-    assert!(kernel.tasks.find(thread.id()).is_none());
-    assert!(kernel.tasks.find(leader.id()).is_some());
+    assert!(kernel.tasks.find_task(thread.id()).is_none());
+    assert!(kernel.tasks.find_task(leader.id()).is_some());
     assert!(kernel.tasks.find_process(child_pid).is_some());
     assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(leader.id()));
     assert!(leader.get_fd_entry(fd).is_some());
@@ -912,8 +912,8 @@ fn leader_exit_keeps_remaining_thread_and_process(pool: &FramePool) {
     assert!(!thread.done());
     assert!(!leader.process.is_terminating());
     assert_eq!(leader.process.thread_ids(), vec![thread.id()]);
-    assert!(kernel.tasks.find(leader.id()).is_none());
-    assert!(kernel.tasks.find(thread.id()).is_some());
+    assert!(kernel.tasks.find_task(leader.id()).is_none());
+    assert!(kernel.tasks.find_task(thread.id()).is_some());
     assert!(kernel.tasks.find_process(leader.process.pid()).is_some());
     assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(thread.id()));
 }
@@ -948,7 +948,7 @@ fn exit_group_terminates_every_thread(pool: &FramePool) {
     assert!(leader.process.is_zombie());
     assert_eq!(leader.process.zombie_wait_status(), Some(11 << 8));
     assert_eq!(leader.process.thread_count(), 3);
-    assert_eq!(kernel.tasks.count(), 3);
+    assert_eq!(kernel.tasks.task_count(), 3);
     assert!(kernel.run_queue.pick_next().is_none());
     assert!(kernel.cur_task(0).is_none());
 }

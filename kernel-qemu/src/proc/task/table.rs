@@ -134,7 +134,7 @@ impl TaskTable {
         if init_pid.is_some() {
             return Err("eexist");
         }
-        if self.count() != 0 || self.process_count() != 0 {
+        if self.task_count() != 0 || self.process_count() != 0 {
             return Err("ebusy");
         }
 
@@ -228,6 +228,8 @@ impl TaskTable {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let mut child_frame = caller_frame.clone();
         child_frame.regs[2] = stack_top as usize;
+        // AGENT TODO: wire the clone flags through the syscall ABI and replace
+        // x4/tp only when CLONE_SETTLS requests a new user TLS pointer.
         child_frame.regs[4] = tls as usize;
         let task = Task::make_child_from_frame(id, process.clone(), src, child_frame, &self.pool)?;
 
@@ -244,7 +246,7 @@ impl TaskTable {
     // AGENT: group read-only task/process lookup, counts, and lifecycle snapshots.
 
     // AGENT: look up one schedulable thread id without treating it as a pid.
-    pub fn find(&self, tid: usize) -> Option<Arc<Task>> {
+    pub fn find_task(&self, tid: usize) -> Option<Arc<Task>> {
         self.tasks.read().unwrap().get(&tid).cloned()
     }
 
@@ -255,7 +257,7 @@ impl TaskTable {
 
     // AGENT: resolve a thread id directly to its owning first-class Process.
     pub fn process_of_tid(&self, tid: usize) -> Option<Arc<Process>> {
-        self.find(tid).map(|task| task.process.clone())
+        self.find_task(tid).map(|task| task.process.clone())
     }
 
     // AGENT: resolve init through the authoritative process index so this role
@@ -266,7 +268,7 @@ impl TaskTable {
     }
 
     // AGENT: report the number of registered schedulable thread ids.
-    pub fn count(&self) -> usize {
+    pub fn task_count(&self) -> usize {
         self.tasks.read().unwrap().len()
     }
 
