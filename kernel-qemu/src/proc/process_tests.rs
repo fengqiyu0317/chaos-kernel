@@ -17,6 +17,8 @@ pub fn run_all(pool: &FramePool) {
     init_process_resolves_through_process_index(pool);
     process_index_keeps_task_and_process_identity_separate(pool);
     pgid_group_keeps_zombie_members_until_reap(pool);
+    job_control_move_process_validates_group_transitions();
+    job_control_start_new_session_validates_leader_rules();
     job_control_stays_authoritative_across_process_transitions(pool);
     reap_rejects_live_process(pool);
     fork_copies_complete_user_frame(pool);
@@ -388,6 +390,108 @@ fn pgid_group_keeps_zombie_members_until_reap(pool: &FramePool) {
     let group = table.pgid_group(pgid);
     assert_eq!(group.len(), 1);
     assert!(Arc::ptr_eq(&group[0], &task.process));
+}
+
+// AGENT: exercise move_process's no-op, group-creation, same-session join,
+// cross-session rejection, and empty-source cleanup branches directly on the
+// authoritative bidirectional job-control indexes.
+fn job_control_move_process_validates_group_transitions() {
+    let mut job_control = JobControl::default();
+    assert_eq!(job_control.move_process(99, 99), Err("esrch"));
+
+    job_control
+        .add_process(10, 10, 10)
+        .expect("session leader should create its initial group");
+    job_control
+        .add_process(11, 10, 10)
+        .expect("first child should inherit the session group");
+    job_control
+        .add_process(12, 10, 10)
+        .expect("second child should inherit the session group");
+    job_control
+        .add_process(20, 20, 20)
+        .expect("other session should create its own group");
+
+    assert_eq!(job_control.move_process(11, 10), Ok(()));
+    assert_eq!(job_control.membership(11), Some((10, 10)));
+    assert_eq!(job_control.members(10), vec![10, 11, 12]);
+
+    assert_eq!(job_control.move_process(11, 13), Err("eperm"));
+    assert_eq!(job_control.membership(11), Some((10, 10)));
+    assert_eq!(job_control.members(10), vec![10, 11, 12]);
+    assert!(job_control.members(13).is_empty());
+
+    assert_eq!(job_control.move_process(11, 11), Ok(()));
+    assert_eq!(job_control.membership(11), Some((11, 10)));
+    assert_eq!(job_control.members(10), vec![10, 12]);
+    assert_eq!(job_control.members(11), vec![11]);
+
+    assert_eq!(job_control.move_process(12, 11), Ok(()));
+    assert_eq!(job_control.membership(12), Some((11, 10)));
+    assert_eq!(job_control.members(10), vec![10]);
+    assert_eq!(job_control.members(11), vec![11, 12]);
+
+    assert_eq!(job_control.move_process(12, 20), Err("eperm"));
+    assert_eq!(job_control.membership(12), Some((11, 10)));
+    assert_eq!(job_control.members(11), vec![11, 12]);
+    assert_eq!(job_control.members(20), vec![20]);
+
+    assert_eq!(job_control.move_process(11, 10), Ok(()));
+    assert_eq!(job_control.members(11), vec![12]);
+    assert_eq!(job_control.move_process(12, 10), Ok(()));
+    assert_eq!(job_control.membership(12), Some((10, 10)));
+    assert!(job_control.members(11).is_empty());
+    assert_eq!(job_control.members(10), vec![10, 11, 12]);
+}
+
+// AGENT: prove setsid-style transitions reject current leaders and surviving
+// PGID collisions, preserve state on failure, and delete an emptied old group
+// before publishing the caller as the sole member of its new session.
+fn job_control_start_new_session_validates_leader_rules() {
+    let mut job_control = JobControl::default();
+    assert_eq!(job_control.start_new_session(99), Err("esrch"));
+
+    job_control
+        .add_process(1, 1, 1)
+        .expect("session leader should create its initial group");
+    job_control
+        .add_process(2, 1, 1)
+        .expect("first child should inherit the session group");
+    job_control
+        .add_process(3, 1, 1)
+        .expect("second child should inherit the session group");
+
+    assert_eq!(job_control.start_new_session(1), Err("eperm"));
+    assert_eq!(job_control.membership(1), Some((1, 1)));
+    assert_eq!(job_control.members(1), vec![1, 2, 3]);
+
+    job_control
+        .move_process(2, 2)
+        .expect("child should create a group in the inherited session");
+    job_control
+        .move_process(3, 2)
+        .expect("sibling should join the existing same-session group");
+    job_control
+        .move_process(2, 1)
+        .expect("group leader may leave while another member keeps the group alive");
+    assert_eq!(job_control.membership(2), Some((1, 1)));
+    assert_eq!(job_control.members(2), vec![3]);
+
+    assert_eq!(job_control.start_new_session(2), Err("eperm"));
+    assert_eq!(job_control.membership(2), Some((1, 1)));
+    assert_eq!(job_control.members(1), vec![1, 2]);
+    assert_eq!(job_control.members(2), vec![3]);
+
+    assert_eq!(job_control.start_new_session(3), Ok(()));
+    assert!(job_control.members(2).is_empty());
+    assert_eq!(job_control.membership(3), Some((3, 3)));
+    assert_eq!(job_control.members(3), vec![3]);
+
+    assert_eq!(job_control.start_new_session(2), Ok(()));
+    assert_eq!(job_control.membership(2), Some((2, 2)));
+    assert_eq!(job_control.members(1), vec![1]);
+    assert_eq!(job_control.members(2), vec![2]);
+    assert_eq!(job_control.start_new_session(2), Err("eperm"));
 }
 
 // AGENT: prove fork, setpgid-style moves, setsid, and reap update the single
@@ -905,8 +1009,8 @@ fn proc_init_push_at_writes_user_stack(pool: &FramePool) {
     assert_eq!(addr_space.read_user_usize(auxv + word * 5).unwrap(), 0);
 }
 
-// AGENT: exercise the shared ELF image builder used by both new_user_task and
-// exec, including file bytes, zero-filled bss, final permissions, and argv.
+// AGENT: exercise the ELF image builder used by exec, including file bytes,
+// zero-filled bss, final permissions, and argv.
 fn prepared_user_image_loads_elf_segment_and_stack(pool: &FramePool) {
     let segment_offset = PAGE_SZ + 0x234;
     let segment_vaddr = 0x0040_1234;

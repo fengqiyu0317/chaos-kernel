@@ -146,37 +146,6 @@ impl TaskTable {
         Ok(task)
     }
 
-    // AGENT: create an initial user process through the shared exec image builder.
-    pub fn new_user_task(
-        &self,
-        path: &str,
-        elf_data: &[u8],
-        args: Vec<String>,
-        envs: Vec<String>,
-        pool: &FramePool,
-    ) -> Result<Arc<Task>, &'static str> {
-        let mut image = prepare_user_image(elf_data, args, envs, pool)?;
-        let task = match self.spawn() {
-            Ok(task) => task,
-            Err(err) => {
-                image.addr_space.release_all_pages();
-                return Err(err);
-            }
-        };
-
-        *task.process.exec_path.lock().unwrap() = path.to_string();
-        task.install_user_trap_frame(TrapFrame::for_user_entry(
-            image.user_entry.entry,
-            image.user_entry.stack_pointer,
-        ))?;
-        {
-            let mut addr_space = task.process.addr_space.lock().unwrap();
-            *addr_space = image.addr_space;
-        }
-        super::fd::install_initial_stdio(&task)?;
-        Ok(task)
-    }
-
     // AGENT: group process and thread derivation from an existing caller.
 
     // AGENT: preserve the direct semantic helper by snapshotting an off-CPU
