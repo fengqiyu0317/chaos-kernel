@@ -11,6 +11,7 @@ pub fn run_all(pool: &FramePool) {
     capset_drop_cap_clears_ambient();
     kernel_stack_uses_and_releases_frame_pool_run(pool);
     task_spawn_reports_kernel_stack_exhaustion();
+    spawn_root_failure_does_not_consume_init_pid();
     task_slot_limit_reopens_only_after_reap(pool);
     spawn_root_creates_single_pid_one_init(pool);
     spawn_root_rejects_nonempty_task_table(pool);
@@ -84,6 +85,19 @@ fn task_spawn_reports_kernel_stack_exhaustion() {
         assert_eq!(table.spawn().err(), Some("enomem"));
     }
     assert_eq!(table.count(), 0);
+}
+
+// AGENT: keep pid 1, init identity, and task-table capacity uncommitted when
+// fallible root-task construction cannot allocate its kernel stack.
+fn spawn_root_failure_does_not_consume_init_pid() {
+    let pool = FramePool::new(KSTK_SZ / PAGE_SZ - 1, MEM_OFF);
+    let table = TaskTable::new(pool);
+
+    assert_eq!(table.spawn_root().err(), Some("enomem"));
+    assert_eq!(table.seq.load(Ordering::SeqCst), INIT_PID);
+    assert_eq!(table.count(), 0);
+    assert_eq!(table.process_count(), 0);
+    assert!(table.init_process().is_none());
 }
 
 // AGENT: keep committed slots occupied until their task-table entries are

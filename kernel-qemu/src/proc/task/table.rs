@@ -102,10 +102,17 @@ impl TaskTable {
         Ok(())
     }
 
-    // AGENT: create Process first and then its leader Task before publication.
-    fn insert_new_process(&self, id: usize) -> Result<Arc<Task>, &'static str> {
+    // AGENT: complete fallible process/task construction before publishing any
+    // table entry or committing a special process identity such as init pid 1.
+    fn make_new_process(&self, id: usize) -> Result<(Arc<Process>, Arc<Task>), &'static str> {
         let process = Arc::new(Process::new(id, AddrSpace::new()));
         let task = Task::make(id, process.clone(), &self.pool)?;
+        Ok((process, task))
+    }
+
+    // AGENT: create Process first and then its leader Task before publication.
+    fn insert_new_process(&self, id: usize) -> Result<Arc<Task>, &'static str> {
+        let (process, task) = self.make_new_process(id)?;
         self.register_process(&process, &task, None)?;
         Ok(task)
     }
@@ -132,6 +139,7 @@ impl TaskTable {
         }
 
         let slot = self.reserve_task_slot()?;
+        let (process, task) = self.make_new_process(INIT_PID)?;
         if self
             .seq
             .compare_exchange(INIT_PID, INIT_PID + 1, Ordering::SeqCst, Ordering::SeqCst)
@@ -140,7 +148,16 @@ impl TaskTable {
             return Err("ebusy");
         }
 
-        let task = self.insert_new_process(INIT_PID)?;
+        if let Err(err) = self.register_process(&process, &task, None) {
+            // No task has been published and the boot-time creator is serial, so
+            // restore pid 1 for a later attempt if an invariant check rejects it.
+            let rolled_back = self
+                .seq
+                .compare_exchange(INIT_PID + 1, INIT_PID, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+            debug_assert!(rolled_back, "init pid rollback raced with task creation");
+            return Err(err);
+        }
         *init_pid = Some(INIT_PID);
         slot.commit();
         Ok(task)
