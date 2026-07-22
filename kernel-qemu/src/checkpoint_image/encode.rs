@@ -153,7 +153,7 @@ fn encode_timers(timers: &[SavedTimer]) -> Result<Vec<u8>, CheckpointError> {
         put_u32(&mut out, timer.signo as u32);
         put_u32(&mut out, 0);
         put_u64(&mut out, timer.sender_tid as u64);
-        put_u64(&mut out, timer.deadline_ticks);
+        put_u64(&mut out, timer.remaining_ticks);
         put_u64(&mut out, timer.interval_ticks);
     }
     Ok(out)

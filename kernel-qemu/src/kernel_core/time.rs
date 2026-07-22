@@ -52,13 +52,9 @@ pub struct TimerEntry {
 }
 
 impl TimerEntry {
-    pub fn new(deadline: usize, interval: usize, id: usize) -> Self {
-        Self::with_target(id, deadline, interval, TimerTarget::Noop)
-    }
-
     // AGENT: interval is the single source of truth for one-shot versus
-    // repeating behavior, avoiding a separate repeat flag that can disagree.
-    pub fn with_target(id: usize, deadline: usize, interval: usize, target: TimerTarget) -> Self {
+    // repeating behavior; TimerWheel alone assigns ids and constructs entries.
+    fn with_target(id: usize, deadline: usize, interval: usize, target: TimerTarget) -> Self {
         Self {
             id,
             deadline,
@@ -68,24 +64,36 @@ impl TimerEntry {
     }
 
     // AGENT: a timer expires on the tick that reaches its deadline.
-    pub fn expired(&self) -> bool {
+    fn expired(&self) -> bool {
         CLK.load(Ordering::Relaxed) >= self.deadline
     }
 
-    // AGENT: only repeating entries are rescheduled; one-shot entries leave the
-    // wheel permanently after they fire.
-    fn reschedule(&mut self) {
-        debug_assert!(self.interval > 0);
-        self.deadline = CLK.load(Ordering::Relaxed) + self.interval;
+    // AGENT: preserve a repeating timer's original phase after delayed handling
+    // by advancing whole intervals from its previous deadline, not from now.
+    fn reschedule_after(&mut self, now: usize) -> bool {
+        let Some(periods) = now
+            .checked_sub(self.deadline)
+            .and_then(|elapsed| elapsed.checked_div(self.interval))
+            .and_then(|elapsed_periods| elapsed_periods.checked_add(1))
+        else {
+            return false;
+        };
+        let Some(next_deadline) = self
+            .interval
+            .checked_mul(periods)
+            .and_then(|delta| self.deadline.checked_add(delta))
+        else {
+            return false;
+        };
+        self.deadline = next_deadline;
+        true
     }
 
-    pub fn remaining(&self) -> usize {
+    // AGENT: report a checkpoint-friendly relative delay without allowing
+    // subtraction to underflow for timers that have already expired.
+    fn remaining(&self) -> usize {
         let now = CLK.load(Ordering::Relaxed);
-        if now >= self.deadline {
-            0
-        } else {
-            self.deadline - now
-        }
+        self.deadline.saturating_sub(now)
     }
 
     // AGENT: convert task-bound registered timers into checkpoint records while
@@ -121,7 +129,7 @@ impl TimerEntry {
             target_kind,
             signo,
             sender_tid,
-            deadline_ticks: u64::try_from(self.deadline).map_err(|_| "einval")?,
+            remaining_ticks: u64::try_from(self.remaining()).map_err(|_| "einval")?,
             interval_ticks: u64::try_from(self.interval).map_err(|_| "einval")?,
         }))
     }
@@ -184,9 +192,9 @@ impl TimerWheel {
             }
         }
         *slot = remaining;
+        let now = CLK.load(Ordering::Relaxed);
         for t in fired.iter_mut() {
-            if t.interval > 0 {
-                t.reschedule();
+            if t.interval > 0 && t.reschedule_after(now) {
                 let new_slot = t.deadline % TIMER_WHEEL_SIZE;
                 let clone = TimerEntry::with_target(t.id, t.deadline, t.interval, t.target.clone());
                 self.slots[new_slot].push(clone);
@@ -233,8 +241,14 @@ impl TimerWheel {
             if timer.clock_id != CHECKPOINT_TIMER_CLOCK_LOGICAL {
                 return Err("enotsup");
             }
-            let deadline = usize::try_from(timer.deadline_ticks).map_err(|_| "einval")?;
+            let remaining = usize::try_from(timer.remaining_ticks).map_err(|_| "einval")?;
             let interval = usize::try_from(timer.interval_ticks).map_err(|_| "einval")?;
+            // AGENT: an already-expired saved timer fires on the next logical
+            // tick; placing it at the current slot would delay it a full wheel.
+            let deadline = CLK
+                .load(Ordering::Relaxed)
+                .checked_add(remaining.max(1))
+                .ok_or("einval")?;
             let target = restored_timer_target(timer, restored_task_id)?;
             self.register_timer(deadline, interval, target);
         }

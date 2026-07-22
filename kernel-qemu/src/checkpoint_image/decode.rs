@@ -202,7 +202,7 @@ fn decode_timers(bytes: &[u8]) -> Result<Vec<SavedTimer>, CheckpointError> {
             target_kind,
             signo,
             sender_tid,
-            deadline_ticks: cursor.read_u64()?,
+            remaining_ticks: cursor.read_u64()?,
             interval_ticks: cursor.read_u64()?,
         });
     }

@@ -43,7 +43,7 @@ fn sample_image() -> CheckpointImage {
         target_kind: SavedTimerTargetKind::SignalTask,
         signo: 14,
         sender_tid: -1,
-        deadline_ticks: 21,
+        remaining_ticks: 21,
         interval_ticks: 3,
     });
     image

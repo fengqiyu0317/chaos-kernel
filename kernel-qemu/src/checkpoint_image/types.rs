@@ -125,15 +125,15 @@ pub struct SavedFdEntry {
     pub offset: u64,
 }
 
-// AGENT: minimal timer state for deadlines that can be restarted against the
-// freshly restored task without carrying stale live timer or task ids.
+// AGENT: save a relative timer delay so restore can restart it against the new
+// logical-clock epoch without carrying stale live timer or task ids.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SavedTimer {
     pub clock_id: u32,
     pub target_kind: SavedTimerTargetKind,
     pub signo: i32,
     pub sender_tid: i64,
-    pub deadline_ticks: u64,
+    pub remaining_ticks: u64,
     pub interval_ticks: u64,
 }
 

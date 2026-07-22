@@ -1,8 +1,33 @@
 use super::*;
 
 pub fn run_all(kernel: &Kernel) {
+    periodic_timer_preserves_phase_after_delayed_advance();
     checkpoint_round_trip_restores_memory_and_trap_frame(kernel);
     checkpoint_round_trip_restores_task_timer(kernel);
+}
+
+// AGENT: a delayed wheel pass must keep a periodic timer on its original phase
+// and schedule the first future interval instead of drifting from the late tick.
+#[cfg_attr(test, test)]
+fn periodic_timer_preserves_phase_after_delayed_advance() {
+    let start = CLK.load(Ordering::Relaxed);
+    let first_deadline = start.checked_add(1).expect("test clock should have room");
+    let delayed_now = start.checked_add(7).expect("test clock should have room");
+    let expected_next = start.checked_add(10).expect("test clock should have room");
+    let mut timers = TimerWheel::new();
+    let timer_id = timers.register_timer(first_deadline, 3, TimerTarget::Noop);
+
+    CLK.store(delayed_now, Ordering::Relaxed);
+    let fired = timers.advance();
+
+    assert_eq!(fired.len(), 1);
+    assert_eq!(fired[0].id, timer_id);
+    let rescheduled = timers.slots[expected_next % TIMER_WHEEL_SIZE]
+        .iter()
+        .find(|entry| entry.id == timer_id)
+        .expect("periodic timer should be rescheduled");
+    assert_eq!(rescheduled.deadline, expected_next);
+    CLK.store(start, Ordering::Relaxed);
 }
 
 // AGENT: prepare the minimal user mappings required by checkpoint validation
@@ -89,8 +114,8 @@ fn checkpoint_round_trip_restores_memory_and_trap_frame(kernel: &Kernel) {
     );
 }
 
-// AGENT: prove checkpoint/restore carries task-bound timer state and rebinds the
-// restored timer target to the new task id instead of the original process.
+// AGENT: prove checkpoint/restore freezes a task-bound timer's remaining delay
+// and rebinds its target to the new task id instead of the original process.
 #[cfg_attr(test, test)]
 fn checkpoint_round_trip_restores_task_timer(kernel: &Kernel) {
     let current = kernel
@@ -130,9 +155,10 @@ fn checkpoint_round_trip_restores_task_timer(kernel: &Kernel) {
         image.timers[0].target_kind,
         SavedTimerTargetKind::SignalTask
     );
-    assert_eq!(image.timers[0].deadline_ticks, deadline as u64);
+    assert_eq!(image.timers[0].remaining_ticks, 2);
 
     assert!(global_timer_wheel().lock().cancel(original_timer_id));
+    kernel.schedule_tick(0);
     let restored_id = kernel
         .restore_process_from_image(image)
         .expect("checkpoint timer should restore");
@@ -150,10 +176,10 @@ fn checkpoint_round_trip_restores_task_timer(kernel: &Kernel) {
         restored_timers[0].target_kind,
         SavedTimerTargetKind::SignalTask
     );
+    assert_eq!(restored_timers[0].remaining_ticks, 2);
 
-    while CLK.load(Ordering::Relaxed) < deadline {
-        kernel.schedule_tick(0);
-    }
-
+    kernel.schedule_tick(0);
+    assert!(!restored.has_interrupting_signal());
+    kernel.schedule_tick(0);
     assert!(restored.has_interrupting_signal());
 }
