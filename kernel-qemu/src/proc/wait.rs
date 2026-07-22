@@ -68,24 +68,15 @@ impl JobControl {
         Ok(())
     }
 
-    pub(super) fn remove_process(&mut self, pid: usize) -> bool {
+    // AGENT: remove both job-control indexes through the shared group cleanup path.
+    pub(super) fn remove_process(&mut self, pid: usize) {
         let Some(pgid) = self.process_groups.remove(&pid) else {
-            return false;
+            return;
         };
-        let remove_group = self
-            .groups
-            .get_mut(&pgid)
-            .map(|group| {
-                group.members.remove(&pid);
-                group.members.is_empty()
-            })
-            .unwrap_or(false);
-        if remove_group {
-            self.groups.remove(&pgid);
-        }
-        true
+        self.remove_member_from_group(pid, pgid);
     }
 
+    // AGENT: update an existing group or create a new one without inserting pid twice.
     pub(super) fn move_process(&mut self, pid: usize, new_pgid: i32) -> Result<(), &'static str> {
         let (old_pgid, session_id) = self.membership(pid).ok_or("esrch")?;
         if old_pgid == new_pgid {
@@ -101,9 +92,10 @@ impl JobControl {
         self.remove_member_from_group(pid, old_pgid);
         self.groups
             .entry(new_pgid)
-            .or_insert_with(|| ProcessGroup::new(pid, session_id))
-            .members
-            .insert(pid);
+            .and_modify(|group| {
+                group.members.insert(pid);
+            })
+            .or_insert_with(|| ProcessGroup::new(pid, session_id));
         self.process_groups.insert(pid, new_pgid);
         Ok(())
     }
