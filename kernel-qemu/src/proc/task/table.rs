@@ -10,7 +10,9 @@ pub struct TaskTable {
     processes: RwLock<BTreeMap<usize, Arc<Process>>>,
     job_control: Mutex<JobControl>,
     pub seq: AtomicUsize,
-    init: Mutex<Option<Arc<Process>>>,
+    // AGENT: record only the designated init identity; processes remains the
+    // authoritative owner and lookup table for every Process allocation.
+    init_pid: Mutex<Option<usize>>,
     // AGENT: reserve capacity before registration so concurrent creators cannot
     // all pass the N_PROC check at once.
     task_reservations: AtomicUsize,
@@ -28,7 +30,7 @@ impl TaskTable {
             processes: RwLock::new(BTreeMap::new()),
             job_control: Mutex::new(JobControl::default()),
             seq: AtomicUsize::new(1),
-            init: Mutex::new(None),
+            init_pid: Mutex::new(None),
             task_reservations: AtomicUsize::new(0),
             pool,
         }
@@ -74,8 +76,8 @@ impl TaskTable {
 
     // AGENT: create init as the singleton pid 1 before any ordinary process.
     pub fn spawn_root(&self) -> Result<Arc<Task>, &'static str> {
-        let mut init = self.init.lock().unwrap();
-        if init.is_some() {
+        let mut init_pid = self.init_pid.lock().unwrap();
+        if init_pid.is_some() {
             return Err("eexist");
         }
         if self.count() != 0 || self.process_count() != 0 {
@@ -92,7 +94,7 @@ impl TaskTable {
         }
 
         let task = self.insert_new_process(INIT_PID)?;
-        *init = Some(task.process.clone());
+        *init_pid = Some(INIT_PID);
         slot.release();
         Ok(task)
     }
@@ -127,9 +129,11 @@ impl TaskTable {
         }
     }
 
-    // AGENT: expose init as a Process for orphan adoption and focused tests.
+    // AGENT: resolve init through the authoritative process index so this role
+    // marker cannot keep a removed Process allocation alive by itself.
     pub fn init_process(&self) -> Option<Arc<Process>> {
-        self.init.lock().unwrap().clone()
+        let pid = *self.init_pid.lock().unwrap();
+        pid.and_then(|pid| self.find_process(pid))
     }
 
     // AGENT: resolve authoritative process-group membership to Process objects.

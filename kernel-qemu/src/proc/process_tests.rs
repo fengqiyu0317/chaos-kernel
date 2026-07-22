@@ -13,6 +13,7 @@ pub fn run_all(pool: &FramePool) {
     task_spawn_reports_kernel_stack_exhaustion();
     spawn_root_creates_single_pid_one_init(pool);
     spawn_root_rejects_nonempty_task_table(pool);
+    init_process_resolves_through_process_index(pool);
     process_index_keeps_task_and_process_identity_separate(pool);
     pgid_group_keeps_zombie_members_until_reap(pool);
     job_control_stays_authoritative_across_process_transitions(pool);
@@ -301,6 +302,22 @@ fn spawn_root_rejects_nonempty_task_table(pool: &FramePool) {
     assert!(table.init_process().is_none());
     assert_eq!(table.count(), 1);
     assert_eq!(table.process_count(), 1);
+}
+
+// AGENT: the init role marker must not retain a Process after the authoritative
+// process index reaps it, and later lookups must observe that removal.
+fn init_process_resolves_through_process_index(pool: &FramePool) {
+    let table = TaskTable::new(pool.clone());
+    let init = table.spawn_root().expect("root spawn should work");
+    let init_process = Arc::downgrade(&init.process);
+
+    assert!(init.process.begin_group_exit(ExitReason::Code(0)).is_some());
+    init.process.finish_process_exit();
+    assert_eq!(table.reap(INIT_PID), Ok(()));
+    assert!(table.init_process().is_none());
+
+    drop(init);
+    assert!(init_process.upgrade().is_none());
 }
 
 // AGENT: prove tid and pid indexes resolve distinct entity types while sharing
