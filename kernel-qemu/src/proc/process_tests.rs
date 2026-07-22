@@ -992,8 +992,8 @@ fn riscv_exit_numbers_map_to_distinct_internal_calls() {
     assert_ne!(INTERNAL_SYS_EXIT, INTERNAL_SYS_EXIT_GROUP);
 }
 
-// AGENT: clone_thread starts from the caller thread context, then applies the
-// clone-specific return value, user stack, TLS, and signal mask.
+// AGENT: clone_thread inherits caller-local context and scheduling policy, then
+// applies the clone-specific return value, user stack, TLS, and signal mask.
 fn clone_thread_copies_caller_context_and_shares_process(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
     let task = table.spawn().expect("standalone spawn should work");
@@ -1012,6 +1012,7 @@ fn clone_thread_copies_caller_context_and_shares_process(pool: &FramePool) {
     task.install_user_trap_frame(source.clone())
         .expect("source frame should install");
     *task.sig_mask.lock().unwrap() = sig_mask;
+    task.sched.lock().unwrap().policy = SchedulePolicy::with_prio(PRIO_MIN + 4);
 
     let thread = table
         .clone_thread(&task, stack_top, tls)
@@ -1020,6 +1021,10 @@ fn clone_thread_copies_caller_context_and_shares_process(pool: &FramePool) {
     assert!(Arc::ptr_eq(&task.process, &thread.process));
     assert!(task.process.has_thread(thread.id()));
     assert_eq!(*thread.sig_mask.lock().unwrap(), sig_mask);
+    let thread_sched = thread.sched.lock().unwrap();
+    assert_eq!(thread_sched.policy.prio, PRIO_MIN + 4);
+    assert_eq!(thread_sched.slice_left, thread_sched.policy.time_slice());
+    drop(thread_sched);
     let cloned = thread
         .snapshot_user_trap_frame()
         .expect("cloned frame should exist");

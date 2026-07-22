@@ -190,11 +190,11 @@ impl TaskTable {
 
         let child_id = self.seq.fetch_add(1, Ordering::SeqCst);
         let child_process = Process::fork_from(&parent_process, child_id, &self.pool)?;
-        let child = Task::make_fork_child(
+        let child = Task::make_child_from_frame(
             child_id,
             child_process.clone(),
             src,
-            caller_frame,
+            caller_frame.clone(),
             &self.pool,
         )?;
         self.register_process(&child_process, &child, Some(parent_process.pid()))?;
@@ -226,14 +226,10 @@ impl TaskTable {
         let task_slot = self.reserve_task_slot()?;
         let process = self.process_of_tid(src.id()).ok_or("esrch")?;
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
-        let task = Task::make(id, process.clone(), &self.pool)?;
-        *task.sig_mask.lock().unwrap() = *src.sig_mask.lock().unwrap();
-        *task.sig_frames.lock().unwrap() = src.sig_frames.lock().unwrap().clone();
         let mut child_frame = caller_frame.clone();
-        child_frame.set_return_value(0);
         child_frame.regs[2] = stack_top as usize;
         child_frame.regs[4] = tls as usize;
-        task.install_user_trap_frame(child_frame)?;
+        let task = Task::make_child_from_frame(id, process.clone(), src, child_frame, &self.pool)?;
 
         let mut tasks = self.tasks.write().unwrap();
         if tasks.contains_key(&id) || !process.add_thread(id) {

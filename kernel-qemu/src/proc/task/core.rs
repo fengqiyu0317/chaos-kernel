@@ -43,20 +43,20 @@ impl Task {
         Ok(task)
     }
 
-    // AGENT: derive only caller-thread state for a fork child around the already
-    // constructed child Process; global identity and publication stay in TaskTable.
-    pub(super) fn make_fork_child(
+    // AGENT: derive caller-thread state for a forked process leader or cloned
+    // thread around the Process selected by TaskTable; identity and publication
+    // remain outside Task.
+    pub(super) fn make_child_from_frame(
         id: usize,
         process: Arc<Process>,
         parent: &Task,
-        caller_frame: &TrapFrame,
+        mut child_frame: TrapFrame,
         pool: &FramePool,
     ) -> Result<Arc<Self>, &'static str> {
         let task = Self::make(id, process, pool)?;
         *task.sig_frames.lock().unwrap() = parent.sig_frames.lock().unwrap().clone();
         *task.sig_mask.lock().unwrap() = *parent.sig_mask.lock().unwrap();
 
-        let mut child_frame = caller_frame.clone();
         child_frame.set_return_value(0);
         task.install_user_trap_frame(child_frame)?;
 
