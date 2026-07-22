@@ -66,7 +66,8 @@ impl Kernel {
     }
 
     // AGENT: own the process-level half of exit after an atomic lifecycle gate:
-    // retire every Task, release shared state, reparent, publish Zombie, notify.
+    // retire every Task, release shared state, reparent, publish Zombie, and
+    // notify both the exiting process's parent and init about adopted zombies.
     fn finish_process_exit(
         &self,
         cpu: usize,
@@ -79,11 +80,22 @@ impl Kernel {
 
         self.release_exit_thread_resources(cpu, task, process, thread_ids);
         process.release_exit_resources();
-        self.tasks.reparent_children_to_init(&process);
+        let adopted_zombie_pids = self.tasks.reparent_children_to_init(&process);
         process.finish_process_exit();
 
         if let Some(parent) = parent {
             self.send_signal_to_process(&parent, SIGCHLD as i32, child_pid as isize);
+        }
+        if !adopted_zombie_pids.is_empty() {
+            if let Some(init_process) = self.tasks.init_process() {
+                for adopted_pid in adopted_zombie_pids {
+                    self.send_signal_to_process(
+                        &init_process,
+                        SIGCHLD as i32,
+                        adopted_pid as isize,
+                    );
+                }
+            }
         }
         if !self.scheduler_active(cpu) {
             self.switch_away_from_exited_current(cpu, task.id());

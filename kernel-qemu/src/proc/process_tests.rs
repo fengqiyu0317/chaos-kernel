@@ -26,6 +26,7 @@ pub fn run_all(pool: &FramePool) {
     fork_splits_process_and_caller_task_inheritance(pool);
     fork_from_nonleader_attaches_process_parent(pool);
     reparent_children_uses_init_process(pool);
+    reparented_zombie_notifies_init(pool);
     clone_thread_copies_caller_context_and_shares_process(pool);
     reap_zombie_process_removes_thread_group_once(pool);
     exiting_phase_blocks_clone_wait_and_reap(pool);
@@ -692,8 +693,9 @@ fn reparent_children_uses_init_process(pool: &FramePool) {
         .fork_process(&parent)
         .expect("child process fork should work");
 
-    table.reparent_children_to_init(&parent.process);
+    let adopted_zombie_pids = table.reparent_children_to_init(&parent.process);
 
+    assert!(adopted_zombie_pids.is_empty());
     assert!(parent.process.has_no_children());
     let adopted_parent = child
         .process
@@ -707,6 +709,71 @@ fn reparent_children_uses_init_process(pool: &FramePool) {
     assert!(init_children
         .iter()
         .any(|process| Arc::ptr_eq(process, &child.process)));
+}
+
+// AGENT: a zombie that is adopted after its original parent exits must publish
+// fresh child-exit readiness and SIGCHLD to init because its earlier exit only
+// notified the old parent.
+fn reparented_zombie_notifies_init(pool: &FramePool) {
+    let kernel = Kernel::new(pool.clone());
+    kernel.proc_init();
+    let init = kernel.cur_task(0).expect("init should be current");
+    assert!(init.process.set_signal_action(
+        SIGCHLD,
+        SigAction {
+            handler: 0x5000,
+            mask: 0,
+        },
+    ));
+
+    let intermediate = kernel
+        .tasks
+        .fork_process(&init)
+        .expect("intermediate process should fork");
+    let exiting_parent = kernel
+        .tasks
+        .fork_process(&intermediate)
+        .expect("exiting parent should fork");
+    let zombie = kernel
+        .tasks
+        .fork_process(&exiting_parent)
+        .expect("future zombie should fork");
+    let zombie_pid = zombie.process.pid();
+
+    kernel.exit_thread_group(0, &zombie, ExitReason::Code(7));
+    assert!(zombie.process.is_zombie());
+
+    init.process.ev.lock().unwrap().clear(EvFlag::CHILD_QUIT);
+    init.process.sig_queue.lock().unwrap().clear();
+    let child_wait_woken = Arc::new(AtomicBool::new(false));
+    let wake_observer = child_wait_woken.clone();
+    init.process.ev.lock().unwrap().sub(
+        EvFlag::CHILD_QUIT,
+        Box::new(move |_| {
+            wake_observer.store(true, Ordering::SeqCst);
+            true
+        }),
+    );
+
+    kernel.exit_thread_group(0, &exiting_parent, ExitReason::Code(8));
+
+    let adopted_parent = zombie
+        .process
+        .parent()
+        .expect("zombie should be adopted by init");
+    assert!(Arc::ptr_eq(&adopted_parent, &init.process));
+    assert!(child_wait_woken.load(Ordering::SeqCst));
+    assert!(init
+        .process
+        .sig_queue
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(signo, sender)| { *signo == SIGCHLD as i32 && *sender == zombie_pid as isize }));
+    assert_eq!(
+        kernel.do_wait(init.id(), zombie_pid as isize, 1),
+        Ok((zombie_pid, 7 << 8))
+    );
 }
 
 // AGENT: multi-threaded zombies are collected at process granularity, while all

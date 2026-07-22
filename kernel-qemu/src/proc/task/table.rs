@@ -307,23 +307,34 @@ impl TaskTable {
         parent.insert_child(child.clone());
     }
 
-    // AGENT: transfer orphaned Process children to init or clear their parent.
-    pub fn reparent_children_to_init(&self, process: &Arc<Process>) {
+    // AGENT: transfer orphaned Process children to init, publish adopted-zombie
+    // readiness after both family links are installed, and return those zombie
+    // pids so the Kernel layer can deliver the corresponding SIGCHLD signals.
+    pub fn reparent_children_to_init(&self, process: &Arc<Process>) -> Vec<usize> {
         let children = process.take_children();
         if children.is_empty() {
-            return;
+            return Vec::new();
         }
         let init = self.init_process();
         match init {
             Some(init_process) if init_process.pid() != process.pid() => {
+                let mut adopted_zombie_pids = Vec::new();
                 for child in children {
+                    if child.is_zombie() {
+                        adopted_zombie_pids.push(child.pid());
+                    }
                     Self::attach_child(&init_process, &child);
                 }
+                if !adopted_zombie_pids.is_empty() {
+                    init_process.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
+                }
+                adopted_zombie_pids
             }
             _ => {
                 for child in children {
                     child.set_parent(None);
                 }
+                Vec::new()
             }
         }
     }
@@ -414,7 +425,7 @@ impl TaskTable {
             parent.remove_child(pid);
         }
         process.set_parent(None);
-        self.reparent_children_to_init(&process);
+        let _ = self.reparent_children_to_init(&process);
         self.job_control.lock().unwrap().remove_process(pid);
 
         let thread_ids = process.take_threads();
