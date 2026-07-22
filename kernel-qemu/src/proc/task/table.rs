@@ -288,13 +288,14 @@ impl TaskTable {
             .collect()
     }
 
-    // AGENT: report one pid per zombie Process for one-time reaping.
-    pub fn zombie_processes(&self) -> Vec<usize> {
+    // AGENT: snapshot zombie Process objects once each for one-time reaping.
+    pub fn zombie_processes(&self) -> Vec<Arc<Process>> {
         self.processes
             .read()
             .unwrap()
-            .iter()
-            .filter_map(|(&pid, process)| process.is_zombie().then_some(pid))
+            .values()
+            .filter(|process| process.is_zombie())
+            .cloned()
             .collect()
     }
 

@@ -795,7 +795,14 @@ fn reap_zombie_process_removes_thread_group_once(pool: &FramePool) {
         .begin_group_exit(ExitReason::Code(7))
         .is_some());
     child.process.finish_process_exit();
-    assert_eq!(table.zombie_processes(), vec![child_pid]);
+    assert_eq!(
+        table
+            .zombie_processes()
+            .iter()
+            .map(|process| process.pid())
+            .collect::<Vec<_>>(),
+        vec![child_pid]
+    );
     assert_eq!(table.reap(thread.id()), Err("esrch"));
     assert_eq!(table.reap(child_pid), Ok(()));
 
