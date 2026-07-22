@@ -217,6 +217,7 @@ RISC-V trap frame
    - 先采用恒等映射 `VA == PA`，降低开启分页后的地址切换风险。
    - 根据 linker symbols 映射 kernel text、rodata、data、bss、boot stack 和 frame allocator metadata。
    - 页表页本身从 frame allocator 分配，并清零后再作为下级页表使用。
+   - 后续 TODO 分两阶段收敛低地址映射：先把整段 RAM 恒等映射收缩到低链接内核镜像和必要启动资源，并强制动态物理页只走高半区 direct map；再在高半区 VMA 链接、分页后高地址跳转、`sp` / `gp` / `stvec` / 上下文和 trap handler 函数指针迁移、linker 符号物理地址换算全部完成后，取消内核根页表的低地址 RAM 恒等映射。
 
 5. 开启分页并保持早期 smoke 可观察：
    - 在 `kernel-qemu/src/csr.rs` 增加 `satp` 写入和 `sfence.vma` helper。

@@ -1,6 +1,6 @@
 # Chaos 项目交接状态
 
-更新日期：2026-07-21
+更新日期：2026-07-22
 
 ## 目标
 
@@ -518,6 +518,11 @@ cargo test --test pressure
 - `[M8][重要] TODO`: `kernel-sim` 的 `KernLock` 目前仍只是可重入自旋式模拟锁，缺少公平性、阻塞等待、抢占/中断控制等真实内核大锁语义；当前 guard 只解决 owner-checked 释放和 guard 路径的自动释放，若后续要把它作为真实大内核锁模型，应继续补齐这些语义或在接口文档中明确它只是 simulator 简化实现。
 
 ### M9 `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
+
+#### 2026-07-22：收缩并最终取消低地址恒等映射
+
+- `[M9][重要] TODO`: 先将 `build_kernel_page_table()` 当前覆盖整段 QEMU RAM 的低地址恒等映射收缩到低地址链接内核在过渡期确实依赖的镜像和启动资源范围；其余动态物理页、页表页、内核堆和任务内核栈只通过高半区 direct map 访问。收缩前需核对 linker `skernel..ekernel`、boot stack、early heap 以及启动后仍存活的低地址指针，并用普通 smoke、`qemu-selftest`、用户 `satp` 往返和 timer/trap 路径验证不再隐式解引用低地址动态 RAM。
+- `[M9][长期][重要] TODO`: 在上述收缩稳定后，把内核主体改为高半区 VMA 链接，仅保留分页前使用的低地址启动 stub；启动代码建表并写入 `satp` 后必须显式跳转到高半区入口，同时迁移 `sp` / `gp` / kernel `stvec`、`KernelContext.ra = task_bootstrap`、user-trap `rust_user_trap` handler 指针，并修正 `trampoline_paddr()`、`ekernel` 等“链接符号直接当物理地址”的边界。验收时内核根页表不再保留低地址 RAM 恒等映射；`TRAMPOLINE` / `TRAP_CONTEXT` 这类明确的 supervisor-only 架构别名不计作该恒等映射。
 
 #### 2026-07-18：CPU0 idle / scheduler context
 

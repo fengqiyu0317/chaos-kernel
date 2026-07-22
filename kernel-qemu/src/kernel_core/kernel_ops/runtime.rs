@@ -40,7 +40,8 @@ impl Kernel {
     }
 
     // AGENT: detach the running CPU0 task before switching back to the idle
-    // context. The scheduler loop retains the Arc<Task> across this suspension.
+    // context, then restore the caller's SIE state if that task is resumed. The
+    // scheduler loop retains the Arc<Task> across this suspension.
     pub(crate) fn switch_current_to_idle(&self, cpu: usize) -> bool {
         if cpu != 0 {
             return false;
@@ -66,6 +67,9 @@ impl Kernel {
         };
         unsafe {
             crate::context::switch_kernel_context(current_context, idle_context);
+        }
+        if restore_interrupts {
+            crate::csr::enable_interrupts();
         }
         true
     }
