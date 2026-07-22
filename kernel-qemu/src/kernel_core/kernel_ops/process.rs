@@ -65,9 +65,9 @@ impl Kernel {
         self.finish_process_exit(cpu, task, &process, thread_ids);
     }
 
-    // AGENT: own the process-level half of exit after an atomic lifecycle gate:
-    // retire every Task, release shared state, reparent, publish Zombie, and
-    // notify both the exiting process's parent and init about adopted zombies.
+    // AGENT: shut down when the designated init reaches process-wide exit;
+    // otherwise retire every Task, release shared state, reparent, publish
+    // Zombie, and notify both the old parent and init about adopted zombies.
     fn finish_process_exit(
         &self,
         cpu: usize,
@@ -75,6 +75,15 @@ impl Kernel {
         process: &Arc<Process>,
         thread_ids: Vec<Tid>,
     ) {
+        if self
+            .tasks
+            .init_process()
+            .is_some_and(|init| Arc::ptr_eq(&init, process))
+        {
+            crate::println!("[kernel-qemu] init process exited");
+            crate::sbi::shutdown();
+        }
+
         let parent = process.parent();
         let child_pid = process.pid();
 

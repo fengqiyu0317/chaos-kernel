@@ -308,36 +308,30 @@ impl TaskTable {
         parent.insert_child(child.clone());
     }
 
-    // AGENT: transfer orphaned Process children to init, publish adopted-zombie
-    // readiness after both family links are installed, and return those zombie
-    // pids so the Kernel layer can deliver the corresponding SIGCHLD signals.
+    // AGENT: require the registered init process for ordinary orphan adoption,
+    // publish adopted-zombie readiness after both family links are installed,
+    // and return those pids so Kernel can deliver the corresponding SIGCHLD.
     pub fn reparent_children_to_init(&self, process: &Arc<Process>) -> Vec<usize> {
+        let init_process = self
+            .init_process()
+            .expect("ordinary process exit requires a registered init process");
+        assert!(
+            !Arc::ptr_eq(&init_process, process),
+            "init exit must be handled before orphan reparenting"
+        );
+
         let children = process.take_children();
-        if children.is_empty() {
-            return Vec::new();
-        }
-        let init = self.init_process();
-        match init {
-            Some(init_process) if init_process.pid() != process.pid() => {
-                let mut adopted_zombie_pids = Vec::new();
-                for child in children {
-                    if child.is_zombie() {
-                        adopted_zombie_pids.push(child.pid());
-                    }
-                    Self::attach_child(&init_process, &child);
-                }
-                if !adopted_zombie_pids.is_empty() {
-                    init_process.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
-                }
-                adopted_zombie_pids
+        let mut adopted_zombie_pids = Vec::new();
+        for child in children {
+            if child.is_zombie() {
+                adopted_zombie_pids.push(child.pid());
             }
-            _ => {
-                for child in children {
-                    child.set_parent(None);
-                }
-                Vec::new()
-            }
+            Self::attach_child(&init_process, &child);
         }
+        if !adopted_zombie_pids.is_empty() {
+            init_process.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
+        }
+        adopted_zombie_pids
     }
 
     // AGENT: group authoritative process-group and session transitions and queries.
@@ -414,11 +408,11 @@ impl TaskTable {
         removed
     }
 
-    // AGENT: reap one zombie process by pid from family, group, process, and
-    // thread indexes; callers must explicitly resolve tids before this boundary.
+    // AGENT: reap only a zombie whose exit path already detached every child,
+    // then remove it from family, group, process, and thread indexes.
     pub fn reap(&self, pid: usize) -> Result<(), &'static str> {
         let process = self.find_process(pid).ok_or("esrch")?;
-        if !process.is_zombie() {
+        if !process.is_zombie() || !process.has_no_children() {
             return Err("ebusy");
         }
 
@@ -426,7 +420,6 @@ impl TaskTable {
             parent.remove_child(pid);
         }
         process.set_parent(None);
-        let _ = self.reparent_children_to_init(&process);
         self.job_control.lock().unwrap().remove_process(pid);
 
         let thread_ids = process.take_threads();
