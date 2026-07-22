@@ -149,20 +149,6 @@ impl Kernel {
         }
     }
 
-    // AGENT: force-reap zombies for maintenance paths; normal wait4 handling
-    // still goes through do_wait so parents can observe the wait status first.
-    pub fn reclaim_zombies(&self) -> usize {
-        let zombies = self.tasks.zombie_processes();
-        let mut count = 0;
-        for id in zombies {
-            self.run_queue.remove(id);
-            if self.tasks.reap(id).is_ok() {
-                count += 1;
-            }
-        }
-        count
-    }
-
     // AGENT: keep fork as a small orchestration layer; TaskTable::fork_task owns
     // state copying, while Kernel only publishes the child to the scheduler.
     pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> {
@@ -230,7 +216,6 @@ impl Kernel {
     // AGENT: commit the destructive half of wait4 after the syscall layer has
     // successfully copied any wait status to userspace.
     pub fn reap_waited_child(&self, child_pid: usize) -> Result<(), &'static str> {
-        self.run_queue.remove(child_pid);
         self.tasks.reap(child_pid)
     }
 
