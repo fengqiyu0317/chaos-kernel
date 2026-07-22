@@ -489,6 +489,7 @@ cargo test --test pressure
 - `[M6][普通] TODO`: `kernel-sim` 的带超时等待仍有路径分散使用 host `Instant` / `thread::park_timeout` 或轮询；后续应继续让 `WaitQueue::sleep_timeout`、`SyncQueue::wait_timeout`、`epoll_wait(timeout)` 等统一通过 timer wheel 注册 deadline。当前 futex syscall timeout 已接入 timer wheel。
 - `[M6][普通] TODO`: `kernel-sim/src/kernel/core/kernel_ops/runtime.rs` 的 `KernelRuntimeTicker` 停机路径当前仍直接使用 `std::sync::Condvar` 管理宿主线程 wait/notify；项目长期应提供自有 runtime wait primitive 包住这层宿主语义，避免业务代码直接依赖 Rust 自带 `Condvar`，但该 primitive 不能依赖由 ticker 自己推进的逻辑 timer wheel。
 - `[M6][普通] TODO`: `kernel-sim/src/kernel/core/time.rs` 的 timer wheel 超过一圈 deadline 和 repeat timer 已依赖绝对 deadline 复查避免提前触发；后续仍应补充显式回归覆盖远期 deadline、重复 timer 重排和取消竞态。
+- `[M6][M9][普通] TODO`: `kernel-qemu/src/kernel_core/time.rs` 的 `TimerWheel::cancel()` 目前只扫描 slots；到期条目被 `advance()` 移入局部 `fired`、释放 wheel 锁并等待 `dispatch_timer()` 分发后，取消路径无法再观察该 ready/in-flight 条目。若后续需要对 `WakeTask`、`SignalTask` 或周期 timer 提供强取消语义，应在同一 timer-wheel 锁下引入 `Queued -> Ready -> Firing -> Done` 状态和可区分 `Cancelled` / `InFlight` / `NotFound` 的取消结果：只有 `Cancelled` 保证回调不会开始，`InFlight` 只阻止周期 timer 再次重排；回调仍须在 wheel 锁外执行。周期 timer 应在成功分发后再重排，或确保取消同时覆盖 ready 条目和已排入下一周期的副本。新增回归至少覆盖到期前取消、`advance()` 后分发前取消、分发已开始时取消以及周期 timer 取消。当前 `WaitToken` 的 event/timeout 通过原子状态竞争保证单一结果，因此这不是现有 wait 路径的已知故障。
 - `[M6][普通] TODO`: `kernel-sim` 尚未建模每进程 timer 集合，因此 exit 资源释放目前没有取消 per-process alarm / interval timer / POSIX timer；等 timer 状态挂到 `ProcessState` 后，需要纳入 `release_process_exit_resources()`。
 
 ### M7 网络协议 helper 与 socket 路径
