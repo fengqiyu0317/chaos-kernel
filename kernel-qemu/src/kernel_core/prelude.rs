@@ -172,7 +172,10 @@ pub const SIGUSR2: u32 = 12;
 pub const SIGALRM: u32 = 14;
 
 pub const TIMER_WHEEL_SIZE: usize = 256;
+// AGENT: keep one positive logical tick frequency as the semantic source used
+// by both duration conversion and the QEMU hardware timer adapter.
 pub const TIMER_TICK_HZ: usize = 100;
+const _: () = assert!(TIMER_TICK_HZ > 0);
 
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;

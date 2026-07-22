@@ -2,10 +2,16 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::{csr, kernel::kernel_core::qemu_wait_timer_tick, sbi};
+use crate::{
+    csr,
+    kernel::kernel_core::{qemu_wait_timer_tick, TIMER_TICK_HZ},
+    sbi,
+};
 
 pub const TIMEBASE_HZ: usize = 10_000_000;
-pub const TICKS_PER_SEC: usize = 100;
+// AGENT: derive the hardware interrupt cadence from the logical kernel clock
+// frequency so timeout accounting and timer delivery cannot drift apart.
+pub const TICKS_PER_SEC: usize = TIMER_TICK_HZ;
 pub const CYCLES_PER_TICK: usize = TIMEBASE_HZ / TICKS_PER_SEC;
 
 static TICKS: AtomicUsize = AtomicUsize::new(0);

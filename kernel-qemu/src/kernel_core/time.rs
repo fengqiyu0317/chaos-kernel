@@ -276,14 +276,17 @@ fn restored_timer_target(
     }
 }
 
-// AGENT: convert host Duration values into simulator clock ticks, rounding up
-// so any nonzero timeout gets at least one logical tick.
+// AGENT: convert relative Duration values into logical clock ticks by scaling
+// with the configured frequency, rounding any fractional tick up, and
+// saturating durations that do not fit the target tick counter.
 pub fn duration_to_ticks(timeout: Duration) -> usize {
-    if timeout.is_zero() {
-        return 0;
-    }
-    let tick_nanos = 1_000_000_000u128 / TIMER_TICK_HZ as u128;
-    let nanos = timeout.as_nanos();
-    let ticks = (nanos + tick_nanos - 1) / tick_nanos;
-    usize::try_from(ticks).unwrap_or(usize::MAX).max(1)
+    const NANOS_PER_SEC: u128 = 1_000_000_000;
+
+    let hz = TIMER_TICK_HZ as u128;
+    let whole_ticks = (timeout.as_secs() as u128).saturating_mul(hz);
+    let fractional_ticks = (timeout.subsec_nanos() as u128)
+        .saturating_mul(hz)
+        .div_ceil(NANOS_PER_SEC);
+    let ticks = whole_ticks.saturating_add(fractional_ticks);
+    usize::try_from(ticks).unwrap_or(usize::MAX)
 }

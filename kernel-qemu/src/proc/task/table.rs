@@ -23,6 +23,8 @@ pub struct TaskTable {
 
 // AGENT: keep task/process indexes and lifecycle transitions in one module.
 impl TaskTable {
+    // AGENT: group task-table initialization and fallible registration plumbing.
+
     // AGENT: bind task construction to the caller-provided physical-frame pool.
     pub fn new(pool: FramePool) -> Self {
         Self {
@@ -36,132 +38,25 @@ impl TaskTable {
         }
     }
 
-    // AGENT: update both sides of one process-family relation through Process
-    // handles so no schedulable Task becomes the family-identity authority.
-    fn attach_child(parent: &Arc<Process>, child: &Arc<Process>) {
-        child.set_parent(Some(parent));
-        parent.insert_child(child.clone());
-    }
-
-    // AGENT: move a process between process groups as one state transition.
-    pub fn move_process_to_group(
-        &self,
-        process: &Arc<Process>,
-        new_pgid: i32,
-    ) -> Result<(), &'static str> {
-        if new_pgid <= 0 {
-            return Err("einval");
+    // AGENT: reserve task-table capacity across fallible construction work.
+    fn reserve_task_slot(&self) -> Result<TaskSlotReservation<'_>, &'static str> {
+        loop {
+            let live = self.count();
+            let reserved = self.task_reservations.load(Ordering::SeqCst);
+            if live.saturating_add(reserved) >= N_PROC {
+                return Err("eagain");
+            }
+            if self
+                .task_reservations
+                .compare_exchange(reserved, reserved + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Ok(TaskSlotReservation {
+                    table: self,
+                    active: true,
+                });
+            }
         }
-        self.job_control
-            .lock()
-            .unwrap()
-            .move_process(process.pid(), new_pgid)
-    }
-
-    // AGENT: make a process a session leader and sole member of its new group.
-    pub fn start_new_session(&self, process: &Arc<Process>) -> Result<usize, &'static str> {
-        let pid = process.pid();
-        self.job_control.lock().unwrap().start_new_session(pid)?;
-        Ok(pid)
-    }
-
-    // AGENT: spawn a standalone process as its own session/process-group leader.
-    pub fn spawn(&self) -> Result<Arc<Task>, &'static str> {
-        let slot = self.reserve_task_slot()?;
-        let id = self.seq.fetch_add(1, Ordering::SeqCst);
-        let task = self.insert_new_process(id)?;
-        slot.release();
-        Ok(task)
-    }
-
-    // AGENT: create init as the singleton pid 1 before any ordinary process.
-    pub fn spawn_root(&self) -> Result<Arc<Task>, &'static str> {
-        let mut init_pid = self.init_pid.lock().unwrap();
-        if init_pid.is_some() {
-            return Err("eexist");
-        }
-        if self.count() != 0 || self.process_count() != 0 {
-            return Err("ebusy");
-        }
-
-        let slot = self.reserve_task_slot()?;
-        if self
-            .seq
-            .compare_exchange(INIT_PID, INIT_PID + 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err("ebusy");
-        }
-
-        let task = self.insert_new_process(INIT_PID)?;
-        *init_pid = Some(INIT_PID);
-        slot.release();
-        Ok(task)
-    }
-
-    // AGENT: look up one schedulable thread id without treating it as a pid.
-    pub fn find(&self, tid: usize) -> Option<Arc<Task>> {
-        self.tasks.read().unwrap().get(&tid).cloned()
-    }
-
-    // AGENT: look up one process directly by pid without resolving a leader Task.
-    pub fn find_process(&self, pid: usize) -> Option<Arc<Process>> {
-        self.processes.read().unwrap().get(&pid).cloned()
-    }
-
-    // AGENT: resolve a thread id directly to its owning first-class Process.
-    pub fn process_of_tid(&self, tid: usize) -> Option<Arc<Process>> {
-        self.find(tid).map(|task| task.process.clone())
-    }
-
-    // AGENT: delete one non-last exited thread immediately without touching its
-    // still-running Process or any sibling task-table entries.
-    pub(crate) fn remove_exited_thread(&self, tid: Tid, process: &Arc<Process>) -> bool {
-        let mut tasks = self.tasks.write().unwrap();
-        if tasks
-            .get(&tid)
-            .is_some_and(|task| Arc::ptr_eq(&task.process, process))
-        {
-            tasks.remove(&tid);
-            true
-        } else {
-            false
-        }
-    }
-
-    // AGENT: resolve init through the authoritative process index so this role
-    // marker cannot keep a removed Process allocation alive by itself.
-    pub fn init_process(&self) -> Option<Arc<Process>> {
-        let pid = *self.init_pid.lock().unwrap();
-        pid.and_then(|pid| self.find_process(pid))
-    }
-
-    // AGENT: resolve authoritative process-group membership to Process objects.
-    pub fn pgid_group(&self, pgid: i32) -> Vec<Arc<Process>> {
-        let members = self.job_control.lock().unwrap().members(pgid);
-        let processes = self.processes.read().unwrap();
-        members
-            .into_iter()
-            .filter_map(|pid| processes.get(&pid).cloned())
-            .collect()
-    }
-
-    // AGENT: expose the authoritative process-group id without mirrored state.
-    pub fn process_pgid(&self, pid: usize) -> Option<i32> {
-        self.job_control
-            .lock()
-            .unwrap()
-            .membership(pid)
-            .map(|(pgid, _)| pgid)
-    }
-
-    // AGENT: derive session identity from the process's authoritative group.
-    pub fn process_sid(&self, pid: usize) -> Option<usize> {
-        self.job_control
-            .lock()
-            .unwrap()
-            .membership(pid)
-            .map(|(_, sid)| sid)
     }
 
     // AGENT: publish one new process and its leader thread while synchronizing
@@ -200,74 +95,6 @@ impl TaskTable {
         Ok(())
     }
 
-    // AGENT: reap one zombie process by pid from family, group, process, and
-    // thread indexes; callers must explicitly resolve tids before this boundary.
-    pub fn reap(&self, pid: usize) -> Result<(), &'static str> {
-        let process = self.find_process(pid).ok_or("esrch")?;
-        if !process.is_zombie() {
-            return Err("ebusy");
-        }
-
-        if let Some(parent) = process.parent() {
-            parent.remove_child(pid);
-        }
-        process.set_parent(None);
-        self.reparent_children_to_init(&process);
-        self.job_control.lock().unwrap().remove_process(pid);
-
-        let thread_ids = process.take_threads();
-        let mut tasks = self.tasks.write().unwrap();
-        for tid in thread_ids {
-            if tasks
-                .get(&tid)
-                .is_some_and(|thread| Arc::ptr_eq(&thread.process, &process))
-            {
-                tasks.remove(&tid);
-            }
-        }
-        drop(tasks);
-
-        let mut processes = self.processes.write().unwrap();
-        if processes
-            .get(&pid)
-            .is_some_and(|registered| Arc::ptr_eq(registered, &process))
-        {
-            processes.remove(&pid);
-        }
-        Ok(())
-    }
-
-    // AGENT: transfer orphaned Process children to init or clear their parent.
-    pub fn reparent_children_to_init(&self, process: &Arc<Process>) {
-        let children = process.take_children();
-        if children.is_empty() {
-            return;
-        }
-        let init = self.init_process();
-        match init {
-            Some(init_process) if init_process.pid() != process.pid() => {
-                for child in children {
-                    Self::attach_child(&init_process, &child);
-                }
-            }
-            _ => {
-                for child in children {
-                    child.set_parent(None);
-                }
-            }
-        }
-    }
-
-    // AGENT: report the number of registered schedulable thread ids.
-    pub fn count(&self) -> usize {
-        self.tasks.read().unwrap().len()
-    }
-
-    // AGENT: report the number of independently registered processes.
-    pub fn process_count(&self) -> usize {
-        self.processes.read().unwrap().len()
-    }
-
     // AGENT: create Process first and then its leader Task before publication.
     fn insert_new_process(&self, id: usize) -> Result<Arc<Task>, &'static str> {
         let process = Arc::new(Process::new(id, AddrSpace::new()));
@@ -276,26 +103,74 @@ impl TaskTable {
         Ok(task)
     }
 
-    // AGENT: reserve task-table capacity across fallible construction work.
-    fn reserve_task_slot(&self) -> Result<TaskSlotReservation<'_>, &'static str> {
-        loop {
-            let live = self.count();
-            let reserved = self.task_reservations.load(Ordering::SeqCst);
-            if live.saturating_add(reserved) >= N_PROC {
-                return Err("eagain");
-            }
-            if self
-                .task_reservations
-                .compare_exchange(reserved, reserved + 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return Ok(TaskSlotReservation {
-                    table: self,
-                    active: true,
-                });
-            }
-        }
+    // AGENT: group entry points that create a process without an existing caller.
+
+    // AGENT: spawn a standalone process as its own session/process-group leader.
+    pub fn spawn(&self) -> Result<Arc<Task>, &'static str> {
+        let slot = self.reserve_task_slot()?;
+        let id = self.seq.fetch_add(1, Ordering::SeqCst);
+        let task = self.insert_new_process(id)?;
+        slot.release();
+        Ok(task)
     }
+
+    // AGENT: create init as the singleton pid 1 before any ordinary process.
+    pub fn spawn_root(&self) -> Result<Arc<Task>, &'static str> {
+        let mut init_pid = self.init_pid.lock().unwrap();
+        if init_pid.is_some() {
+            return Err("eexist");
+        }
+        if self.count() != 0 || self.process_count() != 0 {
+            return Err("ebusy");
+        }
+
+        let slot = self.reserve_task_slot()?;
+        if self
+            .seq
+            .compare_exchange(INIT_PID, INIT_PID + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("ebusy");
+        }
+
+        let task = self.insert_new_process(INIT_PID)?;
+        *init_pid = Some(INIT_PID);
+        slot.release();
+        Ok(task)
+    }
+
+    // AGENT: create an initial user process through the shared exec image builder.
+    pub fn new_user_task(
+        &self,
+        path: &str,
+        elf_data: &[u8],
+        args: Vec<String>,
+        envs: Vec<String>,
+        pool: &FramePool,
+    ) -> Result<Arc<Task>, &'static str> {
+        let mut image = prepare_user_image(elf_data, args, envs, pool)?;
+        let task = match self.spawn() {
+            Ok(task) => task,
+            Err(err) => {
+                image.addr_space.release_all_pages();
+                return Err(err);
+            }
+        };
+
+        *task.process.exec_path.lock().unwrap() = path.to_string();
+        task.install_user_trap_frame(TrapFrame::for_user_entry(
+            image.user_entry.entry,
+            image.user_entry.stack_pointer,
+        ))?;
+        {
+            let mut addr_space = task.process.addr_space.lock().unwrap();
+            *addr_space = image.addr_space;
+        }
+        super::fd::install_initial_stdio(&task)?;
+        Ok(task)
+    }
+
+    // AGENT: group process and thread derivation from an existing caller.
 
     // AGENT: preserve the direct semantic helper by snapshotting an off-CPU
     // source task before delegating to the live-frame-aware fork path.
@@ -397,35 +272,38 @@ impl TaskTable {
         Ok(task)
     }
 
-    // AGENT: create an initial user process through the shared exec image builder.
-    pub fn new_user_task(
-        &self,
-        path: &str,
-        elf_data: &[u8],
-        args: Vec<String>,
-        envs: Vec<String>,
-        pool: &FramePool,
-    ) -> Result<Arc<Task>, &'static str> {
-        let mut image = prepare_user_image(elf_data, args, envs, pool)?;
-        let task = match self.spawn() {
-            Ok(task) => task,
-            Err(err) => {
-                image.addr_space.release_all_pages();
-                return Err(err);
-            }
-        };
+    // AGENT: group read-only task/process lookup, counts, and lifecycle snapshots.
 
-        *task.process.exec_path.lock().unwrap() = path.to_string();
-        task.install_user_trap_frame(TrapFrame::for_user_entry(
-            image.user_entry.entry,
-            image.user_entry.stack_pointer,
-        ))?;
-        {
-            let mut addr_space = task.process.addr_space.lock().unwrap();
-            *addr_space = image.addr_space;
-        }
-        super::fd::install_initial_stdio(&task)?;
-        Ok(task)
+    // AGENT: look up one schedulable thread id without treating it as a pid.
+    pub fn find(&self, tid: usize) -> Option<Arc<Task>> {
+        self.tasks.read().unwrap().get(&tid).cloned()
+    }
+
+    // AGENT: look up one process directly by pid without resolving a leader Task.
+    pub fn find_process(&self, pid: usize) -> Option<Arc<Process>> {
+        self.processes.read().unwrap().get(&pid).cloned()
+    }
+
+    // AGENT: resolve a thread id directly to its owning first-class Process.
+    pub fn process_of_tid(&self, tid: usize) -> Option<Arc<Process>> {
+        self.find(tid).map(|task| task.process.clone())
+    }
+
+    // AGENT: resolve init through the authoritative process index so this role
+    // marker cannot keep a removed Process allocation alive by itself.
+    pub fn init_process(&self) -> Option<Arc<Process>> {
+        let pid = *self.init_pid.lock().unwrap();
+        pid.and_then(|pid| self.find_process(pid))
+    }
+
+    // AGENT: report the number of registered schedulable thread ids.
+    pub fn count(&self) -> usize {
+        self.tasks.read().unwrap().len()
+    }
+
+    // AGENT: report the number of independently registered processes.
+    pub fn process_count(&self) -> usize {
+        self.processes.read().unwrap().len()
     }
 
     // AGENT: snapshot active Process objects once each for process-directed signals.
@@ -447,6 +325,142 @@ impl TaskTable {
             .iter()
             .filter_map(|(&pid, process)| process.is_zombie().then_some(pid))
             .collect()
+    }
+
+    // AGENT: group bidirectional process-family linkage and orphan adoption.
+
+    // AGENT: update both sides of one process-family relation through Process
+    // handles so no schedulable Task becomes the family-identity authority.
+    fn attach_child(parent: &Arc<Process>, child: &Arc<Process>) {
+        child.set_parent(Some(parent));
+        parent.insert_child(child.clone());
+    }
+
+    // AGENT: transfer orphaned Process children to init or clear their parent.
+    pub fn reparent_children_to_init(&self, process: &Arc<Process>) {
+        let children = process.take_children();
+        if children.is_empty() {
+            return;
+        }
+        let init = self.init_process();
+        match init {
+            Some(init_process) if init_process.pid() != process.pid() => {
+                for child in children {
+                    Self::attach_child(&init_process, &child);
+                }
+            }
+            _ => {
+                for child in children {
+                    child.set_parent(None);
+                }
+            }
+        }
+    }
+
+    // AGENT: group authoritative process-group and session transitions and queries.
+
+    // AGENT: move a process between process groups as one state transition.
+    pub fn move_process_to_group(
+        &self,
+        process: &Arc<Process>,
+        new_pgid: i32,
+    ) -> Result<(), &'static str> {
+        if new_pgid <= 0 {
+            return Err("einval");
+        }
+        self.job_control
+            .lock()
+            .unwrap()
+            .move_process(process.pid(), new_pgid)
+    }
+
+    // AGENT: make a process a session leader and sole member of its new group.
+    pub fn start_new_session(&self, process: &Arc<Process>) -> Result<usize, &'static str> {
+        let pid = process.pid();
+        self.job_control.lock().unwrap().start_new_session(pid)?;
+        Ok(pid)
+    }
+
+    // AGENT: resolve authoritative process-group membership to Process objects.
+    pub fn pgid_group(&self, pgid: i32) -> Vec<Arc<Process>> {
+        let members = self.job_control.lock().unwrap().members(pgid);
+        let processes = self.processes.read().unwrap();
+        members
+            .into_iter()
+            .filter_map(|pid| processes.get(&pid).cloned())
+            .collect()
+    }
+
+    // AGENT: expose the authoritative process-group id without mirrored state.
+    pub fn process_pgid(&self, pid: usize) -> Option<i32> {
+        self.job_control
+            .lock()
+            .unwrap()
+            .membership(pid)
+            .map(|(pgid, _)| pgid)
+    }
+
+    // AGENT: derive session identity from the process's authoritative group.
+    pub fn process_sid(&self, pid: usize) -> Option<usize> {
+        self.job_control
+            .lock()
+            .unwrap()
+            .membership(pid)
+            .map(|(_, sid)| sid)
+    }
+
+    // AGENT: group thread removal and zombie-process reaping after exit.
+
+    // AGENT: delete one non-last exited thread immediately without touching its
+    // still-running Process or any sibling task-table entries.
+    pub(crate) fn remove_exited_thread(&self, tid: Tid, process: &Arc<Process>) -> bool {
+        let mut tasks = self.tasks.write().unwrap();
+        if tasks
+            .get(&tid)
+            .is_some_and(|task| Arc::ptr_eq(&task.process, process))
+        {
+            tasks.remove(&tid);
+            true
+        } else {
+            false
+        }
+    }
+
+    // AGENT: reap one zombie process by pid from family, group, process, and
+    // thread indexes; callers must explicitly resolve tids before this boundary.
+    pub fn reap(&self, pid: usize) -> Result<(), &'static str> {
+        let process = self.find_process(pid).ok_or("esrch")?;
+        if !process.is_zombie() {
+            return Err("ebusy");
+        }
+
+        if let Some(parent) = process.parent() {
+            parent.remove_child(pid);
+        }
+        process.set_parent(None);
+        self.reparent_children_to_init(&process);
+        self.job_control.lock().unwrap().remove_process(pid);
+
+        let thread_ids = process.take_threads();
+        let mut tasks = self.tasks.write().unwrap();
+        for tid in thread_ids {
+            if tasks
+                .get(&tid)
+                .is_some_and(|thread| Arc::ptr_eq(&thread.process, &process))
+            {
+                tasks.remove(&tid);
+            }
+        }
+        drop(tasks);
+
+        let mut processes = self.processes.write().unwrap();
+        if processes
+            .get(&pid)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &process))
+        {
+            processes.remove(&pid);
+        }
+        Ok(())
     }
 }
 

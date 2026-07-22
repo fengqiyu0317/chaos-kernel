@@ -4,7 +4,7 @@ use super::futex::FutexWaiter;
 use super::*;
 use crate::kernel::kernel_core::prelude::*;
 use crate::kernel::kernel_core::{
-    global_timer_wheel, init_timer_wheel, TimerTarget, TimerWheel, TIMER_WHEEL,
+    duration_to_ticks, global_timer_wheel, init_timer_wheel, TimerTarget, TimerWheel, TIMER_WHEEL,
 };
 use crate::kernel::{
     clear_global_kernel_for_test, epoll_ready_events, install_kernel, EpCtlOp, EpData, EpEvent,
@@ -25,6 +25,7 @@ pub fn run_all(pool: &FramePool) {
     wait_token_binds_selected_task();
     wait_token_event_wake_wins_once();
     wait_token_timeout_wake_wins_once();
+    duration_to_ticks_rounds_up_at_tick_boundaries();
     wait_token_zero_duration_times_out_without_timer_wheel();
     wait_token_expired_deadline_times_out_immediately();
     wait_token_timer_target_times_out_on_schedule_tick(pool);
@@ -46,6 +47,19 @@ pub fn run_all(pool: &FramePool) {
     fd_alias_keeps_epoll_source_across_number_reuse(pool);
     forked_fd_slot_keeps_epoll_source_until_child_close(pool);
     epoll_ready_list_deduplicates_and_requeues();
+}
+
+// AGENT: cover zero, sub-tick, exact-tick, just-over-tick, and whole-second
+// conversions so relative waits retain their round-up contract.
+#[cfg_attr(test, test)]
+fn duration_to_ticks_rounds_up_at_tick_boundaries() {
+    let tick_nanos = 1_000_000_000u64 / TIMER_TICK_HZ as u64;
+
+    assert_eq!(duration_to_ticks(Duration::ZERO), 0);
+    assert_eq!(duration_to_ticks(Duration::from_nanos(1)), 1);
+    assert_eq!(duration_to_ticks(Duration::from_nanos(tick_nanos)), 1);
+    assert_eq!(duration_to_ticks(Duration::from_nanos(tick_nanos + 1)), 2);
+    assert_eq!(duration_to_ticks(Duration::from_secs(1)), TIMER_TICK_HZ);
 }
 
 // AGENT: reset the scheduler backend and timer state so QEMU boot selftests are
