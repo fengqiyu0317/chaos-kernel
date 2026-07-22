@@ -53,7 +53,7 @@ impl FdTable {
 
     // AGENT: duplicate entries while preserving an identical independent id
     // allocator snapshot for the child process.
-    fn fork_copy(&self) -> Self {
+    pub(in crate::kernel::proc) fn fork_copy(&self) -> Self {
         let mut copied = Self {
             entries: BTreeMap::new(),
             allocator: self.allocator.clone(),
@@ -319,16 +319,6 @@ impl Task {
         };
         drop(old_table);
         Ok(())
-    }
-
-    // AGENT: snapshot inherited descriptors without exposing FdTable internals.
-    pub(super) fn inherit_fds_from(&self, parent: &Task) {
-        let inherited = parent.process.fd_table.lock().unwrap().fork_copy();
-        let previous = {
-            let mut table = self.process.fd_table.lock().unwrap();
-            mem::replace(&mut *table, inherited)
-        };
-        drop(previous);
     }
 
     // AGENT: collect close-on-exec descriptors under the unified fd-table lock.

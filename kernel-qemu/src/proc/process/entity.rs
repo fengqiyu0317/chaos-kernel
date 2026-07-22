@@ -51,15 +51,21 @@ pub struct Process {
 // AGENT: own process identity, family links, shared resources, and thread
 // membership without depending on one representative Task.
 impl Process {
-    // AGENT: construct a registered-identity process before creating its leader
-    // thread, so Process never passes through an invalid placeholder pid.
-    pub(in crate::kernel::proc) fn new(pid: usize, addr_space: AddrSpace) -> Self {
+    // AGENT: initialize one process from explicit process-owned forkable state
+    // while resetting child-only runtime queues, waiters, and lifecycle flags.
+    fn with_owned_state(
+        pid: usize,
+        addr_space: AddrSpace,
+        fd_table: FdTable,
+        exec_path: String,
+        sig_state: SigSet,
+    ) -> Self {
         Self {
             pid,
             parent: Mutex::new(None),
             children: Mutex::new(BTreeMap::new()),
-            fd_table: Mutex::new(FdTable::default()),
-            exec_path: Mutex::new(String::new()),
+            fd_table: Mutex::new(fd_table),
+            exec_path: Mutex::new(exec_path),
             futex: Arc::new(FutexBucket::new()),
             did_exec: AtomicBool::new(false),
             job_stopped: AtomicBool::new(false),
@@ -69,9 +75,40 @@ impl Process {
             }),
             ev: Mutex::new(EvBus::default()),
             sig_queue: Mutex::new(VecDeque::new()),
-            sig_state: Mutex::new(SigSet::new()),
+            sig_state: Mutex::new(sig_state),
             addr_space: Mutex::new(addr_space),
         }
+    }
+
+    // AGENT: construct a registered-identity process before creating its leader
+    // thread, so Process never passes through an invalid placeholder pid.
+    pub(in crate::kernel::proc) fn new(pid: usize, addr_space: AddrSpace) -> Self {
+        Self::with_owned_state(
+            pid,
+            addr_space,
+            FdTable::default(),
+            String::new(),
+            SigSet::new(),
+        )
+    }
+
+    // AGENT: derive only process-owned fork state from the parent; the new child
+    // deliberately starts without pending signals, futex waiters, or family links.
+    pub(in crate::kernel::proc) fn fork_from(
+        parent: &Process,
+        child_pid: usize,
+        pool: &FramePool,
+    ) -> Result<Arc<Self>, &'static str> {
+        let addr_space = {
+            let mut parent_addr_space = parent.addr_space.lock().unwrap();
+            AddrSpace::fork_from(&mut parent_addr_space, pool)?
+        };
+        let exec_path = parent.exec_path.lock().unwrap().clone();
+        let fd_table = parent.fd_table.lock().unwrap().fork_copy();
+        let sig_state = parent.sig_state.lock().unwrap().fork_copy();
+        Ok(Arc::new(Self::with_owned_state(
+            child_pid, addr_space, fd_table, exec_path, sig_state,
+        )))
     }
 
     // AGENT: expose immutable process identity without a registration-state lock.

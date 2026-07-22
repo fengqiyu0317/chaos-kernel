@@ -167,18 +167,17 @@ impl TaskTable {
 
     // AGENT: preserve the direct semantic helper by snapshotting an off-CPU
     // source task before delegating to the live-frame-aware fork path.
-    pub fn fork_task(&self, src: &Arc<Task>, pool: &FramePool) -> Result<Arc<Task>, &'static str> {
+    pub fn fork_process(&self, src: &Arc<Task>) -> Result<Arc<Task>, &'static str> {
         let caller_frame = src.snapshot_user_trap_frame()?;
-        self.fork_task_from_frame(src, &caller_frame, pool)
+        self.fork_process_from_frame(src, &caller_frame)
     }
 
-    // AGENT: create a fresh Process from the caller's owning Process while
-    // inheriting thread-local state from the actual calling Task.
-    pub fn fork_task_from_frame(
+    // AGENT: own only the global fork transaction: capacity, identity,
+    // registration, job control, and family publication.
+    pub fn fork_process_from_frame(
         &self,
         src: &Arc<Task>,
         caller_frame: &TrapFrame,
-        pool: &FramePool,
     ) -> Result<Arc<Task>, &'static str> {
         let task_slot = self.reserve_task_slot()?;
         let parent_process = src.process.clone();
@@ -190,33 +189,14 @@ impl TaskTable {
         }
 
         let child_id = self.seq.fetch_add(1, Ordering::SeqCst);
-        let child_addr_space = {
-            let mut parent_addr_space = parent_process.addr_space.lock().unwrap();
-            AddrSpace::fork_from(&mut parent_addr_space, pool)?
-        };
-        let child_process = Arc::new(Process::new(child_id, child_addr_space));
-        let child = Task::make(child_id, child_process.clone(), &self.pool)?;
-
-        *child_process.exec_path.lock().unwrap() = parent_process.exec_path.lock().unwrap().clone();
-
-        // AGENT: inherit descriptor entries through the unified process table snapshot.
-        child.inherit_fds_from(src);
-
-        *child.sig_frames.lock().unwrap() = src.sig_frames.lock().unwrap().clone();
-        let mut child_frame = caller_frame.clone();
-        child_frame.set_return_value(0);
-        child.install_user_trap_frame(child_frame)?;
-        *child.sig_mask.lock().unwrap() = *src.sig_mask.lock().unwrap();
-
-        // AGENT: inherit process-wide dispositions but never pending signals.
-        *child_process.sig_state.lock().unwrap() =
-            parent_process.sig_state.lock().unwrap().fork_copy();
-        {
-            let parent_policy = src.sched.lock().unwrap().policy.clone();
-            let mut child_sched = child.sched.lock().unwrap();
-            child_sched.policy = parent_policy;
-            child_sched.slice_left = child_sched.policy.time_slice();
-        }
+        let child_process = Process::fork_from(&parent_process, child_id, &self.pool)?;
+        let child = Task::make_fork_child(
+            child_id,
+            child_process.clone(),
+            src,
+            caller_frame,
+            &self.pool,
+        )?;
         self.register_process(&child_process, &child, Some(parent_process.pid()))?;
         Self::attach_child(&parent_process, &child_process);
         task_slot.commit();

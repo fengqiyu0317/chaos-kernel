@@ -23,6 +23,7 @@ pub fn run_all(pool: &FramePool) {
     job_control_stays_authoritative_across_process_transitions(pool);
     reap_rejects_live_process(pool);
     fork_copies_complete_user_frame(pool);
+    fork_splits_process_and_caller_task_inheritance(pool);
     fork_from_nonleader_attaches_process_parent(pool);
     reparent_children_uses_init_process(pool);
     clone_thread_copies_caller_context_and_shares_process(pool);
@@ -516,7 +517,7 @@ fn job_control_stays_authoritative_across_process_transitions(pool: &FramePool) 
     let parent_pid = parent.process.pid();
 
     let moved_child = table
-        .fork_task(&parent, pool)
+        .fork_process(&parent)
         .expect("first child fork should work");
     let moved_pid = moved_child.process.pid();
     assert_eq!(table.process_pgid(moved_pid), Some(parent_pid as i32));
@@ -529,7 +530,7 @@ fn job_control_stays_authoritative_across_process_transitions(pool: &FramePool) 
     assert_eq!(table.process_sid(moved_pid), Some(parent_pid));
 
     let session_child = table
-        .fork_task(&parent, pool)
+        .fork_process(&parent)
         .expect("second child fork should work");
     let session_pid = session_child.process.pid();
     assert_eq!(
@@ -577,7 +578,7 @@ fn fork_copies_complete_user_frame(pool: &FramePool) {
         .expect("parent frame should install");
 
     let child = table
-        .fork_task(&parent, pool)
+        .fork_process(&parent)
         .expect("child fork should succeed");
     let child_frame = child
         .snapshot_user_trap_frame()
@@ -590,6 +591,71 @@ fn fork_copies_complete_user_frame(pool: &FramePool) {
     assert_eq!(child_frame.sepc, source.sepc);
 }
 
+// AGENT: pin the fork ownership split: Process derives process-wide inherited
+// state and resets pending/runtime state, while Task derives caller-thread state.
+fn fork_splits_process_and_caller_task_inheritance(pool: &FramePool) {
+    let table = TaskTable::new(pool.clone());
+    let parent = table.spawn_root().expect("root spawn should work");
+    *parent.process.exec_path.lock().unwrap() = "/bin/fork-parent".to_string();
+    assert!(parent.process.set_signal_action(
+        SIGUSR1,
+        SigAction {
+            handler: 0x5000,
+            mask: 0x24,
+        },
+    ));
+    parent
+        .process
+        .sig_queue
+        .lock()
+        .unwrap()
+        .push_back((SIGUSR2 as i32, parent.id() as isize));
+    parent.process.did_exec.store(true, Ordering::SeqCst);
+    *parent.sig_mask.lock().unwrap() = 0x48;
+    parent.sig_frames.lock().unwrap().push(SigFrame {
+        saved_frame: TrapFrame::for_user_entry(0x401000, 0x8000_0000),
+        saved_mask: 0x12,
+    });
+    {
+        let mut sched = parent.sched.lock().unwrap();
+        sched.policy = SchedulePolicy::with_prio(PRIO_MIN + 3);
+        sched.slice_left = 1;
+    }
+
+    let child = table
+        .fork_process(&parent)
+        .expect("fork should derive process and caller-task state");
+
+    assert!(!Arc::ptr_eq(&parent.process, &child.process));
+    assert_eq!(
+        child.process.exec_path.lock().unwrap().as_str(),
+        "/bin/fork-parent"
+    );
+    let child_action = child
+        .process
+        .sig_state
+        .lock()
+        .unwrap()
+        .get_action(SIGUSR1)
+        .expect("child should inherit SIGUSR1 disposition")
+        .clone();
+    assert_eq!(child_action.handler, 0x5000);
+    assert_eq!(child_action.mask, 0x24);
+    assert!(child.process.sig_queue.lock().unwrap().is_empty());
+    assert!(!child.process.did_exec.load(Ordering::SeqCst));
+
+    assert_eq!(*child.sig_mask.lock().unwrap(), 0x48);
+    let child_sig_frames = child.sig_frames.lock().unwrap();
+    assert_eq!(child_sig_frames.len(), 1);
+    assert_eq!(child_sig_frames[0].saved_frame.sepc, 0x401000);
+    assert_eq!(child_sig_frames[0].saved_mask, 0x12);
+    drop(child_sig_frames);
+
+    let child_sched = child.sched.lock().unwrap();
+    assert_eq!(child_sched.policy.prio, PRIO_MIN + 3);
+    assert_eq!(child_sched.slice_left, child_sched.policy.time_slice());
+}
+
 // AGENT: fork from a cloned thread must attach the child Process to the shared
 // parent Process, never to the calling thread as a family identity.
 fn fork_from_nonleader_attaches_process_parent(pool: &FramePool) {
@@ -599,7 +665,7 @@ fn fork_from_nonleader_attaches_process_parent(pool: &FramePool) {
         .clone_thread(&parent, 0x8000_0000, 0x123)
         .expect("thread clone should succeed");
     let child = table
-        .fork_task(&thread, pool)
+        .fork_process(&thread)
         .expect("fork from nonleader should succeed");
 
     let linked_parent = child
@@ -620,10 +686,10 @@ fn reparent_children_uses_init_process(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
     let init = table.spawn_root().expect("root spawn should work");
     let parent = table
-        .fork_task(&init, pool)
+        .fork_process(&init)
         .expect("parent process fork should work");
     let child = table
-        .fork_task(&parent, pool)
+        .fork_process(&parent)
         .expect("child process fork should work");
 
     table.reparent_children_to_init(&parent.process);
@@ -649,7 +715,7 @@ fn reap_zombie_process_removes_thread_group_once(pool: &FramePool) {
     let table = TaskTable::new(pool.clone());
     let parent = table.spawn_root().expect("root spawn should work");
     let child = table
-        .fork_task(&parent, pool)
+        .fork_process(&parent)
         .expect("child fork should succeed");
     let thread = table
         .clone_thread(&child, 0x8000_0000, 0)
@@ -718,7 +784,7 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     ));
     let leader = kernel
         .tasks
-        .fork_task(&parent, pool)
+        .fork_process(&parent)
         .expect("child process should fork");
     let thread = kernel
         .tasks

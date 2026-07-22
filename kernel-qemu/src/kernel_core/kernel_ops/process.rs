@@ -149,8 +149,8 @@ impl Kernel {
         }
     }
 
-    // AGENT: keep fork as a small orchestration layer; TaskTable::fork_task owns
-    // state copying, while Kernel only publishes the child to the scheduler.
+    // AGENT: keep fork as a small orchestration layer; TaskTable owns process
+    // construction/publication, while Kernel only publishes it to the scheduler.
     pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> {
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let caller_frame = parent.snapshot_user_trap_frame()?;
@@ -169,9 +169,7 @@ impl Kernel {
             return Err("esrch");
         }
 
-        let child = self
-            .tasks
-            .fork_task_from_frame(&parent, caller_frame, &self.pool)?;
+        let child = self.tasks.fork_process_from_frame(&parent, caller_frame)?;
         let child_id = child.id();
         child.set_sched_state(TaskRunState::Runnable);
         child.reset_slice();

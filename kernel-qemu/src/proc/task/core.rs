@@ -43,6 +43,31 @@ impl Task {
         Ok(task)
     }
 
+    // AGENT: derive only caller-thread state for a fork child around the already
+    // constructed child Process; global identity and publication stay in TaskTable.
+    pub(super) fn make_fork_child(
+        id: usize,
+        process: Arc<Process>,
+        parent: &Task,
+        caller_frame: &TrapFrame,
+        pool: &FramePool,
+    ) -> Result<Arc<Self>, &'static str> {
+        let task = Self::make(id, process, pool)?;
+        *task.sig_frames.lock().unwrap() = parent.sig_frames.lock().unwrap().clone();
+        *task.sig_mask.lock().unwrap() = *parent.sig_mask.lock().unwrap();
+
+        let mut child_frame = caller_frame.clone();
+        child_frame.set_return_value(0);
+        task.install_user_trap_frame(child_frame)?;
+
+        let parent_policy = parent.sched.lock().unwrap().policy.clone();
+        let mut child_sched = task.sched.lock().unwrap();
+        child_sched.policy = parent_policy;
+        child_sched.slice_left = child_sched.policy.time_slice();
+        drop(child_sched);
+        Ok(task)
+    }
+
     // AGENT: expose the schedulable thread id.
     pub fn id(&self) -> usize {
         self.id

@@ -705,7 +705,7 @@ fn forked_fd_slot_keeps_epoll_source_until_child_close(pool: &FramePool) {
 
     let child = kernel
         .tasks
-        .fork_task(&parent, pool)
+        .fork_process(&parent)
         .expect("fork should copy fd-table slots");
     parent
         .close_fd(read_fd)
