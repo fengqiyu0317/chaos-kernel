@@ -11,6 +11,7 @@ pub fn run_all(pool: &FramePool) {
     capset_drop_cap_clears_ambient();
     kernel_stack_uses_and_releases_frame_pool_run(pool);
     task_spawn_reports_kernel_stack_exhaustion();
+    task_slot_limit_reopens_only_after_reap(pool);
     spawn_root_creates_single_pid_one_init(pool);
     spawn_root_rejects_nonempty_task_table(pool);
     init_process_resolves_through_process_index(pool);
@@ -77,8 +78,40 @@ fn task_spawn_reports_kernel_stack_exhaustion() {
     let pool = FramePool::new(KSTK_SZ / PAGE_SZ - 1, MEM_OFF);
     let table = TaskTable::new(pool);
 
-    assert_eq!(table.spawn().err(), Some("enomem"));
+    for _ in 0..=N_PROC {
+        assert_eq!(table.spawn().err(), Some("enomem"));
+    }
     assert_eq!(table.count(), 0);
+}
+
+// AGENT: keep committed slots occupied until their task-table entries are
+// actually reaped, while failed over-limit creation leaves no partial task.
+fn task_slot_limit_reopens_only_after_reap(pool: &FramePool) {
+    let table = TaskTable::new(pool.clone());
+    let mut tasks = Vec::new();
+    for _ in 0..N_PROC {
+        tasks.push(table.spawn().expect("task table should fill to its limit"));
+    }
+
+    assert_eq!(table.count(), N_PROC);
+    assert_eq!(table.spawn().err(), Some("eagain"));
+
+    let reaped = tasks.pop().expect("full task table should have a victim");
+    let reaped_pid = reaped.process.pid();
+    assert!(reaped
+        .process
+        .begin_group_exit(ExitReason::Code(0))
+        .is_some());
+    reaped.process.finish_process_exit();
+    assert_eq!(table.reap(reaped_pid), Ok(()));
+    assert_eq!(table.count(), N_PROC - 1);
+
+    let replacement = table
+        .spawn()
+        .expect("reaping one task should reopen exactly one slot");
+    assert!(replacement.id() > reaped.id());
+    assert_eq!(table.count(), N_PROC);
+    assert_eq!(table.spawn().err(), Some("eagain"));
 }
 
 // AGENT: exercise map, protection, unmap, and release transitions while

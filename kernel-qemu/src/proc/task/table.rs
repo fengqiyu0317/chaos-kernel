@@ -13,9 +13,9 @@ pub struct TaskTable {
     // AGENT: record only the designated init identity; processes remains the
     // authoritative owner and lookup table for every Process allocation.
     init_pid: Mutex<Option<usize>>,
-    // AGENT: reserve capacity before registration so concurrent creators cannot
-    // all pass the N_PROC check at once.
-    task_reservations: AtomicUsize,
+    // AGENT: count registered and provisionally reserved task slots in one
+    // atomic authority so reservation-to-publication cannot lose capacity.
+    occupied_task_slots: AtomicUsize,
     // AGENT: share the Kernel-owned physical-frame state with every task stack
     // allocation without introducing a global FramePool singleton.
     pool: FramePool,
@@ -33,30 +33,37 @@ impl TaskTable {
             job_control: Mutex::new(JobControl::default()),
             seq: AtomicUsize::new(1),
             init_pid: Mutex::new(None),
-            task_reservations: AtomicUsize::new(0),
+            occupied_task_slots: AtomicUsize::new(0),
             pool,
         }
     }
 
-    // AGENT: reserve task-table capacity across fallible construction work.
+    // AGENT: atomically occupy capacity shared by registered and in-flight tasks.
     fn reserve_task_slot(&self) -> Result<TaskSlotReservation<'_>, &'static str> {
-        loop {
-            let live = self.count();
-            let reserved = self.task_reservations.load(Ordering::SeqCst);
-            if live.saturating_add(reserved) >= N_PROC {
-                return Err("eagain");
-            }
-            if self
-                .task_reservations
-                .compare_exchange(reserved, reserved + 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return Ok(TaskSlotReservation {
-                    table: self,
-                    active: true,
-                });
-            }
+        self.occupied_task_slots
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |occupied| {
+                (occupied < N_PROC).then_some(occupied + 1)
+            })
+            .map_err(|_| "eagain")?;
+        Ok(TaskSlotReservation {
+            table: self,
+            active: true,
+        })
+    }
+
+    // AGENT: return capacity only after failed construction or actual removal.
+    fn release_task_slots(&self, count: usize) {
+        if count == 0 {
+            return;
         }
+        assert!(
+            self.occupied_task_slots
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |occupied| {
+                    occupied.checked_sub(count)
+                })
+                .is_ok(),
+            "task slot accounting underflow"
+        );
     }
 
     // AGENT: publish one new process and its leader thread while synchronizing
@@ -110,7 +117,7 @@ impl TaskTable {
         let slot = self.reserve_task_slot()?;
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let task = self.insert_new_process(id)?;
-        slot.release();
+        slot.commit();
         Ok(task)
     }
 
@@ -135,7 +142,7 @@ impl TaskTable {
 
         let task = self.insert_new_process(INIT_PID)?;
         *init_pid = Some(INIT_PID);
-        slot.release();
+        slot.commit();
         Ok(task)
     }
 
@@ -226,7 +233,7 @@ impl TaskTable {
         }
         self.register_process(&child_process, &child, Some(parent_process.pid()))?;
         Self::attach_child(&parent_process, &child_process);
-        task_slot.release();
+        task_slot.commit();
         Ok(child)
     }
 
@@ -268,7 +275,7 @@ impl TaskTable {
         }
         tasks.insert(id, task.clone());
         drop(tasks);
-        task_slot.release();
+        task_slot.commit();
         Ok(task)
     }
 
@@ -415,7 +422,7 @@ impl TaskTable {
     // still-running Process or any sibling task-table entries.
     pub(crate) fn remove_exited_thread(&self, tid: Tid, process: &Arc<Process>) -> bool {
         let mut tasks = self.tasks.write().unwrap();
-        if tasks
+        let removed = if tasks
             .get(&tid)
             .is_some_and(|task| Arc::ptr_eq(&task.process, process))
         {
@@ -423,7 +430,12 @@ impl TaskTable {
             true
         } else {
             false
+        };
+        drop(tasks);
+        if removed {
+            self.release_task_slots(1);
         }
+        removed
     }
 
     // AGENT: reap one zombie process by pid from family, group, process, and
@@ -443,15 +455,18 @@ impl TaskTable {
 
         let thread_ids = process.take_threads();
         let mut tasks = self.tasks.write().unwrap();
+        let mut removed_tasks = 0;
         for tid in thread_ids {
             if tasks
                 .get(&tid)
                 .is_some_and(|thread| Arc::ptr_eq(&thread.process, &process))
             {
                 tasks.remove(&tid);
+                removed_tasks += 1;
             }
         }
         drop(tasks);
+        self.release_task_slots(removed_tasks);
 
         let mut processes = self.processes.write().unwrap();
         if processes
@@ -470,18 +485,18 @@ struct TaskSlotReservation<'a> {
     active: bool,
 }
 
-// AGENT: centralize explicit and automatic task-slot release.
+// AGENT: distinguish successful publication from automatic failed-construction release.
 impl TaskSlotReservation<'_> {
-    // AGENT: consume and release a successfully used reservation exactly once.
-    fn release(mut self) {
-        self.release_inner();
+    // AGENT: consume a reservation into a registered task without reopening capacity.
+    fn commit(mut self) {
+        self.active = false;
     }
 
-    // AGENT: decrement the shared reservation counter idempotently.
+    // AGENT: return an uncommitted slot exactly once on an error path.
     fn release_inner(&mut self) {
         if self.active {
             self.active = false;
-            self.table.task_reservations.fetch_sub(1, Ordering::SeqCst);
+            self.table.release_task_slots(1);
         }
     }
 }
