@@ -155,7 +155,8 @@ impl TimerWheel {
         }
     }
 
-    // AGENT: allocate a cancelable timer id and bind it to a typed expiry target.
+    // AGENT: allocate a cancelable timer id and insert the typed timer directly
+    // into its deadline slot; all QEMU timers use this single registration path.
     pub fn register_timer(
         &mut self,
         deadline: usize,
@@ -164,17 +165,12 @@ impl TimerWheel {
     ) -> usize {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1).max(1);
-        self.add_timer(TimerEntry::with_target(id, deadline, interval, target));
-        id
-    }
-
-    pub fn add_timer(&mut self, entry: TimerEntry) {
-        self.next_id = self.next_id.max(entry.id.saturating_add(1));
         // AGENT: far-future deadlines may land in a slot before they expire; the
         // advance path keeps them in that slot until a later wheel pass reaches
         // or passes the full absolute deadline.
-        let slot = entry.deadline % TIMER_WHEEL_SIZE;
-        self.slots[slot].push(entry);
+        let slot = deadline % TIMER_WHEEL_SIZE;
+        self.slots[slot].push(TimerEntry::with_target(id, deadline, interval, target));
+        id
     }
 
     // AGENT: fire due entries, retain future entries, and derive repeating
