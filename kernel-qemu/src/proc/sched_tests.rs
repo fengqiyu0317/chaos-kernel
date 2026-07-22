@@ -3,7 +3,7 @@
 use super::*;
 use crate::kernel::kernel_core::{init_timer_wheel, TIMER_WHEEL};
 use crate::kernel::{
-    install_qemu_wait_kernel, qemu_wait_kernel, signal_bit, FramePool, Kernel, SigAction, SigSet,
+    global_kernel, install_kernel, signal_bit, FramePool, Kernel, SigAction, SigSet,
     SignalDeliveryAction, TaskRunState, NSIG, PRIO_MIN, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP,
     SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGWINCH, SIG_DFL, SIG_IGN, SYS_SIGRETURN,
 };
@@ -42,7 +42,7 @@ fn processor_releases_exited_stack_after_idle_handoff(pool: &FramePool) {
     task.install_test_kernel_entry(processor_exit_test_task)
         .expect("test task should receive kernel entry");
     assert!(task.kernel_stack_top().is_some());
-    install_qemu_wait_kernel(kernel);
+    install_kernel(kernel);
 
     assert!(kernel.run_one_cpu0_task_for_test());
     assert!(PROCESSOR_EXIT_TEST_RAN.load(Ordering::Relaxed));
@@ -55,7 +55,7 @@ fn processor_releases_exited_stack_after_idle_handoff(pool: &FramePool) {
 // live stack, then use the production handoff so the idle side can release it.
 extern "C" fn processor_exit_test_task() -> ! {
     PROCESSOR_EXIT_TEST_RAN.store(true, Ordering::Relaxed);
-    let kernel = qemu_wait_kernel().expect("scheduler test kernel should be installed");
+    let kernel = global_kernel().expect("scheduler test kernel should be installed");
     let task = kernel
         .cur_task(0)
         .expect("scheduler test task should be current");

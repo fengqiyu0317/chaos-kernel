@@ -40,6 +40,7 @@ impl FutexBucket {
     // between seeing the expected value and publishing this waiter.
     pub fn wait<R>(
         &self,
+        task_id: usize,
         addr: usize,
         expected: u32,
         timeout: Option<Duration>,
@@ -48,7 +49,7 @@ impl FutexBucket {
     where
         R: FnOnce() -> Result<u32, &'static str>,
     {
-        let token = WaitToken::current();
+        let token = WaitToken::for_task(task_id);
         {
             let mut w = self.waiters.lock().unwrap();
             if read_word()? != expected {

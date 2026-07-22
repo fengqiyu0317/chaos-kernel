@@ -41,7 +41,7 @@ pub(super) fn sys_futex(
                 Some(read_futex_timeout(&current, timeout_addr)?)
             };
             let futex = current.process.futex.clone();
-            match futex.wait(uaddr, val as u32, timeout, || {
+            match futex.wait(current.id(), uaddr, val as u32, timeout, || {
                 read_user_u32(&current, uaddr)
             }) {
                 Ok(()) => Ok(0),

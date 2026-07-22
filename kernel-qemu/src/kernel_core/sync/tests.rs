@@ -1,15 +1,14 @@
 // AGENT: keep WaitToken regressions next to the QEMU sync primitives and expose
 // them through the same run_all + cfg_attr(test, test) pattern as mm/tests.rs.
 use super::futex::FutexWaiter;
-use super::wait::WAIT_KERNEL;
 use super::*;
 use crate::kernel::kernel_core::prelude::*;
 use crate::kernel::kernel_core::{
-    global_timer_wheel, init_timer_wheel, set_current_task_id, TimerTarget, TimerWheel, TIMER_WHEEL,
+    global_timer_wheel, init_timer_wheel, TimerTarget, TimerWheel, TIMER_WHEEL,
 };
 use crate::kernel::{
-    epoll_ready_events, EpCtlOp, EpData, EpEvent, EpInst, EpKey, FLike, FdEntry, FramePool, Kernel,
-    PipeNode, TaskRunState, CLK, SIGUSR1,
+    clear_global_kernel_for_test, epoll_ready_events, install_kernel, EpCtlOp, EpData, EpEvent,
+    EpInst, EpKey, FLike, FdEntry, FramePool, Kernel, PipeNode, TaskRunState, CLK, SIGUSR1,
 };
 
 // AGENT: include storage/fd allocator regressions and use the boot-discovered
@@ -23,7 +22,7 @@ pub fn run_all(pool: &FramePool) {
     // AGENT: Follow the mount-table selftests to their dedicated module after
     // splitting mount_io_disk into separate responsibilities.
     crate::kernel::fs::mount::tests::run_all();
-    wait_token_captures_current_task();
+    wait_token_binds_selected_task();
     wait_token_event_wake_wins_once();
     wait_token_timeout_wake_wins_once();
     wait_token_zero_duration_times_out_without_timer_wheel();
@@ -49,20 +48,18 @@ pub fn run_all(pool: &FramePool) {
     epoll_ready_list_deduplicates_and_requeues();
 }
 
-// AGENT: reset simulator-global wait state so QEMU boot selftests are
-// deterministic when run after heap and timer-wheel initialization.
-fn reset_wait_token_state(task_id: usize) {
-    WAIT_KERNEL.store(0, Ordering::Release);
-    set_current_task_id(Some(task_id));
+// AGENT: reset the scheduler backend and timer state so QEMU boot selftests are
+// deterministic without publishing a second current-task marker.
+fn reset_wait_token_state() {
+    clear_global_kernel_for_test();
     CLK.store(0, Ordering::Relaxed);
     ensure_timer_wheel();
     *global_timer_wheel().lock() = TimerWheel::new();
 }
 
-// AGENT: leave no current task or scheduler backend behind for later selftests.
+// AGENT: leave no scheduler backend behind for later selftests.
 fn clear_wait_token_state() {
-    WAIT_KERNEL.store(0, Ordering::Release);
-    set_current_task_id(None);
+    clear_global_kernel_for_test();
 }
 
 // AGENT: ordinary Rust tests may enter without rust_main(), while QEMU boot
@@ -73,14 +70,14 @@ fn ensure_timer_wheel() {
     }
 }
 
-// AGENT: WaitToken::current must bind to the current simulator task id and give
-// each wait distinct Arc-backed state without a separate numeric identifier.
+// AGENT: WaitToken::for_task binds an explicitly selected task id and gives each
+// wait distinct Arc-backed state without a separate wait identifier.
 #[cfg_attr(test, test)]
-fn wait_token_captures_current_task() {
-    reset_wait_token_state(11);
+fn wait_token_binds_selected_task() {
+    reset_wait_token_state();
 
-    let first = WaitToken::current();
-    let second = WaitToken::current();
+    let first = WaitToken::for_task(11);
+    let second = WaitToken::for_task(11);
 
     assert_eq!(first.task_id(), 11);
     assert_eq!(second.task_id(), 11);
@@ -94,9 +91,9 @@ fn wait_token_captures_current_task() {
 // timeout attempts.
 #[cfg_attr(test, test)]
 fn wait_token_event_wake_wins_once() {
-    reset_wait_token_state(12);
+    reset_wait_token_state();
 
-    let token = WaitToken::current();
+    let token = WaitToken::for_task(12);
 
     assert!(token.wake_event());
     assert!(!token.wake());
@@ -113,9 +110,9 @@ fn wait_token_event_wake_wins_once() {
 // later event attempts.
 #[cfg_attr(test, test)]
 fn wait_token_timeout_wake_wins_once() {
-    reset_wait_token_state(13);
+    reset_wait_token_state();
 
-    let token = WaitToken::current();
+    let token = WaitToken::for_task(13);
 
     assert!(token.wake_timeout());
     assert!(!token.wake_event());
@@ -132,9 +129,9 @@ fn wait_token_timeout_wake_wins_once() {
 // wheel or entering the spin wait loop.
 #[cfg_attr(test, test)]
 fn wait_token_zero_duration_times_out_without_timer_wheel() {
-    reset_wait_token_state(14);
+    reset_wait_token_state();
 
-    let token = WaitToken::current();
+    let token = WaitToken::for_task(14);
 
     assert_eq!(
         token.wait(Some(Duration::from_nanos(0))),
@@ -150,10 +147,10 @@ fn wait_token_zero_duration_times_out_without_timer_wheel() {
 // registering a timer and spinning.
 #[cfg_attr(test, test)]
 fn wait_token_expired_deadline_times_out_immediately() {
-    reset_wait_token_state(15);
+    reset_wait_token_state();
 
     CLK.store(7, Ordering::Relaxed);
-    let token = WaitToken::current();
+    let token = WaitToken::for_task(15);
 
     assert_eq!(token.wait_until_tick_interruptible(7), WaitOutcome::Timeout);
     assert!(token.is_timeout());
@@ -165,10 +162,10 @@ fn wait_token_expired_deadline_times_out_immediately() {
 // AGENT: the QEMU timer wheel dispatches TimerTarget::WakeToken through the same
 // timeout marker used by WaitToken's unified deadline path.
 fn wait_token_timer_target_times_out_on_schedule_tick(pool: &FramePool) {
-    reset_wait_token_state(16);
+    reset_wait_token_state();
 
     let kernel = Kernel::new(pool.clone());
-    let token = WaitToken::current();
+    let token = WaitToken::for_task(16);
     let deadline = CLK.load(Ordering::Relaxed) + 1;
 
     {
@@ -195,14 +192,13 @@ fn wait_token_timer_target_times_out_on_schedule_tick(pool: &FramePool) {
 // AGENT: when a QEMU scheduler backend is installed, a token event wake should
 // make the sleeping owner task runnable through Kernel::wake_task_for_wait().
 fn wait_token_event_wake_uses_installed_scheduler_backend(pool: &FramePool) {
-    reset_wait_token_state(17);
+    reset_wait_token_state();
 
     let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     let task = kernel.tasks.spawn_root().expect("spawn test init task");
     task.set_sched_state(TaskRunState::Sleeping);
-    set_current_task_id(Some(task.id()));
-    install_qemu_wait_kernel(kernel);
-    let token = WaitToken::current();
+    install_kernel(kernel);
+    let token = WaitToken::for_task(task.id());
 
     assert!(token.wake_event());
     assert_eq!(task.sched_state(), TaskRunState::Runnable);
@@ -214,7 +210,7 @@ fn wait_token_event_wake_uses_installed_scheduler_backend(pool: &FramePool) {
 // AGENT: before the scheduler loop is activated, the compatibility bridge
 // records Sleeping without attempting to use an uninitialized idle context.
 fn wait_token_block_current_keeps_placeholder_stack(pool: &FramePool) {
-    reset_wait_token_state(24);
+    reset_wait_token_state();
 
     let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     kernel.proc_init();
@@ -234,13 +230,13 @@ fn wait_token_block_current_keeps_placeholder_stack(pool: &FramePool) {
 // AGENT: waking the task whose stack is still spinning should not enqueue a
 // duplicate runnable entry; wait completion restores it to Running in place.
 fn wait_token_current_wake_finishes_without_requeue(pool: &FramePool) {
-    reset_wait_token_state(25);
+    reset_wait_token_state();
 
     let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     kernel.proc_init();
-    install_qemu_wait_kernel(kernel);
+    install_kernel(kernel);
     let task = kernel.cur_task(0).expect("init task should be current");
-    let token = WaitToken::current();
+    let token = WaitToken::for_task(task.id());
 
     assert!(kernel.block_task_for_wait(task.id()));
     assert!(token.wake_event());
@@ -257,7 +253,7 @@ fn wait_token_current_wake_finishes_without_requeue(pool: &FramePool) {
 // AGENT: timer ticks must not time-slice the pre-scheduler compatibility state
 // whose sleeping task still occupies Processor.current.
 fn wait_token_tick_leaves_sleeping_current_parked(pool: &FramePool) {
-    reset_wait_token_state(26);
+    reset_wait_token_state();
 
     let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     kernel.proc_init();
@@ -279,14 +275,13 @@ fn wait_token_tick_leaves_sleeping_current_parked(pool: &FramePool) {
 // AGENT: interruptible waits must distinguish pending signals from real event
 // readiness so syscall callers can return EINTR.
 fn wait_token_interruptible_wait_reports_signal_not_event(pool: &FramePool) {
-    reset_wait_token_state(27);
+    reset_wait_token_state();
 
     let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     kernel.proc_init();
-    install_qemu_wait_kernel(kernel);
+    install_kernel(kernel);
     let task = kernel.cur_task(0).expect("init task should be current");
-    set_current_task_id(Some(task.id()));
-    let token = WaitToken::current();
+    let token = WaitToken::for_task(task.id());
 
     kernel.send_signal_to_task(&task, SIGUSR1 as i32, -1);
 
@@ -301,14 +296,14 @@ fn wait_token_interruptible_wait_reports_signal_not_event(pool: &FramePool) {
 // and return the syscall-layer "changed" marker when it differs.
 #[cfg_attr(test, test)]
 fn futex_wait_returns_changed_without_queueing() {
-    reset_wait_token_state(18);
+    reset_wait_token_state();
 
     let futex = FutexBucket::new();
     let addr = 0x4000;
     let calls = AtomicUsize::new(0);
 
     let err = futex
-        .wait(addr, 1, None, || {
+        .wait(18, addr, 1, None, || {
             calls.fetch_add(1, Ordering::Relaxed);
             Ok(0)
         })
@@ -325,13 +320,13 @@ fn futex_wait_returns_changed_without_queueing() {
 // publishing a stale waiter or panicking inside the futex bucket.
 #[cfg_attr(test, test)]
 fn futex_wait_propagates_word_read_fault() {
-    reset_wait_token_state(19);
+    reset_wait_token_state();
 
     let futex = FutexBucket::new();
     let addr = 0x5000;
 
     let err = futex
-        .wait(addr, 1, None, || Err("efault"))
+        .wait(19, addr, 1, None, || Err("efault"))
         .expect_err("read fault should abort wait setup");
 
     assert_eq!(err, "efault");
@@ -344,14 +339,14 @@ fn futex_wait_propagates_word_read_fault() {
 // published first, then removed by finish_wait() when the token times out.
 #[cfg_attr(test, test)]
 fn futex_wait_timeout_removes_published_waiter() {
-    reset_wait_token_state(20);
+    reset_wait_token_state();
 
     let futex = FutexBucket::new();
     let addr = 0x6000;
     let calls = AtomicUsize::new(0);
 
     let err = futex
-        .wait(addr, 1, Some(Duration::from_nanos(0)), || {
+        .wait(20, addr, 1, Some(Duration::from_nanos(0)), || {
             calls.fetch_add(1, Ordering::Relaxed);
             Ok(1)
         })
@@ -368,7 +363,7 @@ fn futex_wait_timeout_removes_published_waiter() {
 // copy-in closure; read errors should be returned instead of panicking.
 #[cfg_attr(test, test)]
 fn futex_cmp_requeue_propagates_word_read_fault() {
-    reset_wait_token_state(21);
+    reset_wait_token_state();
 
     let futex = FutexBucket::new();
     let src = 0x7000;
@@ -389,12 +384,12 @@ fn futex_cmp_requeue_propagates_word_read_fault() {
 // slots, otherwise a stale waiter can consume move_n and leave a live waiter on src.
 #[cfg_attr(test, test)]
 fn futex_requeue_skips_completed_waiters_when_moving() {
-    reset_wait_token_state(22);
+    reset_wait_token_state();
 
     let src = 0x9000;
     let dst = 0xA000;
-    let stale = WaitToken::current();
-    let live = WaitToken::current();
+    let stale = WaitToken::for_task(22);
+    let live = WaitToken::for_task(22);
     let mut waiters = VecDeque::new();
 
     assert!(stale.wake_timeout());
@@ -493,7 +488,7 @@ fn fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool: &FramePool) 
 // AGENT: closing a watched fd must remove the old epoll interest and cancel its
 // pipe source callback before the same fd number can be reused for another file.
 fn fd_close_detaches_epoll_subscription_before_reuse(pool: &FramePool) {
-    reset_wait_token_state(23);
+    reset_wait_token_state();
 
     let kernel = Kernel::new(pool.clone());
     let task = kernel.tasks.spawn_root().expect("spawn test init task");
@@ -578,7 +573,7 @@ fn fd_close_detaches_epoll_subscription_before_reuse(pool: &FramePool) {
 // AGENT: preserve a watched OFD while a dup alias exists, allow the same fd
 // number to register a replacement OFD, and retire only the old key on last close.
 fn fd_alias_keeps_epoll_source_across_number_reuse(pool: &FramePool) {
-    reset_wait_token_state(25);
+    reset_wait_token_state();
 
     let kernel = Kernel::new(pool.clone());
     let task = kernel.tasks.spawn_root().expect("spawn epoll alias task");
@@ -665,7 +660,7 @@ fn fd_alias_keeps_epoll_source_across_number_reuse(pool: &FramePool) {
 // AGENT: count fd-table slots across forked Process tables so closing the
 // parent's watched descriptor cannot retire an OFD still installed in the child.
 fn forked_fd_slot_keeps_epoll_source_until_child_close(pool: &FramePool) {
-    reset_wait_token_state(26);
+    reset_wait_token_state();
 
     let kernel = Kernel::new(pool.clone());
     let parent = kernel.tasks.spawn_root().expect("spawn epoll fork parent");
@@ -720,7 +715,7 @@ fn forked_fd_slot_keeps_epoll_source_until_child_close(pool: &FramePool) {
 // requeue the same still-ready fd.
 #[cfg_attr(test, test)]
 fn epoll_ready_list_deduplicates_and_requeues() {
-    reset_wait_token_state(24);
+    reset_wait_token_state();
 
     let epoll = EpInst::new();
     let (read_end, _write_end) = PipeNode::pair();

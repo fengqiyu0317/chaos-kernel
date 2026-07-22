@@ -177,7 +177,7 @@ pub extern "C" fn rust_kernel_trap(frame: &mut TrapFrame) {
 pub extern "C" fn rust_user_trap(frame: &mut TrapFrame) {
     init_kernel_trap_vector();
     handle_trap(frame, TrapOrigin::User);
-    let Some(kernel) = crate::kernel::qemu_wait_kernel() else {
+    let Some(kernel) = crate::kernel::global_kernel() else {
         println!("[kernel-qemu] user trap return has no installed kernel");
         sbi::shutdown();
     };
@@ -245,7 +245,7 @@ fn handle_page_fault(frame: &TrapFrame, origin: TrapOrigin, scause: usize, stval
 // AGENT: keep trap recovery as an architecture dispatch step; migrated memory
 // semantics stay behind Kernel::handle_pgfault.
 fn recover_user_page_fault(addr: usize, access: PageFaultAccess) -> Result<(), &'static str> {
-    let kernel = crate::kernel::qemu_wait_kernel().ok_or("esrch")?;
+    let kernel = crate::kernel::global_kernel().ok_or("esrch")?;
     kernel.handle_pgfault(addr, access.into_kernel_access())
 }
 
@@ -299,7 +299,7 @@ fn early_fatal_trap_action(origin: TrapOrigin) -> &'static str {
 // AGENT: bind the selected CPU0 task's stack page into its current process root
 // and refresh every runtime-only address after fork, exec, or a prior task ran.
 fn prepare_user_return(task: &Task, frame: &mut TrapFrame) -> Result<(), &'static str> {
-    let kernel = crate::kernel::qemu_wait_kernel().ok_or("esrch")?;
+    let kernel = crate::kernel::global_kernel().ok_or("esrch")?;
     let kernel_frame = frame as *mut TrapFrame as usize;
     let frame_offset = kernel_frame & (PAGE_SZ - 1);
     if frame_offset + core::mem::size_of::<TrapFrame>() > PAGE_SZ {
@@ -484,9 +484,7 @@ impl TrapFrame {
 #[cfg(any(test, feature = "qemu-sched-selftest"))]
 pub mod tests {
     use super::*;
-    use crate::kernel::{
-        install_qemu_wait_kernel, FramePool, Kernel, VmRegion, VM_EXEC, VM_READ, VM_WRITE,
-    };
+    use crate::kernel::{install_kernel, FramePool, Kernel, VmRegion, VM_EXEC, VM_READ, VM_WRITE};
     use alloc::boxed::Box;
 
     const USER_CODE: usize = 0x0001_0000;
@@ -534,7 +532,7 @@ pub mod tests {
         }
         task.install_user_trap_frame(TrapFrame::for_user_entry(USER_CODE, USER_STACK + PAGE_SZ))
             .expect("user exit frame should install");
-        install_qemu_wait_kernel(kernel);
+        install_kernel(kernel);
 
         assert!(kernel.run_one_cpu0_task_for_test());
         assert_eq!(csr::read_satp(), kernel_satp);

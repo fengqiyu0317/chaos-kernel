@@ -1,18 +1,16 @@
 // AGENT
-use crate::kernel::kernel_core::current::{require_current_task_id, NO_CURRENT_TASK_ID};
 use crate::kernel::kernel_core::prelude::*;
 
-const SPIN_NO_OWNER: usize = NO_CURRENT_TASK_ID;
+const SPIN_NO_OWNER: usize = 0;
 
-// AGENT: Spin derives its owner from the current-task context maintained by
-// Kernel::set_cur(), so callers do not pass owner ids through every lock call
-// and Spin does not depend on the full Kernel object.
-fn spin_owner() -> usize {
-    require_current_task_id("Spin")
+// AGENT: validate the Task::id() selected from Processor.current by the caller;
+// zero remains reserved for the unlocked state.
+fn validate_spin_owner(owner: usize) {
+    assert_ne!(owner, SPIN_NO_OWNER, "Spin needs a nonzero Task::id()");
 }
 
-// AGENT: ticket-based simulator spinlock with private state, FIFO acquisition,
-// RAII guard support, and task-id owner checks. It still models only short
+// AGENT: ticket-based spinlock with private state, FIFO acquisition, RAII guard
+// support, and explicit task-id owner checks. It still models only short
 // non-blocking critical sections; it does not mask interrupts or preemption.
 pub struct Spin {
     next_ticket: AtomicUsize,
@@ -27,10 +25,10 @@ impl Spin {
             owner: AtomicUsize::new(SPIN_NO_OWNER),
         }
     }
-    // AGENT: FIFO acquire now owns current-task lookup and ticket acquisition
-    // directly instead of delegating through an owner-parameter helper.
-    pub fn acquire(&self) {
-        let owner = spin_owner();
+    // AGENT: FIFO acquire uses the Task::id() supplied by the scheduler-aware
+    // caller instead of consulting a shadow current-task global.
+    pub fn acquire(&self, owner: usize) {
+        validate_spin_owner(owner);
         assert_ne!(
             self.owner.load(Ordering::Relaxed),
             owner,
@@ -43,11 +41,10 @@ impl Spin {
         }
         self.owner.store(owner, Ordering::Relaxed);
     }
-    // AGENT: non-blocking acquire performs owner lookup inline and only
-    // succeeds when no owner or queued waiter is ahead, preserving ticket-lock
-    // fairness for blocking acquirers.
-    pub fn try_acquire(&self) -> bool {
-        let owner = spin_owner();
+    // AGENT: non-blocking acquire validates the explicit owner and only succeeds
+    // when no owner or queued waiter is ahead, preserving ticket-lock fairness.
+    pub fn try_acquire(&self, owner: usize) -> bool {
+        validate_spin_owner(owner);
         assert_ne!(
             self.owner.load(Ordering::Relaxed),
             owner,
@@ -74,10 +71,9 @@ impl Spin {
         self.owner.store(owner, Ordering::Relaxed);
         true
     }
-    // AGENT: release verifies the current simulator task owns this Spin without
-    // delegating through a private owner-parameter wrapper.
-    pub fn release(&self) {
-        let owner = spin_owner();
+    // AGENT: release verifies the explicitly supplied task owns this Spin.
+    pub fn release(&self, owner: usize) {
+        validate_spin_owner(owner);
         let current_owner = self.owner.load(Ordering::Relaxed);
         assert!(
             current_owner != SPIN_NO_OWNER,
@@ -100,15 +96,15 @@ impl Spin {
     }
     // AGENT: guard reuses acquire() and records the owner written by acquire()
     // so Drop can release without requiring a still-current task context.
-    pub fn guard(&self) -> SpinGuard<'_> {
-        self.acquire();
+    pub fn guard(&self, owner: usize) -> SpinGuard<'_> {
+        self.acquire(owner);
         let owner = self.owner.load(Ordering::Relaxed);
         SpinGuard { lock: self, owner }
     }
     // AGENT: try_guard reuses try_acquire() and captures the stored owner only
     // after the non-blocking acquisition succeeds.
-    pub fn try_guard(&self) -> Option<SpinGuard<'_>> {
-        if self.try_acquire() {
+    pub fn try_guard(&self, owner: usize) -> Option<SpinGuard<'_>> {
+        if self.try_acquire(owner) {
             let owner = self.owner.load(Ordering::Relaxed);
             Some(SpinGuard { lock: self, owner })
         } else {
@@ -160,15 +156,18 @@ impl<T> SpinLock<T> {
             data: ::core::cell::UnsafeCell::new(data),
         }
     }
-    pub fn lock(&self) -> SpinLockGuard<'_, T> {
-        let guard = self.lock.guard();
+    // AGENT: typed locking forwards the Task::id() selected by the caller to
+    // the untyped Spin owner check.
+    pub fn lock(&self, owner: usize) -> SpinLockGuard<'_, T> {
+        let guard = self.lock.guard(owner);
         SpinLockGuard {
             _guard: guard,
             data: self.data.get(),
         }
     }
-    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
-        self.lock.try_guard().map(|guard| SpinLockGuard {
+    // AGENT: typed try-locking preserves the same explicit owner contract.
+    pub fn try_lock(&self, owner: usize) -> Option<SpinLockGuard<'_, T>> {
+        self.lock.try_guard(owner).map(|guard| SpinLockGuard {
             _guard: guard,
             data: self.data.get(),
         })

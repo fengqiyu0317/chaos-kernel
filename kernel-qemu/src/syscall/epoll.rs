@@ -209,7 +209,7 @@ pub(super) fn sys_epoll_wait(
                 return Ok(0);
             }
         }
-        let Some(token) = inst.prepare_wait() else {
+        let Some(token) = inst.prepare_wait(task.id()) else {
             continue;
         };
         let outcome = match deadline {

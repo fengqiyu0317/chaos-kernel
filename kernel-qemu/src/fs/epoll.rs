@@ -280,12 +280,12 @@ impl EpInst {
     // AGENT: enqueue an epoll_wait token only while the ready list is still
     // empty. Holding inner while enqueueing closes the check-then-sleep race
     // against mark_ready().
-    pub fn prepare_wait(&self) -> Option<WaitToken> {
+    pub fn prepare_wait(&self, task_id: usize) -> Option<WaitToken> {
         let inner = self.inner.lock().unwrap();
         if !inner.ready_list.is_empty() {
             return None;
         }
-        let token = self.waiters.enqueue_current_locked();
+        let token = self.waiters.enqueue_task_locked(task_id);
         Some(token)
     }
     // AGENT: remove a timed-out epoll_wait token from the instance queue.

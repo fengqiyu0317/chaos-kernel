@@ -1,37 +1,13 @@
 // AGENT
 use crate::kernel::kernel_core::arch::CLK;
-use crate::kernel::kernel_core::current::require_current_task_id;
-use crate::kernel::kernel_core::kernel_base::Kernel;
+use crate::kernel::kernel_core::kernel_base::global_kernel;
 use crate::kernel::kernel_core::prelude::*;
 use crate::kernel::kernel_core::time::{duration_to_ticks, global_timer_wheel, TimerTarget};
-
-// AGENT: QEMU wait tokens need a scheduler owner to move tasks between
-// Sleeping and Runnable without threading a Kernel parameter through every
-// migrated kernel-sim wait queue. The pointer must be installed from a leaked
-// or static Kernel before real QEMU task waits are exercised.
-pub(super) static WAIT_KERNEL: AtomicUsize = AtomicUsize::new(0);
-
-// AGENT: install the QEMU scheduler backend used by WaitToken wake/block paths.
-pub fn install_qemu_wait_kernel(kernel: &'static Kernel) {
-    WAIT_KERNEL.store(kernel as *const Kernel as usize, Ordering::Release);
-}
-
-// AGENT: return the installed QEMU kernel backend, if this early carrier stage
-// has one. Wait paths and the RISC-V syscall ABI share this single leaked Kernel.
-pub(crate) fn qemu_wait_kernel() -> Option<&'static Kernel> {
-    let ptr = WAIT_KERNEL.load(Ordering::Acquire);
-    if ptr == 0 {
-        None
-    } else {
-        // SAFETY: install_qemu_wait_kernel only accepts a 'static Kernel.
-        Some(unsafe { &*(ptr as *const Kernel) })
-    }
-}
 
 // AGENT: QEMU timer interrupts use this hook to drive the migrated logical
 // kernel clock and timer wheel once a Kernel has been installed.
 pub(crate) fn qemu_wait_timer_tick() {
-    if let Some(kernel) = qemu_wait_kernel() {
+    if let Some(kernel) = global_kernel() {
         kernel.schedule_tick(0);
     }
 }
@@ -61,13 +37,14 @@ struct WaitState {
 }
 
 impl WaitToken {
-    // AGENT: QEMU wait ownership is the current simulator task, not a host
-    // thread. Kernel::set_cur() publishes this id before syscall/wait code runs.
-    pub fn current() -> Self {
+    // AGENT: bind a wait to the task selected from Processor.current by the
+    // caller, avoiding a second global current-task marker in the sync layer.
+    pub fn for_task(task_id: usize) -> Self {
+        assert_ne!(task_id, 0, "WaitToken needs a nonzero Task::id()");
         Self {
             state: Arc::new(WaitState {
                 outcome: AtomicU8::new(WAIT_PENDING),
-                task_id: require_current_task_id("WaitToken"),
+                task_id,
             }),
         }
     }
@@ -147,7 +124,7 @@ impl WaitToken {
     // scheduler backend. In early carrier smoke paths without a backend, the
     // atomic outcome alone lets a spinning waiter observe completion.
     fn wake_waiter_task(&self) {
-        if let Some(kernel) = qemu_wait_kernel() {
+        if let Some(kernel) = global_kernel() {
             kernel.wake_task_for_wait(self.state.task_id);
         }
     }
@@ -155,7 +132,7 @@ impl WaitToken {
     // AGENT: park the owning task in scheduler state; with CPU0 scheduling
     // active, this returns only after a wakeup requeues and resumes the task.
     fn block_waiter_task(&self) {
-        if let Some(kernel) = qemu_wait_kernel() {
+        if let Some(kernel) = global_kernel() {
             kernel.block_task_for_wait(self.state.task_id);
         }
     }
@@ -163,7 +140,7 @@ impl WaitToken {
     // AGENT: normalize the resumed task state before callers continue; this
     // also preserves focused selftests that do not start the scheduler loop.
     fn finish_waiter_task(&self) {
-        if let Some(kernel) = qemu_wait_kernel() {
+        if let Some(kernel) = global_kernel() {
             kernel.finish_task_wait(self.state.task_id);
         }
     }
@@ -171,7 +148,7 @@ impl WaitToken {
     // AGENT: interruptible waits observe pending task signals separately from
     // resource readiness so syscall code can return EINTR instead of success.
     fn has_interrupting_signal(&self) -> bool {
-        qemu_wait_kernel()
+        global_kernel()
             .is_some_and(|kernel| kernel.task_has_interrupting_signal(self.state.task_id))
     }
 
@@ -289,10 +266,10 @@ impl WaitQueue {
         }
     }
 
-    // AGENT: enqueue the current task while the caller still holds the condition
-    // state lock, then let the caller drop that state lock before blocking.
-    pub fn enqueue_current_locked(&self) -> WaitToken {
-        let token = WaitToken::current();
+    // AGENT: enqueue an explicitly selected task while the caller still holds
+    // the condition state lock, then release that state lock before blocking.
+    pub fn enqueue_task_locked(&self, task_id: usize) -> WaitToken {
+        let token = WaitToken::for_task(task_id);
         let mut q = self.q.lock().unwrap();
         q.push_back(token.clone());
         token
@@ -381,22 +358,37 @@ impl ConditionWait {
         }
     }
 
-    pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
-        self.wait_until(g, |d| if pred(d) { Some(true) } else { None })
+    // AGENT: require the scheduler-aware caller to identify the task that may
+    // be parked instead of resolving current task state inside the wait helper.
+    pub fn park_on<T>(&self, task_id: usize, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
+        self.wait_until(task_id, g, |d| if pred(d) { Some(true) } else { None })
     }
 
-    pub fn wait_ev<T>(&self, g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
-        self.wait_until(g, |d| cond(d))
+    // AGENT: propagate the selected Task::id() through the generic event wait.
+    pub fn wait_ev<T>(
+        &self,
+        task_id: usize,
+        g: &Mutex<T>,
+        mut cond: impl FnMut(&T) -> Option<bool>,
+    ) -> bool {
+        self.wait_until(task_id, g, |d| cond(d))
     }
 
-    pub fn wait_until<T, R>(&self, g: &Mutex<T>, mut cond: impl FnMut(&mut T) -> Option<R>) -> R {
+    // AGENT: bind each queued token to the Task::id() supplied by the caller
+    // while preserving the condition-check and enqueue atomicity.
+    pub fn wait_until<T, R>(
+        &self,
+        task_id: usize,
+        g: &Mutex<T>,
+        mut cond: impl FnMut(&mut T) -> Option<R>,
+    ) -> R {
         loop {
             let token = {
                 let mut d = g.lock().unwrap();
                 if let Some(r) = cond(&mut d) {
                     return r;
                 }
-                self.waiters.enqueue_current_locked()
+                self.waiters.enqueue_task_locked(task_id)
             };
             token.wait(None);
         }
@@ -460,12 +452,14 @@ impl CountingEvent {
         );
     }
 
-    pub fn prepare_wait_locked(&self) -> Option<WaitToken> {
+    // AGENT: consume a saved wake or enqueue the explicitly identified task
+    // without consulting global current-task state.
+    pub fn prepare_wait_locked(&self, task_id: usize) -> Option<WaitToken> {
         let mut q = self.waiters.q.lock().unwrap();
         if self.take_pending_wake_locked() {
             None
         } else {
-            let token = WaitToken::current();
+            let token = WaitToken::for_task(task_id);
             q.push_back(token.clone());
             Some(token)
         }

@@ -9,18 +9,14 @@ impl Kernel {
             .and_then(|processor| processor.lock().unwrap().current())
     }
 
-    // AGENT: publish one Processor current task and the CPU0-only current-id
-    // bridge used by low-level sync code.
+    // AGENT: publish the one authoritative current task for this hart; callers
+    // that create wait state pass the selected Task::id() down explicitly.
     pub fn set_cur(&self, cpu: usize, t: Option<Arc<Task>>) {
         let Some(processor) = self.processors.get(cpu) else {
             return;
         };
-        let task_id = t.as_ref().map(|task| task.id());
         let mut processor = processor.lock().unwrap();
         processor.set_current(t);
-        if cpu == 0 {
-            set_current_task_id(task_id);
-        }
     }
 
     // AGENT: report whether a hart has entered its real idle/task switch loop;
@@ -51,10 +47,9 @@ impl Kernel {
         let contexts = {
             let mut processor = self.processors[0].lock().unwrap();
             if processor.scheduler_active() {
-                processor.take_current_context().map(|current_context| {
-                    set_current_task_id(None);
-                    (current_context, processor.idle_context_ptr())
-                })
+                processor
+                    .take_current_context()
+                    .map(|current_context| (current_context, processor.idle_context_ptr()))
             } else {
                 None
             }

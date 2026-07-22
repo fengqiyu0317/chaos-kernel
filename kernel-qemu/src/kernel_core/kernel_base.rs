@@ -1,5 +1,6 @@
 // AGENT
 use super::*;
+use core::sync::atomic::AtomicPtr;
 
 // AGENT: focused selftests construct several Kernel values on the early QEMU
 // heap, so they use a tiny cache while ordinary boot keeps N_CHAINS.
@@ -53,6 +54,37 @@ pub struct Kernel {
     pub shm_store: RwLock<BTreeMap<usize, Weak<ShmSegment>>>,
     pub tty_buf: Mutex<VecDeque<u8>>,
 }
+
+// AGENT: publish the one boot-lifetime Kernel for architecture, syscall, timer,
+// and wait entry points whose fixed ABI cannot carry an explicit reference.
+// Focused selftests may replace it only with another leaked Kernel.
+static KERNEL: AtomicPtr<Kernel> = AtomicPtr::new(ptr::null_mut());
+
+// AGENT: install a Kernel whose leaked/static lifetime makes lock-free global
+// lookup safe for every later trap and scheduler entry.
+pub fn install_kernel(kernel: &'static Kernel) {
+    KERNEL.store(kernel as *const Kernel as *mut Kernel, Ordering::Release);
+}
+
+// AGENT: return the installed global Kernel without tying general runtime
+// lookup to the synchronization subsystem.
+pub fn global_kernel() -> Option<&'static Kernel> {
+    let kernel = KERNEL.load(Ordering::Acquire);
+    if kernel.is_null() {
+        None
+    } else {
+        // SAFETY: install_kernel accepts only leaked/static Kernel references.
+        Some(unsafe { &*kernel })
+    }
+}
+
+// AGENT: isolate test-only global reset instead of exposing KERNEL mutation to
+// synchronization tests directly.
+#[cfg(any(test, feature = "qemu-sync-selftest"))]
+pub(crate) fn clear_global_kernel_for_test() {
+    KERNEL.store(ptr::null_mut(), Ordering::Release);
+}
+
 impl Kernel {
     // AGENT: construct shared kernel state around a caller-initialized frame
     // pool so QEMU boot can seed only linker/RAM-derived free pages.

@@ -130,11 +130,9 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     {
         println!("[kernel-qemu] user satp selftest start");
         trap::tests::user_satp_exit_round_trip(frame_pool.as_ref());
-        kernel::install_qemu_wait_kernel(kernel);
-        // AGENT: the disposable selftest kernel returned with no CPU0 task;
-        // republish the production init task to the low-level wait owner bridge.
-        let current = kernel.cur_task(0);
-        kernel.set_cur(0, current);
+        // AGENT: focused scheduler tests replace the global Kernel; restore the
+        // production instance before later timer and trap entry points use it.
+        kernel::install_kernel(kernel);
         println!("[kernel-qemu] user satp selftest passed");
     }
     // AGENT: keep the ordinary boot path warning-free while proc selftests are
@@ -204,7 +202,7 @@ fn init_qemu_kernel_backend(frame_pool: kernel::FramePool) -> (&'static kernel::
             }
             None => false,
         };
-    kernel::install_qemu_wait_kernel(kernel);
+    kernel::install_kernel(kernel);
     let current = kernel.cur_task(0).map(|task| task.id()).unwrap_or(0);
     println!(
         "[kernel-qemu] kernel timer backend installed current_task={}",
@@ -284,7 +282,12 @@ fn init_qemu_frame_pool() -> kernel::FramePool {
 // AGENT: Arm a one-tick logical timer target before hardware timer interrupts
 // are enabled; the real interrupt path must expire it through schedule_tick().
 fn arm_timer_wheel_probe() -> kernel::WaitToken {
-    let token = kernel::WaitToken::current();
+    let kernel = kernel::global_kernel().expect("timer probe needs the global Kernel");
+    let task_id = kernel
+        .cur_task(0)
+        .expect("timer probe needs the CPU0 current task")
+        .id();
+    let token = kernel::WaitToken::for_task(task_id);
     let deadline = kernel::CLK.load(Ordering::Relaxed).saturating_add(1);
     let timer_id = {
         let mut timers = kernel::global_timer_wheel().lock();

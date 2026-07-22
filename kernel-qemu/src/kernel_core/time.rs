@@ -41,16 +41,14 @@ pub enum TimerTarget {
     },
 }
 
-// AGENT: timer entries keep a numeric id only for cancellation; behavior lives
-// in TimerTarget.
+// AGENT: keep only independent timer state: interval zero means one-shot,
+// while membership in TimerWheel means the entry is active.
 #[derive(Clone)]
 pub struct TimerEntry {
     pub id: usize,
     pub deadline: usize,
     pub interval: usize,
     pub target: TimerTarget,
-    pub active: bool,
-    pub repeat: bool,
 }
 
 impl TimerEntry {
@@ -58,14 +56,14 @@ impl TimerEntry {
         Self::with_target(id, deadline, interval, TimerTarget::Noop)
     }
 
+    // AGENT: interval is the single source of truth for one-shot versus
+    // repeating behavior, avoiding a separate repeat flag that can disagree.
     pub fn with_target(id: usize, deadline: usize, interval: usize, target: TimerTarget) -> Self {
         Self {
             id,
             deadline,
             interval,
             target,
-            active: true,
-            repeat: interval > 0,
         }
     }
 
@@ -74,12 +72,11 @@ impl TimerEntry {
         CLK.load(Ordering::Relaxed) >= self.deadline
     }
 
-    pub fn reset(&mut self) {
-        if self.repeat {
-            self.deadline = CLK.load(Ordering::Relaxed) + self.interval;
-        } else {
-            self.active = false;
-        }
+    // AGENT: only repeating entries are rescheduled; one-shot entries leave the
+    // wheel permanently after they fire.
+    fn reschedule(&mut self) {
+        debug_assert!(self.interval > 0);
+        self.deadline = CLK.load(Ordering::Relaxed) + self.interval;
     }
 
     pub fn remaining(&self) -> usize {
@@ -91,24 +88,16 @@ impl TimerEntry {
         }
     }
 
-    pub fn cancel(&mut self) {
-        self.active = false;
-    }
-
-    // AGENT: convert task-bound active timers into checkpoint records while
+    // AGENT: convert task-bound registered timers into checkpoint records while
     // rejecting wait-token timers that belong to an in-flight blocking wait.
     fn snapshot_for_checkpoint_task(
         &self,
         task_id: usize,
     ) -> Result<Option<SavedTimer>, &'static str> {
-        if !self.active {
-            return Ok(None);
-        }
-
         let (target_kind, signo, sender_tid) = match &self.target {
             TimerTarget::Noop => return Ok(None),
             TimerTarget::WakeToken { token } if token.task_id() == task_id => {
-                return Err("enotsup")
+                return Err("enotsup");
             }
             TimerTarget::WakeToken { .. } => return Ok(None),
             TimerTarget::WakeTask { task_id: target } if *target == task_id => {
@@ -180,22 +169,24 @@ impl TimerWheel {
         self.slots[slot].push(entry);
     }
 
+    // AGENT: fire due entries, retain future entries, and derive repeating
+    // behavior directly from a nonzero interval.
     pub fn advance(&mut self) -> Vec<TimerEntry> {
         self.current_slot = (self.current_slot + 1) % TIMER_WHEEL_SIZE;
         let mut fired = Vec::new();
         let slot = &mut self.slots[self.current_slot];
         let mut remaining = Vec::new();
         for entry in slot.drain(..) {
-            if entry.active && entry.expired() {
+            if entry.expired() {
                 fired.push(entry);
-            } else if entry.active {
+            } else {
                 remaining.push(entry);
             }
         }
         *slot = remaining;
         for t in fired.iter_mut() {
-            if t.repeat {
-                t.reset();
+            if t.interval > 0 {
+                t.reschedule();
                 let new_slot = t.deadline % TIMER_WHEEL_SIZE;
                 let clone = TimerEntry::with_target(t.id, t.deadline, t.interval, t.target.clone());
                 self.slots[new_slot].push(clone);
@@ -204,13 +195,13 @@ impl TimerWheel {
         fired
     }
 
+    // AGENT: remove canceled timers immediately so wheel membership itself is
+    // the single source of truth for whether a timer remains active.
     pub fn cancel(&mut self, id: usize) -> bool {
         for slot in self.slots.iter_mut() {
-            for entry in slot.iter_mut() {
-                if entry.id == id && entry.active {
-                    entry.active = false;
-                    return true;
-                }
+            if let Some(index) = slot.iter().position(|entry| entry.id == id) {
+                slot.swap_remove(index);
+                return true;
             }
         }
         false
@@ -250,12 +241,10 @@ impl TimerWheel {
         Ok(())
     }
 
+    // AGENT: every entry retained by the wheel is active now that cancellation
+    // removes entries instead of leaving inactive tombstones.
     pub fn active_count(&self) -> usize {
-        self.slots
-            .iter()
-            .flat_map(|s| s.iter())
-            .filter(|e| e.active)
-            .count()
+        self.slots.iter().map(|slot| slot.len()).sum()
     }
 }
 

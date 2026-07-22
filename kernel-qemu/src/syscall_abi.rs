@@ -64,7 +64,7 @@ pub fn dispatch_from_trap_frame(frame: &mut TrapFrame) {
 
 // AGENT: Keep syscall behavior behind a semantic entry rather than in the trap layer.
 fn dispatch_migrated_semantics(request: SyscallRequest, frame: &mut TrapFrame) {
-    match crate::kernel::qemu_wait_kernel() {
+    match crate::kernel::global_kernel() {
         Some(kernel) => dispatch_installed_kernel(kernel, request, frame),
         None => write_return(frame, crate::semantics::dispatch_syscall(request)),
     }

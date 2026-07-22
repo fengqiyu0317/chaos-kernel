@@ -1,7 +1,7 @@
 use core::arch::global_asm;
 use core::cell::UnsafeCell;
 
-use crate::kernel::qemu_wait_kernel;
+use crate::kernel::global_kernel;
 use crate::{println, sbi, trap};
 
 global_asm!(include_str!("context.S"));
@@ -98,7 +98,7 @@ pub unsafe fn switch_kernel_context(current: *mut KernelContext, next: *const Ke
 // complete TrapFrame already installed at the top of its own kernel stack.
 #[no_mangle]
 pub extern "C" fn task_bootstrap() -> ! {
-    let Some(kernel) = qemu_wait_kernel() else {
+    let Some(kernel) = global_kernel() else {
         println!("[kernel-qemu] task bootstrap has no installed kernel");
         sbi::shutdown();
     };

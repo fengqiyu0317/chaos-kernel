@@ -5,7 +5,6 @@ pub mod arch;
 // AGENT: expose focused checkpoint/restore regressions to optional QEMU boot selftests.
 #[cfg(any(test, feature = "qemu-checkpoint-selftest"))]
 pub mod checkpoint_tests;
-pub mod current;
 pub mod kernel_base;
 pub mod kernel_ops;
 pub mod prelude;
@@ -14,7 +13,6 @@ pub mod sync;
 pub mod time;
 
 pub use self::arch::*;
-pub use self::current::*;
 pub use self::kernel_base::*;
 pub use self::kernel_ops::*;
 pub use self::prelude::*;

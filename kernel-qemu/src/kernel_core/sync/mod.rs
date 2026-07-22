@@ -6,9 +6,9 @@
 // Active paths:
 // - GKL/KernLock backs Kernel::tick() through KernLockGuard so release stays
 //   caller-checked and panic-safe.
-// - Spin backs short critical sections through SpinGuard so release is panic-safe
-//   and callers cannot touch the atomic state directly; ownership is keyed by
-//   simulator Task::id() values instead of host std::thread identity.
+// - Spin models short critical sections through SpinGuard so release is
+//   panic-safe; reserved callers must pass a Task::id() selected from
+//   Processor.current rather than consulting a second current-task global.
 // - EvBus/EvFlag is used as event-bit storage by pipe, process exit/signal,
 //   semaphore state transitions, and pipe-backed epoll readiness notification.
 // - WaitToken is the common task wait token used by Channel,
@@ -44,10 +44,8 @@ pub use self::futex::FutexBucket;
 pub use self::kern_lock::{KernLock, KernLockGuard, GKL};
 pub use self::sema::{Sema, SemaGuard};
 pub use self::spin::{Spin, SpinGuard, SpinLock, SpinLockGuard};
-pub use self::wait::{
-    install_qemu_wait_kernel, ConditionWait, CountingEvent, WaitOutcome, WaitToken,
-};
-pub(crate) use self::wait::{qemu_wait_kernel, qemu_wait_timer_tick, WaitQueue};
+pub(crate) use self::wait::{qemu_wait_timer_tick, WaitQueue};
+pub use self::wait::{ConditionWait, CountingEvent, WaitOutcome, WaitToken};
 
 // AGENT: expose WaitToken-focused regressions to both Rust tests and the optional
 // QEMU boot self-test feature, matching the mm/tests.rs pattern.

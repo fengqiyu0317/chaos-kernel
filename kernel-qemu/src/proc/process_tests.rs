@@ -4,11 +4,8 @@ use super::*;
 use crate::trap::TrapFrame;
 
 // AGENT: expose process, initial-stack, and shared ELF image regressions to the
-// optional QEMU boot selftest path while restoring its CPU0 current-id bridge.
+// optional QEMU boot selftest path.
 pub fn run_all(pool: &FramePool) {
-    // AGENT: focused Kernel instances below reuse the CPU0 current-id bridge;
-    // restore the boot kernel's marker before timer/wait selftests continue.
-    let saved_current_task_id = current_task_id();
     capset_inherit_keeps_only_allowed_bits();
     capset_raise_ambient_requires_owned_inheritable_cap();
     capset_drop_cap_clears_ambient();
@@ -45,7 +42,6 @@ pub fn run_all(pool: &FramePool) {
     forked_writable_page_resolves_cow(pool);
     shm_segment_maps_shared_physical_page(pool);
     release_all_pages_drops_same_space_aliases(pool);
-    set_current_task_id(saved_current_task_id);
 }
 
 // AGENT: preserve detailed parser diagnostics for focused parser tests while

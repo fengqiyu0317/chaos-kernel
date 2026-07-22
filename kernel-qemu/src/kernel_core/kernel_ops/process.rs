@@ -213,7 +213,7 @@ impl Kernel {
                 return Ok((0, 0));
             }
 
-            let wait = Self::prepare_child_wait(&parent);
+            let wait = Self::prepare_child_wait(&parent, parent_id);
             if let Some(child) = self.find_waitable_child(&parent, target_pid)? {
                 Self::cancel_child_wait(&parent, wait);
                 return Ok(child);
@@ -288,8 +288,8 @@ impl Kernel {
 
     // AGENT: clear stale child-exit readiness before subscribing so a later
     // child exit changes the event bits and wakes this one-shot waiter.
-    fn prepare_child_wait(parent: &Arc<Process>) -> (WaitToken, usize) {
-        let token = WaitToken::current();
+    fn prepare_child_wait(parent: &Arc<Process>, parent_task_id: usize) -> (WaitToken, usize) {
+        let token = WaitToken::for_task(parent_task_id);
         let wake_token = token.clone();
         let sub_id = {
             let mut ev = parent.ev.lock().unwrap();
