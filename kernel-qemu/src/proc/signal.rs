@@ -31,6 +31,15 @@ pub const fn is_realtime_signal(signo: u32) -> bool {
 // same signo-minus-one mapping used for userspace sigset_t values.
 pub const UNMASKABLE_SIGNAL_MASK: u64 = (1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1));
 
+// AGENT: keep every pending/wakeup/delivery query on one mask rule so stale
+// internal mask bits can never suppress SIGKILL or SIGSTOP.
+pub(crate) const fn signal_is_unblocked_by_mask(mask: u64, signo: u32) -> bool {
+    match signal_bit(signo) {
+        Some(bit) => (bit & UNMASKABLE_SIGNAL_MASK) != 0 || (mask & bit) == 0,
+        None => false,
+    }
+}
+
 // AGENT: keep only signal disposition state with live delivery semantics;
 // sigaction flag support remains an explicit syscall-boundary TODO.
 #[derive(Clone)]

@@ -5,8 +5,8 @@ use crate::kernel::kernel_core::{init_timer_wheel, TIMER_WHEEL};
 use crate::kernel::{
     global_kernel, install_kernel, signal_bit, FramePool, Kernel, SigAction, SigSet,
     SignalDeliveryAction, SignalEnqueueResult, TaskRunState, NSIG, PRIO_MIN, SIGCHLD, SIGCONT,
-    SIGRTMIN, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGWINCH, SIG_DFL,
-    SIG_IGN, SYS_SIGRETURN, USER_SIGTRAMP,
+    SIGKILL, SIGRTMIN, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGWINCH,
+    SIG_DFL, SIG_IGN, SYS_SIGRETURN, UNMASKABLE_SIGNAL_MASK, USER_SIGTRAMP,
 };
 use crate::trap::TrapFrame;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +21,8 @@ pub fn run_all(pool: &FramePool) {
     kernel_boost_updates_task_policy_and_run_queue_order(pool);
     signal_numbering_uses_all_linux_slots();
     highest_signal_can_be_queued_and_blocked(pool);
+    unmaskable_signals_ignore_stale_mask_bits(pool);
+    default_sigcont_does_not_interrupt_wait(pool);
     standard_signals_coalesce_and_realtime_signals_queue(pool);
     default_signal_actions_follow_linux_classes();
     ignored_signal_is_neither_queued_nor_woken(pool);
@@ -182,6 +184,49 @@ fn highest_signal_can_be_queued_and_blocked(pool: &FramePool) {
     assert_eq!(
         task.take_deliverable_signal().map(|signal| signal.signo),
         Some(NSIG)
+    );
+}
+
+// AGENT: enforce the kernel invariant at every query boundary even if internal
+// state contains stale SIGKILL/SIGSTOP mask bits that userspace cannot install.
+fn unmaskable_signals_ignore_stale_mask_bits(pool: &FramePool) {
+    ensure_timer_wheel();
+
+    let kernel = Kernel::new(pool.clone());
+    let task = kernel.tasks.spawn().expect("spawn signal mask task");
+    *task.sig_mask.lock().unwrap() = UNMASKABLE_SIGNAL_MASK;
+
+    for signo in [SIGKILL, SIGSTOP] {
+        assert_eq!(
+            task.enqueue_signal(signo as i32, -1),
+            SignalEnqueueResult::Queued
+        );
+        assert!(task.signal_is_unblocked(signo));
+        assert!(task.has_interrupting_signal());
+        assert_eq!(
+            task.take_deliverable_signal().map(|signal| signal.signo),
+            Some(signo)
+        );
+    }
+}
+
+// AGENT: a default SIGCONT may resume job control but must not turn an unrelated
+// interruptible wait into EINTR; caught SIGCONT remains covered by Handler.
+fn default_sigcont_does_not_interrupt_wait(pool: &FramePool) {
+    ensure_timer_wheel();
+
+    let kernel = Kernel::new(pool.clone());
+    let task = kernel.tasks.spawn().expect("spawn SIGCONT task");
+    assert_eq!(
+        task.enqueue_signal(SIGCONT as i32, -1),
+        SignalEnqueueResult::Queued
+    );
+
+    assert!(!task.has_interrupting_signal());
+    assert_eq!(
+        task.take_deliverable_signal()
+            .map(|signal| signal.action.resolve(signal.signo)),
+        Some(SignalDeliveryAction::Continue)
     );
 }
 

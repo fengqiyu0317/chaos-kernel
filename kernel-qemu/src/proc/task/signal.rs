@@ -10,10 +10,7 @@ impl Task {
     // the syscall boundary already strips unmaskable bits, but enforce them here
     // as well for kernel-generated signals and focused state tests.
     pub(crate) fn signal_is_unblocked(&self, signo: u32) -> bool {
-        let Some(bit) = signal_bit(signo) else {
-            return false;
-        };
-        (bit & UNMASKABLE_SIGNAL_MASK) != 0 || (*self.sig_mask.lock().unwrap() & bit) == 0
+        signal_is_unblocked_by_mask(*self.sig_mask.lock().unwrap(), signo)
     }
 
     // AGENT: only a caught signal or a default terminate/stop action interrupts
@@ -76,8 +73,7 @@ impl Task {
                 return false;
             }
             let signo = *sig as u32;
-            let bit = signal_bit(signo).expect("validated pending signal");
-            if (mask & bit) != 0 {
+            if !signal_is_unblocked_by_mask(mask, signo) {
                 return false;
             }
             sig_state.get_action(signo).is_some_and(|action| {
@@ -99,9 +95,8 @@ impl Task {
         loop {
             let (signo, sender_tid) = {
                 let mut sq = self.process.sig_queue.lock().unwrap();
-                let deliverable = |sig: i32| {
-                    sig > 0 && signal_bit(sig as u32).is_some_and(|bit| (mask & bit) == 0)
-                };
+                let deliverable =
+                    |sig: i32| sig > 0 && signal_is_unblocked_by_mask(mask, sig as u32);
                 let standard_pos = sq
                     .iter()
                     .position(|(sig, _)| deliverable(*sig) && !is_realtime_signal(*sig as u32));
