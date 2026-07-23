@@ -1,6 +1,6 @@
 # kernel-sim 到 QEMU 裸机内核的迁移设计
 
-更新时间：2026-06-30
+更新时间：2026-07-23
 
 ## 目标
 
@@ -302,6 +302,35 @@ QEMU 侧的上下文所有权按下列边界固定，不再保留从 simulator
 - `Task::done()` 只读取线程局部的 `TaskRunState::Zombie`。`Process` 用同一生命周期锁维护 `ProcessPhase::{Running, Exiting, Zombie}` 和线程 TID 集合，使最后线程判断与禁止退出期 clone 成为一个原子状态转换。
 - RISC-V `exit(93)` 进入单线程退出；`exit_group(94)` 和默认终止信号进入线程组退出。非最后线程不得释放 fd、地址空间或 futex waiters，也不得重定向子进程、发布 `CHILD_QUIT` 或发送 `SIGCHLD`。
 - `wait4` / reap 只能观察 `ProcessPhase::Zombie`；`Exiting` 表示资源清理尚未完成，不能提前暴露给父进程。
+
+#### Signal 第二阶段待办：把现场迁移到用户栈
+
+提交 `da7e18f` 已完成第一阶段的 RISC-V signal syscall ABI、真实用户地址空间 copy-in/copy-out、独立用户态 sigreturn trampoline 和 U-mode handler round-trip。第二阶段应在这个基线上把内核 `Task::sig_frames` shadow stack 替换为用户栈上的 Linux RISC-V `rt_sigframe`；在下列任务全部完成并通过回归前，必须继续保留 `Task::sig_frames`：
+
+1. 明确用户 ABI：
+   - 若目标是运行 musl，直接匹配 Linux RISC-V 的 `siginfo_t + ucontext_t` 布局，不把 Rust `TrapFrame` 当成 ABI。
+   - frame 至少保存原信号屏蔽字、原 `sepc` 和 `x1..x31`，所有字段使用固定宽度和显式 offset/size。
+   - frame 起始地址保持 16 字节对齐，并为 `siginfo`、`ucontext` 定义可测试的固定 offset。
+2. 让 `Task::enter_signal_handler()` 成为可失败的用户栈写入：
+   - 从被中断现场的用户 `sp` 使用 checked subtraction 预留 frame，再向下按 16 字节对齐。
+   - 使用 `AddrSpace::write_user_bytes()` 写入编码后的 frame；用户栈溢出、未映射或不可写不能 panic，也不能留下半提交的 handler 现场。
+   - 写入成功后设置 `ra=USER_SIGTRAMP`、`sp=frame_sp`、`a0=signo`、`a1=SIGINFO_ADDR`、`a2=UCONTEXT_ADDR`。
+3. 让 `rt_sigreturn` 只信任用户 frame 中允许恢复的状态：
+   - 从 syscall caller frame 的当前用户 `sp` 定位 `rt_sigframe`，使用 `AddrSpace::read_user_bytes()` copyin 并验证完整 frame。
+   - 只恢复用户 GPR、`sepc` 和信号屏蔽字；恢复 mask 后强制清除 `SIGKILL`、`SIGSTOP`。
+   - `sstatus` 由内核重建并保证 `SPP=0`；不得从用户 frame 恢复 `kernel_satp`、`user_satp`、`kernel_frame`、内核栈地址或其他 trap/trampoline 运行时字段。
+4. 定义坏 frame 的不可返回失败路径：
+   - 错误地址、错误大小/对齐、非法用户 `sepc`/`sp` 或不可接受的恢复状态应终止进程并产生 `SIGSEGV`。
+   - 不允许 sigreturn 失败后从 trampoline 的 `ecall` 继续执行。
+5. 增加真实 U-mode 验收：
+   - 单次 handler `ret -> USER_SIGTRAMP -> rt_sigreturn -> 恢复被中断现场`。
+   - 嵌套信号在用户栈形成连续 frame，并按 LIFO 顺序恢复。
+   - mask 恢复、`SIGKILL`/`SIGSTOP` 强制清除、坏 frame 触发 `SIGSEGV`。
+   - 若以 musl 为目标，增加由其 ABI 布局构造/解释 frame 的兼容测试。
+6. 最后删除内核 shadow stack：
+   - 删除 `Task::sig_frames`、内核 `SigFrame`、构造时的 `Vec::new()`、fork/clone 显式复制、exec `clear()`、exit `mem::take()` 和依赖这些内部状态的旧测试。
+   - 改为验证 fork 通过地址空间 COW 自然继承正在执行的用户 signal frame，exec 更换地址空间后旧 frame 自然消失，exit 只需释放地址空间。
+   - 删除前审查 checkpoint/restore，确认它不会继续假设存在内核 signal-frame stack。
 
 后续按 `kernel-sim` 现有能力逐步迁移：
 

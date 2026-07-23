@@ -1,6 +1,6 @@
 # Chaos 项目交接状态
 
-更新日期：2026-07-22
+更新日期：2026-07-23
 
 ## 目标
 
@@ -519,6 +519,16 @@ cargo test --test pressure
 - `[M8][重要] TODO`: `kernel-sim` 的 `KernLock` 目前仍只是可重入自旋式模拟锁，缺少公平性、阻塞等待、抢占/中断控制等真实内核大锁语义；当前 guard 只解决 owner-checked 释放和 guard 路径的自动释放，若后续要把它作为真实大内核锁模型，应继续补齐这些语义或在接口文档中明确它只是 simulator 简化实现。
 
 ### M9 `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
+
+#### 2026-07-23：RISC-V 用户栈 `rt_sigframe` 第二阶段
+
+- 第一阶段基线：提交 `da7e18f` 已接通 RISC-V signal syscall ABI、真实 `AddrSpace` usercopy、用户态 sigreturn trampoline 和 U-mode handler round-trip；第二阶段完成并通过回归前必须保留 `Task::sig_frames`，不能提前删除内核 shadow frame stack。
+- `[M9][重要] TODO`: 定义与 Linux RISC-V/musl 兼容的用户态 `rt_sigframe` ABI，至少包含 `siginfo_t` 和 `ucontext_t` 中的原信号屏蔽字、原 `sepc`、`x1..x31`；用固定宽度字段和显式 offset/size 表达布局，保证 signal frame 起始地址 16 字节对齐，不把 Rust `TrapFrame` 或内核运行时字段直接暴露为用户 ABI。
+- `[M9][重要] TODO`: 将 `Task::enter_signal_handler()` 改为可失败的用户栈 frame 构造路径：从被中断现场的用户 `sp` checked-subtract frame 大小并向下按 16 字节对齐，通过 `AddrSpace::write_user_bytes()` copyout；成功后设置 `ra=USER_SIGTRAMP`、`sp=frame_sp`、`a0=signo`、`a1=&siginfo`、`a2=&ucontext`。栈溢出、未映射或不可写时走明确的信号失败路径。
+- `[M9][重要] TODO`: 将 `rt_sigreturn` 改为从 syscall caller frame 的当前用户 `sp` 定位 frame，并用 `AddrSpace::read_user_bytes()` copyin；只恢复用户 GPR、`sepc` 和信号屏蔽字，强制清除 `SIGKILL`/`SIGSTOP` mask，重新构造保证 `SPP=0` 的 `sstatus`，不得接受用户提供的 `kernel_satp`、`user_satp`、`kernel_frame` 等内核运行时元数据。
+- `[M9][重要] TODO`: 为无效 `rt_sigframe` 定义不可返回的失败语义：错误地址、错误大小/对齐、非法 `sepc`/用户 `sp` 或不可接受的恢复状态应终止进程并产生 `SIGSEGV`，不能让 trampoline 的 `ecall` 返回后继续执行。
+- `[M9][重要] TODO`: 增加真实 U-mode 回归，至少覆盖单次 handler `ret -> USER_SIGTRAMP -> rt_sigreturn`、嵌套信号形成连续用户栈 frame、mask 恢复及不可屏蔽信号清除、坏 frame 触发 `SIGSEGV`；若目标包含 musl，再用其 RISC-V `siginfo_t/ucontext_t` 布局做 ABI 兼容验证。
+- `[M9][重要] TODO`: 上述用户栈版本全部通过后，再删除 `Task::sig_frames`、内核 `SigFrame` 及其构造、fork/clone 复制、exec 清空、exit `mem::take()` 和旧测试断言；改为验证 fork 通过地址空间 COW 继承栈上 frame、exec 换地址空间自然丢弃旧 frame、exit 仅随地址空间释放清理。删除前必须确认 checkpoint/restore 对正在执行的 signal frame 没有残留的内核 shadow-state 假设。
 
 #### 2026-07-22：收缩并最终取消低地址恒等映射
 
