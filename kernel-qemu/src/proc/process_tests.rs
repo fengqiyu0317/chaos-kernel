@@ -1250,6 +1250,21 @@ fn prepared_user_image_loads_elf_segment_and_stack(pool: &FramePool) {
         .addr_space
         .write_user_bytes(segment_vaddr, b"x", pool)
         .is_err());
+    let sigtramp = image
+        .addr_space
+        .mapped_region(USER_SIGTRAMP)
+        .expect("prepared user image should contain the signal restorer page");
+    assert_eq!(sigtramp.flags, VM_READ | VM_EXEC);
+    let mut sigtramp_code = [0u8; USER_SIGTRAMP_CODE.len()];
+    image
+        .addr_space
+        .read_user_bytes(USER_SIGTRAMP, &mut sigtramp_code)
+        .expect("signal restorer code should be readable");
+    assert_eq!(sigtramp_code, USER_SIGTRAMP_CODE);
+    assert!(image
+        .addr_space
+        .write_user_bytes(USER_SIGTRAMP, b"x", pool)
+        .is_err());
 
     let sp = image.user_entry.stack_pointer;
     assert_eq!(image.addr_space.read_user_usize(sp).unwrap(), 1);

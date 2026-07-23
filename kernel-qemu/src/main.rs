@@ -130,9 +130,12 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     {
         println!("[kernel-qemu] user satp selftest start");
         trap::tests::user_satp_exit_round_trip(frame_pool.as_ref());
+        println!("[kernel-qemu] user signal round-trip selftest start");
+        trap::tests::user_signal_round_trip(frame_pool.as_ref());
         // AGENT: focused scheduler tests replace the global Kernel; restore the
         // production instance before later timer and trap entry points use it.
         kernel::install_kernel(kernel);
+        println!("[kernel-qemu] user signal round-trip selftest passed");
         println!("[kernel-qemu] user satp selftest passed");
     }
     // AGENT: keep the ordinary boot path warning-free while proc selftests are

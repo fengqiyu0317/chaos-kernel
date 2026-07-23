@@ -306,12 +306,13 @@ fn prepare_user_return(task: &Task, frame: &mut TrapFrame) -> Result<(), &'stati
         return Err("ekstk");
     }
     let trap_context_paddr = task.user_trap_frame_page_paddr()?;
-    let user_satp = task
-        .process
-        .addr_space
-        .lock()
-        .unwrap()
-        .bind_cpu0_user_trap(trampoline_paddr(), trap_context_paddr, &kernel.pool)?;
+    let user_satp = {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        // AGENT: cover hand-built/bootstrap address spaces as well as exec
+        // images before any handler can receive USER_SIGTRAMP in ra.
+        addr_space.ensure_user_sigtramp(&kernel.pool)?;
+        addr_space.bind_cpu0_user_trap(trampoline_paddr(), trap_context_paddr, &kernel.pool)?
+    };
     let kernel_satp = csr::read_satp();
     if kernel_satp == 0 || kernel_satp == user_satp {
         return Err("esatp");
@@ -484,11 +485,69 @@ impl TrapFrame {
 #[cfg(any(test, feature = "qemu-sched-selftest"))]
 pub mod tests {
     use super::*;
-    use crate::kernel::{install_kernel, FramePool, Kernel, VmRegion, VM_EXEC, VM_READ, VM_WRITE};
+    use crate::kernel::{
+        install_kernel, signal_bit, FramePool, Kernel, Task, TaskRunState, VmRegion, SIGUSR1,
+        SIGUSR2, VM_EXEC, VM_READ, VM_WRITE,
+    };
     use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::mem;
 
     const USER_CODE: usize = 0x0001_0000;
     const USER_STACK: usize = 0x0002_0000;
+    const USER_DATA: usize = 0x0003_0000;
+    const USER_HANDLER: usize = USER_CODE + 0x100;
+
+    // AGENT: create a non-init process that can terminate back to the finite
+    // idle-side selftest without invoking the real init-shutdown policy.
+    fn prepare_user_test_task(kernel: &Kernel) -> Arc<Task> {
+        kernel.proc_init();
+        let task = kernel.tasks.spawn().expect("user test task should spawn");
+        task.set_sched_state(TaskRunState::Runnable);
+        kernel.run_queue.enqueue(&task);
+        task
+    }
+
+    // AGENT: encode one RV64 I-format instruction for the hand-written U-mode
+    // signal program without depending on a userspace toolchain at boot.
+    fn rv_i(opcode: u32, funct3: u32, rd: u32, rs1: u32, imm: i32) -> u32 {
+        assert!(rd < 32 && rs1 < 32 && (-2048..=2047).contains(&imm));
+        ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+    }
+
+    // AGENT: encode one RV64 S-format store used by the userspace handler.
+    fn rv_s(opcode: u32, funct3: u32, rs1: u32, rs2: u32, imm: i32) -> u32 {
+        assert!(rs1 < 32 && rs2 < 32 && (-2048..=2047).contains(&imm));
+        let immediate = imm as u32 & 0xfff;
+        ((immediate >> 5) << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (funct3 << 12)
+            | ((immediate & 0x1f) << 7)
+            | opcode
+    }
+
+    // AGENT: encode one RV64 register-register instruction for the final
+    // exit-code proof assembled by the userspace program.
+    fn rv_r(opcode: u32, funct3: u32, funct7: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+        assert!(rd < 32 && rs1 < 32 && rs2 < 32);
+        (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+    }
+
+    // AGENT: encode one RV64 U-format instruction for page-aligned user data.
+    fn rv_u(opcode: u32, rd: u32, value: usize) -> u32 {
+        assert!(rd < 32 && value <= u32::MAX as usize);
+        (value as u32 & 0xffff_f000) | (rd << 7) | opcode
+    }
+
+    // AGENT: serialize RV64 instruction words in the little-endian byte order
+    // consumed by the QEMU virt CPU.
+    fn write_user_instructions(dst: &mut [u8], words: &[u32]) {
+        assert!(dst.len() >= words.len() * mem::size_of::<u32>());
+        for (bytes, word) in dst.chunks_exact_mut(4).zip(words.iter()) {
+            bytes.copy_from_slice(&word.to_le_bytes());
+        }
+    }
 
     // AGENT: execute real RISC-V user instructions under a process satp, return
     // to U-mode after getpid, then prove SYS_EXIT reaches idle on kernel satp
@@ -496,8 +555,7 @@ pub mod tests {
     pub fn user_satp_exit_round_trip(pool: &FramePool) {
         let kernel_satp = csr::read_satp();
         let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
-        kernel.proc_init();
-        let task = kernel.cur_task(0).expect("init task should be current");
+        let task = prepare_user_test_task(kernel);
 
         let instructions = [
             0x0ac0_0893u32, // addi a7, zero, 172 (getpid)
@@ -538,6 +596,117 @@ pub mod tests {
         assert_eq!(csr::read_satp(), kernel_satp);
         assert!(kernel.cur_task(0).is_none());
         assert!(task.done());
+        assert!(task.kernel_stack_top().is_none());
+    }
+
+    // AGENT: run rt_sigprocmask, rt_sigaction, kill, a normal handler `ret`,
+    // USER_SIGTRAMP's rt_sigreturn ecall, restored code, and exit in real U-mode.
+    pub fn user_signal_round_trip(pool: &FramePool) {
+        const ACTION_OFFSET: usize = 0;
+        const SET_OFFSET: usize = 0x20;
+        const OLD_SET_OFFSET: usize = 0x28;
+        const QUERY_SET_OFFSET: usize = 0x30;
+        const OLD_ACTION_OFFSET: usize = 0x40;
+        const HANDLER_RESULT_OFFSET: usize = 0x80;
+        const HANDLER_RESULT: usize = 42;
+        const EXPECTED_EXIT_CODE: usize = HANDLER_RESULT + 1;
+
+        let kernel_satp = csr::read_satp();
+        let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
+        let task = prepare_user_test_task(kernel);
+
+        let addi = |rd, rs1, imm| rv_i(0x13, 0, rd, rs1, imm);
+        let lui = |rd, value| rv_u(0x37, rd, value);
+        let ecall = 0x0000_0073u32;
+        let main = [
+            addi(10, 0, 0), // SIG_BLOCK
+            lui(11, USER_DATA),
+            addi(11, 11, SET_OFFSET as i32), // set
+            lui(12, USER_DATA),
+            addi(12, 12, OLD_SET_OFFSET as i32), // oldset
+            addi(13, 0, 8),                      // sigsetsize
+            addi(17, 0, 135),                    // rt_sigprocmask
+            ecall,
+            addi(10, 0, SIGUSR1 as i32), // signo
+            lui(11, USER_DATA),
+            addi(11, 11, ACTION_OFFSET as i32), // act
+            lui(12, USER_DATA),
+            addi(12, 12, OLD_ACTION_OFFSET as i32), // oldact
+            addi(13, 0, 8),                         // sigsetsize
+            addi(17, 0, 134),                       // rt_sigaction
+            ecall,
+            addi(17, 0, 172), // getpid
+            ecall,
+            addi(11, 0, SIGUSR1 as i32),
+            addi(17, 0, 129), // kill(self, SIGUSR1)
+            ecall,
+            addi(10, 0, 2), // SIG_SETMASK
+            addi(11, 0, 0), // query only
+            lui(12, USER_DATA),
+            addi(12, 12, QUERY_SET_OFFSET as i32), // restored old mask
+            addi(13, 0, 8),
+            addi(17, 0, 135), // rt_sigprocmask
+            ecall,
+            lui(5, USER_DATA),
+            rv_i(0x03, 3, 6, 5, HANDLER_RESULT_OFFSET as i32), // ld t1, result(t0)
+            rv_i(0x03, 3, 7, 5, QUERY_SET_OFFSET as i32),      // ld t2, mask(t0)
+            rv_i(0x13, 5, 7, 7, (SIGUSR2 - 1) as i32),         // srli t2, t2, 11
+            rv_r(0x33, 0, 0, 10, 6, 7),                        // add a0, t1, t2
+            addi(17, 0, 93),                                   // exit
+            ecall,
+            0x0000_006f, // unreachable loop
+        ];
+        let handler = [
+            lui(5, USER_DATA),
+            addi(6, 0, HANDLER_RESULT as i32),
+            rv_s(0x23, 3, 5, 6, HANDLER_RESULT_OFFSET as i32), // sd t1, result(t0)
+            rv_i(0x67, 0, 0, 1, 0),                            // ret
+        ];
+        let mut code = [0u8; 0x110];
+        write_user_instructions(&mut code[..main.len() * 4], &main);
+        write_user_instructions(&mut code[0x100..], &handler);
+
+        let mut data = [0u8; HANDLER_RESULT_OFFSET + mem::size_of::<usize>()];
+        data[ACTION_OFFSET..ACTION_OFFSET + 8].copy_from_slice(&USER_HANDLER.to_ne_bytes());
+        let blocked = signal_bit(SIGUSR2).expect("SIGUSR2 should have a mask bit");
+        data[SET_OFFSET..SET_OFFSET + 8].copy_from_slice(&blocked.to_ne_bytes());
+
+        {
+            let mut addr_space = task.process.addr_space.lock().unwrap();
+            addr_space
+                .map_region(
+                    VmRegion::new(USER_CODE, PAGE_SZ, VM_READ | VM_WRITE | VM_EXEC),
+                    pool,
+                )
+                .expect("user signal code page should map");
+            addr_space
+                .write_user_bytes(USER_CODE, &code, pool)
+                .expect("user signal code should copy");
+            addr_space
+                .protect(USER_CODE, PAGE_SZ, VM_READ | VM_EXEC)
+                .expect("user signal code should become read-execute");
+            addr_space
+                .map_region(VmRegion::new(USER_DATA, PAGE_SZ, VM_READ | VM_WRITE), pool)
+                .expect("user signal data page should map");
+            addr_space
+                .write_user_bytes(USER_DATA, &data, pool)
+                .expect("user signal ABI data should copy");
+            addr_space
+                .map_region(VmRegion::new(USER_STACK, PAGE_SZ, VM_READ | VM_WRITE), pool)
+                .expect("user signal stack page should map");
+        }
+        task.install_user_trap_frame(TrapFrame::for_user_entry(USER_CODE, USER_STACK + PAGE_SZ))
+            .expect("user signal frame should install");
+        install_kernel(kernel);
+
+        assert!(kernel.run_one_cpu0_task_for_test());
+        assert_eq!(csr::read_satp(), kernel_satp);
+        assert!(kernel.cur_task(0).is_none());
+        assert!(task.done());
+        assert_eq!(
+            task.process.zombie_wait_status(),
+            Some(EXPECTED_EXIT_CODE << 8)
+        );
         assert!(task.kernel_stack_top().is_none());
     }
 }

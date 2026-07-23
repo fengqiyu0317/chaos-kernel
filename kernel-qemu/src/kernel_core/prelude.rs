@@ -32,6 +32,13 @@ pub const SV39_LOWER_TOP: usize = 1usize << 38;
 pub const TRAMPOLINE: usize = SV39_LOWER_TOP - PAGE_SZ;
 pub const TRAP_CONTEXT: usize = TRAMPOLINE - PAGE_SZ;
 pub const USER_TOP: usize = TRAP_CONTEXT;
+// AGENT: reserve the final ordinary user page for the RV64 rt_sigreturn stub;
+// unlike TRAMPOLINE, this page is U-mode readable/executable.
+pub const USER_SIGTRAMP: usize = USER_TOP - PAGE_SZ;
+pub const USER_SIGTRAMP_CODE: [u8; 8] = [
+    0x93, 0x08, 0xb0, 0x08, // addi a7, zero, 139 (rt_sigreturn)
+    0x73, 0x00, 0x00, 0x00, // ecall
+];
 pub const N_PROC: usize = 256;
 pub const MAX_FD: usize = 256; // AGENT
 pub const N_FRAMES: usize = 65536;

@@ -101,6 +101,7 @@ impl Task {
         *self.sig_mask.lock().unwrap() = next_mask;
 
         let mut next = interrupted;
+        next.regs[1] = USER_SIGTRAMP;
         next.regs[10] = sig.signo as usize;
         next.regs[11] = sig.sender_tid as usize;
         next.regs[12] = interrupted_pc;

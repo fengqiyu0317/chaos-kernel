@@ -9,6 +9,10 @@ pub const RISCV_SYS_UMOUNT2: usize = 39;
 pub const RISCV_SYS_MOUNT: usize = 40;
 pub const RISCV_SYS_READ: usize = 63;
 pub const RISCV_SYS_WRITE: usize = 64;
+pub const RISCV_SYS_KILL: usize = 129;
+pub const RISCV_SYS_RT_SIGACTION: usize = 134;
+pub const RISCV_SYS_RT_SIGPROCMASK: usize = 135;
+pub const RISCV_SYS_RT_SIGRETURN: usize = 139;
 pub const RISCV_SYS_BRK: usize = 214;
 pub const RISCV_SYS_EXIT: usize = 93;
 pub const RISCV_SYS_EXIT_GROUP: usize = 94;
@@ -20,7 +24,11 @@ pub const INTERNAL_SYS_BRK: usize = 12;
 pub const INTERNAL_SYS_EXIT: usize = 60;
 pub const INTERNAL_SYS_EXIT_GROUP: usize = 231;
 pub const INTERNAL_SYS_GETPID: usize = 39;
+pub const INTERNAL_SYS_KILL: usize = 62;
 pub const INTERNAL_SYS_MOUNT: usize = 165;
+pub const INTERNAL_SYS_RT_SIGACTION: usize = 13;
+pub const INTERNAL_SYS_RT_SIGPROCMASK: usize = 14;
+pub const INTERNAL_SYS_RT_SIGRETURN: usize = 15;
 pub const INTERNAL_SYS_UMOUNT2: usize = 166;
 
 // AGENT: Decoded RISC-V syscall request before it reaches migrated kernel-sim semantics.
@@ -38,6 +46,10 @@ pub fn map_riscv_nr(nr: usize) -> Option<usize> {
         RISCV_SYS_MOUNT => Some(INTERNAL_SYS_MOUNT),
         RISCV_SYS_READ => Some(INTERNAL_SYS_READ),
         RISCV_SYS_WRITE => Some(INTERNAL_SYS_WRITE),
+        RISCV_SYS_KILL => Some(INTERNAL_SYS_KILL),
+        RISCV_SYS_RT_SIGACTION => Some(INTERNAL_SYS_RT_SIGACTION),
+        RISCV_SYS_RT_SIGPROCMASK => Some(INTERNAL_SYS_RT_SIGPROCMASK),
+        RISCV_SYS_RT_SIGRETURN => Some(INTERNAL_SYS_RT_SIGRETURN),
         RISCV_SYS_BRK => Some(INTERNAL_SYS_BRK),
         RISCV_SYS_EXIT => Some(INTERNAL_SYS_EXIT),
         RISCV_SYS_EXIT_GROUP => Some(INTERNAL_SYS_EXIT_GROUP),
@@ -179,10 +191,11 @@ pub fn write_return(frame: &mut TrapFrame, value: usize) {
 // filesystem selftest without widening the private ABI conversion interface.
 #[cfg(any(test, feature = "qemu-fs-selftest"))]
 pub mod tests {
-    use super::errno_ret;
+    use super::*;
 
     pub fn run_all() {
         standard_errno_names_use_linux_riscv_numbers();
+        signal_syscalls_map_to_migrated_semantics();
     }
 
     // AGENT: keep every audited file/exec errno distinguishable from EINVAL at
@@ -200,5 +213,24 @@ pub mod tests {
         ] {
             assert_eq!(errno_ret(name), (-(errno as isize)) as usize);
         }
+    }
+
+    // AGENT: pin the four asm-generic RISC-V signal syscall numbers to the
+    // existing migrated signal-semantic entries.
+    #[cfg_attr(test, test)]
+    fn signal_syscalls_map_to_migrated_semantics() {
+        assert_eq!(map_riscv_nr(RISCV_SYS_KILL), Some(INTERNAL_SYS_KILL));
+        assert_eq!(
+            map_riscv_nr(RISCV_SYS_RT_SIGACTION),
+            Some(INTERNAL_SYS_RT_SIGACTION)
+        );
+        assert_eq!(
+            map_riscv_nr(RISCV_SYS_RT_SIGPROCMASK),
+            Some(INTERNAL_SYS_RT_SIGPROCMASK)
+        );
+        assert_eq!(
+            map_riscv_nr(RISCV_SYS_RT_SIGRETURN),
+            Some(INTERNAL_SYS_RT_SIGRETURN)
+        );
     }
 }

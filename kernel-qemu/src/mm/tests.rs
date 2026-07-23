@@ -3,7 +3,7 @@
 use super::*;
 use crate::kernel::{
     check_access, check_access_rw, hash_combine, BuddyAllocator, FramePool, VmMap, VmRegion,
-    MEM_OFF, PAGE_SZ, TRAMPOLINE, TRAP_CONTEXT, USER_TOP, VM_READ, VM_WRITE,
+    MEM_OFF, PAGE_SZ, TRAMPOLINE, TRAP_CONTEXT, USER_SIGTRAMP, USER_TOP, VM_READ, VM_WRITE,
 };
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -167,6 +167,7 @@ fn vm_map_insert_rejects_invalid_ranges_and_overlaps() {
 fn user_range_checks_reserve_trap_pages() {
     assert_eq!(USER_TOP, TRAP_CONTEXT);
     assert_eq!(TRAP_CONTEXT + PAGE_SZ, TRAMPOLINE);
+    assert_eq!(USER_SIGTRAMP + PAGE_SZ, USER_TOP);
     assert!(check_access(USER_TOP - PAGE_SZ, PAGE_SZ));
     assert!(check_access_rw(USER_TOP - PAGE_SZ, PAGE_SZ, true));
     assert!(!check_access(USER_TOP - PAGE_SZ, PAGE_SZ + 1));

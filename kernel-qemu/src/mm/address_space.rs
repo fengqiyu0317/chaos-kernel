@@ -90,6 +90,39 @@ impl AddrSpace {
         }
     }
 
+    // AGENT: install the dedicated U-mode rt_sigreturn code page once, or
+    // verify an inherited/restored copy before the address space enters U-mode.
+    pub(crate) fn ensure_user_sigtramp(&mut self, pool: &FramePool) -> Result<(), &'static str> {
+        if let Some(flags) = self.mapped_region(USER_SIGTRAMP).map(|region| region.flags) {
+            if flags != (VM_READ | VM_EXEC) {
+                return Err("eacces");
+            }
+            let mut code = [0u8; USER_SIGTRAMP_CODE.len()];
+            self.read_user_bytes(USER_SIGTRAMP, &mut code)?;
+            return if code == USER_SIGTRAMP_CODE {
+                Ok(())
+            } else {
+                Err("eacces")
+            };
+        }
+
+        self.map_region(
+            VmRegion::new(USER_SIGTRAMP, PAGE_SZ, VM_READ | VM_WRITE),
+            pool,
+        )?;
+        if let Err(err) = self.write_user_bytes(USER_SIGTRAMP, &USER_SIGTRAMP_CODE, pool) {
+            self.unmap_range(USER_SIGTRAMP, PAGE_SZ, pool)
+                .expect("new signal trampoline mapping should roll back");
+            return Err(err);
+        }
+        if let Err(err) = self.protect(USER_SIGTRAMP, PAGE_SZ, VM_READ | VM_EXEC) {
+            self.unmap_range(USER_SIGTRAMP, PAGE_SZ, pool)
+                .expect("new signal trampoline protection should roll back");
+            return Err(err);
+        }
+        Ok(())
+    }
+
     // AGENT: derive the switch token from the live Sv39 root instead of storing
     // a simulator-only vm_token_id.
     pub fn vm_token(&self) -> Result<usize, &'static str> {

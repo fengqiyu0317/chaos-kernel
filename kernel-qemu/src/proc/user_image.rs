@@ -209,6 +209,10 @@ fn populate_user_image(
     } = elf;
     let load_regions = normalize_elf_load_regions(&load_segments)?;
 
+    // AGENT: every executable user image owns the same fixed RX restorer page;
+    // mapping it first also rejects an ELF that tries to occupy the ABI slot.
+    addr_space.ensure_user_sigtramp(pool)?;
+
     // AGENT: map each maximal permission run once with temporary write access;
     // shared boundary pages retain the union of all covering segment flags.
     for region in &load_regions {

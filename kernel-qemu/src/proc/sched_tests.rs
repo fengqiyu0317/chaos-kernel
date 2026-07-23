@@ -6,6 +6,7 @@ use crate::kernel::{
     global_kernel, install_kernel, signal_bit, FramePool, Kernel, SigAction, SigSet,
     SignalDeliveryAction, TaskRunState, NSIG, PRIO_MIN, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP,
     SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGWINCH, SIG_DFL, SIG_IGN, SYS_SIGRETURN,
+    USER_SIGTRAMP,
 };
 use crate::trap::TrapFrame;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +39,14 @@ fn processor_releases_exited_stack_after_idle_handoff(pool: &FramePool) {
 
     let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     kernel.proc_init();
-    let task = kernel.cur_task(0).expect("init task should be current");
+    // AGENT: init exit is the real machine-shutdown policy; use a queued
+    // ordinary process for this finite task -> idle -> assertion round trip.
+    let task = kernel
+        .tasks
+        .spawn()
+        .expect("processor exit test task should spawn");
+    task.set_sched_state(TaskRunState::Runnable);
+    kernel.run_queue.enqueue(&task);
     task.install_test_kernel_entry(processor_exit_test_task)
         .expect("test task should receive kernel entry");
     assert!(task.kernel_stack_top().is_some());
@@ -443,11 +451,12 @@ fn signal_handler_uses_supplied_interrupted_frame(pool: &FramePool) {
         .expect("handler delivery should produce a next frame");
 
     assert_eq!(next.sepc, handler);
+    assert_eq!(next.regs[1], USER_SIGTRAMP);
     assert_eq!(next.regs[10], SIGUSR1 as usize);
     assert_eq!(next.regs[11], 77);
     assert_eq!(next.regs[12], interrupted.sepc);
     for index in 0..interrupted.regs.len() {
-        if !matches!(index, 10..=12) {
+        if !matches!(index, 1 | 10..=12) {
             assert_eq!(next.regs[index], interrupted.regs[index]);
         }
     }

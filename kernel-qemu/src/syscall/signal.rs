@@ -1,14 +1,82 @@
 // AGENT
 use super::*;
 
-// AGENT: matches the userspace litc sigaction layout used by kernel-sim tests.
-#[repr(C)]
+const KERNEL_SIGSET_SIZE: usize = mem::size_of::<u64>();
+const _: () = assert!(mem::size_of::<usize>() == KERNEL_SIGSET_SIZE);
+
+// AGENT: match the RV64 asm-generic kernel rt_sigaction ABI: RISC-V has no
+// SA_RESTORER field, and the extensible signal mask is the final 8-byte field.
 #[derive(Clone, Copy)]
-struct UserSigAction {
-    sa_handler: usize,
-    sa_sigaction: usize,
-    sa_mask: u64,
-    sa_flags: i32,
+struct UserRtSigAction {
+    handler: usize,
+    flags: usize,
+    mask: u64,
+}
+
+// AGENT: keep fixed ABI encoding separate from Rust layout and route every
+// userspace access through the live AddrSpace translation helpers.
+impl UserRtSigAction {
+    const SIZE: usize = mem::size_of::<usize>() * 2 + KERNEL_SIGSET_SIZE;
+
+    // AGENT: copy in one RV64 kernel sigaction without dereferencing its user VA.
+    fn read_from(task: &Task, addr: usize) -> Result<Self, &'static str> {
+        let mut bytes = [0u8; Self::SIZE];
+        task.process
+            .addr_space
+            .lock()
+            .unwrap()
+            .read_user_bytes(addr, &mut bytes)?;
+
+        let mut handler = [0u8; mem::size_of::<usize>()];
+        handler.copy_from_slice(&bytes[..8]);
+        let mut flags = [0u8; mem::size_of::<usize>()];
+        flags.copy_from_slice(&bytes[8..16]);
+        let mut mask = [0u8; KERNEL_SIGSET_SIZE];
+        mask.copy_from_slice(&bytes[16..24]);
+        Ok(Self {
+            handler: usize::from_ne_bytes(handler),
+            flags: usize::from_ne_bytes(flags),
+            mask: u64::from_ne_bytes(mask),
+        })
+    }
+
+    // AGENT: copy out one RV64 kernel sigaction through the writable user VMA.
+    fn write_to(&self, kernel: &Kernel, task: &Task, addr: usize) -> Result<(), &'static str> {
+        let mut bytes = [0u8; Self::SIZE];
+        bytes[..8].copy_from_slice(&self.handler.to_ne_bytes());
+        bytes[8..16].copy_from_slice(&self.flags.to_ne_bytes());
+        bytes[16..24].copy_from_slice(&self.mask.to_ne_bytes());
+        task.process
+            .addr_space
+            .lock()
+            .unwrap()
+            .write_user_bytes(addr, &bytes, &kernel.pool)
+    }
+}
+
+// AGENT: copy one RV64 kernel sigset_t from the current process page table.
+fn read_user_sigset(task: &Task, addr: usize) -> Result<u64, &'static str> {
+    let mut bytes = [0u8; KERNEL_SIGSET_SIZE];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(addr, &mut bytes)?;
+    Ok(u64::from_ne_bytes(bytes))
+}
+
+// AGENT: copy one RV64 kernel sigset_t to the current process page table.
+fn write_user_sigset(
+    kernel: &Kernel,
+    task: &Task,
+    addr: usize,
+    set: u64,
+) -> Result<(), &'static str> {
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .write_user_bytes(addr, &set.to_ne_bytes(), &kernel.pool)
 }
 
 // AGENT: accept Linux signal numbers through 64 while retaining signal zero as
@@ -92,58 +160,55 @@ pub(super) fn sys_sigaction(
     a1: usize,
     a2: usize,
     a3: usize,
-    a4: usize,
 ) -> Result<usize, &'static str> {
     let signo = a0;
     let act_addr = a1;
     let oldact_addr = a2;
-    let act_size = mem::size_of::<UserSigAction>();
+    let sigsetsize = a3;
+    if sigsetsize != KERNEL_SIGSET_SIZE {
+        return Err("einval");
+    }
     if signo == 0 || signo > NSIG as usize {
         return Err("einval");
     }
     if signo == SIGKILL as usize || signo == SIGSTOP as usize {
         return Err("einval");
-    } // AGENT: fix inverted condition
-    if act_addr != 0 && !check_access(act_addr, act_size) {
-        return Err("efault");
-    }
-    if oldact_addr != 0 && !check_access(oldact_addr, act_size) {
-        return Err("efault");
     }
     let cur = kernel.cur_task(0).ok_or("esrch")?;
     let signo = signo as u32;
 
-    if oldact_addr != 0 {
-        let action = {
-            let sig_state = cur.process.sig_state.lock().unwrap();
-            sig_state.get_action(signo).ok_or("einval")?.clone()
-        };
-        let old = UserSigAction {
-            sa_handler: action.handler,
-            sa_sigaction: action.handler,
-            sa_mask: action.mask,
-            sa_flags: 0,
-        };
-        unsafe {
-            ptr::write_unaligned(oldact_addr as *mut UserSigAction, old);
-        }
-    }
-
-    if act_addr != 0 {
-        let act = unsafe { ptr::read_unaligned(act_addr as *const UserSigAction) };
-        let requested_flags = if a3 != 0 { a3 } else { act.sa_flags as usize };
+    let requested = if act_addr == 0 {
+        None
+    } else {
+        let action = UserRtSigAction::read_from(&cur, act_addr)?;
         // TODO(AGENT): implement sigaction flags as one coherent delivery
         // feature, starting with real SA_SIGINFO frames; until then reject
         // nonzero flags instead of storing or partially honoring them.
-        if requested_flags != 0 {
+        if action.flags != 0 {
             return Err("enotsup");
         }
-        let sa_mask = if a4 != 0 { a4 as u64 } else { act.sa_mask };
+        Some(action)
+    };
+
+    let old_action = {
+        let sig_state = cur.process.sig_state.lock().unwrap();
+        sig_state.get_action(signo).ok_or("einval")?.clone()
+    };
+    if oldact_addr != 0 {
+        UserRtSigAction {
+            handler: old_action.handler,
+            flags: 0,
+            mask: old_action.mask,
+        }
+        .write_to(kernel, &cur, oldact_addr)?;
+    }
+
+    if let Some(action) = requested {
         if !cur.process.set_signal_action(
             signo,
             SigAction {
-                handler: act.sa_handler,
-                mask: sa_mask,
+                handler: action.handler,
+                mask: action.mask,
             },
         ) {
             return Err("einval");
@@ -159,33 +224,34 @@ pub(super) fn sys_sigprocmask(
     a0: usize,
     a1: usize,
     a2: usize,
+    a3: usize,
 ) -> Result<usize, &'static str> {
     let how = a0;
     let set_addr = a1;
     let oldset_addr = a2;
-    const SIG_BLOCK_HOW: usize = 1;
+    let sigsetsize = a3;
+    const SIG_BLOCK_HOW: usize = 0;
+    const SIG_UNBLOCK_HOW: usize = 1;
     const SIG_SETMASK_HOW: usize = 2;
-    const SIG_UNBLOCK_HOW: usize = 3;
-    if set_addr != 0 && !check_access(set_addr, 8) {
-        return Err("efault");
-    }
-    if oldset_addr != 0 && !check_access(oldset_addr, 8) {
-        return Err("efault");
+    if sigsetsize != KERNEL_SIGSET_SIZE {
+        return Err("einval");
     }
     // AGENT: userspace sigset_t maps signal N to bit N-1, including the
     // unmaskable SIGKILL and SIGSTOP bits removed at this syscall boundary.
     let unmaskable = UNMASKABLE_SIGNAL_MASK;
     let t = kernel.cur_task(0).ok_or("esrch")?;
+    // AGENT: capture the requested set before copy-out so aliased set/oldset
+    // pointers retain Linux's input value rather than the overwritten old mask.
+    let requested_set = if set_addr == 0 {
+        None
+    } else {
+        Some(read_user_sigset(&t, set_addr)?)
+    };
     let old_mask = *t.sig_mask.lock().unwrap();
     if oldset_addr != 0 {
-        // AGENT: expose the previous blocked-set value back to userspace.
-        unsafe {
-            ptr::write_unaligned(oldset_addr as *mut u64, old_mask);
-        }
+        write_user_sigset(kernel, &t, oldset_addr, old_mask)?;
     }
-    if set_addr != 0 {
-        // AGENT: userspace passes a pointer to sigset_t, not the mask value itself.
-        let new_set = unsafe { ptr::read_unaligned(set_addr as *const u64) };
+    if let Some(new_set) = requested_set {
         let mut mask = t.sig_mask.lock().unwrap();
         match how {
             SIG_BLOCK_HOW => {
