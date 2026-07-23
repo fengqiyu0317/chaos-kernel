@@ -122,44 +122,54 @@ impl Kernel {
     }
 
     // AGENT: route process-directed signals through the process thread set so
-    // family and pid callers never need to store or rediscover a leader Task.
+    // family and pid callers never need to store or rediscover a leader Task;
+    // prefer an unblocked thread so a sleeping eligible receiver is awakened.
     pub fn send_signal_to_process(&self, process: &Arc<Process>, signo: i32, sender_pid: isize) {
-        let target = process
+        let live_tasks: Vec<_> = process
             .thread_ids()
             .into_iter()
             .filter_map(|tid| self.tasks.find_task(tid))
-            .find(|task| !task.done());
+            .filter(|task| !task.done())
+            .collect();
+        let target = live_tasks
+            .iter()
+            .find(|task| signo > 0 && task.signal_is_unblocked(signo as u32))
+            .or_else(|| live_tasks.first());
         if let Some(target) = target {
-            self.send_signal_to_task(&target, signo, sender_pid);
+            self.send_signal_to_task(target, signo, sender_pid);
         }
     }
 
     // AGENT: keep thread-target selection, pending-signal enqueue, and scheduler
-    // wakeup together after a target Task has been selected.
+    // wakeup together after a target Task has been selected; blocked/default-
+    // continue signals remain pending without spuriously completing a wait.
     pub fn send_signal_to_task(&self, task: &Arc<Task>, signo: i32, sender_tid: isize) {
         if signo <= 0 || signo as u32 > NSIG {
             return;
         }
         let signo = signo as u32;
-        let queued = task.enqueue_signal(signo as i32, sender_tid);
-        if task.done() || (!queued && signo != SIGCONT && signo != SIGKILL) {
+        let enqueue_result = task.enqueue_signal(signo as i32, sender_tid);
+        if task.done() || enqueue_result == SignalEnqueueResult::Rejected {
             return;
         }
-        match signo {
-            SIGCONT => {
-                self.set_process_job_stopped(task, false);
+        if signo == SIGCONT {
+            self.set_process_job_stopped(task, false);
+        }
+        if enqueue_result == SignalEnqueueResult::Ignored {
+            return;
+        }
+        if signo == SIGKILL {
+            self.set_process_job_stopped(task, false);
+            if task.sched_state() == TaskRunState::Sleeping {
+                self.make_task_runnable(task);
             }
-            SIGKILL => {
-                self.set_process_job_stopped(task, false);
-                if task.sched_state() == TaskRunState::Sleeping {
-                    self.make_task_runnable(task);
-                }
-            }
-            _ if task.process.is_job_stopped() => {}
-            _ if task.sched_state() == TaskRunState::Sleeping => {
-                self.wake_task_for_wait(task.id());
-            }
-            _ => {}
+            return;
+        }
+        if task.process.is_job_stopped() {
+            return;
+        }
+        if task.sched_state() == TaskRunState::Sleeping && task.signal_interrupts_wait(signo) {
+            self.wake_task_for_wait(task.id());
         }
     }
 

@@ -9,7 +9,6 @@ impl EvFlag {
     pub const CLOSED: u32 = 1 << 3;
     pub const PROC_QUIT: u32 = 1 << 10;
     pub const CHILD_QUIT: u32 = 1 << 11;
-    pub const RECV_SIG: u32 = 1 << 12;
     pub const SEM_RM: u32 = 1 << 20;
     pub const SEM_ACQ: u32 = 1 << 21;
 }

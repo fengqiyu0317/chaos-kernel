@@ -4,9 +4,9 @@ use super::*;
 use crate::kernel::kernel_core::{init_timer_wheel, TIMER_WHEEL};
 use crate::kernel::{
     global_kernel, install_kernel, signal_bit, FramePool, Kernel, SigAction, SigSet,
-    SignalDeliveryAction, TaskRunState, NSIG, PRIO_MIN, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP,
-    SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGWINCH, SIG_DFL, SIG_IGN, SYS_SIGRETURN,
-    USER_SIGTRAMP,
+    SignalDeliveryAction, SignalEnqueueResult, TaskRunState, NSIG, PRIO_MIN, SIGCHLD, SIGCONT,
+    SIGRTMIN, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGWINCH, SIG_DFL,
+    SIG_IGN, SYS_SIGRETURN, USER_SIGTRAMP,
 };
 use crate::trap::TrapFrame;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -21,9 +21,12 @@ pub fn run_all(pool: &FramePool) {
     kernel_boost_updates_task_policy_and_run_queue_order(pool);
     signal_numbering_uses_all_linux_slots();
     highest_signal_can_be_queued_and_blocked(pool);
+    standard_signals_coalesce_and_realtime_signals_queue(pool);
     default_signal_actions_follow_linux_classes();
     ignored_signal_is_neither_queued_nor_woken(pool);
     changing_to_ignored_action_discards_pending_signal(pool);
+    sigcont_and_stop_generation_discard_pending_opposites(pool);
+    process_signal_wakes_an_unblocked_thread(pool);
     signal_stop_and_sigcont_cover_thread_group(pool);
     sigcont_resumes_stopped_task_without_resuming_for_plain_signal(pool);
     sigcont_keeps_sleeping_task_asleep_until_wait_wakeup(pool);
@@ -182,6 +185,56 @@ fn highest_signal_can_be_queued_and_blocked(pool: &FramePool) {
     );
 }
 
+// AGENT: retain one pending instance and its first sender for standard signals,
+// but queue realtime duplicates and deliver them by signal number then FIFO.
+fn standard_signals_coalesce_and_realtime_signals_queue(pool: &FramePool) {
+    ensure_timer_wheel();
+
+    let kernel = Kernel::new(pool.clone());
+    let task = kernel.tasks.spawn().expect("spawn signal queue task");
+    assert_eq!(
+        task.enqueue_signal(SIGUSR1 as i32, 10),
+        SignalEnqueueResult::Queued
+    );
+    assert_eq!(
+        task.enqueue_signal(SIGUSR1 as i32, 11),
+        SignalEnqueueResult::AlreadyPending
+    );
+
+    let realtime_high = SIGRTMIN + 2;
+    assert_eq!(
+        task.enqueue_signal(realtime_high as i32, 20),
+        SignalEnqueueResult::Queued
+    );
+    assert_eq!(
+        task.enqueue_signal(SIGRTMIN as i32, 21),
+        SignalEnqueueResult::Queued
+    );
+    assert_eq!(
+        task.enqueue_signal(realtime_high as i32, 22),
+        SignalEnqueueResult::Queued
+    );
+    assert_eq!(task.process.sig_queue.lock().unwrap().len(), 4);
+
+    let delivered: Vec<_> = (0..4)
+        .map(|_| {
+            let signal = task
+                .take_deliverable_signal()
+                .expect("queued signal should be deliverable");
+            (signal.signo, signal.sender_tid)
+        })
+        .collect();
+    assert_eq!(
+        delivered,
+        vec![
+            (SIGUSR1, 10),
+            (SIGRTMIN, 21),
+            (realtime_high, 20),
+            (realtime_high, 22),
+        ]
+    );
+}
+
 // AGENT: keep the SIG_DFL policy table pinned to the Linux/RISC-V ignore,
 // continue, stop, and terminate classes supported by the current carrier.
 #[cfg_attr(test, test)]
@@ -230,7 +283,10 @@ fn changing_to_ignored_action_discards_pending_signal(pool: &FramePool) {
 
     let kernel = Kernel::new(pool.clone());
     let task = kernel.tasks.spawn().expect("spawn worker");
-    assert!(task.enqueue_signal(SIGUSR1 as i32, -1));
+    assert_eq!(
+        task.enqueue_signal(SIGUSR1 as i32, -1),
+        SignalEnqueueResult::Queued
+    );
     assert!(task.process.set_signal_action(
         SIGUSR1,
         SigAction {
@@ -247,11 +303,106 @@ fn changing_to_ignored_action_discards_pending_signal(pool: &FramePool) {
             mask: 0,
         },
     ));
-    assert!(task.enqueue_signal(SIGURG as i32, -1));
+    assert_eq!(
+        task.enqueue_signal(SIGURG as i32, -1),
+        SignalEnqueueResult::Queued
+    );
     assert!(task
         .process
         .set_signal_action(SIGURG, SigAction::default_action()));
     assert!(task.process.sig_queue.lock().unwrap().is_empty());
+}
+
+// AGENT: apply the generation-time job-control rule even when the newly
+// generated opposite signal is ignored by its current disposition.
+fn sigcont_and_stop_generation_discard_pending_opposites(pool: &FramePool) {
+    ensure_timer_wheel();
+
+    let kernel = Kernel::new(pool.clone());
+    let task = kernel.tasks.spawn().expect("spawn job-control queue task");
+    assert_eq!(
+        task.enqueue_signal(SIGSTOP as i32, -1),
+        SignalEnqueueResult::Queued
+    );
+    assert_eq!(
+        task.enqueue_signal(SIGCONT as i32, -1),
+        SignalEnqueueResult::Queued
+    );
+    assert_eq!(
+        task.process
+            .sig_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(signo, _)| *signo)
+            .collect::<Vec<_>>(),
+        vec![SIGCONT as i32]
+    );
+
+    assert_eq!(
+        task.enqueue_signal(SIGTSTP as i32, -1),
+        SignalEnqueueResult::Queued
+    );
+    assert_eq!(
+        task.process
+            .sig_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(signo, _)| *signo)
+            .collect::<Vec<_>>(),
+        vec![SIGTSTP as i32]
+    );
+
+    assert!(task.process.set_signal_action(
+        SIGCONT,
+        SigAction {
+            handler: SIG_IGN,
+            mask: 0,
+        },
+    ));
+    assert_eq!(
+        task.enqueue_signal(SIGCONT as i32, -1),
+        SignalEnqueueResult::Ignored
+    );
+    assert!(task.process.sig_queue.lock().unwrap().is_empty());
+}
+
+// AGENT: a process-directed signal chooses an unblocked sibling for scheduler
+// wakeup and remains pending without waking any thread when every mask blocks it.
+fn process_signal_wakes_an_unblocked_thread(pool: &FramePool) {
+    ensure_timer_wheel();
+
+    let kernel = Kernel::new(pool.clone());
+    let leader = kernel.tasks.spawn().expect("spawn process leader");
+    let thread = kernel
+        .tasks
+        .clone_thread(&leader, 0x8000_0000, 0)
+        .expect("clone signal receiver");
+    let signal_mask = signal_bit(SIGUSR1).expect("SIGUSR1 has a mask bit");
+    *leader.sig_mask.lock().unwrap() = signal_mask;
+    leader.set_sched_state(TaskRunState::Sleeping);
+    thread.set_sched_state(TaskRunState::Sleeping);
+
+    kernel.send_signal_to_process(&leader.process, SIGUSR1 as i32, -1);
+
+    assert_eq!(leader.sched_state(), TaskRunState::Sleeping);
+    assert_eq!(thread.sched_state(), TaskRunState::Runnable);
+    assert_eq!(kernel.run_queue.pick_next(), Some(thread.id()));
+    assert_eq!(
+        thread.take_deliverable_signal().map(|signal| signal.signo),
+        Some(SIGUSR1)
+    );
+
+    kernel.run_queue.remove(thread.id());
+    *thread.sig_mask.lock().unwrap() = signal_mask;
+    thread.set_sched_state(TaskRunState::Sleeping);
+    kernel.send_signal_to_process(&leader.process, SIGUSR1 as i32, -1);
+
+    assert_eq!(leader.sched_state(), TaskRunState::Sleeping);
+    assert_eq!(thread.sched_state(), TaskRunState::Sleeping);
+    assert_eq!(kernel.run_queue.pick_next(), None);
+    assert_eq!(leader.process.sig_queue.lock().unwrap().len(), 1);
 }
 
 // AGENT: QEMU boot selftests initialize the timer wheel in rust_main(), while

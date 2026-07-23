@@ -161,6 +161,9 @@ pub const SCHED_BATCH: u8 = 3;
 // AGENT: Linux/RISC-V exposes signal numbers 1 through 64 inclusive; signal
 // tables and masks translate that public number to the zero-based slot/bit.
 pub const NSIG: u32 = 64;
+// AGENT: asm-generic Linux ABIs, including RISC-V, reserve 32..=64 for
+// realtime signals whose duplicate instances must remain queued.
+pub const SIGRTMIN: u32 = 32;
 pub const SIG_DFL: usize = 0;
 pub const SIG_IGN: usize = 1;
 pub const SIGKILL: u32 = 9;

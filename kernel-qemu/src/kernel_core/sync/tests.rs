@@ -44,7 +44,7 @@ pub fn run_all(pool: &FramePool) {
     wait_token_block_current_keeps_placeholder_stack(pool);
     wait_token_tick_leaves_sleeping_current_parked(pool);
     wait_token_interruptible_wait_reports_signal_not_event(pool);
-    wait_token_reblocks_after_masked_signal_wake(pool);
+    wait_token_stays_blocked_after_masked_signal(pool);
     wait_token_sleeping_wait_reports_later_signal(pool);
     futex_wait_returns_changed_without_queueing();
     futex_wait_propagates_word_read_fault();
@@ -297,10 +297,9 @@ fn wait_token_interruptible_wait_reports_signal_not_event(pool: &FramePool) {
     clear_wait_token_state();
 }
 
-// AGENT: a masked signal may make a Sleeping task runnable without completing
-// its WaitToken; after that scheduler round trip the task must sleep again until
-// the watched event really wins.
-fn wait_token_reblocks_after_masked_signal_wake(pool: &FramePool) {
+// AGENT: a masked signal remains pending without waking a Sleeping task or
+// completing its WaitToken; only the watched event resumes this wait.
+fn wait_token_stays_blocked_after_masked_signal(pool: &FramePool) {
     reset_wait_token_state();
 
     let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
@@ -319,8 +318,6 @@ fn wait_token_reblocks_after_masked_signal_wake(pool: &FramePool) {
     assert!(!token.is_woken());
 
     kernel.send_signal_to_task(&task, SIGUSR1 as i32, -1);
-    assert_eq!(task.sched_state(), TaskRunState::Runnable);
-    assert!(kernel.run_one_cpu0_task_for_test());
     assert_eq!(task.sched_state(), TaskRunState::Sleeping);
     assert!(!token.is_woken());
     assert_eq!(*WAIT_ROUND_TRIP_OUTCOME.lock().unwrap(), None);

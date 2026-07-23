@@ -21,6 +21,12 @@ pub const fn signal_bit(signo: u32) -> Option<u64> {
     }
 }
 
+// AGENT: distinguish realtime signals before applying pending-queue
+// coalescing and delivery ordering.
+pub const fn is_realtime_signal(signo: u32) -> bool {
+    signo >= SIGRTMIN && signo <= NSIG
+}
+
 // AGENT: SIGKILL and SIGSTOP can never be blocked; express their mask with the
 // same signo-minus-one mapping used for userspace sigset_t values.
 pub const UNMASKABLE_SIGNAL_MASK: u64 = (1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1));
@@ -84,6 +90,16 @@ pub struct PendingSignal {
     pub signo: u32,
     pub sender_tid: isize,
     pub action: SigAction,
+}
+
+// AGENT: let the scheduler distinguish a newly queued or coalesced pending
+// signal from one discarded by disposition or rejected by task lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SignalEnqueueResult {
+    Queued,
+    AlreadyPending,
+    Ignored,
+    Rejected,
 }
 
 // AGENT: current QEMU signal state keeps dispositions only; pending signals

@@ -6,24 +6,64 @@ use crate::trap::TrapFrame;
 // AGENT: centralize signal operations whose mutable state belongs to one Task
 // or its shared Process rather than to the Kernel scheduler.
 impl Task {
-    // AGENT: enqueue a non-duplicated standard pending signal for this process.
-    pub(crate) fn enqueue_signal(&self, signo: i32, sender_tid: isize) -> bool {
-        if signo <= 0 || signo as u32 > NSIG {
+    // AGENT: report whether this thread may currently receive one valid signal;
+    // the syscall boundary already strips unmaskable bits, but enforce them here
+    // as well for kernel-generated signals and focused state tests.
+    pub(crate) fn signal_is_unblocked(&self, signo: u32) -> bool {
+        let Some(bit) = signal_bit(signo) else {
+            return false;
+        };
+        (bit & UNMASKABLE_SIGNAL_MASK) != 0 || (*self.sig_mask.lock().unwrap() & bit) == 0
+    }
+
+    // AGENT: only a caught signal or a default terminate/stop action interrupts
+    // a blocking syscall; ignored/default-continue signals do not report EINTR.
+    pub(crate) fn signal_interrupts_wait(&self, signo: u32) -> bool {
+        if !self.signal_is_unblocked(signo) {
             return false;
         }
+        self.process
+            .sig_state
+            .lock()
+            .unwrap()
+            .get_action(signo)
+            .is_some_and(|action| {
+                matches!(
+                    action.resolve(signo),
+                    SignalDeliveryAction::Handler(_)
+                        | SignalDeliveryAction::Stop
+                        | SignalDeliveryAction::Terminate
+                )
+            })
+    }
+
+    // AGENT: apply Linux generation rules to the process-wide pending queue:
+    // standard signals coalesce, realtime instances queue, and SIGCONT/stop
+    // signals discard their pending opposites before disposition is consulted.
+    pub(crate) fn enqueue_signal(&self, signo: i32, sender_tid: isize) -> SignalEnqueueResult {
+        if signo <= 0 || signo as u32 > NSIG {
+            return SignalEnqueueResult::Rejected;
+        }
+        if self.done() || self.process.is_terminating() || self.process.is_zombie() {
+            return SignalEnqueueResult::Rejected;
+        }
+        let signo = signo as u32;
         let mut sq = self.process.sig_queue.lock().unwrap();
+        if signo == SIGCONT {
+            sq.retain(|(pending, _)| !is_stop_signal(*pending));
+        } else if is_stop_signal(signo as i32) {
+            sq.retain(|(pending, _)| *pending != SIGCONT as i32);
+        }
         let sig_state = self.process.sig_state.lock().unwrap();
-        if sig_state.is_ignored(signo as u32) {
-            return false;
+        if sig_state.is_ignored(signo) {
+            return SignalEnqueueResult::Ignored;
         }
         drop(sig_state);
-        if sq.iter().any(|(sig, _)| *sig == signo) {
-            return false;
+        if !is_realtime_signal(signo) && sq.iter().any(|(pending, _)| *pending == signo as i32) {
+            return SignalEnqueueResult::AlreadyPending;
         }
-        sq.push_back((signo, sender_tid));
-        drop(sq);
-        self.process.ev.lock().unwrap().set(EvFlag::RECV_SIG);
-        true
+        sq.push_back((signo as i32, sender_tid));
+        SignalEnqueueResult::Queued
     }
 
     // AGENT: restore a signal that could not be delivered without user context.
@@ -33,7 +73,6 @@ impl Task {
             .lock()
             .unwrap()
             .push_front((signo, sender_tid));
-        self.process.ev.lock().unwrap().set(EvFlag::RECV_SIG);
     }
 
     // AGENT: detect pending signals that should interrupt a blocking syscall.
@@ -50,21 +89,38 @@ impl Task {
             if (mask & bit) != 0 {
                 return false;
             }
-            sig_state
-                .get_action(signo)
-                .is_some_and(|action| action.resolve(signo) != SignalDeliveryAction::Ignore)
+            sig_state.get_action(signo).is_some_and(|action| {
+                matches!(
+                    action.resolve(signo),
+                    SignalDeliveryAction::Handler(_)
+                        | SignalDeliveryAction::Stop
+                        | SignalDeliveryAction::Terminate
+                )
+            })
         })
     }
 
-    // AGENT: select the first unblocked non-ignored pending signal for delivery.
+    // AGENT: select an unblocked standard signal before realtime signals, then
+    // use ascending realtime signal number while preserving FIFO among equal
+    // realtime instances.
     pub fn take_deliverable_signal(&self) -> Option<PendingSignal> {
         let mask = *self.sig_mask.lock().unwrap();
         loop {
             let (signo, sender_tid) = {
                 let mut sq = self.process.sig_queue.lock().unwrap();
-                let pos = sq.iter().position(|(sig, _)| {
-                    *sig > 0 && signal_bit(*sig as u32).is_some_and(|bit| (mask & bit) == 0)
-                })?;
+                let deliverable = |sig: i32| {
+                    sig > 0 && signal_bit(sig as u32).is_some_and(|bit| (mask & bit) == 0)
+                };
+                let standard_pos = sq
+                    .iter()
+                    .position(|(sig, _)| deliverable(*sig) && !is_realtime_signal(*sig as u32));
+                let realtime_pos = sq
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (sig, _))| deliverable(*sig) && is_realtime_signal(*sig as u32))
+                    .min_by_key(|(_, (sig, _))| *sig)
+                    .map(|(pos, _)| pos);
+                let pos = standard_pos.or(realtime_pos)?;
                 sq.remove(pos)?
             };
             let action = {
@@ -116,4 +172,10 @@ impl Task {
         *self.sig_mask.lock().unwrap() = frame.saved_mask;
         Ok(frame.saved_frame)
     }
+}
+
+// AGENT: keep the job-control stop class explicit so enqueue-time SIGCONT
+// cancellation cannot drift from default stop-action resolution.
+fn is_stop_signal(signo: i32) -> bool {
+    matches!(signo as u32, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
 }
