@@ -137,14 +137,6 @@ impl WaitToken {
         }
     }
 
-    // AGENT: normalize the resumed task state before callers continue; this
-    // also preserves focused selftests that do not start the scheduler loop.
-    fn finish_waiter_task(&self) {
-        if let Some(kernel) = global_kernel() {
-            kernel.finish_task_wait(self.state.task_id);
-        }
-    }
-
     // AGENT: interruptible waits observe pending task signals separately from
     // resource readiness so syscall code can return EINTR instead of success.
     fn has_interrupting_signal(&self) -> bool {
@@ -188,7 +180,6 @@ impl WaitToken {
             None => None,
         };
 
-        let mut ever_blocked = false;
         while !self.is_woken() {
             if interruptible && self.has_interrupting_signal() {
                 self.wake_signal();
@@ -200,13 +191,9 @@ impl WaitToken {
             // such spurious wake instead of spinning forever after the first
             // block round trip.
             self.block_waiter_task();
-            ever_blocked = true;
             if self.is_woken() {
                 break;
             }
-        }
-        if ever_blocked {
-            self.finish_waiter_task();
         }
 
         let outcome = self.outcome();

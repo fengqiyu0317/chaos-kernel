@@ -179,11 +179,6 @@ impl Process {
         self.lifecycle.lock().unwrap().threads.len()
     }
 
-    // AGENT: report exact thread membership for focused lifecycle tests.
-    pub fn has_thread(&self, tid: Tid) -> bool {
-        self.lifecycle.lock().unwrap().threads.contains(&tid)
-    }
-
     // AGENT: drain every retained thread id exactly once after Zombie has made
     // the process reapable; non-last exited threads were removed immediately.
     pub(in crate::kernel::proc) fn take_threads(&self) -> Vec<Tid> {

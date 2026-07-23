@@ -1143,7 +1143,7 @@ fn clone_thread_copies_caller_context_and_shares_process(pool: &FramePool) {
         .expect("thread clone should succeed");
 
     assert!(Arc::ptr_eq(&task.process, &thread.process));
-    assert!(task.process.has_thread(thread.id()));
+    assert!(task.process.thread_ids().contains(&thread.id()));
     assert_eq!(*thread.sig_mask.lock().unwrap(), sig_mask);
     let thread_sched = thread.sched.lock().unwrap();
     assert_eq!(thread_sched.policy.prio, PRIO_MIN + 4);

@@ -37,7 +37,6 @@ pub fn run_all(pool: &FramePool) {
     wait_token_timer_target_times_out_on_schedule_tick(pool);
     wait_token_event_wake_uses_installed_scheduler_backend(pool);
     wait_token_block_current_keeps_placeholder_stack(pool);
-    wait_token_current_wake_finishes_without_requeue(pool);
     wait_token_tick_leaves_sleeping_current_parked(pool);
     wait_token_interruptible_wait_reports_signal_not_event(pool);
     wait_token_reblocks_after_masked_signal_wake(pool);
@@ -242,29 +241,6 @@ fn wait_token_block_current_keeps_placeholder_stack(pool: &FramePool) {
     assert_eq!(task.sched_state(), TaskRunState::Sleeping);
     assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(task.id()));
     assert_eq!(kernel.run_queue.pick_next(), Some(peer.id()));
-
-    clear_wait_token_state();
-}
-
-// AGENT: waking the task whose stack is still spinning should not enqueue a
-// duplicate runnable entry; wait completion restores it to Running in place.
-fn wait_token_current_wake_finishes_without_requeue(pool: &FramePool) {
-    reset_wait_token_state();
-
-    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
-    kernel.proc_init();
-    install_kernel(kernel);
-    let task = kernel.cur_task(0).expect("init task should be current");
-    let token = WaitToken::for_task(task.id());
-
-    assert!(kernel.block_task_for_wait(task.id()));
-    assert!(token.wake_event());
-    assert_eq!(task.sched_state(), TaskRunState::Runnable);
-    assert_eq!(kernel.run_queue.pick_next(), None);
-
-    assert!(kernel.finish_task_wait(task.id()));
-    assert_eq!(task.sched_state(), TaskRunState::Running);
-    assert_eq!(kernel.run_queue.pick_next(), None);
 
     clear_wait_token_state();
 }

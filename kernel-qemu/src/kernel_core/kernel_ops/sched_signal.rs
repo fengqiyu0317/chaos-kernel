@@ -87,32 +87,6 @@ impl Kernel {
         true
     }
 
-    // AGENT: normalize a completed wait after either a real idle round trip or
-    // the metadata-only compatibility bridge used before scheduler activation.
-    pub(crate) fn finish_task_wait(&self, task_id: usize) -> bool {
-        let Some(task) = self.tasks.find_task(task_id) else {
-            return false;
-        };
-        if task.done() {
-            return false;
-        }
-        if task.is_job_stopped() {
-            return false;
-        }
-        if self.is_current_task_on_cpu0(task_id) {
-            self.run_queue.remove(task_id);
-            task.set_sched_state(TaskRunState::Running);
-            task.reset_slice();
-            return true;
-        }
-
-        if task.sched_state() == TaskRunState::Sleeping {
-            task.set_sched_state(TaskRunState::Runnable);
-            self.enqueue_task_if_ready(&task);
-        }
-        true
-    }
-
     // AGENT: publish a voluntary CPU0 yield before returning through the idle
     // context; the RISC-V sched_yield ABI can reuse this boundary when added.
     pub fn yield_current(&self, cpu: usize) -> bool {
