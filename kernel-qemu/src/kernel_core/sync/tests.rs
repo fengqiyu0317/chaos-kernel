@@ -16,6 +16,11 @@ use crate::kernel::{
 // run_all executes them serially on CPU0.
 static WAIT_ROUND_TRIP_TOKEN: Mutex<Option<WaitToken>> = Mutex::new(None);
 static WAIT_ROUND_TRIP_OUTCOME: Mutex<Option<WaitOutcome>> = Mutex::new(None);
+// AGENT: share one futex/result pair with task-stack round-trip regressions so
+// Event and Signal exercise FutexBucket::wait through the real scheduler path.
+static FUTEX_ROUND_TRIP_BUCKET: Mutex<Option<Arc<FutexBucket>>> = Mutex::new(None);
+static FUTEX_ROUND_TRIP_RESULT: Mutex<Option<Result<(), &'static str>>> = Mutex::new(None);
+const FUTEX_ROUND_TRIP_ADDR: usize = 0xB000;
 
 // AGENT: include storage/fd allocator regressions and use the boot-discovered
 // physical pool for tests that allocate real task kernel-stack pages.
@@ -44,6 +49,8 @@ pub fn run_all(pool: &FramePool) {
     futex_wait_returns_changed_without_queueing();
     futex_wait_propagates_word_read_fault();
     futex_wait_timeout_removes_published_waiter();
+    futex_wait_event_removes_published_waiter(pool);
+    futex_wait_signal_removes_published_waiter(pool);
     futex_cmp_requeue_propagates_word_read_fault();
     futex_requeue_skips_completed_waiters_when_moving();
     pipe_uses_bounded_ring_buffer_and_reports_writable();
@@ -449,6 +456,100 @@ fn futex_wait_timeout_removes_published_waiter() {
     assert_eq!(futex.pending_at(addr), 0);
 
     clear_wait_token_state();
+}
+
+// AGENT: a real FUTEX_WAKE round trip must return success and leave no waiter,
+// even though the event producer currently also unlinks the selected entry.
+fn futex_wait_event_removes_published_waiter(pool: &FramePool) {
+    reset_wait_token_state();
+
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init task should be current");
+    let futex = Arc::new(FutexBucket::new());
+    *FUTEX_ROUND_TRIP_BUCKET.lock().unwrap() = Some(futex.clone());
+    *FUTEX_ROUND_TRIP_RESULT.lock().unwrap() = None;
+    task.install_test_kernel_entry(futex_wait_round_trip_test_task)
+        .expect("futex wait test task should receive kernel entry");
+    install_kernel(kernel);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    assert_eq!(futex.pending_at(FUTEX_ROUND_TRIP_ADDR), 1);
+    assert_eq!(*FUTEX_ROUND_TRIP_RESULT.lock().unwrap(), None);
+
+    assert_eq!(futex.wake(FUTEX_ROUND_TRIP_ADDR, 1), 1);
+    assert_eq!(task.sched_state(), TaskRunState::Runnable);
+    assert!(kernel.run_one_cpu0_task_for_test());
+
+    assert_eq!(*FUTEX_ROUND_TRIP_RESULT.lock().unwrap(), Some(Ok(())));
+    assert_eq!(futex.pending_at(FUTEX_ROUND_TRIP_ADDR), 0);
+    assert!(task.done());
+
+    *FUTEX_ROUND_TRIP_BUCKET.lock().unwrap() = None;
+    *FUTEX_ROUND_TRIP_RESULT.lock().unwrap() = None;
+    clear_wait_token_state();
+}
+
+// AGENT: an interrupting signal must return EINTR and let finish_wait unlink
+// the published futex waiter rather than leaving a completed queue entry.
+fn futex_wait_signal_removes_published_waiter(pool: &FramePool) {
+    reset_wait_token_state();
+
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init task should be current");
+    let futex = Arc::new(FutexBucket::new());
+    *FUTEX_ROUND_TRIP_BUCKET.lock().unwrap() = Some(futex.clone());
+    *FUTEX_ROUND_TRIP_RESULT.lock().unwrap() = None;
+    task.install_test_kernel_entry(futex_wait_round_trip_test_task)
+        .expect("futex wait test task should receive kernel entry");
+    install_kernel(kernel);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    assert_eq!(futex.pending_at(FUTEX_ROUND_TRIP_ADDR), 1);
+    assert_eq!(*FUTEX_ROUND_TRIP_RESULT.lock().unwrap(), None);
+
+    kernel.send_signal_to_task(&task, SIGUSR1 as i32, -1);
+    assert_eq!(task.sched_state(), TaskRunState::Runnable);
+    assert!(kernel.run_one_cpu0_task_for_test());
+
+    assert_eq!(*FUTEX_ROUND_TRIP_RESULT.lock().unwrap(), Some(Err("eintr")));
+    assert_eq!(futex.pending_at(FUTEX_ROUND_TRIP_ADDR), 0);
+    assert!(task.done());
+
+    *FUTEX_ROUND_TRIP_BUCKET.lock().unwrap() = None;
+    *FUTEX_ROUND_TRIP_RESULT.lock().unwrap() = None;
+    clear_wait_token_state();
+}
+
+// AGENT: execute FutexBucket::wait on a real task kernel stack and publish its
+// terminal result before returning to the test driver's idle context.
+extern "C" fn futex_wait_round_trip_test_task() -> ! {
+    let futex = FUTEX_ROUND_TRIP_BUCKET
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("futex round-trip bucket should be installed")
+        .clone();
+    let kernel = crate::kernel::global_kernel().expect("futex test kernel should be installed");
+    let task_id = kernel
+        .cur_task(0)
+        .expect("futex test task should be current")
+        .id();
+    let result = futex.wait(task_id, FUTEX_ROUND_TRIP_ADDR, 1, None, || Ok(1));
+    *FUTEX_ROUND_TRIP_RESULT.lock().unwrap() = Some(result);
+
+    let task = kernel
+        .cur_task(0)
+        .expect("futex test task should still be current");
+    task.mark_thread_exited();
+    drop(task);
+    assert!(kernel.switch_current_to_idle(0));
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 // AGENT: cmp_requeue now reads the source futex word through a caller-supplied

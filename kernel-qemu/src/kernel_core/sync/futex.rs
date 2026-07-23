@@ -65,19 +65,17 @@ impl FutexBucket {
         self.finish_wait(&token, outcome)
     }
 
+    // AGENT: remove this wait identity for every terminal outcome so queue
+    // cleanup does not depend on each event producer remembering to unlink it.
     fn finish_wait(&self, token: &WaitToken, outcome: WaitOutcome) -> Result<(), &'static str> {
+        let mut w = self.waiters.lock().unwrap();
+        w.retain(|waiter| !waiter.token.same(token));
+        drop(w);
+
         match outcome {
             WaitOutcome::Event => Ok(()),
-            WaitOutcome::Timeout => {
-                let mut w = self.waiters.lock().unwrap();
-                w.retain(|waiter| !waiter.token.same(token));
-                Err("timeout")
-            }
-            WaitOutcome::Signal => {
-                let mut w = self.waiters.lock().unwrap();
-                w.retain(|waiter| !waiter.token.same(token));
-                Err("eintr")
-            }
+            WaitOutcome::Timeout => Err("timeout"),
+            WaitOutcome::Signal => Err("eintr"),
         }
     }
     pub fn wake(&self, addr: usize, count: usize) -> usize {
