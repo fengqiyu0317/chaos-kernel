@@ -66,15 +66,6 @@ impl Task {
         SignalEnqueueResult::Queued
     }
 
-    // AGENT: restore a signal that could not be delivered without user context.
-    pub(crate) fn requeue_signal_front(&self, signo: i32, sender_tid: isize) {
-        self.process
-            .sig_queue
-            .lock()
-            .unwrap()
-            .push_front((signo, sender_tid));
-    }
-
     // AGENT: detect pending signals that should interrupt a blocking syscall.
     pub fn has_interrupting_signal(&self) -> bool {
         let mask = *self.sig_mask.lock().unwrap();

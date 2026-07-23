@@ -242,16 +242,13 @@ impl Kernel {
                     break;
                 }
                 SignalDeliveryAction::Handler(handler) => {
-                    let interrupted = match active_frame
-                        .take()
-                        .or_else(|| task.snapshot_user_trap_frame().ok())
-                    {
-                        Some(ctx) => ctx,
-                        None => {
-                            task.requeue_signal_front(sig.signo as i32, sig.sender_tid);
-                            break;
-                        }
-                    };
+                    // AGENT: a running task must retain its authoritative user
+                    // TrapFrame; absence is a lifecycle violation, not a
+                    // retryable signal-delivery state.
+                    let interrupted = active_frame.take().unwrap_or_else(|| {
+                        task.snapshot_user_trap_frame()
+                            .expect("running task is missing its user trap frame")
+                    });
                     let ctx = task.enter_signal_handler(sig, handler, interrupted);
                     active_frame = Some(ctx.clone());
                     updated_frame = Some(ctx);
