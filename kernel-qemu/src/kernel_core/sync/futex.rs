@@ -145,6 +145,16 @@ impl FutexBucket {
             .count()
     }
 
+    // AGENT: let feature-gated regressions publish controlled waiters without
+    // exposing queue mutation through the production FutexBucket API.
+    #[cfg(any(test, feature = "qemu-sync-selftest"))]
+    pub(super) fn publish_waiter_for_test(&self, addr: usize, token: WaitToken) {
+        self.waiters
+            .lock()
+            .unwrap()
+            .push_back(FutexWaiter { addr, token });
+    }
+
     // AGENT: collect wait completion cleanup with the other private helpers.
     fn finish_wait(&self, token: &WaitToken, outcome: WaitOutcome) -> Result<(), &'static str> {
         let mut w = self.waiters.lock().unwrap();

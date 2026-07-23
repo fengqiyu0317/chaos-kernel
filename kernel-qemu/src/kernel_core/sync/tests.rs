@@ -8,8 +8,8 @@ use crate::kernel::kernel_core::{
 };
 use crate::kernel::{
     clear_global_kernel_for_test, epoll_ready_events, install_kernel, signal_bit, EpCtlOp, EpData,
-    EpEvent, EpInst, EpKey, FLike, FdEntry, FramePool, Kernel, PipeNode, TaskRunState, CLK,
-    SIGUSR1,
+    EpEvent, EpInst, EpKey, FLike, FdEntry, FramePool, Kernel, PipeNode, TaskRunState, VmRegion,
+    CLK, SIGUSR1,
 };
 
 // AGENT: share one token/result slot with the real task-stack wait regressions;
@@ -22,8 +22,8 @@ static FUTEX_ROUND_TRIP_BUCKET: Mutex<Option<Arc<FutexBucket>>> = Mutex::new(Non
 static FUTEX_ROUND_TRIP_RESULT: Mutex<Option<Result<(), &'static str>>> = Mutex::new(None);
 const FUTEX_ROUND_TRIP_ADDR: usize = 0xB000;
 
-// AGENT: include storage/fd allocator regressions and use the boot-discovered
-// physical pool for tests that allocate real task kernel-stack pages.
+// AGENT: include futex requeue/user-mapping and storage/fd regressions, using
+// the boot-discovered physical pool whenever tests allocate mapped task pages.
 pub fn run_all(pool: &FramePool) {
     #[cfg(feature = "qemu-sync-selftest")]
     crate::kernel::fs::block_device::tests::run_all();
@@ -52,7 +52,10 @@ pub fn run_all(pool: &FramePool) {
     futex_wait_event_removes_published_waiter(pool);
     futex_wait_signal_removes_published_waiter(pool);
     futex_cmp_requeue_propagates_word_read_fault();
+    futex_cmp_requeue_mismatch_preserves_waiters();
+    futex_cmp_requeue_wakes_moves_and_returns_affected();
     futex_requeue_skips_completed_waiters_when_moving();
+    futex_requeue_syscalls_reject_unmapped_destination(pool);
     pipe_uses_bounded_ring_buffer_and_reports_writable();
     pipe_rejects_wrong_direction_direct_io();
     pipe_epoll_closed_status_reports_hup_and_err();
@@ -573,6 +576,72 @@ fn futex_cmp_requeue_propagates_word_read_fault() {
     clear_wait_token_state();
 }
 
+// AGENT: a failed comparison must leave every waiter on the source queue and
+// must not consume either the wake or move quota.
+#[cfg_attr(test, test)]
+fn futex_cmp_requeue_mismatch_preserves_waiters() {
+    reset_wait_token_state();
+
+    let futex = FutexBucket::new();
+    let src = 0x7100;
+    let dst = 0x8100;
+    let waiter = WaitToken::for_task(23);
+    futex.publish_waiter_for_test(src, waiter.clone());
+
+    let err = futex
+        .cmp_requeue(src, dst, 1, 1, 2, || Ok(1))
+        .expect_err("a mismatched source word should reject cmp_requeue");
+
+    assert_eq!(err, "changed");
+    assert_eq!(futex.pending_at(src), 1);
+    assert_eq!(futex.pending_at(dst), 0);
+    assert!(!waiter.is_woken());
+    assert_eq!(futex.wake(src, 1), 1);
+
+    clear_wait_token_state();
+}
+
+// AGENT: a matching comparison wakes the first waiter, moves only the requested
+// successor, returns wake+move, and makes the moved waiter visible at dst.
+#[cfg_attr(test, test)]
+fn futex_cmp_requeue_wakes_moves_and_returns_affected() {
+    reset_wait_token_state();
+
+    let futex = FutexBucket::new();
+    let src = 0x7200;
+    let dst = 0x8200;
+    let first = WaitToken::for_task(24);
+    let second = WaitToken::for_task(25);
+    let third = WaitToken::for_task(26);
+    futex.publish_waiter_for_test(src, first.clone());
+    futex.publish_waiter_for_test(src, second.clone());
+    futex.publish_waiter_for_test(src, third.clone());
+    let reads = AtomicUsize::new(0);
+
+    let affected = futex
+        .cmp_requeue(src, dst, 1, 1, 7, || {
+            reads.fetch_add(1, Ordering::Relaxed);
+            Ok(7)
+        })
+        .expect("a matching source word should requeue waiters");
+
+    assert_eq!(affected, 2);
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    assert!(first.is_woken());
+    assert!(!second.is_woken());
+    assert!(!third.is_woken());
+    assert_eq!(futex.pending_at(src), 1);
+    assert_eq!(futex.pending_at(dst), 1);
+
+    assert_eq!(futex.wake(dst, 1), 1);
+    assert!(second.is_woken());
+    assert!(!third.is_woken());
+    assert_eq!(futex.wake(src, 1), 1);
+    assert!(third.is_woken());
+
+    clear_wait_token_state();
+}
+
 // AGENT: completed timeout entries must be discarded before requeue counts move
 // slots, otherwise a stale waiter can consume move_n and leave a live waiter on src.
 #[cfg_attr(test, test)]
@@ -602,6 +671,42 @@ fn futex_requeue_skips_completed_waiters_when_moving() {
     assert_eq!(waiters.len(), 1);
     assert_eq!(waiters[0].addr, dst);
     assert!(waiters[0].token.same(&live));
+
+    clear_wait_token_state();
+}
+
+// AGENT: REQUEUE and CMP_REQUEUE must resolve uaddr2 through the live Sv39 map,
+// not accept every aligned numeric address below USER_TOP as a valid futex.
+#[cfg_attr(test, test)]
+fn futex_requeue_syscalls_reject_unmapped_destination(pool: &FramePool) {
+    reset_wait_token_state();
+
+    let kernel = Kernel::new(pool.clone());
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init task should be current");
+    let src = 0x4100_0000;
+    let unmapped_dst = 0x4200_0000;
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(src, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("source futex page should map");
+        addr_space
+            .write_user_bytes(src, &7u32.to_ne_bytes(), &kernel.pool)
+            .expect("source futex word should be writable");
+    }
+
+    assert_eq!(
+        kernel.dispatch_syscall(SYS_FUTEX, src, 3, 0, 0, unmapped_dst, 0),
+        Err("efault")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall(SYS_FUTEX, src, 9, 0, 0, unmapped_dst, 7),
+        Err("efault")
+    );
 
     clear_wait_token_state();
 }

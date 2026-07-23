@@ -70,6 +70,9 @@ pub(super) fn sys_futex(
             let requeue_count = timeout_addr;
             let wake_limit = val;
             let current = kernel.cur_task(0).ok_or("esrch")?;
+            // AGENT: resolve the target futex through AddrSpace before publishing
+            // requeued waiters, so an aligned but unmapped uaddr2 returns EFAULT.
+            let _ = read_user_u32(&current, uaddr2)?;
             Ok(current
                 .process
                 .futex
@@ -102,6 +105,9 @@ pub(super) fn sys_futex(
                 return Err("einval");
             }
             let current = kernel.cur_task(0).ok_or("esrch")?;
+            // AGENT: validate the target mapping separately from the compared
+            // source word because cmp_requeue only reads uaddr itself.
+            let _ = read_user_u32(&current, uaddr2)?;
             let futex = current.process.futex.clone();
             match futex.cmp_requeue(uaddr, uaddr2, val, timeout_addr, val3 as u32, || {
                 read_user_u32(&current, uaddr)
