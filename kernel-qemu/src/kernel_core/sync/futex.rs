@@ -30,12 +30,15 @@ impl FutexRequeueResult {
 pub struct FutexBucket {
     waiters: Mutex<VecDeque<FutexWaiter>>,
 }
+
 impl FutexBucket {
+    // AGENT: keep construction at the start of the public FutexBucket API.
     pub fn new() -> Self {
         Self {
             waiters: Mutex::new(VecDeque::new()),
         }
     }
+
     // AGENT: compare and enqueue under one queue lock so a wake cannot slip
     // between seeing the expected value and publishing this waiter.
     pub fn wait<R>(
@@ -65,23 +68,12 @@ impl FutexBucket {
         self.finish_wait(&token, outcome)
     }
 
-    // AGENT: remove this wait identity for every terminal outcome so queue
-    // cleanup does not depend on each event producer remembering to unlink it.
-    fn finish_wait(&self, token: &WaitToken, outcome: WaitOutcome) -> Result<(), &'static str> {
-        let mut w = self.waiters.lock().unwrap();
-        w.retain(|waiter| !waiter.token.same(token));
-        drop(w);
-
-        match outcome {
-            WaitOutcome::Event => Ok(()),
-            WaitOutcome::Timeout => Err("timeout"),
-            WaitOutcome::Signal => Err("eintr"),
-        }
-    }
+    // AGENT: place the basic address wake operation first in the wake API group.
     pub fn wake(&self, addr: usize, count: usize) -> usize {
         let mut w = self.waiters.lock().unwrap();
         Self::wake_locked(&mut w, addr, count)
     }
+
     // AGENT: process exit detaches the complete queue under its lock, then wakes
     // waiters unlocked and releases the old VecDeque allocation with the entries.
     pub fn wake_all(&self) -> usize {
@@ -95,6 +87,8 @@ impl FutexBucket {
         }
         count
     }
+
+    // AGENT: keep the compound wake operation with the other public wake APIs.
     pub fn wake_op(
         &self,
         addr: usize,
@@ -113,10 +107,13 @@ impl FutexBucket {
         }
         Ok(woken)
     }
+
+    // AGENT: place the unconditional requeue operation before its compare variant.
     pub fn requeue(&self, src: usize, dst: usize, wake_n: usize, move_n: usize) -> usize {
         let mut w = self.waiters.lock().unwrap();
         Self::requeue_locked(&mut w, src, dst, wake_n, move_n).woken
     }
+
     // AGENT: compare the source futex word through a caller-supplied reader
     // while holding the futex queue lock, matching wait's ordering.
     pub fn cmp_requeue<R>(
@@ -137,6 +134,8 @@ impl FutexBucket {
         }
         Ok(Self::requeue_locked(&mut w, src, dst, wake_n, move_n).affected())
     }
+
+    // AGENT: keep the queue-inspection helper after the mutating public APIs.
     pub fn pending_at(&self, addr: usize) -> usize {
         self.waiters
             .lock()
@@ -145,6 +144,21 @@ impl FutexBucket {
             .filter(|waiter| waiter.addr == addr)
             .count()
     }
+
+    // AGENT: collect wait completion cleanup with the other private helpers.
+    fn finish_wait(&self, token: &WaitToken, outcome: WaitOutcome) -> Result<(), &'static str> {
+        let mut w = self.waiters.lock().unwrap();
+        w.retain(|waiter| !waiter.token.same(token));
+        drop(w);
+
+        match outcome {
+            WaitOutcome::Event => Ok(()),
+            WaitOutcome::Timeout => Err("timeout"),
+            WaitOutcome::Signal => Err("eintr"),
+        }
+    }
+
+    // AGENT: keep lock-assuming wake mechanics outside the public API group.
     fn wake_locked(waiters: &mut VecDeque<FutexWaiter>, addr: usize, count: usize) -> usize {
         let mut woken = 0;
         waiters.retain(|waiter| {
@@ -159,6 +173,8 @@ impl FutexBucket {
         });
         woken
     }
+
+    // AGENT: keep lock-assuming requeue mechanics beside wake_locked.
     pub(super) fn requeue_locked(
         waiters: &mut VecDeque<FutexWaiter>,
         src: usize,
