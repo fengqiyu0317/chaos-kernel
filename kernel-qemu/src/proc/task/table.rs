@@ -410,6 +410,11 @@ impl TaskTable {
 
     // AGENT: reap only a zombie whose exit path already detached every child,
     // then remove it from family, group, process, and thread indexes.
+    // AGENT TODO: reject the designated init process explicitly; its process-level
+    // exit must shut down the machine rather than become an ordinary reapable zombie.
+    // AGENT TODO: before enabling SMP or concurrent wait4 callers, make zombie
+    // selection and reaping one exclusive, parent-authorized transaction so two
+    // waiters cannot both claim success or observe partially removed indexes.
     pub fn reap(&self, pid: usize) -> Result<(), &'static str> {
         let process = self.find_process(pid).ok_or("esrch")?;
         if !process.is_zombie() || !process.has_no_children() {
@@ -476,9 +481,4 @@ impl Drop for TaskSlotReservation<'_> {
     fn drop(&mut self) {
         self.release_inner();
     }
-}
-
-// AGENT: expose the synchronous carrier-thread yield used by migrated callers.
-pub fn yield_now_sync() {
-    thread::yield_now();
 }
