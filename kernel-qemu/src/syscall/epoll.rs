@@ -212,16 +212,11 @@ pub(super) fn sys_epoll_wait(
         let Some(token) = inst.prepare_wait(task.id()) else {
             continue;
         };
-        let outcome = match deadline {
-            Some(deadline) => {
-                if CLK.load(Ordering::Relaxed) >= deadline {
-                    inst.remove_waiter(&token);
-                    return Ok(0);
-                }
-                token.wait_until_tick_interruptible(deadline)
-            }
-            None => token.wait_interruptible(None),
-        };
+        if deadline.is_some_and(|deadline| CLK.load(Ordering::Relaxed) >= deadline) {
+            inst.remove_waiter(&token);
+            return Ok(0);
+        }
+        let outcome = token.wait_interruptible(deadline);
         match outcome {
             WaitOutcome::Event => {}
             WaitOutcome::Timeout => {

@@ -35,13 +35,19 @@ pub(super) fn sys_futex(
                 return Err("efault");
             }
             let current = kernel.cur_task(0).ok_or("esrch")?;
-            let timeout = if timeout_addr == 0 {
+            // AGENT: convert FUTEX_WAIT's relative timespec once at the syscall
+            // boundary so WaitToken and its timer wheel use only absolute ticks.
+            let deadline = if timeout_addr == 0 {
                 None
             } else {
-                Some(read_futex_timeout(&current, timeout_addr)?)
+                let timeout = read_futex_timeout(&current, timeout_addr)?;
+                Some(
+                    CLK.load(Ordering::Relaxed)
+                        .saturating_add(duration_to_ticks(timeout)),
+                )
             };
             let futex = current.process.futex.clone();
-            match futex.wait(current.id(), uaddr, val as u32, timeout, || {
+            match futex.wait(current.id(), uaddr, val as u32, deadline, || {
                 read_user_u32(&current, uaddr)
             }) {
                 Ok(()) => Ok(0),

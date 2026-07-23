@@ -7,9 +7,15 @@ use crate::kernel::kernel_core::{
     duration_to_ticks, global_timer_wheel, init_timer_wheel, TimerTarget, TimerWheel, TIMER_WHEEL,
 };
 use crate::kernel::{
-    clear_global_kernel_for_test, epoll_ready_events, install_kernel, EpCtlOp, EpData, EpEvent,
-    EpInst, EpKey, FLike, FdEntry, FramePool, Kernel, PipeNode, TaskRunState, CLK, SIGUSR1,
+    clear_global_kernel_for_test, epoll_ready_events, install_kernel, signal_bit, EpCtlOp, EpData,
+    EpEvent, EpInst, EpKey, FLike, FdEntry, FramePool, Kernel, PipeNode, TaskRunState, CLK,
+    SIGUSR1,
 };
+
+// AGENT: share one token/result slot with the real task-stack wait regressions;
+// run_all executes them serially on CPU0.
+static WAIT_ROUND_TRIP_TOKEN: Mutex<Option<WaitToken>> = Mutex::new(None);
+static WAIT_ROUND_TRIP_OUTCOME: Mutex<Option<WaitOutcome>> = Mutex::new(None);
 
 // AGENT: include storage/fd allocator regressions and use the boot-discovered
 // physical pool for tests that allocate real task kernel-stack pages.
@@ -26,7 +32,7 @@ pub fn run_all(pool: &FramePool) {
     wait_token_event_wake_wins_once();
     wait_token_timeout_wake_wins_once();
     duration_to_ticks_rounds_up_at_tick_boundaries();
-    wait_token_zero_duration_times_out_without_timer_wheel();
+    wait_token_current_deadline_times_out_without_timer_wheel();
     wait_token_expired_deadline_times_out_immediately();
     wait_token_timer_target_times_out_on_schedule_tick(pool);
     wait_token_event_wake_uses_installed_scheduler_backend(pool);
@@ -34,6 +40,8 @@ pub fn run_all(pool: &FramePool) {
     wait_token_current_wake_finishes_without_requeue(pool);
     wait_token_tick_leaves_sleeping_current_parked(pool);
     wait_token_interruptible_wait_reports_signal_not_event(pool);
+    wait_token_reblocks_after_masked_signal_wake(pool);
+    wait_token_sleeping_wait_reports_later_signal(pool);
     futex_wait_returns_changed_without_queueing();
     futex_wait_propagates_word_read_fault();
     futex_wait_timeout_removes_published_waiter();
@@ -139,18 +147,15 @@ fn wait_token_timeout_wake_wins_once() {
     clear_wait_token_state();
 }
 
-// AGENT: zero-length waits must finish as timeouts without touching the timer
-// wheel or entering the spin wait loop.
+// AGENT: a plain wait whose absolute deadline is the current tick must finish
+// as a timeout without touching the timer wheel or entering the wait loop.
 #[cfg_attr(test, test)]
-fn wait_token_zero_duration_times_out_without_timer_wheel() {
+fn wait_token_current_deadline_times_out_without_timer_wheel() {
     reset_wait_token_state();
 
     let token = WaitToken::for_task(14);
 
-    assert_eq!(
-        token.wait(Some(Duration::from_nanos(0))),
-        WaitOutcome::Timeout
-    );
+    assert_eq!(token.wait(Some(0)), WaitOutcome::Timeout);
     assert!(token.is_timeout());
     assert_eq!(global_timer_wheel().lock().active_count(), 0);
 
@@ -166,7 +171,7 @@ fn wait_token_expired_deadline_times_out_immediately() {
     CLK.store(7, Ordering::Relaxed);
     let token = WaitToken::for_task(15);
 
-    assert_eq!(token.wait_until_tick_interruptible(7), WaitOutcome::Timeout);
+    assert_eq!(token.wait_interruptible(Some(7)), WaitOutcome::Timeout);
     assert!(token.is_timeout());
     assert_eq!(global_timer_wheel().lock().active_count(), 0);
 
@@ -306,6 +311,103 @@ fn wait_token_interruptible_wait_reports_signal_not_event(pool: &FramePool) {
     clear_wait_token_state();
 }
 
+// AGENT: a masked signal may make a Sleeping task runnable without completing
+// its WaitToken; after that scheduler round trip the task must sleep again until
+// the watched event really wins.
+fn wait_token_reblocks_after_masked_signal_wake(pool: &FramePool) {
+    reset_wait_token_state();
+
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init task should be current");
+    *task.sig_mask.lock().unwrap() = signal_bit(SIGUSR1).expect("SIGUSR1 should have a mask bit");
+    let token = WaitToken::for_task(task.id());
+    *WAIT_ROUND_TRIP_TOKEN.lock().unwrap() = Some(token.clone());
+    *WAIT_ROUND_TRIP_OUTCOME.lock().unwrap() = None;
+    task.install_test_kernel_entry(wait_round_trip_test_task)
+        .expect("wait test task should receive kernel entry");
+    install_kernel(kernel);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    assert!(!token.is_woken());
+
+    kernel.send_signal_to_task(&task, SIGUSR1 as i32, -1);
+    assert_eq!(task.sched_state(), TaskRunState::Runnable);
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    assert!(!token.is_woken());
+    assert_eq!(*WAIT_ROUND_TRIP_OUTCOME.lock().unwrap(), None);
+
+    assert!(token.wake_event());
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(
+        *WAIT_ROUND_TRIP_OUTCOME.lock().unwrap(),
+        Some(WaitOutcome::Event)
+    );
+    assert!(task.done());
+
+    *WAIT_ROUND_TRIP_TOKEN.lock().unwrap() = None;
+    clear_wait_token_state();
+}
+
+// AGENT: prove that a signal arriving only after the task has switched to idle
+// resumes the kernel wait frame and is surfaced as Signal rather than Event.
+fn wait_token_sleeping_wait_reports_later_signal(pool: &FramePool) {
+    reset_wait_token_state();
+
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init task should be current");
+    let token = WaitToken::for_task(task.id());
+    *WAIT_ROUND_TRIP_TOKEN.lock().unwrap() = Some(token.clone());
+    *WAIT_ROUND_TRIP_OUTCOME.lock().unwrap() = None;
+    task.install_test_kernel_entry(wait_round_trip_test_task)
+        .expect("wait test task should receive kernel entry");
+    install_kernel(kernel);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    assert!(!token.is_woken());
+
+    kernel.send_signal_to_task(&task, SIGUSR1 as i32, -1);
+    assert_eq!(task.sched_state(), TaskRunState::Runnable);
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(
+        *WAIT_ROUND_TRIP_OUTCOME.lock().unwrap(),
+        Some(WaitOutcome::Signal)
+    );
+    assert!(task.done());
+
+    *WAIT_ROUND_TRIP_TOKEN.lock().unwrap() = None;
+    clear_wait_token_state();
+}
+
+// AGENT: enter wait_interruptible() on a real task kernel stack, then mark only
+// the test task exited and use the production task-to-idle handoff; invoking
+// process-level exit here would trigger the real init-exit shutdown policy.
+extern "C" fn wait_round_trip_test_task() -> ! {
+    let token = WAIT_ROUND_TRIP_TOKEN
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("wait round-trip token should be installed")
+        .clone();
+    let outcome = token.wait_interruptible(None);
+    *WAIT_ROUND_TRIP_OUTCOME.lock().unwrap() = Some(outcome);
+
+    let kernel = crate::kernel::global_kernel().expect("wait test kernel should be installed");
+    let task = kernel
+        .cur_task(0)
+        .expect("wait test task should still be current");
+    task.mark_thread_exited();
+    drop(task);
+    assert!(kernel.switch_current_to_idle(0));
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 // AGENT: FutexBucket::wait must compare the current futex word before enqueueing
 // and return the syscall-layer "changed" marker when it differs.
 #[cfg_attr(test, test)]
@@ -349,8 +451,8 @@ fn futex_wait_propagates_word_read_fault() {
     clear_wait_token_state();
 }
 
-// AGENT: a matching word with an immediate timeout proves the waiter is
-// published first, then removed by finish_wait() when the token times out.
+// AGENT: a matching word with an already-expired absolute deadline proves the
+// waiter is published first, then removed by finish_wait() on timeout.
 #[cfg_attr(test, test)]
 fn futex_wait_timeout_removes_published_waiter() {
     reset_wait_token_state();
@@ -360,7 +462,7 @@ fn futex_wait_timeout_removes_published_waiter() {
     let calls = AtomicUsize::new(0);
 
     let err = futex
-        .wait(20, addr, 1, Some(Duration::from_nanos(0)), || {
+        .wait(20, addr, 1, Some(0), || {
             calls.fetch_add(1, Ordering::Relaxed);
             Ok(1)
         })

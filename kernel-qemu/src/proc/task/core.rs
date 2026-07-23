@@ -90,9 +90,9 @@ impl Task {
         self.kernel_context.get()
     }
 
-    // AGENT: replace an off-CPU task's first kernel entry only for the focused
-    // QEMU scheduler round-trip test.
-    #[cfg(any(test, feature = "qemu-sched-selftest"))]
+    // AGENT: replace an off-CPU task's first kernel entry only for focused QEMU
+    // scheduler or wait round-trip tests.
+    #[cfg(any(test, feature = "qemu-sched-selftest", feature = "qemu-sync-selftest"))]
     pub(crate) fn install_test_kernel_entry(
         &self,
         entry: extern "C" fn() -> !,

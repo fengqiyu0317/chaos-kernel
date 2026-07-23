@@ -2,7 +2,7 @@
 use crate::kernel::kernel_core::arch::CLK;
 use crate::kernel::kernel_core::kernel_base::global_kernel;
 use crate::kernel::kernel_core::prelude::*;
-use crate::kernel::kernel_core::time::{duration_to_ticks, global_timer_wheel, TimerTarget};
+use crate::kernel::kernel_core::time::{global_timer_wheel, TimerTarget};
 
 // AGENT: QEMU timer interrupts use this hook to drive the migrated logical
 // kernel clock and timer wheel once a Kernel has been installed.
@@ -152,35 +152,21 @@ impl WaitToken {
             .is_some_and(|kernel| kernel.task_has_interrupting_signal(self.state.task_id))
     }
 
-    // AGENT: convert an optional relative timeout to the logical absolute
-    // deadline consumed by the single QEMU wait implementation.
-    pub fn wait(&self, timeout: Option<Duration>) -> WaitOutcome {
-        let deadline = timeout.map(|timeout| {
-            CLK.load(Ordering::Relaxed)
-                .saturating_add(duration_to_ticks(timeout))
-        });
-        self.wait_deadline(deadline, false)
+    // AGENT: plain kernel waits use an optional absolute logical tick deadline;
+    // None waits indefinitely and does not observe pending task signals.
+    pub fn wait(&self, deadline: Option<usize>) -> WaitOutcome {
+        self.wait_inner(deadline, false)
     }
 
-    // AGENT: syscall-facing relative waits share the same deadline engine but
-    // additionally surface pending signals as WaitOutcome::Signal.
-    pub fn wait_interruptible(&self, timeout: Option<Duration>) -> WaitOutcome {
-        let deadline = timeout.map(|timeout| {
-            CLK.load(Ordering::Relaxed)
-                .saturating_add(duration_to_ticks(timeout))
-        });
-        self.wait_deadline(deadline, true)
-    }
-
-    // AGENT: absolute-deadline variant for syscall waits that can be interrupted
-    // by signals without resetting the deadline across caller retry loops.
-    pub fn wait_until_tick_interruptible(&self, deadline: usize) -> WaitOutcome {
-        self.wait_deadline(Some(deadline), true)
+    // AGENT: syscall-facing waits use the same absolute deadline representation
+    // but additionally surface pending signals as WaitOutcome::Signal.
+    pub fn wait_interruptible(&self, deadline: Option<usize>) -> WaitOutcome {
+        self.wait_inner(deadline, true)
     }
 
     // AGENT: centralize optional timer registration, signal interruption,
     // scheduler state transitions, and early-wake timer cancellation.
-    fn wait_deadline(&self, deadline: Option<usize>, interruptible: bool) -> WaitOutcome {
+    fn wait_inner(&self, deadline: Option<usize>, interruptible: bool) -> WaitOutcome {
         if self.is_woken() {
             return self.outcome();
         }
@@ -202,24 +188,27 @@ impl WaitToken {
             None => None,
         };
 
-        let mut blocked = false;
+        let mut ever_blocked = false;
         while !self.is_woken() {
             if interruptible && self.has_interrupting_signal() {
                 self.wake_signal();
                 break;
             }
-            if !blocked {
-                self.block_waiter_task();
-                blocked = true;
-                if self.is_woken() {
-                    break;
-                }
+            // AGENT: a scheduler wake is not necessarily this token completing:
+            // masked signals and unrelated task wakes may resume the waiter
+            // while its outcome is still pending. Re-enter Sleeping after every
+            // such spurious wake instead of spinning forever after the first
+            // block round trip.
+            self.block_waiter_task();
+            ever_blocked = true;
+            if self.is_woken() {
+                break;
             }
             // AGENT: this loop is reached only by pre-scheduler compatibility
-            // paths; an active scheduler suspends inside block_waiter_task().
+            // paths; an active scheduler suspends on each block_waiter_task().
             ::core::hint::spin_loop();
         }
-        if blocked {
+        if ever_blocked {
             self.finish_waiter_task();
         }
 

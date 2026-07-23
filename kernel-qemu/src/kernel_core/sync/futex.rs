@@ -43,7 +43,7 @@ impl FutexBucket {
         task_id: usize,
         addr: usize,
         expected: u32,
-        timeout: Option<Duration>,
+        deadline: Option<usize>,
         read_word: R,
     ) -> Result<(), &'static str>
     where
@@ -61,7 +61,7 @@ impl FutexBucket {
             });
         }
 
-        let outcome = token.wait_interruptible(timeout);
+        let outcome = token.wait_interruptible(deadline);
         self.finish_wait(&token, outcome)
     }
 

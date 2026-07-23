@@ -53,9 +53,9 @@ impl KernelContext {
         })
     }
 
-    // AGENT: let the QEMU scheduler selftest enter a kernel-only task function
-    // on a real Task stack without fabricating a user TrapFrame return.
-    #[cfg(any(test, feature = "qemu-sched-selftest"))]
+    // AGENT: let QEMU scheduler and wait selftests enter a kernel-only task
+    // function on a real Task stack without fabricating a user TrapFrame return.
+    #[cfg(any(test, feature = "qemu-sched-selftest", feature = "qemu-sync-selftest"))]
     pub fn for_test_task(
         kernel_stack_top: usize,
         entry: extern "C" fn() -> !,

@@ -402,11 +402,16 @@ impl Kernel {
         true
     }
 
-    // AGENT: exercise one finite Processor/idle/task round trip in the QEMU
-    // scheduler selftest without entering the production infinite idle loop.
-    #[cfg(any(test, feature = "qemu-sched-selftest"))]
+    // AGENT: exercise finite Processor/idle/task round trips in scheduler and
+    // wait selftests without entering the production infinite idle loop; reuse
+    // the installed idle context when one task must wake and block repeatedly.
+    #[cfg(any(test, feature = "qemu-sched-selftest", feature = "qemu-sync-selftest"))]
     pub(crate) fn run_one_cpu0_task_for_test(&'static self) -> bool {
-        let idle_context = self.prepare_cpu0_scheduler();
+        let idle_context = if self.scheduler_active(0) {
+            self.processors[0].lock().unwrap().idle_context_ptr()
+        } else {
+            self.prepare_cpu0_scheduler()
+        };
         self.run_one_cpu0_task(idle_context)
     }
 
