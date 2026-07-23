@@ -204,9 +204,6 @@ impl WaitToken {
             if self.is_woken() {
                 break;
             }
-            // AGENT: this loop is reached only by pre-scheduler compatibility
-            // paths; an active scheduler suspends on each block_waiter_task().
-            ::core::hint::spin_loop();
         }
         if ever_blocked {
             self.finish_waiter_task();
