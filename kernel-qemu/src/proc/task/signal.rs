@@ -94,30 +94,37 @@ impl Task {
         let mask = *self.sig_mask.lock().unwrap();
         loop {
             let (signo, sender_tid) = {
-                let mut sq = self.process.sig_queue.lock().unwrap();
-                let deliverable =
-                    |sig: i32| sig > 0 && signal_is_unblocked_by_mask(mask, sig as u32);
-                let standard_pos = sq
-                    .iter()
-                    .position(|(sig, _)| deliverable(*sig) && !is_realtime_signal(*sig as u32));
-                let realtime_pos = sq
+                let mut queue = self.process.sig_queue.lock().unwrap();
+                let pos = queue
                     .iter()
                     .enumerate()
-                    .filter(|(_, (sig, _))| deliverable(*sig) && is_realtime_signal(*sig as u32))
-                    .min_by_key(|(_, (sig, _))| *sig)
-                    .map(|(pos, _)| pos);
-                let pos = standard_pos.or(realtime_pos)?;
-                sq.remove(pos)?
+                    .filter(|(_, (signo, _))| {
+                        *signo > 0 && signal_is_unblocked_by_mask(mask, *signo as u32)
+                    })
+                    .min_by_key(|(_, (signo, _))| {
+                        let signo = *signo as u32;
+                        if is_realtime_signal(signo) {
+                            (1, signo)
+                        } else {
+                            (0, 0)
+                        }
+                    })
+                    .map(|(pos, _)| pos)?;
+                queue.remove(pos)?
             };
-            let action = {
-                let sig_state = self.process.sig_state.lock().unwrap();
-                if sig_state.is_ignored(signo as u32) {
-                    continue;
-                }
-                sig_state.get_action(signo as u32)?.clone()
-            };
+            let signo = signo as u32;
+            let action = self
+                .process
+                .sig_state
+                .lock()
+                .unwrap()
+                .get_action(signo)?
+                .clone();
+            if action.resolve(signo) == SignalDeliveryAction::Ignore {
+                continue;
+            }
             return Some(PendingSignal {
-                signo: signo as u32,
+                signo,
                 sender_tid,
                 action,
             });
