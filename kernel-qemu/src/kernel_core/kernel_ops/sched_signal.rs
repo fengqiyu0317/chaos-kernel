@@ -13,7 +13,7 @@ impl Kernel {
     // AGENT: enqueue only runnable tasks that are not held by job-control stop.
     fn enqueue_task_if_ready(&self, task: &Arc<Task>) {
         if task.sched_state() == TaskRunState::Runnable
-            && !task.is_job_stopped()
+            && !task.process.is_job_stopped()
             && !self.is_current_task_on_cpu0(task.id())
         {
             self.run_queue.enqueue(task);
@@ -30,7 +30,7 @@ impl Kernel {
     // AGENT: apply one job-control transition to the whole thread group while
     // keeping each thread's live scheduler state as the resume source of truth.
     fn set_process_job_stopped(&self, task: &Arc<Task>, stopped: bool) {
-        task.set_job_stopped(stopped);
+        task.process.set_job_stopped(stopped);
         let thread_ids = task.process.thread_ids();
         for thread_id in thread_ids {
             let Some(thread) = self.tasks.find_task(thread_id) else {
@@ -73,7 +73,7 @@ impl Kernel {
         if task.done() {
             return false;
         }
-        if task.is_job_stopped() {
+        if task.process.is_job_stopped() {
             return false;
         }
         if task.sched_state() == TaskRunState::Sleeping {
@@ -155,7 +155,7 @@ impl Kernel {
                     self.make_task_runnable(task);
                 }
             }
-            _ if task.is_job_stopped() => {}
+            _ if task.process.is_job_stopped() => {}
             _ if task.sched_state() == TaskRunState::Sleeping => {
                 self.wake_task_for_wait(task.id());
             }
@@ -394,7 +394,7 @@ impl Kernel {
     fn dequeue_runnable_task(&self) -> Option<Arc<Task>> {
         while let Some(task) = self.run_queue.dequeue() {
             if !task.done()
-                && !task.is_job_stopped()
+                && !task.process.is_job_stopped()
                 && task.sched_state() == TaskRunState::Runnable
             {
                 task.set_sched_state(TaskRunState::Running);

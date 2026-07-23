@@ -119,10 +119,9 @@ impl Kernel {
         } else {
             None
         };
-        if running_task_id == Some(task.id()) {
-            task.mark_thread_exited();
-        } else {
-            task.release_thread_exit_resources();
+        task.mark_thread_exited();
+        if running_task_id != Some(task.id()) {
+            task.release_kernel_stack();
         }
         self.run_queue.remove(task.id());
     }

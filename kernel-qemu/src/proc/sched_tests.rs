@@ -344,8 +344,8 @@ fn signal_stop_and_sigcont_cover_thread_group(pool: &FramePool) {
     kernel.send_signal_to_task(&task, SIGSTOP as i32, -1);
 
     assert_eq!(kernel.deliver_pending_signals(0), 1);
-    assert!(task.is_job_stopped());
-    assert!(thread.is_job_stopped());
+    assert!(task.process.is_job_stopped());
+    assert!(thread.process.is_job_stopped());
     assert_eq!(task.sched_state(), TaskRunState::Runnable);
     assert_eq!(thread.sched_state(), TaskRunState::Runnable);
     assert!(kernel.cur_task(0).is_none());
@@ -353,8 +353,8 @@ fn signal_stop_and_sigcont_cover_thread_group(pool: &FramePool) {
 
     kernel.send_signal_to_task(&task, SIGCONT as i32, -1);
 
-    assert!(!task.is_job_stopped());
-    assert!(!thread.is_job_stopped());
+    assert!(!task.process.is_job_stopped());
+    assert!(!thread.process.is_job_stopped());
     let mut resumed = [
         kernel.run_queue.dequeue().expect("first resumed task").id(),
         kernel
@@ -378,15 +378,15 @@ fn sigcont_resumes_stopped_task_without_resuming_for_plain_signal(pool: &FramePo
     let kernel = Kernel::new(pool.clone());
     let task = kernel.tasks.spawn().expect("spawn worker");
     task.set_sched_state(TaskRunState::Runnable);
-    task.set_job_stopped(true);
+    task.process.set_job_stopped(true);
 
     kernel.send_signal_to_task(&task, SIGUSR1 as i32, -1);
-    assert!(task.is_job_stopped());
+    assert!(task.process.is_job_stopped());
     assert_eq!(task.sched_state(), TaskRunState::Runnable);
     assert_eq!(kernel.run_queue.pick_next(), None);
 
     kernel.send_signal_to_task(&task, SIGCONT as i32, -1);
-    assert!(!task.is_job_stopped());
+    assert!(!task.process.is_job_stopped());
     assert_eq!(task.sched_state(), TaskRunState::Runnable);
     assert_eq!(kernel.run_queue.pick_next(), Some(task.id()));
 }
@@ -399,10 +399,10 @@ fn sigcont_keeps_sleeping_task_asleep_until_wait_wakeup(pool: &FramePool) {
     let kernel = Kernel::new(pool.clone());
     let task = kernel.tasks.spawn().expect("spawn worker");
     task.set_sched_state(TaskRunState::Sleeping);
-    task.set_job_stopped(true);
+    task.process.set_job_stopped(true);
 
     kernel.send_signal_to_task(&task, SIGCONT as i32, -1);
-    assert!(!task.is_job_stopped());
+    assert!(!task.process.is_job_stopped());
     assert_eq!(task.sched_state(), TaskRunState::Sleeping);
     assert_eq!(kernel.run_queue.pick_next(), None);
 

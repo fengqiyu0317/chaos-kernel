@@ -2,9 +2,10 @@
 use super::*;
 use crate::trap::TrapFrame;
 
+// AGENT: adapt fork arguments to the current task and optional live trap frame;
+// address-space identity is derived by TaskTable during process construction.
 pub(super) fn sys_fork(
     kernel: &Kernel,
-    _caller_token: usize,
     caller_frame: Option<&TrapFrame>,
 ) -> Result<usize, &'static str> {
     let parent_id = kernel.cur_task(0).map(|task| task.id()).ok_or("esrch")?;

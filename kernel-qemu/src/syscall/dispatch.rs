@@ -22,12 +22,6 @@ impl Kernel {
     ) -> Result<SyscallOutcome, &'static str> {
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
         let _ts_enter = CLK.load(Ordering::Relaxed);
-        // AGENT: caller_token mirrors the current address-space token for syscall
-        // entry bookkeeping; user-memory access is routed through Task.addr_space.
-        let _caller_token = self
-            .cur_task(0)
-            .and_then(|task| task.vm_token().ok())
-            .unwrap_or(0);
         match nr {
             SYS_READ => returning(sys_read(self, a0, a1, a2)),
             SYS_WRITE => returning(sys_write(self, a0, a1, a2)),
@@ -43,7 +37,7 @@ impl Kernel {
             SYS_PIPE => returning(sys_pipe(self, a0, a1)),
             SYS_DUP => returning(sys_dup(self, a0)),
             SYS_DUP2 => returning(sys_dup2(self, a0, a1)),
-            SYS_FORK => returning(sys_fork(self, _caller_token, caller_frame)),
+            SYS_FORK => returning(sys_fork(self, caller_frame)),
             SYS_EXEC => sys_exec(self, a0, a1, a2),
             SYS_EXIT => sys_exit(self, a0),
             SYS_EXIT_GROUP => sys_exit_group(self, a0),

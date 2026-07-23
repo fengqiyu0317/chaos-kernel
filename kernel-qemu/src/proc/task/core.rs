@@ -18,8 +18,9 @@ pub struct Task {
     pub sched: Mutex<SchedEntity>,
 }
 
-// AGENT: implement task identity, scheduling, exit teardown, and signal queues;
-// descriptor-specific methods live in task/fd.rs.
+// AGENT: keep task methods ordered by construction, identity/context, user
+// TrapFrame access, scheduling, and exit teardown; descriptor-specific methods
+// live in task/fd.rs.
 impl Task {
     // AGENT: construct only thread-local state around an already-created
     // Process so task construction never implicitly invents process identity.
@@ -71,11 +72,6 @@ impl Task {
     // AGENT: expose the schedulable thread id.
     pub fn id(&self) -> usize {
         self.id
-    }
-
-    // AGENT: report the shared address-space switch token for trap handling.
-    pub fn vm_token(&self) -> Result<usize, &'static str> {
-        self.process.addr_space.lock().unwrap().vm_token()
     }
 
     // AGENT: expose only the kernel stack top needed by trap setup.
@@ -151,12 +147,6 @@ impl Task {
         Ok(unsafe { (&*ptr).clone() })
     }
 
-    // AGENT: report only this thread's terminal scheduler state; one sibling's
-    // SYS_EXIT must never make every Task in the Process appear dead.
-    pub fn done(&self) -> bool {
-        self.sched_state() == TaskRunState::Zombie
-    }
-
     // AGENT: read this task's scheduler placement state.
     pub fn sched_state(&self) -> TaskRunState {
         self.sched.lock().unwrap().state
@@ -167,14 +157,10 @@ impl Task {
         self.sched.lock().unwrap().state = state;
     }
 
-    // AGENT: expose process job-control stop without overloading run-queue state.
-    pub fn is_job_stopped(&self) -> bool {
-        self.process.is_job_stopped()
-    }
-
-    // AGENT: update process job-control stop independently of scheduler placement.
-    pub fn set_job_stopped(&self, stopped: bool) {
-        self.process.set_job_stopped(stopped);
+    // AGENT: report only this thread's terminal scheduler state; one sibling's
+    // SYS_EXIT must never make every Task in the Process appear dead.
+    pub fn done(&self) -> bool {
+        self.sched_state() == TaskRunState::Zombie
     }
 
     // AGENT: clone the task-owned scheduling policy for queue operations.
@@ -205,12 +191,6 @@ impl Task {
             sched.slice_left -= 1;
         }
         sched.slice_left == 0
-    }
-
-    // AGENT: drop the execution resources owned by one task during teardown.
-    pub fn release_thread_exit_resources(&self) {
-        self.mark_thread_exited();
-        self.release_kernel_stack();
     }
 
     // AGENT: publish exit state, release saved signal-frame backing storage, and
