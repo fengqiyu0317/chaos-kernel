@@ -18,6 +18,14 @@ pub struct Task {
     pub sched: Mutex<SchedEntity>,
 }
 
+// AGENT: prove the fixed top-of-stack TrapFrame fits both its owning kernel
+// stack and the single page rebound through the TRAP_CONTEXT alias.
+const _: () = {
+    assert!(mem::size_of::<TrapFrame>() <= KSTK_SZ);
+    assert!(mem::size_of::<TrapFrame>() <= PAGE_SZ);
+    assert!(PAGE_SZ % mem::align_of::<TrapFrame>() == 0);
+};
+
 // AGENT: keep task methods ordered by construction, identity/context, user
 // TrapFrame access, scheduling, and exit teardown; descriptor-specific methods
 // live in task/fd.rs.
@@ -101,50 +109,43 @@ impl Task {
         Ok(())
     }
 
-    // AGENT: compute the fixed trap-frame slot while its owning stack is still
-    // protected by the caller's kstk guard.
-    fn trap_frame_ptr_in(kstk: &KStk) -> Result<*mut TrapFrame, &'static str> {
-        let frame_addr = kstk
-            .top()
-            .checked_sub(mem::size_of::<TrapFrame>())
-            .ok_or("ekstk")?;
-        if frame_addr % mem::align_of::<TrapFrame>() != 0 {
-            return Err("ekstk");
-        }
-        Ok(frame_addr as *mut TrapFrame)
+    // AGENT: run one operation against a live kernel stack while keeping its
+    // ownership guard held for the complete operation.
+    fn with_kstk<R>(&self, f: impl FnOnce(&KStk) -> R) -> Result<R, &'static str> {
+        let kstk = self.kstk.lock().unwrap();
+        Ok(f(kstk.as_ref().ok_or("ekstk")?))
+    }
+
+    // AGENT: derive the fixed trap-frame slot from the statically checked stack
+    // and frame layout while the caller keeps the owning kstk guard held.
+    fn trap_frame_ptr_in(kstk: &KStk) -> *mut TrapFrame {
+        (kstk.top() - mem::size_of::<TrapFrame>()) as *mut TrapFrame
     }
 
     // AGENT: locate the architecture frame trap.S owns at the fixed top slot of
     // this task's kernel stack. Callers must not create a second mutable access
     // while the live trap path already holds &mut TrapFrame for the same slot.
     pub(crate) fn user_trap_frame_ptr(&self) -> Result<*mut TrapFrame, &'static str> {
-        let kstk = self.kstk.lock().unwrap();
-        Self::trap_frame_ptr_in(kstk.as_ref().ok_or("ekstk")?)
+        self.with_kstk(Self::trap_frame_ptr_in)
     }
 
     // AGENT: return the physical page backing the authoritative TrapFrame so
     // CPU0 can rebind the fixed supervisor-only TRAP_CONTEXT alias before sret.
     pub(crate) fn user_trap_frame_page_paddr(&self) -> Result<usize, &'static str> {
-        let kstk = self.kstk.lock().unwrap();
-        Ok(kstk.as_ref().ok_or("ekstk")?.top_page_paddr())
+        self.with_kstk(KStk::top_page_paddr)
     }
 
     // AGENT: initialize or replace an off-CPU task's complete user return frame.
     pub fn install_user_trap_frame(&self, frame: TrapFrame) -> Result<(), &'static str> {
-        let kstk = self.kstk.lock().unwrap();
-        let ptr = Self::trap_frame_ptr_in(kstk.as_ref().ok_or("ekstk")?)?;
-        unsafe {
-            ptr.write(frame);
-        }
-        Ok(())
+        self.with_kstk(|kstk| unsafe {
+            Self::trap_frame_ptr_in(kstk).write(frame);
+        })
     }
 
     // AGENT: clone an off-CPU task's complete user return frame for fork,
     // checkpoint, tests, or scheduler-side signal delivery.
     pub fn snapshot_user_trap_frame(&self) -> Result<TrapFrame, &'static str> {
-        let kstk = self.kstk.lock().unwrap();
-        let ptr = Self::trap_frame_ptr_in(kstk.as_ref().ok_or("ekstk")?)?;
-        Ok(unsafe { (&*ptr).clone() })
+        self.with_kstk(|kstk| unsafe { (&*Self::trap_frame_ptr_in(kstk)).clone() })
     }
 
     // AGENT: read this task's scheduler placement state.
