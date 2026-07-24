@@ -8,8 +8,10 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::global_asm;
+#[cfg(feature = "qemu-boot-smoke")]
 use core::hint::spin_loop;
 use core::panic::PanicInfo;
+#[cfg(feature = "qemu-boot-smoke")]
 use core::sync::atomic::Ordering;
 
 use crate::irq_lock::IrqOnceCell;
@@ -69,6 +71,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     heap::promote(frame_pool.clone());
 
     println!("[kernel-qemu] boot hart={} dtb={:#x}", hartid, dtb_pa);
+    #[cfg(feature = "qemu-boot-smoke")]
     heap::smoke_check();
     kernel::kernel_core::init_timer_wheel();
     #[cfg(feature = "qemu-mm-selftest")]
@@ -142,6 +145,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     // feature-gated out.
     #[cfg(not(feature = "qemu-proc-selftest"))]
     let _ = kernel;
+    #[cfg(feature = "qemu-boot-smoke")]
     let timer_probe = arm_timer_wheel_probe();
     trap::init_kernel_trap_vector();
     println!(
@@ -149,8 +153,11 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         csr::read_stvec()
     );
     timer::init();
-    wait_for_first_timer_tick();
-    wait_for_timer_wheel_probe(&timer_probe);
+    #[cfg(feature = "qemu-boot-smoke")]
+    {
+        wait_for_first_timer_tick();
+        wait_for_timer_wheel_probe(&timer_probe);
+    }
     if init_ready {
         println!("[kernel-qemu] CPU0 scheduler start");
         kernel.run_cpu0();
@@ -282,8 +289,9 @@ fn init_qemu_frame_pool() -> kernel::FramePool {
     pool
 }
 
-// AGENT: Arm a one-tick logical timer target before hardware timer interrupts
-// are enabled; the real interrupt path must expire it through schedule_tick().
+// AGENT: Compile the one-tick timer-wheel probe only into explicit boot-smoke
+// images; normal kernels do not need this diagnostic target.
+#[cfg(feature = "qemu-boot-smoke")]
 fn arm_timer_wheel_probe() -> kernel::WaitToken {
     let kernel = kernel::global_kernel().expect("timer probe needs the global Kernel");
     let task_id = kernel
@@ -321,7 +329,9 @@ fn clear_bss() {
     }
 }
 
-// AGENT: Smoke-check that the early S-mode trap vector receives a real timer interrupt.
+// AGENT: Compile the real timer-interrupt observation loop only into explicit
+// boot-smoke images.
+#[cfg(feature = "qemu-boot-smoke")]
 fn wait_for_first_timer_tick() {
     let start = csr::read_time();
     let timeout_cycles = timer::CYCLES_PER_TICK * 20;
@@ -337,8 +347,9 @@ fn wait_for_first_timer_tick() {
     }
 }
 
-// AGENT: Smoke-check that a real QEMU timer interrupt also advances the migrated
-// Kernel timer wheel, not just the carrier-layer tick counter.
+// AGENT: Compile the migrated timer-wheel observation loop only into explicit
+// boot-smoke images.
+#[cfg(feature = "qemu-boot-smoke")]
 fn wait_for_timer_wheel_probe(token: &kernel::WaitToken) {
     let start = csr::read_time();
     let timeout_cycles = timer::CYCLES_PER_TICK * 20;

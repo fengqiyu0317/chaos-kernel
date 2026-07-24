@@ -4,13 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+qemu-boot-smoke = []
 qemu-mm-selftest = []
 qemu-fs-selftest = []
 qemu-proc-selftest = []
 qemu-sched-selftest = []
 qemu-sync-selftest = []
 qemu-checkpoint-selftest = []
-qemu-selftest = ["qemu-mm-selftest", "qemu-fs-selftest", "qemu-sched-selftest", "qemu-sync-selftest", "qemu-proc-selftest", "qemu-checkpoint-selftest"]
+qemu-selftest = [
+    "qemu-boot-smoke",
+    "qemu-mm-selftest",
+    "qemu-fs-selftest",
+    "qemu-sched-selftest",
+    "qemu-sync-selftest",
+    "qemu-proc-selftest",
+    "qemu-checkpoint-selftest",
+]
 
 [profile.dev]
 panic = "abort"

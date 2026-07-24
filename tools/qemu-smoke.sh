@@ -9,7 +9,9 @@ if ! command -v qemu-system-riscv64 >/dev/null 2>&1; then
 fi
 
 cd "$ROOT/kernel-qemu"
-cargo build --release
+# AGENT: keep boot diagnostics out of ordinary images and opt into them only
+# for this smoke-validation build.
+cargo build --release --features qemu-boot-smoke
 
 KERNEL="$ROOT/kernel-qemu/target/riscv64gc-unknown-none-elf/release/kernel-qemu"
 LOG="$(mktemp)"

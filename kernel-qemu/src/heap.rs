@@ -1,8 +1,11 @@
 // AGENT: bootstrap Rust alloc users from the linker heap, then switch to a
 // reclaiming direct-map heap whose physical pages come from FramePool on demand.
+#[cfg(feature = "qemu-boot-smoke")]
 use alloc::boxed::Box;
+#[cfg(feature = "qemu-boot-smoke")]
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+#[cfg(feature = "qemu-boot-smoke")]
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
@@ -212,7 +215,9 @@ impl KernelHeap {
         self.promoted.store(true, Ordering::Release);
     }
 
-    // AGENT: expose allocation and frame counts used by the QEMU smoke test.
+    // AGENT: compile allocation/frame accounting queries only for explicit
+    // QEMU boot-smoke images.
+    #[cfg(feature = "qemu-boot-smoke")]
     fn stats(&self) -> (usize, usize, usize) {
         let heap = self.dynamic.lock();
         (
@@ -282,8 +287,9 @@ pub fn promote(pool: Arc<FramePool>) {
     );
 }
 
-// AGENT: prove page-backed allocations of several sizes and alignments are
-// returned to FramePool rather than consuming a fixed boot arena permanently.
+// AGENT: compile the page-backed allocation/reclamation probe only into
+// explicit QEMU boot-smoke images.
+#[cfg(feature = "qemu-boot-smoke")]
 pub fn smoke_check() {
     let (_, _, free_before) = HEAP.stats();
     {
