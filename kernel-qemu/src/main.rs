@@ -165,8 +165,9 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         println!("[kernel-qemu] CPU0 scheduler start");
         kernel.run_cpu0();
     }
-    println!("[kernel-qemu] minimal carrier only; kernel-sim semantics not loaded");
-    println!("[kernel-qemu] shutdown");
+    // AGENT: run_cpu0() never returns, so this fallback means /bin/init could
+    // not be prepared as a runnable user task.
+    println!("[kernel-qemu] no runnable /bin/init; shutting down");
 
     sbi::shutdown()
 }
