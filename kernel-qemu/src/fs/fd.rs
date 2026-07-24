@@ -93,7 +93,20 @@ impl OpenFileDesc {
         match &self.file {
             FLike::File(f) => {
                 let status = self.status_flags();
-                f.write_with_status(status, buf)
+                if !status.wr {
+                    return Err("ebadf");
+                }
+                // AGENT: retain the migrated regular-file fd/OFD model while
+                // binding its first-stage terminal paths to the QEMU carrier's
+                // SBI console backend.
+                if matches!(
+                    f.instance().path.as_str(),
+                    "/dev/tty" | "/dev/stdout" | "/dev/stderr"
+                ) {
+                    Ok(crate::console::write_bytes(buf))
+                } else {
+                    f.write_with_status(status, buf)
+                }
             }
             FLike::Pipe(p) => {
                 if !self.status_flags().wr {

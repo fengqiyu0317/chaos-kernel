@@ -5,15 +5,22 @@ use crate::sbi;
 // AGENT: Minimal SBI-backed console writer for the M9 QEMU boot shell.
 struct SbiConsole;
 
+// AGENT: expose the byte-oriented SBI backend to the first userspace fd while
+// retaining the kernel console's newline normalization.
+pub fn write_bytes(bytes: &[u8]) -> usize {
+    for &byte in bytes {
+        if byte == b'\n' {
+            sbi::console_putchar(b'\r');
+        }
+        sbi::console_putchar(byte);
+    }
+    bytes.len()
+}
+
 impl Write for SbiConsole {
     // AGENT: Route formatted Rust output to the legacy SBI console.
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for byte in s.bytes() {
-            if byte == b'\n' {
-                sbi::console_putchar(b'\r');
-            }
-            sbi::console_putchar(byte);
-        }
+        write_bytes(s.as_bytes());
         Ok(())
     }
 }

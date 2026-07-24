@@ -1,6 +1,8 @@
 // AGENT
 use super::*;
 
+const MAX_RW_COUNT: usize = PAGE_SZ * 16;
+
 // AGENT: read a NUL-terminated path from the current user address space.
 fn read_user_path(task: &Task, addr: usize) -> Result<String, &'static str> {
     if addr == 0 {
@@ -106,14 +108,39 @@ pub(super) fn sys_read(
     Err("enosys")
 }
 
-// AGENT: keep the write syscall entry while standard QEMU usercopy-backed I/O is pending.
+// AGENT: copy a bounded readable userspace prefix into kernel memory before
+// dispatching through the current task's shared open-file description.
 pub(super) fn sys_write(
-    _kernel: &Kernel,
-    _a0: usize,
-    _a1: usize,
-    _a2: usize,
+    kernel: &Kernel,
+    a0: usize,
+    a1: usize,
+    a2: usize,
 ) -> Result<usize, &'static str> {
-    Err("enosys")
+    let fd = a0;
+    let buf_addr = a1;
+    let count = a2;
+    if count == 0 {
+        return Ok(0);
+    }
+    if buf_addr == 0 {
+        return Err("efault");
+    }
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    let request_len = min(count, MAX_RW_COUNT);
+    let readable_len = {
+        let addr_space = task.process.addr_space.lock().unwrap();
+        addr_space.readable_user_prefix_len(buf_addr, request_len)?
+    };
+    let mut tmp = vec![0u8; readable_len];
+    if readable_len != 0 {
+        task.process
+            .addr_space
+            .lock()
+            .unwrap()
+            .read_user_bytes(buf_addr, &mut tmp)?;
+    }
+    let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
+    entry.write(&tmp)
 }
 
 // AGENT: propagate fd allocator exhaustion instead of manufacturing an

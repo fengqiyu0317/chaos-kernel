@@ -57,9 +57,9 @@ static KERNEL_PAGE_TABLE: IrqOnceCell<kernel::PageTable> = IrqOnceCell::new();
 // the complete boot lifetime so ordinary FramePool allocation cannot reuse it.
 static BOOT_RESERVED_FRAMES: IrqOnceCell<Vec<kernel::PgFrame>> = IrqOnceCell::new();
 
-// AGENT: optional first-stage init ELF installed as the normal /bin/init file.
-// Keep this empty until a real RISC-V user ELF is produced.
-const ROOT_INIT_ELF: &[u8] = &[];
+// AGENT: embed the separately linked fixed-address RISC-V init ELF produced by
+// build.rs and install it through the ordinary path-backed exec file store.
+const ROOT_INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/root-init"));
 
 // AGENT: First Rust entry point for the M9 QEMU carrier layer.
 #[no_mangle]
@@ -101,22 +101,25 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         kernel::proc::sched::tests::run_all(frame_pool.as_ref());
         println!("[kernel-qemu] sched selftest passed");
     }
-    let (kernel, init_ready) = init_qemu_kernel_backend(frame_pool.as_ref().clone());
     // AGENT: run ProcInit stack-writing checks only after the real QEMU frame
     // pool and direct map are installed.
     #[cfg(feature = "qemu-proc-selftest")]
     {
         println!("[kernel-qemu] proc selftest start");
-        kernel::proc::process_tests::run_all(&kernel.pool);
+        kernel::proc::process_tests::run_all(frame_pool.as_ref());
         println!("[kernel-qemu] proc selftest passed");
     }
+    // AGENT: isolate selftests that intentionally mutate current-task, restored
+    // process, and run-queue state from the production Kernel built below.
+    #[cfg(any(feature = "qemu-fs-selftest", feature = "qemu-checkpoint-selftest"))]
+    let selftest_kernel = init_qemu_selftest_backend(frame_pool.as_ref().clone());
     // AGENT: filesystem syscall selftests cover ABI errno encoding before using
     // the installed Kernel, current task, frame pool, Sv39 mappings, and usercopy.
     #[cfg(feature = "qemu-fs-selftest")]
     {
         println!("[kernel-qemu] fs syscall selftest start");
         syscall_abi::tests::run_all();
-        kernel::syscall::tests::run_all(kernel);
+        kernel::syscall::tests::run_all(selftest_kernel);
         println!("[kernel-qemu] fs syscall selftest passed");
     }
     // AGENT: checkpoint selftests run after Kernel/FramePool setup because the
@@ -124,7 +127,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     #[cfg(feature = "qemu-checkpoint-selftest")]
     {
         println!("[kernel-qemu] checkpoint selftest start");
-        kernel::kernel_core::checkpoint_tests::run_all(kernel);
+        kernel::kernel_core::checkpoint_tests::run_all(selftest_kernel);
         println!("[kernel-qemu] checkpoint selftest passed");
     }
     // AGENT: validate the complete kernel-satp -> user-satp -> kernel-satp
@@ -135,16 +138,16 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
         trap::tests::user_satp_exit_round_trip(frame_pool.as_ref());
         println!("[kernel-qemu] user signal round-trip selftest start");
         trap::tests::user_signal_round_trip(frame_pool.as_ref());
-        // AGENT: focused scheduler tests replace the global Kernel; restore the
-        // production instance before later timer and trap entry points use it.
-        kernel::install_kernel(kernel);
         println!("[kernel-qemu] user signal round-trip selftest passed");
         println!("[kernel-qemu] user satp selftest passed");
     }
-    // AGENT: keep the ordinary boot path warning-free while proc selftests are
-    // feature-gated out.
-    #[cfg(not(feature = "qemu-proc-selftest"))]
-    let _ = kernel;
+    // AGENT: construct production task/process/run-queue state only after every
+    // boot selftest has finished creating or scheduling disposable tasks.
+    let (kernel, init_installed) = init_qemu_kernel_backend(frame_pool.as_ref().clone());
+    // AGENT: build the authoritative init address space and user frame only
+    // after boot selftests finish mutating disposable test state, so every
+    // feature combination enters the same clean init image.
+    let init_ready = prepare_root_init_task(kernel, init_installed);
     #[cfg(feature = "qemu-boot-smoke")]
     let timer_probe = arm_timer_wheel_probe();
     trap::init_kernel_trap_vector();
@@ -190,35 +193,50 @@ fn init_qemu_kernel_backend(frame_pool: kernel::FramePool) -> (&'static kernel::
         }
     };
     kernel.proc_init();
-    let init_ready = init_installed
-        && match kernel.cur_task(0) {
-            Some(init) => {
-                let prepared = crate::kernel::proc::task::fd::install_initial_stdio(&init)
-                    .and_then(|()| {
-                        kernel.do_exec(
-                            kernel::INIT_PID,
-                            "/bin/init",
-                            alloc::vec![alloc::string::String::from("/bin/init")],
-                            Vec::new(),
-                        )
-                    });
-                match prepared {
-                    Ok(()) => true,
-                    Err(err) => {
-                        println!("[kernel-qemu] failed to prepare init task: {}", err);
-                        false
-                    }
-                }
-            }
-            None => false,
-        };
     kernel::install_kernel(kernel);
     let current = kernel.cur_task(0).map(|task| task.id()).unwrap_or(0);
     println!(
         "[kernel-qemu] kernel timer backend installed current_task={}",
         current
     );
-    (kernel, init_ready)
+    (kernel, init_installed)
+}
+
+// AGENT: provide a disposable installed Kernel for boot selftests that require
+// live usercopy or checkpoint state without contaminating production scheduling.
+#[cfg(any(feature = "qemu-fs-selftest", feature = "qemu-checkpoint-selftest"))]
+fn init_qemu_selftest_backend(frame_pool: kernel::FramePool) -> &'static kernel::Kernel {
+    let kernel = Box::leak(Box::new(kernel::Kernel::new(frame_pool)));
+    kernel.proc_init();
+    kernel::install_kernel(kernel);
+    kernel
+}
+
+// AGENT: perform the final transactional init exec after optional boot tests so
+// their address-space and trap-frame fixtures cannot leak into normal scheduling.
+fn prepare_root_init_task(kernel: &kernel::Kernel, init_installed: bool) -> bool {
+    if !init_installed {
+        return false;
+    }
+    let prepared = kernel
+        .cur_task(0)
+        .ok_or("esrch")
+        .and_then(|init| crate::kernel::proc::task::fd::install_initial_stdio(&init))
+        .and_then(|()| {
+            kernel.do_exec(
+                kernel::INIT_PID,
+                "/bin/init",
+                alloc::vec![alloc::string::String::from("/bin/init")],
+                Vec::new(),
+            )
+        });
+    match prepared {
+        Ok(()) => true,
+        Err(err) => {
+            println!("[kernel-qemu] failed to prepare init task: {}", err);
+            false
+        }
+    }
 }
 
 // AGENT: install the linked init payload through the same path-backed file store

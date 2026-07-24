@@ -457,6 +457,29 @@ impl AddrSpace {
         Ok(())
     }
 
+    // AGENT: report the contiguous Sv39-readable prefix of a user buffer so
+    // write-like syscalls can preserve the kernel-sim short-I/O boundary.
+    pub fn readable_user_prefix_len(&self, addr: usize, len: usize) -> Result<usize, &'static str> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let end = Self::checked_user_end(addr, len)?;
+        let mut checked = 0usize;
+        while checked < len {
+            let cur = addr + checked;
+            if self.sv39.translate(cur, PageAccess::Read).is_err() {
+                return if checked == 0 {
+                    Err("efault")
+                } else {
+                    Ok(checked)
+                };
+            }
+            let page_off = cur & (PAGE_SZ - 1);
+            checked += min(end - cur, PAGE_SZ - page_off);
+        }
+        Ok(checked)
+    }
+
     // AGENT: read scalar user data through the unified byte-copy path.
     pub fn read_user_usize(&self, addr: usize) -> Result<usize, &'static str> {
         let mut bytes = [0u8; mem::size_of::<usize>()];

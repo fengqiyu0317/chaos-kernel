@@ -520,6 +520,16 @@ cargo test --test pressure
 
 ### M9 `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
 
+#### 2026-07-24：内嵌 RISC-V `/bin/init` 用户态启动闭环
+
+- 语义来源：沿用 `kernel-sim` 已稳定的 path-backed exec、初始 fd/OFD、用户缓冲区复制和进程退出语义；QEMU 侧只新增 bare-metal 用户 ELF 构建、SBI console 后端和真实 U-mode 验证。
+- 已完成：`kernel-qemu/build.rs` 使用 `riscv64gc-unknown-none-elf` 单独构建 `kernel-qemu/user/init.rs`，经专用 linker script 生成固定地址 `ELF64 ET_EXEC`；内核通过 `include_bytes!` 将产物安装为 `/bin/init`，不再保留空 `ROOT_INIT_ELF`。
+- 已完成：init 从入口执行 RISC-V Linux ABI `write(64)` 和 `exit(93)`；QEMU `sys_write()` 通过当前 `AddrSpace` 做有界 copyin，再经 fd/OFD 权限和 `/dev/tty` 后端输出到 SBI console。ELF 入口为 `0x10000`，两个页对齐 `PT_LOAD` 分别为 `R-X` 与 `R--`。
+- 启动隔离：会创建恢复任务和 runnable 状态的 boot selftest 使用一次性 Kernel；全部自测结束后再构造生产 Kernel 并事务式 `do_exec("/bin/init")`，避免 checkpoint 测试任务进入生产 run queue。
+- QEMU 回归：普通 release 镜像和 `bash tools/qemu-smoke.sh` 均观测到 `installed embedded /bin/init`、`CPU0 scheduler start`、`[init] userspace /bin/init reached`、`init process exited` 并正常 shutdown；`qemu-selftest` 的 mm/sync/context/sched/proc/fs/checkpoint/user-satp/signal 全部通过后，同样完成 init `write -> exit`。
+- 编译回归：`cargo check --target riscv64gc-unknown-none-elf`、`cargo check --target riscv64gc-unknown-none-elf --all-features`、`cargo build --release` 和 `cargo build --release --features qemu-selftest` 通过。
+- host 语义基准：`CARGO_TARGET_DIR=/tmp/chaos-kernel-sim-target cargo test` 通过，其中 `smoke` 为 `84 passed; 0 failed`；原 `kernel-sim/target` 仍因旧测试 ELF 不可执行而报 `Permission denied`，本轮未清理或覆盖该用户产物。
+
 #### 2026-07-23：RISC-V 用户栈 `rt_sigframe` 第二阶段
 
 - 第一阶段基线：提交 `da7e18f` 已接通 RISC-V signal syscall ABI、真实 `AddrSpace` usercopy、用户态 sigreturn trampoline 和 U-mode handler round-trip；第二阶段完成并通过回归前必须保留 `Task::sig_frames`，不能提前删除内核 shadow frame stack。
@@ -540,7 +550,7 @@ cargo test --test pressure
 - 目标：把 `kernel-sim` 已有的 task 运行状态、阻塞/唤醒和时间片语义接到 QEMU 真实上下文切换；QEMU 侧用 boot/idle stack、`KernelContext` 和 timer interrupt 替换 host thread 承载，本轮没有可抽入 `kernel-common/` 的新逻辑。
 - 已完成：`Kernel` 的 CPU 当前 task 数组改为 per-hart `Processor { current, idle_context, ... }`，并实现 CPU0 boot-stack scheduler loop；无 runnable task 时清空 current、打开中断并执行 `wfi`。
 - 已接线：wait block、主动 yield、timer slice 抢占和 `SYS_EXIT`/默认终止信号都先发布 task 状态，再从 task kernel context 切回 idle context；运行中 task 的内核栈延迟到 idle 侧释放。
-- 启动边界：嵌入并成功准备 `/bin/init` 时，`main.rs` 会进入 `Kernel::run_cpu0()`；当前 `ROOT_INIT_ELF` 仍为空，所以普通 carrier smoke 仍在 timer 验证后明确 shutdown，不会尝试返回空用户现场。
+- 启动边界（当时）：嵌入并成功准备 `/bin/init` 时，`main.rs` 会进入 `Kernel::run_cpu0()`；该阶段 `ROOT_INIT_ELF` 仍为空。此缺口已由上方 2026-07-24 启动闭环补齐。
 - 回归：`cargo check --target riscv64gc-unknown-none-elf --all-features` 通过；`qemu-sched-selftest` 的真实 `idle -> task -> idle` 往返通过；`qemu-selftest` 中 mm/sync/context/sched/proc/fs/checkpoint 全部通过；`bash tools/qemu-smoke.sh` 通过。
 - host 语义基准：使用 `CARGO_TARGET_DIR=/tmp/chaos-kernel-sim-target cargo test` 重建后通过，其中 `smoke` 为 `84 passed; 0 failed`。原 `kernel-sim/target` 内旧测试 ELF 为 `0644`，直接 `cargo test` 会因 `Permission denied` 无法执行，本轮没有清理或覆盖该用户构建产物。
 - 后续：多 hart 的 per-hart 独占协议、IPI 和跨 CPU wakeup 仍未实现；RISC-V `sched_yield` syscall 尚未映射，但底层 `Kernel::yield_current()` 已提供同一 idle handoff 边界。

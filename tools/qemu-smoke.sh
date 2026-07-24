@@ -32,4 +32,9 @@ grep -F "[kernel-qemu] heap alloc smoke" "$LOG"
 grep -F "[kernel-qemu] heap reclaim smoke passed" "$LOG"
 grep -F "[kernel-qemu] timer tick observed" "$LOG"
 grep -F "[kernel-qemu] timer wheel target observed" "$LOG"
-grep -F "[kernel-qemu] shutdown" "$LOG"
+# AGENT: ordinary boot must now install and run the embedded RISC-V init, cross
+# the user write ecall, and terminate through the migrated init-exit policy.
+grep -F "[kernel-qemu] installed embedded /bin/init" "$LOG"
+grep -F "[kernel-qemu] CPU0 scheduler start" "$LOG"
+grep -F "[init] userspace /bin/init reached" "$LOG"
+grep -F "[kernel-qemu] init process exited" "$LOG"
