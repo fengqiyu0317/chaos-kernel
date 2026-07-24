@@ -5,7 +5,7 @@ const WAIT4_WNOHANG: usize = 1;
 
 impl Kernel {
     // AGENT: create the simulator init task and install it as CPU0's current task.
-    pub fn proc_init(&self) {
+    pub(crate) fn proc_init(&self) {
         let root = self
             .tasks
             .spawn_root()
@@ -17,14 +17,22 @@ impl Kernel {
 
     // AGENT: route SYS_EXIT through the thread-local path; only the final member
     // is allowed to commit process-level teardown and parent notification.
-    pub fn do_exit_current_thread(&self, cpu: usize, code: usize) -> Result<(), &'static str> {
+    pub(crate) fn do_exit_current_thread(
+        &self,
+        cpu: usize,
+        code: usize,
+    ) -> Result<(), &'static str> {
         let task = self.cur_task(cpu).ok_or("esrch")?;
         self.exit_current_thread(cpu, &task, ExitReason::Code((code & 0xFF) as u8))
     }
 
     // AGENT: route SYS_EXIT_GROUP through the process-wide path and retain one
     // NoReturn control-flow result for the trap owner.
-    pub fn do_exit_group_current(&self, cpu: usize, code: usize) -> Result<(), &'static str> {
+    pub(crate) fn do_exit_group_current(
+        &self,
+        cpu: usize,
+        code: usize,
+    ) -> Result<(), &'static str> {
         let task = self.cur_task(cpu).ok_or("esrch")?;
         self.exit_thread_group(cpu, &task, ExitReason::Code((code & 0xFF) as u8));
         Ok(())
@@ -32,7 +40,7 @@ impl Kernel {
 
     // AGENT: retire one Task without touching shared resources unless the
     // lifecycle lock proves that this caller is the process's final thread.
-    pub(crate) fn exit_current_thread(
+    fn exit_current_thread(
         &self,
         cpu: usize,
         task: &Arc<Task>,
@@ -169,27 +177,19 @@ impl Kernel {
         }
     }
 
-    // AGENT: keep fork as a small orchestration layer; TaskTable owns process
-    // construction/publication, while Kernel only publishes it to the scheduler.
-    pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> {
-        let parent = self.tasks.find_task(parent_id).ok_or("esrch")?;
-        let caller_frame = parent.snapshot_user_trap_frame()?;
-        self.do_fork_from_frame(parent_id, &caller_frame)
-    }
-
     // AGENT: fork from the complete frame captured by the active trap path so
-    // the child inherits every user register at the post-ecall continuation.
+    // the child inherits every user register at the post-ecall continuation;
+    // the syscall adapter owns any test-only fallback to a stored frame.
     pub(crate) fn do_fork_from_frame(
         &self,
-        parent_id: usize,
+        parent: &Arc<Task>,
         caller_frame: &TrapFrame,
     ) -> Result<usize, &'static str> {
-        let parent = self.tasks.find_task(parent_id).ok_or("esrch")?;
         if parent.done() {
             return Err("esrch");
         }
 
-        let child = self.tasks.fork_process_from_frame(&parent, caller_frame)?;
+        let child = self.tasks.fork_process_from_frame(parent, caller_frame)?;
         let child_id = child.id();
         child.set_sched_state(TaskRunState::Runnable);
         child.reset_slice();
@@ -199,7 +199,7 @@ impl Kernel {
 
     // AGENT: wait for a matching child to become reapable, but leave the final
     // zombie deletion to sys_wait4 after any userspace status copyout succeeds.
-    pub fn do_wait(
+    pub(crate) fn do_wait(
         &self,
         parent_id: usize,
         target_pid: isize,
@@ -229,12 +229,6 @@ impl Kernel {
                 return Err("eintr");
             }
         }
-    }
-
-    // AGENT: commit the destructive half of wait4 after the syscall layer has
-    // successfully copied any wait status to userspace.
-    pub fn reap_waited_child(&self, child_pid: usize) -> Result<(), &'static str> {
-        self.tasks.reap(child_pid)
     }
 
     // AGENT: scan only the parent's current child list; blocking and reaping are

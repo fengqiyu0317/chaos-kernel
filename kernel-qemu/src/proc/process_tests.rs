@@ -596,24 +596,26 @@ fn reap_rejects_zombie_with_unreparented_children(pool: &FramePool) {
         .is_some_and(|linked| Arc::ptr_eq(&linked, &parent.process)));
 }
 
-// AGENT: fork copies every architectural user register and return CSR from the
-// caller frame while changing only the child-side a0 return value.
+// AGENT: the Kernel fork path copies every architectural user register and
+// return CSR from the live caller frame while changing only child-side a0.
 fn fork_copies_complete_user_frame(pool: &FramePool) {
-    let table = TaskTable::new(pool.clone());
-    let parent = table.spawn_root().expect("root spawn should work");
+    let kernel = Kernel::new(pool.clone());
+    kernel.proc_init();
+    let parent = kernel.cur_task(0).expect("init should be current");
     let mut source = TrapFrame::new();
     for index in 1..source.regs.len() {
         source.regs[index] = 0x1000 + index;
     }
     source.sstatus = 0x20;
     source.sepc = 0x401004;
-    parent
-        .install_user_trap_frame(source.clone())
-        .expect("parent frame should install");
 
-    let child = table
-        .fork_process(&parent)
+    let child_id = kernel
+        .do_fork_from_frame(&parent, &source)
         .expect("child fork should succeed");
+    let child = kernel
+        .tasks
+        .find_task(child_id)
+        .expect("forked child should be registered");
     let child_frame = child
         .snapshot_user_trap_frame()
         .expect("child frame should exist");
@@ -997,7 +999,7 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
         kernel.do_wait(parent.id(), child_pid as isize, 1),
         Ok((child_pid, 9 << 8))
     );
-    assert_eq!(kernel.reap_waited_child(child_pid), Ok(()));
+    assert_eq!(kernel.tasks.reap(child_pid), Ok(()));
 }
 
 // AGENT: prove a thread-group leader is only a Task for SYS_EXIT purposes; its

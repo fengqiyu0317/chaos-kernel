@@ -2,19 +2,22 @@
 use super::*;
 use crate::trap::TrapFrame;
 
-// AGENT: adapt fork arguments to the current task and optional live trap frame;
-// address-space identity is derived by TaskTable during process construction.
+// AGENT: pass the live trap frame into the single Kernel fork path; direct
+// semantic selftests fall back to the task-owned snapshot at this ABI boundary.
 pub(super) fn sys_fork(
     kernel: &Kernel,
     caller_frame: Option<&TrapFrame>,
 ) -> Result<usize, &'static str> {
-    let parent_id = kernel.cur_task(0).map(|task| task.id()).ok_or("esrch")?;
-    // AGENT: the QEMU trap path supplies the live post-ecall frame; direct
-    // semantic tests retain the task-snapshot fallback.
-    match caller_frame {
-        Some(frame) => kernel.do_fork_from_frame(parent_id, frame),
-        None => kernel.do_fork(parent_id),
-    }
+    let parent = kernel.cur_task(0).ok_or("esrch")?;
+    let stored_frame;
+    let caller_frame = match caller_frame {
+        Some(frame) => frame,
+        None => {
+            stored_frame = parent.snapshot_user_trap_frame()?;
+            &stored_frame
+        }
+    };
+    kernel.do_fork_from_frame(&parent, caller_frame)
 }
 
 pub(super) fn sys_exec(
@@ -138,7 +141,7 @@ pub(super) fn sys_wait4(
             .write_user_bytes(status_addr, &status, &kernel.pool)?;
     }
     if pid != 0 {
-        kernel.reap_waited_child(pid)?;
+        kernel.tasks.reap(pid)?;
     }
     Ok(pid)
 }
