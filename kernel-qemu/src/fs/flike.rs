@@ -26,6 +26,8 @@ impl FLike {
                 ap: false,
                 nb: false,
             },
+            // AGENT TODO: remove this O_RDWR compatibility seed once every TTY
+            // open-description constructor supplies its access mode explicitly.
             FLike::Tty(_) => FdOpt {
                 rd: true,
                 wr: true,

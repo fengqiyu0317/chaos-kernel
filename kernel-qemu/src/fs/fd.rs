@@ -123,12 +123,12 @@ impl OpenFileDesc {
     // AGENT: return explicit poll status so epoll can preserve closed peer state.
     pub fn poll(&self) -> PollStatus {
         match &self.file {
-            FLike::File(f) => f.poll_status_with_status(self.status_flags()),
             FLike::Pipe(p) => p.poll(),
             FLike::Ep(e) => e.poll_status(),
-            // AGENT: the first terminal backend is always writable and reports
-            // its read-side EOF placeholder as immediately observable.
-            FLike::Tty(_) => {
+            // AGENT: regular files and the first EOF-placeholder terminal have
+            // no object-local readiness state, so derive readiness directly
+            // from the shared open-file-description access mode.
+            FLike::File(_) | FLike::Tty(_) => {
                 let status = self.status_flags();
                 PollStatus {
                     readable: status.rd,

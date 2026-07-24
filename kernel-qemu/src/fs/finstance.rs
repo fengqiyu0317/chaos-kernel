@@ -103,16 +103,6 @@ impl FInstance {
     pub fn read_entry(&self, idx: usize) -> Result<String, &'static str> {
         self.node.dir_entry_at(idx)
     }
-    // AGENT: let OpenFileDesc provide the visible access mode when fd
-    // polling goes through the fd table.
-    pub(super) fn poll_status_with_status(&self, status: FdOpt) -> PollStatus {
-        PollStatus {
-            readable: status.rd,
-            writable: status.wr,
-            error: false,
-            closed: false,
-        }
-    }
     // AGENT: regular files only report supported ioctl results; unknown
     // requests must not be silently treated as success.
     pub(super) fn io_ctl_with_offset(

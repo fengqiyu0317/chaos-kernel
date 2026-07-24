@@ -112,10 +112,6 @@ impl FHandle {
         self.instance.fallocate(offset, len)
     }
 
-    pub(super) fn poll_status_with_status(&self, status: FdOpt) -> PollStatus {
-        self.instance.poll_status_with_status(status)
-    }
-
     pub(super) fn io_ctl(&self, cmd: usize) -> Result<usize, &'static str> {
         self.instance.io_ctl_with_offset(cmd, self.offset())
     }
