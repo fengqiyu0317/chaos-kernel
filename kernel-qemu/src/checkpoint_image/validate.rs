@@ -63,7 +63,13 @@ pub(super) fn validate_header_static(header: &CheckpointHeader) -> Result<(), Ch
 fn validate_fd_scope(fds: &[SavedFdEntry]) -> Result<(), CheckpointError> {
     for fd in fds {
         match fd.kind {
-            SavedFdKind::Stdin | SavedFdKind::Stdout | SavedFdKind::Stderr => {}
+            // AGENT: first-version stdio is now restored as a nonseekable typed
+            // terminal, so path-tagged legacy offsets cannot be represented.
+            SavedFdKind::Stdin | SavedFdKind::Stdout | SavedFdKind::Stderr => {
+                if fd.offset != 0 {
+                    return Err(CheckpointError::UnsupportedFd);
+                }
+            }
             SavedFdKind::RegularMemoryFile
             | SavedFdKind::Pipe
             | SavedFdKind::Epoll

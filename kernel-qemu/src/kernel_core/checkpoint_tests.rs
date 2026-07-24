@@ -2,6 +2,7 @@ use super::*;
 
 pub fn run_all(kernel: &Kernel) {
     periodic_timer_preserves_phase_after_delayed_advance();
+    checkpoint_stdio_round_trip_preserves_typed_terminal_objects(kernel);
     checkpoint_round_trip_restores_memory_and_trap_frame(kernel);
     checkpoint_round_trip_restores_task_timer(kernel);
 }
@@ -28,6 +29,76 @@ fn periodic_timer_preserves_phase_after_delayed_advance() {
         .expect("periodic timer should be rescheduled");
     assert_eq!(rescheduled.deadline, expected_next);
     CLK.store(start, Ordering::Relaxed);
+}
+
+// AGENT: prove first-version checkpoint keeps stdio roles while reconstructing
+// typed terminal objects, and rejects a redirected regular file it cannot save.
+#[cfg_attr(test, test)]
+fn checkpoint_stdio_round_trip_preserves_typed_terminal_objects(kernel: &Kernel) {
+    let source = kernel
+        .tasks
+        .spawn()
+        .expect("checkpoint stdio source should spawn");
+    crate::kernel::proc::task::fd::install_initial_stdio(&source)
+        .expect("checkpoint stdio should install");
+
+    let saved = source
+        .snapshot_checkpoint_fds()
+        .expect("typed terminal stdio should snapshot");
+    assert_eq!(saved.len(), 3);
+    assert_eq!(saved[0].kind, SavedFdKind::Stdin);
+    assert_eq!(saved[1].kind, SavedFdKind::Stdout);
+    assert_eq!(saved[2].kind, SavedFdKind::Stderr);
+    assert!(saved.iter().all(|entry| entry.offset == 0));
+
+    let restored = kernel
+        .tasks
+        .spawn()
+        .expect("checkpoint stdio target should spawn");
+    restored
+        .restore_checkpoint_fds(&saved)
+        .expect("typed terminal stdio should restore");
+    for fd in 0..=2 {
+        let entry = restored
+            .get_fd_entry(fd)
+            .expect("restored stdio fd should exist");
+        assert!(entry.is_tty());
+        assert!(!entry.is_regular_file());
+        assert_eq!(entry.offset(), 0);
+        assert_eq!(entry.seek(FSeek::Start(0)), Err("espipe"));
+    }
+
+    let mut stdin_byte = [0u8; 1];
+    assert_eq!(
+        restored
+            .get_fd_entry(0)
+            .expect("restored stdin should exist")
+            .read(&mut stdin_byte),
+        Ok(0)
+    );
+    assert_eq!(
+        restored
+            .get_fd_entry(1)
+            .expect("restored stdout should exist")
+            .read(&mut stdin_byte),
+        Err("ebadf")
+    );
+
+    source.close_fd(1).expect("stdout redirect should close");
+    let redirected = source
+        .add_file_with_status(
+            FLike::File(FHandle::new(FInstance::new("/tmp/redirected"))),
+            FdOpt {
+                rd: false,
+                wr: true,
+                ap: false,
+                nb: false,
+            },
+            false,
+        )
+        .expect("redirected stdout should reuse fd 1");
+    assert_eq!(redirected, 1);
+    assert_eq!(source.snapshot_checkpoint_fds(), Err("enotsup"));
 }
 
 // AGENT: prepare the minimal user mappings required by checkpoint validation

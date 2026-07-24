@@ -34,9 +34,9 @@ fn sample_image() -> CheckpointImage {
         fd: 1,
         description_id: 1,
         cloexec: false,
-        status_flags: 0,
+        status_flags: 1,
         kind: SavedFdKind::Stdout,
-        offset: 7,
+        offset: 0,
     });
     image.timers.push(SavedTimer {
         clock_id: 0,
@@ -97,6 +97,18 @@ fn validation_rejects_unsupported_fd_kind() {
     );
 }
 
+// AGENT: typed stdio terminals are nonseekable, so first-version images must
+// reject offsets left by the old path-tagged regular-file representation.
+#[test]
+fn validation_rejects_stdio_offset() {
+    let mut image = sample_image();
+    image.fds[0].offset = 1;
+    assert_eq!(
+        image.validate_first_version(),
+        Err(CheckpointError::UnsupportedFd)
+    );
+}
+
 // AGENT: duplicate descriptors sharing one open-file-description must agree
 // on serializable offset and status state.
 #[test]
@@ -108,7 +120,7 @@ fn validation_rejects_inconsistent_open_description() {
         cloexec: false,
         status_flags: 0,
         kind: SavedFdKind::Stdout,
-        offset: 8,
+        offset: 0,
     });
     assert_eq!(
         image.validate_first_version(),

@@ -81,6 +81,12 @@ impl OpenFileDesc {
                 p.read_at(buf)
             }
             FLike::Ep(_) => Err("enosys"),
+            FLike::Tty(tty) => {
+                if !self.status_flags().rd {
+                    return Err("ebadf");
+                }
+                Ok(tty.read(buf))
+            }
         }
     }
 
@@ -96,17 +102,7 @@ impl OpenFileDesc {
                 if !status.wr {
                     return Err("ebadf");
                 }
-                // AGENT: retain the migrated regular-file fd/OFD model while
-                // binding its first-stage terminal paths to the QEMU carrier's
-                // SBI console backend.
-                if matches!(
-                    f.instance().path.as_str(),
-                    "/dev/tty" | "/dev/stdout" | "/dev/stderr"
-                ) {
-                    Ok(crate::console::write_bytes(buf))
-                } else {
-                    f.write_with_status(status, buf)
-                }
+                f.write_with_status(status, buf)
             }
             FLike::Pipe(p) => {
                 if !self.status_flags().wr {
@@ -115,6 +111,12 @@ impl OpenFileDesc {
                 p.write_at(buf)
             }
             FLike::Ep(_) => Err("enosys"),
+            FLike::Tty(tty) => {
+                if !self.status_flags().wr {
+                    return Err("ebadf");
+                }
+                Ok(tty.write(buf))
+            }
         }
     }
 
@@ -124,9 +126,22 @@ impl OpenFileDesc {
             FLike::File(f) => f.poll_status_with_status(self.status_flags()),
             FLike::Pipe(p) => p.poll(),
             FLike::Ep(e) => e.poll_status(),
+            // AGENT: the first terminal backend is always writable and reports
+            // its read-side EOF placeholder as immediately observable.
+            FLike::Tty(_) => {
+                let status = self.status_flags();
+                PollStatus {
+                    readable: status.rd,
+                    writable: status.wr,
+                    error: false,
+                    closed: false,
+                }
+            }
         }
     }
 
+    // AGENT: dispatch ioctl semantics by concrete fd object, keeping the first
+    // typed terminal honest about its not-yet-migrated termios support.
     pub fn io_ctl(&self, req: usize) -> Result<usize, &'static str> {
         match &self.file {
             FLike::File(f) => f.io_ctl(req),
@@ -135,6 +150,9 @@ impl OpenFileDesc {
                 _ => Err("enotty"),
             },
             FLike::Ep(_) => Err("enosys"),
+            // AGENT: do not pretend that the minimal SBI terminal implements
+            // termios ioctls before its input and line discipline are migrated.
+            FLike::Tty(_) => Err("enotty"),
         }
     }
 
@@ -213,6 +231,12 @@ impl OpenFileDesc {
     // cloning the backing file instance when the offset/status live elsewhere.
     pub fn is_regular_file(&self) -> bool {
         matches!(self.file, FLike::File(_))
+    }
+
+    // AGENT: let checkpoint code validate stdio by concrete object type instead
+    // of assuming that fd numbers 0, 1, and 2 contain path-tagged regular files.
+    pub fn is_tty(&self) -> bool {
+        matches!(self.file, FLike::Tty(_))
     }
 
     // AGENT: keep splice on the shared open-file-description path so mutable
@@ -493,6 +517,12 @@ impl FdEntry {
     // underlying FInstance or implying fd-dup semantics.
     pub fn is_regular_file(&self) -> bool {
         self.desc.is_regular_file()
+    }
+
+    // AGENT: expose terminal classification without leaking the polymorphic
+    // open-file-description internals into task fd-table code.
+    pub fn is_tty(&self) -> bool {
+        self.desc.is_tty()
     }
 
     // AGENT: fd-table callers splice through descriptor entries rather than

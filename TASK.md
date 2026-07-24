@@ -520,11 +520,20 @@ cargo test --test pressure
 
 ### M9 `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
 
+#### 2026-07-24：初始 stdio 改为显式 TTY fd 对象
+
+- 语义来源与范围：沿用 `kernel-sim` 的 fd entry / open-file-description 多态对象边界，并按 `docs/kernel-sim-qemu-migration-design.md` 的第一阶段最小字符设备范围实现；本轮不是完整 `/dev`、TTY 行规程或控制台输入迁移。
+- 已完成：`kernel-qemu` 新增无状态 `TtyDevice` 和 `FLike::Tty`，初始 fd `0/1/2` 直接安装只读/只写 TTY open-file-description；`OpenFileDesc::{read,write,poll,io_ctl}` 按具体对象类型分派，不再通过 `"/dev/tty"`、`"/dev/stdout"`、`"/dev/stderr"` 路径字符串把普通文件改道到 SBI console。
+- checkpoint：first-version snapshot 只接受 fd `0/1/2` 上的显式 TTY，TTY offset 固定为 `0`，restore 直接重建 `FLike::Tty` 且拒绝非零 offset；stdout 被重定向到普通文件时明确返回 `enotsup`，避免按 stdio 设备静默错误恢复。
+- 回归覆盖：fd 自测验证 TTY 的 EOF/权限/poll/不可 seek 语义及名为 `/dev/tty` 的普通文件仍写入普通存储；checkpoint 自测验证 stdio typed-TTY round trip 和普通文件重定向拒绝路径。
+- 验证结果：`cargo fmt --check`、`cargo check --target riscv64gc-unknown-none-elf --all-features`、`cargo build --release --features qemu-selftest` 通过；组合 QEMU 自测的 sync/fs/checkpoint/user-satp 等全部通过并完成 `/bin/init` 的 `write -> exit`；`bash tools/qemu-smoke.sh` 通过。host 语义基准使用独立 target 运行 `cargo test`，结果为 unit `1 passed`、ELF `3 passed`、smoke `84 passed`。
+- 剩余边界：`kernel-qemu` 的 syscall `read` 入口仍为 `enosys`，`TtyDevice::read()` 的 EOF 占位只在 fd 对象层可用；真实 UART/SBI 输入、`tty_buf` 接线、阻塞唤醒、termios/ioctl、设备节点和 `/dev/stdout`/`stderr` 路径解析仍是后续工作。
+
 #### 2026-07-24：内嵌 RISC-V `/bin/init` 用户态启动闭环
 
 - 语义来源：沿用 `kernel-sim` 已稳定的 path-backed exec、初始 fd/OFD、用户缓冲区复制和进程退出语义；QEMU 侧只新增 bare-metal 用户 ELF 构建、SBI console 后端和真实 U-mode 验证。
 - 已完成：`kernel-qemu/build.rs` 使用 `riscv64gc-unknown-none-elf` 单独构建 `kernel-qemu/user/init.rs`，经专用 linker script 生成固定地址 `ELF64 ET_EXEC`；内核通过 `include_bytes!` 将产物安装为 `/bin/init`，不再保留空 `ROOT_INIT_ELF`。
-- 已完成：init 从入口执行 RISC-V Linux ABI `write(64)` 和 `exit(93)`；QEMU `sys_write()` 通过当前 `AddrSpace` 做有界 copyin，再经 fd/OFD 权限和 `/dev/tty` 后端输出到 SBI console。ELF 入口为 `0x10000`，两个页对齐 `PT_LOAD` 分别为 `R-X` 与 `R--`。
+- 已完成：init 从入口执行 RISC-V Linux ABI `write(64)` 和 `exit(93)`；QEMU `sys_write()` 通过当前 `AddrSpace` 做有界 copyin，再经 fd/OFD 权限和显式 `FLike::Tty` 后端输出到 SBI console。ELF 入口为 `0x10000`，两个页对齐 `PT_LOAD` 分别为 `R-X` 与 `R--`。
 - 启动隔离：会创建恢复任务和 runnable 状态的 boot selftest 使用一次性 Kernel；全部自测结束后再构造生产 Kernel 并事务式 `do_exec("/bin/init")`，避免 checkpoint 测试任务进入生产 run queue。
 - QEMU 回归：普通 release 镜像和 `bash tools/qemu-smoke.sh` 均观测到 `installed embedded /bin/init`、`CPU0 scheduler start`、`[init] userspace /bin/init reached`、`init process exited` 并正常 shutdown；`qemu-selftest` 的 mm/sync/context/sched/proc/fs/checkpoint/user-satp/signal 全部通过后，同样完成 init `write -> exit`。
 - 编译回归：`cargo check --target riscv64gc-unknown-none-elf`、`cargo check --target riscv64gc-unknown-none-elf --all-features`、`cargo build --release` 和 `cargo build --release --features qemu-selftest` 通过。

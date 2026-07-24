@@ -137,11 +137,12 @@ fn checkpoint_description_id(
     Ok(id)
 }
 
-// AGENT: rebuild the stdio-like instances supported by checkpoint restore.
-fn checkpoint_stdio_instance(
+// AGENT: rebuild first-version stdio as an explicit terminal object instead of
+// manufacturing path-tagged regular files during checkpoint restore.
+fn checkpoint_stdio_file(
     kind: SavedFdKind,
     status_flags: u32,
-) -> Result<(FInstance, FdOpt), &'static str> {
+) -> Result<(FLike, FdOpt), &'static str> {
     let mut opt = match kind {
         SavedFdKind::Stdin => FdOpt {
             rd: true,
@@ -162,13 +163,7 @@ fn checkpoint_stdio_instance(
         | SavedFdKind::Tty => return Err("enotsup"),
     };
     opt.apply_status_flags(status_flags as usize);
-    let path = match kind {
-        SavedFdKind::Stdin => "/dev/stdin",
-        SavedFdKind::Stdout => "/dev/stdout",
-        SavedFdKind::Stderr => "/dev/stderr",
-        _ => return Err("enotsup"),
-    };
-    Ok((FInstance::new(path), opt))
+    Ok((FLike::Tty(TtyDevice), opt))
 }
 
 // AGENT: seed stdio through the unified allocator used by later open, dup, and
@@ -186,21 +181,10 @@ pub(crate) fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str
         ap: false,
         nb: false,
     };
-    let stdin_instance = FInstance::new("/dev/tty");
-    let stdout_instance = FInstance::new("/dev/tty");
-    let stderr_instance = stdout_instance.dup();
-    let stdin =
-        task.add_file_with_status(FLike::File(FHandle::new(stdin_instance)), stdin_opt, false)?;
-    let stdout = task.add_file_with_status(
-        FLike::File(FHandle::new(stdout_instance)),
-        stdout_opt,
-        false,
-    )?;
-    let stderr = task.add_file_with_status(
-        FLike::File(FHandle::new(stderr_instance)),
-        stdout_opt,
-        false,
-    )?;
+    let tty = TtyDevice;
+    let stdin = task.add_file_with_status(FLike::Tty(tty), stdin_opt, false)?;
+    let stdout = task.add_file_with_status(FLike::Tty(tty), stdout_opt, false)?;
+    let stderr = task.add_file_with_status(FLike::Tty(tty), stdout_opt, false)?;
     if (stdin, stdout, stderr) != (0, 1, 2) {
         return Err("ebadf");
     }
@@ -271,7 +255,9 @@ impl Task {
         let mut saved = Vec::with_capacity(table.entries.len());
         for (&fd, entry) in table.entries.iter() {
             let kind = checkpoint_fd_kind(fd)?;
-            if !entry.is_regular_file() {
+            // AGENT: first-version checkpoint only supports the initial terminal
+            // stdio surface and must reject redirected regular files explicitly.
+            if !entry.is_tty() {
                 return Err("enotsup");
             }
             let description_id = checkpoint_description_id(entry, &mut descriptions)?;
@@ -281,7 +267,8 @@ impl Task {
                 cloexec: entry.is_cloexec(),
                 status_flags: u32::try_from(entry.status_flags_bits()).map_err(|_| "einval")?,
                 kind,
-                offset: entry.offset(),
+                // AGENT: character terminals have no seek position.
+                offset: 0,
             });
         }
         Ok(saved)
@@ -296,16 +283,16 @@ impl Task {
             if fd >= MAX_FD || restored.contains_key(&fd) {
                 return Err("ebadf");
             }
+            // AGENT: reject legacy path-tagged terminal offsets instead of
+            // silently assigning regular-file seek semantics to a character fd.
+            if saved.offset != 0 {
+                return Err("einval");
+            }
             let entry = if let Some(template) = descriptions.get(&saved.description_id) {
                 template.dup(saved.cloexec)
             } else {
-                let (instance, status) = checkpoint_stdio_instance(saved.kind, saved.status_flags)?;
-                let entry = FdEntry::with_status(
-                    FLike::File(FHandle::new(instance)),
-                    status,
-                    saved.cloexec,
-                );
-                entry.seek(FSeek::Start(saved.offset))?;
+                let (file, status) = checkpoint_stdio_file(saved.kind, saved.status_flags)?;
+                let entry = FdEntry::with_status(file, status, saved.cloexec);
                 descriptions.insert(saved.description_id, entry.clone());
                 entry
             };

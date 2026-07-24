@@ -11,6 +11,8 @@ pub fn run_all() {
     fallocate_validates_and_only_grows_regular_files();
     read_entry_uses_open_description_offset();
     regular_file_poll_and_ioctl_are_explicit();
+    terminal_is_a_typed_nonseekable_fd_object();
+    regular_file_named_dev_tty_stays_a_regular_file();
     splice_checks_permissions_before_moving_offsets();
     splice_uses_shared_append_status();
 }
@@ -231,6 +233,43 @@ fn regular_file_poll_and_ioctl_are_explicit() {
     assert_eq!(entry.read(&mut buf), Ok(2));
     assert_eq!(entry.io_ctl(TIOCINQ), Ok(2));
     assert_eq!(entry.io_ctl(0xDEAD), Err("enotty"));
+}
+
+// AGENT: verify that terminal behavior follows the concrete FLike variant and
+// keeps character-device EOF, permissions, polling, and seek semantics explicit.
+#[cfg_attr(test, test)]
+fn terminal_is_a_typed_nonseekable_fd_object() {
+    let read_only = FdEntry::with_status(FLike::Tty(TtyDevice), FdOpt::default(), false);
+    assert!(read_only.is_tty());
+    assert!(!read_only.is_regular_file());
+    assert_eq!(read_only.offset(), 0);
+    assert_eq!(read_only.seek(FSeek::Start(0)), Err("espipe"));
+    assert_eq!(read_only.write(b"x"), Err("ebadf"));
+    assert_eq!(read_only.io_ctl(TCGETS), Err("enotty"));
+
+    let mut buf = [0xaa; 4];
+    assert_eq!(read_only.read(&mut buf), Ok(0));
+    assert_eq!(buf, [0xaa; 4]);
+
+    let poll = read_only.poll();
+    assert!(poll.readable);
+    assert!(!poll.writable);
+    assert!(!poll.error);
+    assert!(!poll.closed);
+}
+
+// AGENT: prove path strings no longer select the console backend; only an
+// explicit FLike::Tty may bypass regular-file storage and offsets.
+#[cfg_attr(test, test)]
+fn regular_file_named_dev_tty_stays_a_regular_file() {
+    let instance = FInstance::with_data("/dev/tty", Vec::new());
+    let entry = file_entry(&instance, writable_opt());
+
+    assert!(entry.is_regular_file());
+    assert!(!entry.is_tty());
+    assert_eq!(entry.write(b"file-data"), Ok(9));
+    assert_eq!(entry.offset(), 9);
+    assert_eq!(file_bytes(&instance, 0, 9), b"file-data");
 }
 
 // AGENT: moved splice permission regression out of fd.rs unchanged.

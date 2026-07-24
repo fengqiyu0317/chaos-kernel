@@ -1,5 +1,26 @@
 // AGENT
 
+// AGENT: represent the first QEMU terminal character device explicitly instead
+// of recognizing device behavior from a regular file's path string.
+#[derive(Clone, Copy, Default)]
+pub struct TtyDevice;
+
+impl TtyDevice {
+    // AGENT: keep stdin at the migration design's permitted EOF placeholder
+    // until a QEMU console-input backend feeds the kernel TTY queue.
+    pub fn read(&self, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    // AGENT: route terminal bytes through the existing newline-normalizing SBI
+    // console backend without creating a synthetic regular-file offset.
+    pub fn write(&self, buf: &[u8]) -> usize {
+        crate::console::write_bytes(buf)
+    }
+}
+
+// AGENT: retain the migrated termios-shaped state for later line-discipline
+// work; the first explicit TtyDevice does not claim those semantics yet.
 #[derive(Clone, Copy)]
 pub struct TrmIO {
     pub iflag: u32,
@@ -11,6 +32,9 @@ pub struct TrmIO {
     pub ispeed: u32,
     pub ospeed: u32,
 }
+
+// AGENT: keep the terminal attribute defaults identical while documenting this
+// block as migrated terminal state rather than an implicit regular file.
 impl Default for TrmIO {
     fn default() -> Self {
         TrmIO {
@@ -29,6 +53,7 @@ impl Default for TrmIO {
     }
 }
 
+// AGENT: preserve the ABI-shaped terminal window size for future tty ioctls.
 #[derive(Clone, Copy, Default)]
 pub struct WinSz {
     pub row: u16,
