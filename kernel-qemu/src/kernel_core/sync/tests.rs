@@ -41,8 +41,6 @@ pub fn run_all(pool: &FramePool) {
     wait_token_expired_deadline_times_out_immediately();
     wait_token_timer_target_times_out_on_schedule_tick(pool);
     wait_token_event_wake_uses_installed_scheduler_backend(pool);
-    wait_token_block_current_keeps_placeholder_stack(pool);
-    wait_token_tick_leaves_sleeping_current_parked(pool);
     wait_token_interruptible_wait_reports_signal_not_event(pool);
     wait_token_stays_blocked_after_masked_signal(pool);
     wait_token_sleeping_wait_reports_later_signal(pool);
@@ -235,48 +233,6 @@ fn wait_token_event_wake_uses_installed_scheduler_backend(pool: &FramePool) {
     clear_wait_token_state();
 }
 
-// AGENT: before the scheduler loop is activated, the compatibility bridge
-// records Sleeping without attempting to use an uninitialized idle context.
-fn wait_token_block_current_keeps_placeholder_stack(pool: &FramePool) {
-    reset_wait_token_state();
-
-    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
-    kernel.proc_init();
-    let task = kernel.cur_task(0).expect("init task should be current");
-    let peer = kernel.tasks.spawn().expect("spawn peer task");
-    peer.set_sched_state(TaskRunState::Runnable);
-    kernel.run_queue.enqueue(&peer);
-
-    assert!(kernel.block_task_for_wait(task.id()));
-    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
-    assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(task.id()));
-    assert_eq!(kernel.run_queue.pick_next(), Some(peer.id()));
-
-    clear_wait_token_state();
-}
-
-// AGENT: timer ticks must not time-slice the pre-scheduler compatibility state
-// whose sleeping task still occupies Processor.current.
-fn wait_token_tick_leaves_sleeping_current_parked(pool: &FramePool) {
-    reset_wait_token_state();
-
-    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
-    kernel.proc_init();
-    let task = kernel.cur_task(0).expect("init task should be current");
-    let peer = kernel.tasks.spawn().expect("spawn peer task");
-    task.set_sched_state(TaskRunState::Sleeping);
-    peer.set_sched_state(TaskRunState::Runnable);
-    kernel.run_queue.enqueue(&peer);
-
-    kernel.schedule_tick(0);
-
-    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
-    assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(task.id()));
-    assert_eq!(kernel.run_queue.pick_next(), Some(peer.id()));
-
-    clear_wait_token_state();
-}
-
 // AGENT: interruptible waits must distinguish pending signals from real event
 // readiness so syscall callers can return EINTR.
 fn wait_token_interruptible_wait_reports_signal_not_event(pool: &FramePool) {
@@ -385,7 +341,7 @@ extern "C" fn wait_round_trip_test_task() -> ! {
         .expect("wait test task should still be current");
     task.mark_thread_exited();
     drop(task);
-    assert!(kernel.switch_current_to_idle(0));
+    kernel.switch_current_to_idle(0);
     loop {
         core::hint::spin_loop();
     }
@@ -546,7 +502,7 @@ extern "C" fn futex_wait_round_trip_test_task() -> ! {
         .expect("futex test task should still be current");
     task.mark_thread_exited();
     drop(task);
-    assert!(kernel.switch_current_to_idle(0));
+    kernel.switch_current_to_idle(0);
     loop {
         core::hint::spin_loop();
     }

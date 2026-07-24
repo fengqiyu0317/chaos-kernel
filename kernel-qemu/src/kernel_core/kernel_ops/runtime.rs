@@ -19,8 +19,8 @@ impl Kernel {
         processor.set_current(t);
     }
 
-    // AGENT: report whether a hart has entered its real idle/task switch loop;
-    // metadata-only selftests retain their old no-switch behavior until then.
+    // AGENT: report whether CPU0 has initialized the idle-side switch context;
+    // callers use this only to enforce one-time scheduler setup.
     pub(crate) fn scheduler_active(&self, cpu: usize) -> bool {
         self.processors
             .get(cpu)
@@ -38,27 +38,20 @@ impl Kernel {
     // AGENT: detach the running CPU0 task before switching back to the idle
     // context, then restore the caller's SIE state if that task is resumed. The
     // scheduler loop retains the Arc<Task> across this suspension.
-    pub(crate) fn switch_current_to_idle(&self, cpu: usize) -> bool {
-        if cpu != 0 {
-            return false;
-        }
+    pub(crate) fn switch_current_to_idle(&self, cpu: usize) {
+        assert_eq!(cpu, 0, "only CPU0 owns a scheduler context");
         let restore_interrupts = crate::csr::read_sstatus() & crate::csr::SSTATUS_SIE != 0;
         crate::csr::disable_interrupts();
-        let contexts = {
+        let (current_context, idle_context) = {
             let mut processor = self.processors[0].lock().unwrap();
-            if processor.scheduler_active() {
-                processor
-                    .take_current_context()
-                    .map(|current_context| (current_context, processor.idle_context_ptr()))
-            } else {
-                None
-            }
-        };
-        let Some((current_context, idle_context)) = contexts else {
-            if restore_interrupts {
-                crate::csr::enable_interrupts();
-            }
-            return false;
+            assert!(
+                processor.scheduler_active(),
+                "CPU0 idle context is not initialized"
+            );
+            let current_context = processor
+                .take_current_context()
+                .expect("CPU0 scheduler has no current task to switch");
+            (current_context, processor.idle_context_ptr())
         };
         unsafe {
             crate::context::switch_kernel_context(current_context, idle_context);
@@ -66,6 +59,5 @@ impl Kernel {
         if restore_interrupts {
             crate::csr::enable_interrupts();
         }
-        true
     }
 }

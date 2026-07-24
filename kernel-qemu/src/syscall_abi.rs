@@ -120,10 +120,8 @@ fn dispatch_installed_kernel(
         crate::kernel::SyscallOutcome::NoReturn => {
             // AGENT: every non-returning syscall abandons the exited task's trap
             // stack through idle; the outcome, not one hard-coded nr, owns flow.
-            if kernel.switch_current_to_idle(0) {
-                unreachable!("a no-return syscall task was scheduled again");
-            }
-            crate::sbi::shutdown();
+            kernel.switch_current_to_idle(0);
+            unreachable!("a no-return syscall task was scheduled again");
         }
     }
 }
@@ -137,7 +135,8 @@ fn deliver_pending_signal(kernel: &crate::kernel::Kernel, frame: &mut TrapFrame)
     // AGENT: a default-terminating signal uses the same task -> idle handoff as
     // SYS_EXIT instead of returning a zombie frame to user mode.
     let current_done = kernel.cur_task(0).is_some_and(|task| task.done());
-    if current_done && kernel.switch_current_to_idle(0) {
+    if current_done {
+        kernel.switch_current_to_idle(0);
         unreachable!("a signal-terminated task was scheduled again");
     }
 }

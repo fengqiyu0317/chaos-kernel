@@ -3,7 +3,7 @@
 use super::*;
 use crate::kernel::kernel_core::{init_timer_wheel, TIMER_WHEEL};
 use crate::kernel::{
-    global_kernel, install_kernel, signal_bit, FramePool, Kernel, SigAction, SigSet,
+    global_kernel, install_kernel, signal_bit, ExitReason, FramePool, Kernel, SigAction, SigSet,
     SignalDeliveryAction, SignalEnqueueResult, TaskRunState, NSIG, PRIO_MIN, SIGCHLD, SIGCONT,
     SIGKILL, SIGRTMIN, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGWINCH,
     SIG_DFL, SIG_IGN, SYS_SIGRETURN, UNMASKABLE_SIGNAL_MASK, USER_SIGTRAMP,
@@ -12,6 +12,8 @@ use crate::trap::TrapFrame;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 static PROCESSOR_EXIT_TEST_RAN: AtomicBool = AtomicBool::new(false);
+static PROCESSOR_STOP_TEST_ENTERED: AtomicBool = AtomicBool::new(false);
+static PROCESSOR_STOP_TEST_RESUMED: AtomicBool = AtomicBool::new(false);
 
 // AGENT: expose focused scheduler queue checks to the optional QEMU boot
 // selftest path and use its discovered RAM pool for real task kernel stacks.
@@ -64,24 +66,22 @@ fn processor_releases_exited_stack_after_idle_handoff(pool: &FramePool) {
     assert!(task.kernel_stack_top().is_none());
 }
 
-// AGENT: run SYS_EXIT on the selected Task stack, verify teardown retained that
-// live stack, then use the production handoff so the idle side can release it.
+// AGENT: exit the selected Task on its live stack, verify teardown retained that
+// stack, then use the production handoff so the idle side can release it.
 extern "C" fn processor_exit_test_task() -> ! {
     PROCESSOR_EXIT_TEST_RAN.store(true, Ordering::Relaxed);
     let kernel = global_kernel().expect("scheduler test kernel should be installed");
     let task = kernel
         .cur_task(0)
         .expect("scheduler test task should be current");
-    // AGENT: exercise the syscall-owned current-task/exit-code adapter before
-    // checking the scheduler's live-stack handoff invariant.
     assert_eq!(
-        kernel.dispatch_syscall_without_signal_delivery(SYS_EXIT, 0, 0, 0, 0, 0, 0),
-        Ok(0)
+        kernel.exit_current_thread(0, &task, ExitReason::Code(0)),
+        Ok(())
     );
     assert!(task.done());
     assert!(task.kernel_stack_top().is_some());
     drop(task);
-    assert!(kernel.switch_current_to_idle(0));
+    kernel.switch_current_to_idle(0);
     loop {
         core::hint::spin_loop();
     }
@@ -535,24 +535,33 @@ fn kernel_boost_updates_task_policy_and_run_queue_order(pool: &FramePool) {
     assert_eq!(kernel.run_queue.pick_next(), Some(first.id()));
 }
 
-// AGENT: SIGSTOP removes every thread in the process from the run queue, while
-// SIGCONT requeues every still-runnable thread rather than only its signal target.
+// AGENT: run SIGSTOP and SIGCONT through the real task -> idle -> task path;
+// stopping removes every sibling from the queue and continuing requeues all
+// threads whose underlying scheduler state remains runnable.
 fn signal_stop_and_sigcont_cover_thread_group(pool: &FramePool) {
     ensure_timer_wheel();
+    PROCESSOR_STOP_TEST_ENTERED.store(false, Ordering::Relaxed);
+    PROCESSOR_STOP_TEST_RESUMED.store(false, Ordering::Relaxed);
 
-    let kernel = Kernel::new(pool.clone());
-    kernel.proc_init();
-    let task = kernel.cur_task(0).expect("init task should be current");
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
+    let task = kernel
+        .tasks
+        .spawn_root()
+        .expect("stop test init task should spawn");
+    task.set_sched_state(TaskRunState::Runnable);
+    kernel.run_queue.enqueue(&task);
     let thread = kernel
         .tasks
         .clone_thread(&task, 0x8000_0000, 0)
         .expect("thread clone should succeed");
     thread.set_sched_state(TaskRunState::Runnable);
     kernel.run_queue.enqueue(&thread);
+    task.install_test_kernel_entry(processor_stop_test_task)
+        .expect("stop test task should receive kernel entry");
+    install_kernel(kernel);
 
-    kernel.send_signal_to_task(&task, SIGSTOP as i32, -1);
-
-    assert_eq!(kernel.deliver_pending_signals(0), 1);
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert!(PROCESSOR_STOP_TEST_ENTERED.load(Ordering::Relaxed));
     assert!(task.process.is_job_stopped());
     assert!(thread.process.is_job_stopped());
     assert_eq!(task.sched_state(), TaskRunState::Runnable);
@@ -564,19 +573,40 @@ fn signal_stop_and_sigcont_cover_thread_group(pool: &FramePool) {
 
     assert!(!task.process.is_job_stopped());
     assert!(!thread.process.is_job_stopped());
-    let mut resumed = [
-        kernel.run_queue.dequeue().expect("first resumed task").id(),
-        kernel
-            .run_queue
-            .dequeue()
-            .expect("second resumed task")
-            .id(),
-    ];
-    resumed.sort_unstable();
-    let mut expected = [task.id(), thread.id()];
-    expected.sort_unstable();
-    assert_eq!(resumed, expected);
-    assert!(kernel.run_queue.dequeue().is_none());
+    assert_eq!(kernel.run_queue.len(), 2);
+    assert_eq!(kernel.run_queue.pick_next(), Some(task.id()));
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert!(PROCESSOR_STOP_TEST_RESUMED.load(Ordering::Relaxed));
+    assert!(task.done());
+    assert!(kernel.cur_task(0).is_none());
+    assert_eq!(kernel.run_queue.pick_next(), Some(thread.id()));
+
+    kernel.run_queue.remove(thread.id());
+    thread.mark_thread_exited();
+    thread.release_kernel_stack();
+}
+
+// AGENT: enter stop delivery on the selected task's real kernel stack; the
+// function resumes only after the test driver sends SIGCONT and dispatches it
+// again through the idle scheduler.
+extern "C" fn processor_stop_test_task() -> ! {
+    PROCESSOR_STOP_TEST_ENTERED.store(true, Ordering::Relaxed);
+    let kernel = global_kernel().expect("stop test kernel should be installed");
+    let task = kernel
+        .cur_task(0)
+        .expect("stop test task should be current");
+
+    kernel.send_signal_to_task(&task, SIGSTOP as i32, -1);
+    assert_eq!(kernel.deliver_pending_signals(0), 1);
+
+    PROCESSOR_STOP_TEST_RESUMED.store(true, Ordering::Relaxed);
+    task.mark_thread_exited();
+    drop(task);
+    kernel.switch_current_to_idle(0);
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 // AGENT: ordinary pending signals stay queued for a stopped task; SIGCONT is

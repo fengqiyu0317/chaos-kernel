@@ -30,9 +30,6 @@ impl Kernel {
                 self.release_exited_thread(cpu, task);
                 let removed = self.tasks.remove_exited_thread(task.id(), &process);
                 debug_assert!(removed);
-                if !self.scheduler_active(cpu) {
-                    self.switch_away_from_exited_current(cpu, task.id());
-                }
             }
             ThreadExitDecision::Last => {
                 self.finish_process_exit(cpu, task, &process, vec![task.id()]);
@@ -92,21 +89,22 @@ impl Kernel {
                 }
             }
         }
-        if !self.scheduler_active(cpu) {
-            self.switch_away_from_exited_current(cpu, task.id());
-        }
     }
 
     // AGENT: publish one thread's Zombie state and free its private resources,
     // deferring a live scheduler-owned kernel stack until idle resumes.
     fn release_exited_thread(&self, cpu: usize, task: &Arc<Task>) {
-        let running_task_id = if self.scheduler_active(cpu) {
-            self.cur_task(cpu).map(|current| current.id())
-        } else {
-            None
-        };
+        let is_current = self
+            .cur_task(cpu)
+            .is_some_and(|current| current.id() == task.id());
+        if is_current {
+            assert!(
+                self.scheduler_active(cpu),
+                "current thread exited before CPU scheduler initialization"
+            );
+        }
         task.mark_thread_exited();
-        if running_task_id != Some(task.id()) {
+        if !is_current {
             task.release_kernel_stack();
         }
         self.run_queue.remove(task.id());
@@ -138,20 +136,6 @@ impl Kernel {
 
         if !released_requested_task {
             self.release_exited_thread(cpu, task);
-        }
-    }
-
-    // AGENT: current QEMU scheduling is CPU0-only; this keeps that policy local
-    // while making the exit path read as a plain teardown sequence.
-    fn switch_away_from_exited_current(&self, cpu: usize, task_id: usize) {
-        if cpu == 0
-            && self
-                .cur_task(cpu)
-                .as_ref()
-                .is_some_and(|current| current.id() == task_id)
-        {
-            self.set_cur(cpu, None);
-            self.schedule_next_runnable(cpu);
         }
     }
 

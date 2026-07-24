@@ -63,9 +63,8 @@ impl Kernel {
         true
     }
 
-    // AGENT: common QEMU wait-token block path. Once CPU0 scheduling is active,
-    // the current task returns to the idle context after publishing Sleeping;
-    // metadata-only selftests retain the earlier no-switch compatibility path.
+    // AGENT: common QEMU wait-token block path. Only the current CPU0 task may
+    // block itself, and it always returns through the initialized idle context.
     pub(crate) fn block_task_for_wait(&self, task_id: usize) -> bool {
         let Some(task) = self.tasks.find_task(task_id) else {
             return false;
@@ -76,14 +75,15 @@ impl Kernel {
         if task.process.is_job_stopped() {
             return false;
         }
-        if task.sched_state() == TaskRunState::Sleeping {
-            return true;
+        if !self.is_current_task_on_cpu0(task_id) {
+            return false;
+        }
+        if task.sched_state() != TaskRunState::Running {
+            return false;
         }
         task.set_sched_state(TaskRunState::Sleeping);
         self.run_queue.remove(task_id);
-        if self.is_current_task_on_cpu0(task_id) {
-            self.switch_current_to_idle(0);
-        }
+        self.switch_current_to_idle(0);
         true
     }
 
@@ -101,9 +101,7 @@ impl Kernel {
         }
         task.set_sched_state(TaskRunState::Runnable);
         self.run_queue.enqueue(&task);
-        if !self.switch_current_to_idle(cpu) {
-            self.schedule_next_runnable(cpu);
-        }
+        self.switch_current_to_idle(cpu);
         true
     }
 
@@ -229,12 +227,9 @@ impl Kernel {
                 SignalDeliveryAction::Stop => {
                     task.set_sched_state(TaskRunState::Runnable);
                     self.set_process_job_stopped(&task, true);
-                    // AGENT: a stopped live task must leave its kernel stack
-                    // through idle; metadata-only tests still select in place.
-                    if !self.switch_current_to_idle(cpu) {
-                        self.set_cur(cpu, None);
-                        self.schedule_next_runnable(cpu);
-                    }
+                    // AGENT: a stopped live task always leaves its kernel stack
+                    // through the initialized CPU0 idle context.
+                    self.switch_current_to_idle(cpu);
                     break;
                 }
                 SignalDeliveryAction::Terminate => {
@@ -307,9 +302,7 @@ impl Kernel {
             Some(t) if t.done() => {
                 t.set_sched_state(TaskRunState::Zombie);
                 self.run_queue.remove(t.id());
-                if !self.switch_current_to_idle(cpu) {
-                    self.schedule_next_runnable(cpu);
-                }
+                self.switch_current_to_idle(cpu);
             }
             Some(t) if t.sched_state() != TaskRunState::Running => {}
             Some(t) => {
@@ -323,14 +316,8 @@ impl Kernel {
                     }
                 }
             }
-            None => {
-                // AGENT: before the real scheduler starts, focused state tests
-                // still use the old metadata-only selection path. Once active,
-                // the idle loop owns selection after the interrupt returns.
-                if !self.scheduler_active(cpu) {
-                    self.schedule_next_runnable(cpu);
-                }
-            }
+            // AGENT: only the idle loop selects work when no task is current.
+            None => {}
         }
     }
 
@@ -397,7 +384,7 @@ impl Kernel {
     }
 
     // AGENT: select one runnable CPU0 task without publishing it as current;
-    // the idle loop and metadata-only helper share this stale-entry filtering.
+    // the idle loop owns selection and filters stale queue entries here.
     fn dequeue_runnable_task(&self) -> Option<Arc<Task>> {
         while let Some(task) = self.run_queue.dequeue() {
             if !task.done()
@@ -413,20 +400,5 @@ impl Kernel {
             }
         }
         None
-    }
-
-    // AGENT: select from the runnable set and publish the winner only through
-    // Kernel::set_cur(), avoiding a second current-task marker in RunQueue.
-    pub(crate) fn schedule_next_runnable(&self, cpu: usize) -> bool {
-        if cpu != 0 {
-            return false;
-        }
-        if let Some(task) = self.dequeue_runnable_task() {
-            self.set_cur(cpu, Some(task));
-            self.deliver_pending_signals(cpu);
-            return true;
-        }
-        self.set_cur(cpu, None);
-        false
     }
 }

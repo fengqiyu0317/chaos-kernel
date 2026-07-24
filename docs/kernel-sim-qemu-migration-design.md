@@ -297,7 +297,7 @@ QEMU 侧的上下文所有权按下列边界固定，不再保留从 simulator
 - 每次 CPU0 返回某个任务用户态前，将固定 `TRAP_CONTEXT` 重新绑定到该任务内核栈顶 TrapFrame 所在物理页；该映射无 `PTE_U`，不进入用户 VMA、COW、checkpoint 或 resident-page 语义。用户 trap 先通过该别名保存完整现场，再切回 kernel satp 和 high-half 内核栈。
 - `exec`、`sigreturn` 或重新调度后必须在每次用户返回边界刷新 user satp、kernel satp、内核 TrapFrame 指针和 trampoline 地址，不能复用旧地址空间的运行时元数据。
 - 固定单个 `TRAP_CONTEXT` 别名依赖“只有 CPU0 执行真实用户任务”的现阶段约束；引入多 hart 前必须改为 per-hart trap context 槽位或其他不会并发重绑定同一用户根的协议。
-- CPU0 scheduler 在 boot stack 上关中断选取 runnable task，先发布 `Running` 和 `current`，再从 `idle_context` 切换到 task context；task 阻塞、时间片用尽或退出时先发布状态，然后切回 idle context。无 runnable task 时必须清空 `current`，打开中断并在 idle stack 上执行 `wfi`。
+- CPU0 scheduler 在 boot stack 上关中断选取 runnable task，先发布 `Running` 和 `current`，再从 `idle_context` 切换到 task context；task 阻塞、时间片用尽或退出时先发布状态，然后切回 idle context。无 runnable task 时必须清空 `current`，打开中断并在 idle stack 上执行 `wfi`。运行路径不保留“scheduler 尚未初始化时只修改 `current` / run queue”的兼容分支；任何需要换出当前 task 的操作都必须发生在已初始化的 idle-context 调度器中，否则属于内核生命周期错误。
 - 正在运行的退出 task 只先标记 zombie 并保留内核栈；只有 `__switch` 已经回到 idle stack 后，scheduler 才能释放该栈。
 - `Task::done()` 只读取线程局部的 `TaskRunState::Zombie`。`Process` 用同一生命周期锁维护 `ProcessPhase::{Running, Exiting, Zombie}` 和线程 TID 集合，使最后线程判断与禁止退出期 clone 成为一个原子状态转换。
 - RISC-V `exit(93)` 进入单线程退出；`exit_group(94)` 和默认终止信号进入线程组退出。非最后线程不得释放 fd、地址空间或 futex waiters，也不得重定向子进程、发布 `CHILD_QUIT` 或发送 `SIGCHLD`。

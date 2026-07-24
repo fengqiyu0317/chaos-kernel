@@ -96,7 +96,9 @@ impl Kernel {
                 task.install_user_trap_frame(frame)?;
                 Ok(value)
             }
-            SyscallOutcome::NoReturn => Ok(0),
+            SyscallOutcome::NoReturn => {
+                unreachable!("non-returning syscalls require the trap handoff path")
+            }
         }
     }
 
@@ -146,7 +148,9 @@ impl Kernel {
                 task.install_user_trap_frame(frame)?;
                 Ok(value)
             }
-            SyscallOutcome::NoReturn => Ok(0),
+            SyscallOutcome::NoReturn => {
+                unreachable!("non-returning syscalls require the trap handoff path")
+            }
         }
     }
 }

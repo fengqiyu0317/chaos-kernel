@@ -877,7 +877,7 @@ fn exiting_phase_blocks_clone_wait_and_reap(pool: &FramePool) {
     assert_eq!(table.reap(pid), Ok(()));
 }
 
-// AGENT: exercise nonleader SYS_EXIT followed by final-thread exit: shared
+// AGENT: exercise nonleader exit followed by final-thread exit: shared
 // resources survive only the first step, while final exit releases zombie-only
 // redundant paths, subscriptions, and saved signal-frame backing storage.
 fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
@@ -928,11 +928,9 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
 
     leader.set_sched_state(TaskRunState::Runnable);
     kernel.run_queue.enqueue(&leader);
-    thread.set_sched_state(TaskRunState::Running);
-    kernel.set_cur(0, Some(thread.clone()));
     assert_eq!(
-        kernel.dispatch_syscall_without_signal_delivery(SYS_EXIT, 5, 0, 0, 0, 0, 0),
-        Ok(0)
+        kernel.exit_current_thread(0, &thread, ExitReason::Code(5)),
+        Ok(())
     );
 
     assert!(thread.done());
@@ -942,7 +940,7 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     assert!(kernel.tasks.find_task(thread.id()).is_none());
     assert!(kernel.tasks.find_task(leader.id()).is_some());
     assert!(kernel.tasks.find_process(child_pid).is_some());
-    assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(leader.id()));
+    assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(parent.id()));
     assert!(leader.get_fd_entry(fd).is_some());
     assert_eq!(
         leader.process.exec_path.lock().unwrap().as_str(),
@@ -965,8 +963,8 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     );
 
     assert_eq!(
-        kernel.dispatch_syscall_without_signal_delivery(SYS_EXIT, 9, 0, 0, 0, 0, 0),
-        Ok(0)
+        kernel.exit_current_thread(0, &leader, ExitReason::Code(9)),
+        Ok(())
     );
 
     assert!(leader.done());
@@ -1002,12 +1000,14 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     assert_eq!(kernel.tasks.reap(child_pid), Ok(()));
 }
 
-// AGENT: prove a thread-group leader is only a Task for SYS_EXIT purposes; its
+// AGENT: prove a thread-group leader is only a Task for thread-exit purposes; its
 // Process identity remains registered while a nonleader sibling is still alive.
 fn leader_exit_keeps_remaining_thread_and_process(pool: &FramePool) {
     let kernel = Kernel::new(pool.clone());
-    kernel.proc_init();
-    let leader = kernel.cur_task(0).expect("init should be current");
+    let leader = kernel
+        .tasks
+        .spawn_root()
+        .expect("init process leader should spawn");
     let thread = kernel
         .tasks
         .clone_thread(&leader, 0x8000_0000, 0)
@@ -1015,10 +1015,9 @@ fn leader_exit_keeps_remaining_thread_and_process(pool: &FramePool) {
     thread.set_sched_state(TaskRunState::Runnable);
     kernel.run_queue.enqueue(&thread);
 
-    // AGENT: cover leader-only thread exit through the syscall-owned adapter.
     assert_eq!(
-        kernel.dispatch_syscall_without_signal_delivery(SYS_EXIT, 4, 0, 0, 0, 0, 0),
-        Ok(0)
+        kernel.exit_current_thread(0, &leader, ExitReason::Code(4)),
+        Ok(())
     );
 
     assert!(leader.done());
@@ -1028,7 +1027,7 @@ fn leader_exit_keeps_remaining_thread_and_process(pool: &FramePool) {
     assert!(kernel.tasks.find_task(leader.id()).is_none());
     assert!(kernel.tasks.find_task(thread.id()).is_some());
     assert!(kernel.tasks.find_process(leader.process.pid()).is_some());
-    assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(thread.id()));
+    assert!(kernel.cur_task(0).is_none());
 }
 
 // AGENT: ensure exit_group marks and detaches every runnable sibling while
@@ -1053,15 +1052,7 @@ fn exit_group_terminates_every_thread(pool: &FramePool) {
         thread.set_sched_state(TaskRunState::Runnable);
         kernel.run_queue.enqueue(thread);
     }
-    init.set_sched_state(TaskRunState::Runnable);
-    kernel.run_queue.enqueue(&init);
-    leader.set_sched_state(TaskRunState::Running);
-    kernel.set_cur(0, Some(leader.clone()));
-
-    assert_eq!(
-        kernel.dispatch_syscall_without_signal_delivery(SYS_EXIT_GROUP, 11, 0, 0, 0, 0, 0),
-        Ok(0)
-    );
+    kernel.exit_thread_group(0, &leader, ExitReason::Code(11));
 
     assert!(leader.done());
     assert!(first.done());
@@ -1090,13 +1081,15 @@ fn fatal_signal_terminates_every_thread(pool: &FramePool) {
         .expect("thread clone should succeed");
     thread.set_sched_state(TaskRunState::Runnable);
     kernel.run_queue.enqueue(&thread);
-    init.set_sched_state(TaskRunState::Runnable);
-    kernel.run_queue.enqueue(&init);
-    leader.set_sched_state(TaskRunState::Running);
-    kernel.set_cur(0, Some(leader.clone()));
-
     kernel.send_signal_to_task(&leader, SIGUSR1 as i32, -1);
-    assert_eq!(kernel.deliver_pending_signals(0), 1);
+    let pending = leader
+        .take_deliverable_signal()
+        .expect("default-fatal signal should be deliverable");
+    assert_eq!(
+        pending.action.resolve(pending.signo),
+        SignalDeliveryAction::Terminate
+    );
+    kernel.exit_thread_group(0, &leader, ExitReason::Signal(pending.signo as u8));
 
     assert!(leader.done());
     assert!(thread.done());

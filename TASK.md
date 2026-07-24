@@ -520,6 +520,14 @@ cargo test --test pressure
 
 ### M9 `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
 
+#### 2026-07-24：删除 CPU0 调度器未启动时的元数据兼容路径
+
+- 范围：只清理 `kernel-qemu` 中阻塞、yield、停止信号、timer 死亡任务和线程/进程退出在 idle-context 调度器尚未初始化时通过修改 `current` / run queue 模拟切换的旧路径；不修改 `kernel-sim` 语义。
+- 已完成：删除 `switch_away_from_exited_current()` 和 `schedule_next_runnable()`，所有当前 task 换出统一调用 `switch_current_to_idle()` 并经过真实 `__switch`；该函数不再以 `false` 请求调用者回退，而是把非 CPU0、未初始化 idle context 或没有 current task 视为内核生命周期错误。
+- 已完成：`block_task_for_wait()` 只允许处于 `Running` 的 CPU0 current task 阻塞自己；退出线程仅在不是 CPU current 时立即释放内核栈，current task 仍由 idle 侧在恢复控制后释放。
+- 自测调整：删除两项专门固定 pre-scheduler 元数据行为的 sync 自测；进程生命周期自测直接验证 thread/process 状态转换，SIGSTOP/SIGCONT 改为真实 `task -> idle -> task` 往返；直接 syscall 测试入口不再把 `SyscallOutcome::NoReturn` 伪装成普通 `Ok(0)` 返回。
+- 验证：`cargo fmt --check`、`cargo check --target riscv64gc-unknown-none-elf --all-features`、`cargo build --release --features qemu-selftest` 通过；组合 QEMU 自测的 sync/sched/proc/fs/checkpoint/user-satp/signal 全部通过并完成用户态 `/bin/init` 的 `write -> exit`；`bash tools/qemu-smoke.sh` 通过；独立 target 的 `kernel-sim cargo test` 通过（unit 1、ELF 3、smoke 84）。
+
 #### 2026-07-24：初始 stdio 改为显式 TTY fd 对象
 
 - 语义来源与范围：沿用 `kernel-sim` 的 fd entry / open-file-description 多态对象边界，并按 `docs/kernel-sim-qemu-migration-design.md` 的第一阶段最小字符设备范围实现；本轮不是完整 `/dev`、TTY 行规程或控制台输入迁移。
