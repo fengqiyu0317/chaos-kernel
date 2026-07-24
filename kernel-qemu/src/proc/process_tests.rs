@@ -1015,7 +1015,11 @@ fn leader_exit_keeps_remaining_thread_and_process(pool: &FramePool) {
     thread.set_sched_state(TaskRunState::Runnable);
     kernel.run_queue.enqueue(&thread);
 
-    assert_eq!(kernel.do_exit_current_thread(0, 4), Ok(()));
+    // AGENT: cover leader-only thread exit through the syscall-owned adapter.
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_EXIT, 4, 0, 0, 0, 0, 0),
+        Ok(0)
+    );
 
     assert!(leader.done());
     assert!(!thread.done());

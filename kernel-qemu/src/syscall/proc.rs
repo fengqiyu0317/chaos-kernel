@@ -97,16 +97,20 @@ fn read_user_string_array(
 }
 
 // AGENT: terminate only the calling Task, allowing the final-thread lifecycle
-// decision to promote this syscall into process teardown when necessary.
+// decision to promote this syscall into process teardown when necessary. Keep
+// current-task lookup and syscall exit-code decoding at the syscall boundary.
 pub(super) fn sys_exit(kernel: &Kernel, a0: usize) -> Result<SyscallOutcome, &'static str> {
-    kernel.do_exit_current_thread(0, a0)?;
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    kernel.exit_current_thread(0, &task, ExitReason::Code((a0 & 0xFF) as u8))?;
     Ok(SyscallOutcome::NoReturn)
 }
 
 // AGENT: terminate every Task in the caller's Process while preserving the
-// common NoReturn handoff contract with thread-local SYS_EXIT.
+// common NoReturn handoff contract with thread-local SYS_EXIT. Current-task
+// lookup and syscall exit-code decoding belong to this syscall adapter.
 pub(super) fn sys_exit_group(kernel: &Kernel, a0: usize) -> Result<SyscallOutcome, &'static str> {
-    kernel.do_exit_group_current(0, a0)?;
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    kernel.exit_thread_group(0, &task, ExitReason::Code((a0 & 0xFF) as u8));
     Ok(SyscallOutcome::NoReturn)
 }
 

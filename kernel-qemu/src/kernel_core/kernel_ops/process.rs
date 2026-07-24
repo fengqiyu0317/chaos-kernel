@@ -15,32 +15,10 @@ impl Kernel {
         self.set_cur(0, Some(root));
     }
 
-    // AGENT: route SYS_EXIT through the thread-local path; only the final member
-    // is allowed to commit process-level teardown and parent notification.
-    pub(crate) fn do_exit_current_thread(
-        &self,
-        cpu: usize,
-        code: usize,
-    ) -> Result<(), &'static str> {
-        let task = self.cur_task(cpu).ok_or("esrch")?;
-        self.exit_current_thread(cpu, &task, ExitReason::Code((code & 0xFF) as u8))
-    }
-
-    // AGENT: route SYS_EXIT_GROUP through the process-wide path and retain one
-    // NoReturn control-flow result for the trap owner.
-    pub(crate) fn do_exit_group_current(
-        &self,
-        cpu: usize,
-        code: usize,
-    ) -> Result<(), &'static str> {
-        let task = self.cur_task(cpu).ok_or("esrch")?;
-        self.exit_thread_group(cpu, &task, ExitReason::Code((code & 0xFF) as u8));
-        Ok(())
-    }
-
     // AGENT: retire one Task without touching shared resources unless the
-    // lifecycle lock proves that this caller is the process's final thread.
-    fn exit_current_thread(
+    // lifecycle lock proves that this caller is the process's final thread;
+    // syscall argument adaptation stays in syscall/proc.rs.
+    pub(crate) fn exit_current_thread(
         &self,
         cpu: usize,
         task: &Arc<Task>,

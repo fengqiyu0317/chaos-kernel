@@ -72,7 +72,12 @@ extern "C" fn processor_exit_test_task() -> ! {
     let task = kernel
         .cur_task(0)
         .expect("scheduler test task should be current");
-    assert_eq!(kernel.do_exit_current_thread(0, 0), Ok(()));
+    // AGENT: exercise the syscall-owned current-task/exit-code adapter before
+    // checking the scheduler's live-stack handoff invariant.
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_EXIT, 0, 0, 0, 0, 0, 0),
+        Ok(0)
+    );
     assert!(task.done());
     assert!(task.kernel_stack_top().is_some());
     drop(task);
