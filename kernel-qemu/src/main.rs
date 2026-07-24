@@ -61,10 +61,16 @@ static BOOT_RESERVED_FRAMES: IrqOnceCell<Vec<kernel::PgFrame>> = IrqOnceCell::ne
 // build.rs and install it through the ordinary path-backed exec file store.
 const ROOT_INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/root-init"));
 
-// AGENT: First Rust entry point for the M9 QEMU carrier layer.
+// AGENT: Enter the M9 QEMU carrier with cleared global state, then install the
+// kernel trap vector before heap, frame, page-table, or Kernel initialization.
 #[no_mangle]
 pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     clear_bss();
+    trap::init_kernel_trap_vector();
+    println!(
+        "[kernel-qemu] trap vector installed stvec={:#x}",
+        csr::read_stvec()
+    );
     heap::init();
     let frame_pool = Arc::new(init_qemu_frame_pool());
     install_kernel_page_table(frame_pool.as_ref());
@@ -150,11 +156,6 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     let init_ready = prepare_root_init_task(kernel, init_installed);
     #[cfg(feature = "qemu-boot-smoke")]
     let timer_probe = arm_timer_wheel_probe();
-    trap::init_kernel_trap_vector();
-    println!(
-        "[kernel-qemu] trap vector installed stvec={:#x}",
-        csr::read_stvec()
-    );
     timer::init();
     #[cfg(feature = "qemu-boot-smoke")]
     {
