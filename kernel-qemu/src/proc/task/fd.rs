@@ -7,6 +7,7 @@ use super::*;
 pub(crate) struct FdTable {
     entries: BTreeMap<usize, FdEntry>,
     allocator: AllocatorState,
+    pending: BTreeSet<usize>,
 }
 
 // AGENT: initialize an empty descriptor table with every bounded fd available.
@@ -15,6 +16,7 @@ impl Default for FdTable {
         Self {
             entries: BTreeMap::new(),
             allocator: AllocatorState::new(MAX_FD),
+            pending: BTreeSet::new(),
         }
     }
 }
@@ -36,6 +38,30 @@ impl FdTable {
         self.allocator.allocate_from(start).ok_or("emfile")
     }
 
+    // AGENT: keep an fd unavailable while an open-like constructor performs
+    // fallible work without holding the interrupt-disabling fd-table lock.
+    fn reserve_pending_from(&mut self, start: usize) -> Result<usize, &'static str> {
+        let fd = self.reserve_from(start)?;
+        let inserted = self.pending.insert(fd);
+        debug_assert!(inserted);
+        Ok(fd)
+    }
+
+    // AGENT: publish a fully built entry only if the same table still owns its
+    // pending reservation; process teardown may replace the whole table.
+    fn commit_pending(&mut self, fd: usize, entry: FdEntry) -> Result<(), &'static str> {
+        if !self.pending.remove(&fd) {
+            return Err("esrch");
+        }
+        self.install_entry(fd, entry);
+        Ok(())
+    }
+
+    // AGENT: return an uncommitted reservation after constructor failure.
+    fn cancel_pending(&mut self, fd: usize) -> bool {
+        self.pending.remove(&fd) && self.allocator.release(fd)
+    }
+
     // AGENT: count only actual map slots as user-visible descriptor references;
     // FdEntry clones used by I/O and epoll remain transient Arc owners.
     fn install_entry(&mut self, fd: usize, entry: FdEntry) {
@@ -51,14 +77,13 @@ impl FdTable {
         Ok(FdCloseCleanup::new(closed_entry))
     }
 
-    // AGENT: duplicate entries while preserving an identical independent id
-    // allocator snapshot for the child process.
+    // AGENT: duplicate installed entries and rebuild the child's allocator so
+    // an in-progress parent open reservation is neither inherited nor leaked.
     pub(in crate::kernel::proc) fn fork_copy(&self) -> Self {
-        let mut copied = Self {
-            entries: BTreeMap::new(),
-            allocator: self.allocator.clone(),
-        };
+        let mut copied = Self::default();
         for (&fd, entry) in self.entries.iter() {
+            let reserved = copied.allocator.reserve(fd);
+            assert_eq!(reserved, Some(fd));
             copied.install_entry(fd, entry.clone());
         }
         copied
@@ -212,6 +237,37 @@ impl Task {
         let mut table = self.process.fd_table.lock().unwrap();
         let fd = table.reserve_from(0)?;
         table.install_entry(fd, FdEntry::with_status(fl, status, cloexec));
+        Ok(fd)
+    }
+
+    // AGENT: reserve descriptor capacity before a fallible open-like builder can
+    // create or truncate a path, then publish the completed OFD atomically.
+    pub fn add_file_with_status_from<F>(
+        &self,
+        status: FdOpt,
+        cloexec: bool,
+        build: F,
+    ) -> Result<usize, &'static str>
+    where
+        F: FnOnce() -> Result<FLike, &'static str>,
+    {
+        let fd = {
+            let mut table = self.process.fd_table.lock().unwrap();
+            table.reserve_pending_from(0)?
+        };
+        let file = match build() {
+            Ok(file) => file,
+            Err(err) => {
+                let mut table = self.process.fd_table.lock().unwrap();
+                let cancelled = table.cancel_pending(fd);
+                debug_assert!(
+                    cancelled || self.process.is_terminating() || self.process.is_zombie()
+                );
+                return Err(err);
+            }
+        };
+        let mut table = self.process.fd_table.lock().unwrap();
+        table.commit_pending(fd, FdEntry::with_status(file, status, cloexec))?;
         Ok(fd)
     }
 

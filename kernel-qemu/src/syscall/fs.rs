@@ -2,6 +2,48 @@
 use super::*;
 
 const MAX_RW_COUNT: usize = PAGE_SZ * 16;
+const O_ACCMODE: usize = 0x3;
+const SUPPORTED_OPEN_FLAGS: usize =
+    O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_NONBLOCK | O_APPEND | O_CLOEXEC;
+
+// AGENT: keep the first-stage supported open flags explicit instead of
+// accepting unimplemented path, durability, or directory semantics silently.
+#[derive(Clone, Copy)]
+struct OpenOptions {
+    status: FdOpt,
+    create: bool,
+    exclusive: bool,
+    truncate: bool,
+    cloexec: bool,
+}
+
+// AGENT: decode immutable access mode separately from mutable OFD status flags.
+impl OpenOptions {
+    // AGENT: reject unsupported flag bits at the syscall semantic boundary.
+    fn parse(flags: usize) -> Result<Self, &'static str> {
+        let (rd, wr) = match flags & O_ACCMODE {
+            0 => (true, false),
+            1 => (false, true),
+            2 => (true, true),
+            _ => return Err("einval"),
+        };
+        if flags & !SUPPORTED_OPEN_FLAGS != 0 {
+            return Err("enotsup");
+        }
+        Ok(Self {
+            status: FdOpt {
+                rd,
+                wr,
+                ap: flags & O_APPEND != 0,
+                nb: flags & O_NONBLOCK != 0,
+            },
+            create: flags & O_CREAT != 0,
+            exclusive: flags & O_EXCL != 0,
+            truncate: flags & O_TRUNC != 0,
+            cloexec: flags & O_CLOEXEC != 0,
+        })
+    }
+}
 
 // AGENT: read a NUL-terminated path from the current user address space.
 fn read_user_path(task: &Task, addr: usize) -> Result<String, &'static str> {
@@ -143,77 +185,45 @@ pub(super) fn sys_write(
     entry.write(&tmp)
 }
 
-// AGENT: propagate fd allocator exhaustion instead of manufacturing an
-// out-of-range descriptor.
-pub(super) fn sys_open(
+// AGENT: install one absolute path through a descriptor reservation so EMFILE
+// is reported before path creation or truncation can change global state.
+fn do_open(
     kernel: &Kernel,
-    a0: usize,
-    a1: usize,
-    a2: usize,
+    task: &Task,
+    path: &str,
+    flags: usize,
+    _mode: usize,
 ) -> Result<usize, &'static str> {
-    let path_addr = a0;
-    let flags = a1;
-    let mode = a2;
-    let acc_mode = flags & 0x3;
-    if acc_mode == 3 {
-        return Err("einval");
+    if path.is_empty() {
+        return Err("enoent");
     }
-    let _rdonly = acc_mode == 0;
-    let _wronly = acc_mode == 1;
-    let _rdwr = acc_mode == 2;
-    let _create = (flags & O_CREAT) != 0;
-    let _excl = (flags & O_EXCL) != 0;
-    let _truncate = (flags & O_TRUNC) != 0;
-    let _nonblock = (flags & O_NONBLOCK) != 0;
-    let _append = (flags & O_APPEND) != 0;
-    let _cloexec = (flags & O_CLOEXEC) != 0;
-    let _follow_sym = (flags & AT_NOFOLLOW) == 0;
+    if !path.starts_with('/') {
+        return Err("enotsup");
+    }
+    let options = OpenOptions::parse(flags)?;
+    task.add_file_with_status_from(options.status, options.cloexec, || {
+        let resolved = kernel.lookup_path(path)?;
+        let node = kernel.open_regular_node(&resolved, options.create, options.exclusive)?;
+        let instance = FInstance::with_node_on_storage(&resolved, node, kernel.file_storage());
+        if options.truncate && options.status.wr {
+            instance.set_len(0)?;
+        }
+        Ok(FLike::File(FHandle::new(instance)))
+    })
+}
 
+// AGENT: expose the real RISC-V openat ABI while supporting only absolute paths
+// until per-process cwd and directory-fd traversal migrate as one coherent layer.
+pub(super) fn sys_openat(
+    kernel: &Kernel,
+    _dirfd: usize,
+    path_addr: usize,
+    flags: usize,
+    mode: usize,
+) -> Result<usize, &'static str> {
     let task = kernel.cur_task(0).ok_or("esrch")?;
     let path = read_user_path(&task, path_addr)?;
-    let resolved = kernel.lookup_path(&path)?;
-    let existing = kernel.file_nodes.read().unwrap().get(&resolved).cloned();
-    if _create && _excl && existing.is_some() {
-        return Err("eexist");
-    }
-    let node = match existing {
-        Some(node) => node,
-        None if _create => {
-            let node = Arc::new(FileNode::regular(false));
-            kernel
-                .file_nodes
-                .write()
-                .unwrap()
-                .insert(resolved.clone(), node.clone());
-            kernel.note_path_in_parent_dir(&resolved)?;
-            node
-        }
-        None => return Err("enoent"),
-    };
-    if node.kind != FileKind::Regular {
-        return Err("eisdir");
-    }
-    let rd = _rdonly || _rdwr;
-    let wr = _wronly || _rdwr;
-    let opt = FdOpt {
-        rd,
-        wr,
-        ap: _append,
-        nb: _nonblock,
-    };
-    let instance = FInstance::with_node_on_storage(&resolved, node, kernel.file_storage());
-    if _truncate && wr {
-        instance.set_len(0)?;
-    }
-    let fd = task.add_file_with_status(FLike::File(FHandle::new(instance)), opt, _cloexec)?;
-    let _perm_check = {
-        let owner_r = (mode >> 8) & 0x4;
-        let owner_w = (mode >> 8) & 0x2;
-        let group_r = (mode >> 4) & 0x4;
-        let other_r = mode & 0x4;
-        owner_r | owner_w | group_r | other_r
-    };
-    Ok(fd)
+    do_open(kernel, &task, &path, flags, mode)
 }
 
 pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {

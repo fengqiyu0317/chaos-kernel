@@ -25,7 +25,7 @@ impl Kernel {
         match nr {
             SYS_READ => returning(sys_read(self, a0, a1, a2)),
             SYS_WRITE => returning(sys_write(self, a0, a1, a2)),
-            SYS_OPEN => returning(sys_open(self, a0, a1, a2)),
+            SYS_OPENAT => returning(sys_openat(self, a0, a1, a2, a3)),
             SYS_MOUNT => returning(sys_mount(self, a0, a1, a2, a3, a4)),
             SYS_UMOUNT2 => returning(sys_umount2(self, a0, a1)),
             SYS_CLOSE => returning(sys_close(self, a0)),

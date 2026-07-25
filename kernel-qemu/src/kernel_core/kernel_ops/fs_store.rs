@@ -61,6 +61,42 @@ impl Kernel {
         Ok(())
     }
 
+    // AGENT: perform lookup, O_EXCL validation, optional parent-directory
+    // bookkeeping, and creation under one path-table write lock.
+    pub(crate) fn open_regular_node(
+        &self,
+        resolved_path: &str,
+        create: bool,
+        exclusive: bool,
+    ) -> Result<Arc<FileNode>, &'static str> {
+        let mut nodes = self.file_nodes.write().unwrap();
+        if let Some(node) = nodes.get(resolved_path).cloned() {
+            if create && exclusive {
+                return Err("eexist");
+            }
+            if node.kind != FileKind::Regular {
+                return Err("eisdir");
+            }
+            return Ok(node);
+        }
+        if !create {
+            return Err("enoent");
+        }
+
+        if let Some((parent, name)) = Self::parent_dir_entry(resolved_path) {
+            if let Some(parent_node) = nodes.get(&parent).cloned() {
+                if parent_node.kind != FileKind::Directory {
+                    return Err("enotdir");
+                }
+                parent_node.add_dir_entry(&self.file_storage(), &name)?;
+            }
+        }
+
+        let node = Arc::new(FileNode::regular(false));
+        nodes.insert(resolved_path.to_string(), node.clone());
+        Ok(node)
+    }
+
     // AGENT: install a regular path-backed file used by both file instances and exec.
     pub fn install_file(
         &self,

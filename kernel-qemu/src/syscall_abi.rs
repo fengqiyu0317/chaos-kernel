@@ -7,6 +7,7 @@ pub const ENOSYS_RET: usize = (-38isize) as usize;
 // AGENT: Linux asm-generic syscall numbers used by the RISC-V ABI.
 pub const RISCV_SYS_UMOUNT2: usize = 39;
 pub const RISCV_SYS_MOUNT: usize = 40;
+pub const RISCV_SYS_OPENAT: usize = 56;
 pub const RISCV_SYS_READ: usize = 63;
 pub const RISCV_SYS_WRITE: usize = 64;
 pub const RISCV_SYS_KILL: usize = 129;
@@ -30,6 +31,7 @@ pub const INTERNAL_SYS_RT_SIGACTION: usize = 13;
 pub const INTERNAL_SYS_RT_SIGPROCMASK: usize = 14;
 pub const INTERNAL_SYS_RT_SIGRETURN: usize = 15;
 pub const INTERNAL_SYS_UMOUNT2: usize = 166;
+pub const INTERNAL_SYS_OPENAT: usize = 257;
 
 // AGENT: Decoded RISC-V syscall request before it reaches migrated kernel-sim semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +46,7 @@ pub fn map_riscv_nr(nr: usize) -> Option<usize> {
     match nr {
         RISCV_SYS_UMOUNT2 => Some(INTERNAL_SYS_UMOUNT2),
         RISCV_SYS_MOUNT => Some(INTERNAL_SYS_MOUNT),
+        RISCV_SYS_OPENAT => Some(INTERNAL_SYS_OPENAT),
         RISCV_SYS_READ => Some(INTERNAL_SYS_READ),
         RISCV_SYS_WRITE => Some(INTERNAL_SYS_WRITE),
         RISCV_SYS_KILL => Some(INTERNAL_SYS_KILL),
@@ -194,6 +197,7 @@ pub mod tests {
 
     pub fn run_all() {
         standard_errno_names_use_linux_riscv_numbers();
+        openat_maps_to_the_four_argument_internal_entry();
         signal_syscalls_map_to_migrated_semantics();
     }
 
@@ -212,6 +216,19 @@ pub mod tests {
         ] {
             assert_eq!(errno_ret(name), (-(errno as isize)) as usize);
         }
+    }
+
+    // AGENT: preserve openat's dirfd/path/flags/mode argument layout while the
+    // RISC-V ABI adapter changes only the syscall number namespace.
+    #[cfg_attr(test, test)]
+    fn openat_maps_to_the_four_argument_internal_entry() {
+        let mut frame = TrapFrame::new();
+        frame.regs[10..16].copy_from_slice(&[usize::MAX - 99, 0x4000, 0x81, 0o640, 5, 6]);
+        frame.regs[17] = RISCV_SYS_OPENAT;
+
+        let request = decode_from_trap_frame(&frame);
+        assert_eq!(request.internal_nr, Some(INTERNAL_SYS_OPENAT));
+        assert_eq!(request.args, [usize::MAX - 99, 0x4000, 0x81, 0o640, 5, 6]);
     }
 
     // AGENT: pin the four asm-generic RISC-V signal syscall numbers to the

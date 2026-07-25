@@ -71,7 +71,6 @@ pub const O_TRUNC: usize = 0o1000;
 pub const O_NONBLOCK: usize = 0o4000;
 pub const O_APPEND: usize = 0o2000;
 pub const O_CLOEXEC: usize = 0o2000000;
-pub const AT_NOFOLLOW: usize = 0x100;
 
 // AGENT: Linux splice(2) flag bits; the syscall entry is currently a TODO stub
 // until pipe-buffer-backed movement is migrated.
@@ -196,7 +195,7 @@ pub const AF_UNIX: u32 = 1;
 
 pub const SYS_READ: usize = 0;
 pub const SYS_WRITE: usize = 1;
-pub const SYS_OPEN: usize = 2;
+pub const SYS_OPENAT: usize = 257;
 pub const SYS_CLOSE: usize = 3;
 pub const SYS_STAT: usize = 4;
 pub const SYS_FSTAT: usize = 5;
