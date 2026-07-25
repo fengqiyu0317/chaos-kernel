@@ -54,7 +54,7 @@ impl CacheSlot {
     // AGENT: keep single-slot writeback with the slot that owns the dirty flag.
     fn flush_to<D: BlockDevice + ?Sized>(&self, device: &D) -> Result<(), &'static str> {
         if self.modified {
-            device.write_block(self.key.dev, self.key.block, &self.payload)?;
+            device.write_block(self.key.block, &self.payload)?;
         }
         Ok(())
     }
@@ -163,7 +163,7 @@ impl BlockCache {
             }
         }
 
-        let block_data = device.read_block(dev, block)?;
+        let block_data = device.read_block(block)?;
         let payload = block_payload_from_slice(&block_data, "eio")?;
         {
             let mut items = ch.items.lock().unwrap();
@@ -310,21 +310,27 @@ pub mod tests {
         }
     }
 
+    // AGENT: provide the complete block-device surface needed by cache tests.
     impl BlockDevice for ChangingReadDevice {
+        // AGENT: make capacity irrelevant to this cache-hit-only test device.
+        fn block_count(&self) -> usize {
+            usize::MAX
+        }
+
         // AGENT: return a different full-block payload on each device read.
-        fn read_block(&self, _dev: usize, _block: usize) -> Result<Vec<u8>, &'static str> {
+        fn read_block(&self, _block: usize) -> Result<Vec<u8>, &'static str> {
             let value = self.reads.fetch_add(1, Ordering::Relaxed).wrapping_add(1) as u8;
             Ok(vec![value; BLOCK_CACHE_BLOCK_SIZE])
         }
 
         // AGENT: accept writes because these tests only care about read-hit
         // residency and cached write payload updates.
-        fn write_block(
-            &self,
-            _dev: usize,
-            _block: usize,
-            _data: &[u8],
-        ) -> Result<(), &'static str> {
+        fn write_block(&self, _block: usize, _data: &[u8]) -> Result<(), &'static str> {
+            Ok(())
+        }
+
+        // AGENT: this read-hit test device has no persistence layer.
+        fn flush(&self) -> Result<(), &'static str> {
             Ok(())
         }
     }
@@ -351,22 +357,37 @@ pub mod tests {
         }
     }
 
+    // AGENT: delegate storage while injecting one concurrent cache rewrite.
     impl BlockDevice for RewriteDuringFlushDevice<'_> {
+        // AGENT: preserve the real RAM backend's capacity checks.
+        fn block_count(&self) -> usize {
+            self.backing.block_count()
+        }
+
         // AGENT: delegate reads to the real RAM backend so the final persisted
         // payload can be checked after flush_dirty() returns.
-        fn read_block(&self, dev: usize, block: usize) -> Result<Vec<u8>, &'static str> {
-            self.backing.read_block(dev, block)
+        fn read_block(&self, block: usize) -> Result<Vec<u8>, &'static str> {
+            self.backing.read_block(block)
         }
 
         // AGENT: mutate the cached slot once during writeback to make the first
         // pass clear zero slots while dirty_count() still reports pending work.
-        fn write_block(&self, dev: usize, block: usize, data: &[u8]) -> Result<(), &'static str> {
-            self.backing.write_block(dev, block, data)?;
+        fn write_block(&self, block: usize, data: &[u8]) -> Result<(), &'static str> {
+            self.backing.write_block(block, data)?;
             if self.writes.fetch_add(1, Ordering::Relaxed) == 0 {
-                self.cache
-                    .write_block_cached(self, dev, block, &self.rewrite_payload)?;
+                self.cache.write_block_cached(
+                    self,
+                    ROOT_BLOCK_DEVICE,
+                    block,
+                    &self.rewrite_payload,
+                )?;
             }
             Ok(())
+        }
+
+        // AGENT: delegate the terminal flush after the cache-drain regression.
+        fn flush(&self) -> Result<(), &'static str> {
+            self.backing.flush()
         }
     }
 
@@ -410,7 +431,7 @@ pub mod tests {
         );
         assert_eq!(cache.dirty_count(), 1);
         assert_eq!(
-            device.read_block(ROOT_BLOCK_DEVICE, 5).unwrap().as_slice(),
+            device.read_block(5).unwrap().as_slice(),
             &[0u8; BLOCK_CACHE_BLOCK_SIZE][..]
         );
 
@@ -426,15 +447,12 @@ pub mod tests {
         );
         assert_eq!(cache.dirty_count(), 1);
         assert_eq!(
-            device.read_block(ROOT_BLOCK_DEVICE, 5).unwrap().as_slice(),
+            device.read_block(5).unwrap().as_slice(),
             &[0u8; BLOCK_CACHE_BLOCK_SIZE][..]
         );
         assert_eq!(cache.flush_dirty(&device).unwrap(), 1);
         assert_eq!(cache.dirty_count(), 0);
-        assert_eq!(
-            device.read_block(ROOT_BLOCK_DEVICE, 5).unwrap().as_slice(),
-            &second[..]
-        );
+        assert_eq!(device.read_block(5).unwrap().as_slice(), &second[..]);
     }
 
     // AGENT: prove flush_dirty() drains until dirty_count() is zero, not until a
@@ -454,10 +472,7 @@ pub mod tests {
         assert_eq!(cache.flush_dirty(&device).unwrap(), 1);
         assert_eq!(cache.dirty_count(), 0);
         assert_eq!(device.writes.load(Ordering::Relaxed), 2);
-        assert_eq!(
-            device.read_block(ROOT_BLOCK_DEVICE, 8).unwrap().as_slice(),
-            &rewrite[..]
-        );
+        assert_eq!(device.read_block(8).unwrap().as_slice(), &rewrite[..]);
     }
 
     // AGENT: keep the fixed-size chain bound while replacing a dirty victim
@@ -488,7 +503,7 @@ pub mod tests {
 
         assert_eq!(cache.dirty_count(), BLOCK_CACHE_CHAIN_SLOTS);
         assert_eq!(
-            device.read_block(ROOT_BLOCK_DEVICE, 0).unwrap().as_slice(),
+            device.read_block(0).unwrap().as_slice(),
             &[1u8; BLOCK_CACHE_BLOCK_SIZE][..]
         );
         assert_eq!(
@@ -502,7 +517,7 @@ pub mod tests {
         assert_eq!(cache.dirty_count(), 0);
         assert_eq!(
             device
-                .read_block(ROOT_BLOCK_DEVICE, BLOCK_CACHE_CHAIN_SLOTS)
+                .read_block(BLOCK_CACHE_CHAIN_SLOTS)
                 .unwrap()
                 .as_slice(),
             &replacement[..]
@@ -524,7 +539,7 @@ pub mod tests {
         }
         let incoming = [0xeeu8; BLOCK_CACHE_BLOCK_SIZE];
         device
-            .write_block(ROOT_BLOCK_DEVICE, BLOCK_CACHE_CHAIN_SLOTS, &incoming)
+            .write_block(BLOCK_CACHE_CHAIN_SLOTS, &incoming)
             .unwrap();
 
         assert_eq!(
@@ -537,7 +552,7 @@ pub mod tests {
 
         assert_eq!(cache.dirty_count(), BLOCK_CACHE_CHAIN_SLOTS - 1);
         assert_eq!(
-            device.read_block(ROOT_BLOCK_DEVICE, 0).unwrap().as_slice(),
+            device.read_block(0).unwrap().as_slice(),
             &[1u8; BLOCK_CACHE_BLOCK_SIZE][..]
         );
     }

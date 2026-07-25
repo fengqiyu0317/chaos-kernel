@@ -11,20 +11,27 @@ fi
 cd "$ROOT/kernel-qemu"
 # AGENT: keep boot diagnostics out of ordinary images and opt into them only
 # for this smoke-validation build.
-cargo build --release --features qemu-boot-smoke
+if [[ "${KERNEL_QEMU_SKIP_BUILD:-0}" != "1" ]]; then
+    cargo build --release --features qemu-boot-smoke
+fi
 
 KERNEL="$ROOT/kernel-qemu/target/riscv64gc-unknown-none-elf/release/kernel-qemu"
 LOG="$(mktemp)"
-trap 'rm -f "$LOG"' EXIT
+DISK_IMAGE="$(mktemp)"
+trap 'rm -f "$LOG" "$DISK_IMAGE"' EXIT
+truncate -s 4M "$DISK_IMAGE"
 
 timeout 15s qemu-system-riscv64 \
     -machine virt \
     -m 128M \
     -nographic \
     -bios default \
-    -kernel "$KERNEL" 2>&1 | tee "$LOG"
+    -kernel "$KERNEL" \
+    -drive "file=$DISK_IMAGE,format=raw,if=none,id=rootdisk" \
+    -device virtio-blk-device,drive=rootdisk 2>&1 | tee "$LOG"
 
 grep -F "[kernel-qemu] boot" "$LOG"
+grep -F "[kernel-qemu] virtio-blk ready" "$LOG"
 # AGENT: keep the ordinary boot gate sensitive to fixed-arena regressions and
 # page leaks in the post-bootstrap global allocator.
 grep -F "[kernel-qemu] dynamic heap ready" "$LOG"

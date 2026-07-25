@@ -17,8 +17,8 @@ pub enum FileKind {
     Directory,
 }
 
-// AGENT: track root RamBlockDevice block ownership so truncated FileNode data
-// can return space to later files instead of only bumping a high-water mark.
+// AGENT: track root block-device ownership so truncated FileNode data can
+// return space to later files instead of only bumping a high-water mark.
 pub struct FileBlockAllocator {
     state: Mutex<AllocatorState>,
 }
@@ -60,7 +60,7 @@ impl FileBlockAllocator {
 // a cloneable handle while FileBlock only adds single-block ownership.
 struct FileStorageInner {
     cache: Arc<BlockCache>,
-    device: Arc<RamBlockDevice>,
+    device: Arc<dyn BlockDevice>,
     allocator: Arc<FileBlockAllocator>,
 }
 
@@ -69,7 +69,7 @@ impl FileStorageInner {
     // owned file blocks.
     fn new(
         cache: Arc<BlockCache>,
-        device: Arc<RamBlockDevice>,
+        device: Arc<dyn BlockDevice>,
         allocator: Arc<FileBlockAllocator>,
     ) -> Self {
         Self {
@@ -141,7 +141,7 @@ impl FileStorage {
     // of duplicating the backend fields in every owned block.
     pub fn new(
         cache: Arc<BlockCache>,
-        device: Arc<RamBlockDevice>,
+        device: Arc<dyn BlockDevice>,
         allocator: Arc<FileBlockAllocator>,
     ) -> Self {
         Self {
@@ -182,9 +182,12 @@ impl FileStorage {
         )
     }
 
-    // AGENT: sync writes dirty cache slots back to the shared RAM block device.
+    // AGENT: write every dirty cache slot to the device before issuing the
+    // backend flush that makes completed writes stable across guest restart.
     fn flush(&self) -> Result<usize, &'static str> {
-        self.inner.cache.flush_dirty(self.inner.device.as_ref())
+        let flushed = self.inner.cache.flush_dirty(self.inner.device.as_ref())?;
+        self.inner.device.flush()?;
+        Ok(flushed)
     }
 
     // AGENT: expose allocator reuse to fd regressions without leaking raw block

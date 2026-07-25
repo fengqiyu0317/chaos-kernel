@@ -19,6 +19,7 @@ use crate::irq_lock::IrqOnceCell;
 mod console;
 mod context;
 mod csr;
+mod drivers;
 mod heap;
 mod irq_lock;
 // AGENT: Directly connect the migrated kernel-sim module tree under the
@@ -77,6 +78,10 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     heap::promote(frame_pool.clone());
 
     println!("[kernel-qemu] boot hart={} dtb={:#x}", hartid, dtb_pa);
+    // AGENT: isolate the raw-sector persistence proof from FileStorage and the
+    // still-non-mountable FileNode metadata format.
+    #[cfg(feature = "qemu-virtio-blk-smoke")]
+    run_virtio_blk_raw_smoke(frame_pool.as_ref().clone());
     #[cfg(feature = "qemu-boot-smoke")]
     heap::smoke_check();
     kernel::kernel_core::init_timer_wheel();
@@ -176,7 +181,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
 // AGENT: Install a leaked Kernel as the QEMU scheduler/timer backend so real
 // timer interrupts can drive migrated Kernel::schedule_tick() state.
 fn init_qemu_kernel_backend(frame_pool: kernel::FramePool) -> (&'static kernel::Kernel, bool) {
-    let root_block = Arc::new(kernel::RamBlockDevice::empty());
+    let root_block = init_root_block_device(frame_pool.clone());
     let kernel = Box::leak(Box::new(kernel::Kernel::new_with_block_device(
         frame_pool, root_block,
     )));
@@ -202,6 +207,78 @@ fn init_qemu_kernel_backend(frame_pool: kernel::FramePool) -> (&'static kernel::
         current
     );
     (kernel, init_installed)
+}
+
+// AGENT: production boot requires a real VirtIO block device; the RAM backend
+// is available only when the caller explicitly opts into its fallback feature.
+fn init_root_block_device(frame_pool: kernel::FramePool) -> Arc<dyn kernel::BlockDevice> {
+    #[cfg(feature = "ram-block-device")]
+    {
+        let _ = frame_pool;
+        println!("[kernel-qemu] root block backend=ram-block-device feature fallback");
+        Arc::new(kernel::RamBlockDevice::empty())
+    }
+    #[cfg(not(feature = "ram-block-device"))]
+    {
+        drivers::virtio_blk::probe_root_block(frame_pool)
+            .expect("production boot requires a probed virtio-blk device")
+    }
+}
+
+// AGENT: read a host-seeded sector, persist a second sector with an explicit
+// device flush, and report whether that output survived a previous QEMU boot.
+#[cfg(feature = "qemu-virtio-blk-smoke")]
+fn run_virtio_blk_raw_smoke(frame_pool: kernel::FramePool) {
+    const INPUT_BLOCK: usize = 8;
+    const OUTPUT_BLOCK: usize = 9;
+    const INPUT_MAGIC: &[u8] = b"CHAOS-VIRTIO-INPUT-v1";
+    const OUTPUT_MAGIC: &[u8] = b"CHAOS-VIRTIO-PERSIST-v1";
+
+    let device = drivers::virtio_blk::probe_root_block(frame_pool)
+        .expect("virtio-blk raw smoke requires a block device");
+    assert!(
+        device.block_count() > OUTPUT_BLOCK,
+        "virtio-blk smoke image is too small"
+    );
+
+    let input = device
+        .read_block(INPUT_BLOCK)
+        .expect("virtio-blk smoke input read failed");
+    assert_eq!(
+        &input[..INPUT_MAGIC.len()],
+        INPUT_MAGIC,
+        "virtio-blk smoke input magic mismatch"
+    );
+    println!("[virtio-blk-smoke] input magic ok block={}", INPUT_BLOCK);
+
+    let old_output = device
+        .read_block(OUTPUT_BLOCK)
+        .expect("virtio-blk smoke persisted-sector read failed");
+    if &old_output[..OUTPUT_MAGIC.len()] == OUTPUT_MAGIC {
+        println!(
+            "[virtio-blk-smoke] persisted magic ok block={}",
+            OUTPUT_BLOCK
+        );
+    }
+
+    let mut output = alloc::vec![0u8; kernel::BLOCK_CACHE_BLOCK_SIZE];
+    output[..OUTPUT_MAGIC.len()].copy_from_slice(OUTPUT_MAGIC);
+    device
+        .write_block(OUTPUT_BLOCK, &output)
+        .expect("virtio-blk smoke output write failed");
+    device
+        .flush()
+        .expect("virtio-blk smoke device flush failed");
+    let reread = device
+        .read_block(OUTPUT_BLOCK)
+        .expect("virtio-blk smoke output reread failed");
+    assert_eq!(
+        &reread[..OUTPUT_MAGIC.len()],
+        OUTPUT_MAGIC,
+        "virtio-blk smoke output magic mismatch after flush"
+    );
+    println!("[virtio-blk-smoke] write flushed block={}", OUTPUT_BLOCK);
+    sbi::shutdown()
 }
 
 // AGENT: provide a disposable installed Kernel for boot selftests that require
@@ -262,6 +339,10 @@ fn install_kernel_page_table(frame_pool: &kernel::FramePool) {
         QEMU_VIRT_RAM_START,
         QEMU_VIRT_RAM_END,
         trap::trampoline_paddr(),
+        &[(
+            drivers::QEMU_VIRTIO_MMIO_START,
+            drivers::QEMU_VIRTIO_MMIO_SIZE,
+        )],
     )
     .expect("kernel Sv39 page table should build");
     page_table

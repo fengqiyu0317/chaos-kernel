@@ -520,6 +520,17 @@ cargo test --test pressure
 
 ### M9 `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
 
+#### 2026-07-25：轮询式 virtio-blk 与真实 raw sector 持久化
+
+- 目标与边界：本里程碑只证明 `kernel-qemu` 的 512 字节块 I/O 已经过 `virtqueue/DMA -> QEMU raw image`，并把它接到现有 `BlockCache/FileStorage`；不把 raw sector 持久化误报为可挂载文件系统，也不引入 superblock、bitmap、inode/root locator 或 metadata 解码恢复。
+- 块设备抽象：`BlockDevice` 现在是 `Send + Sync` 的容量/read/write/flush 接口，具体设备不再接收 cache 的 `dev_id`；`FileStorage` 和 `Kernel::new_with_block_device()` 改为持有 `Arc<dyn BlockDevice>`。`FileStorage::flush()` 先清空 guest `BlockCache` 脏块，再调用设备 `flush()`，QEMU 自测覆盖该顺序。
+- 裸机驱动：固定 `virtio-drivers = 0.13.0`，新增 `drivers/{virtio_hal,virtio_blk}.rs`。HAL 的 DMA 页从同一个 `FramePool::alloc_contiguous_pages()` 分配、清零并通过 direct map 访问，释放回同一 pool；share 对高半区 direct-map 地址执行 `v2p()`，对低地址链接内核/栈保持 identity physical address。轮询驱动实现单 sector read/write 和 `VIRTIO_BLK_T_FLUSH`。
+- MMIO/启动：Sv39 在启用 `satp` 前把 QEMU virt 的 `0x10001000..0x10009000` 映射为 supervisor RW/NX；probe 扫描全部 8 个 slot 并按 VirtIO device ID 2 选择 block device，不假定磁盘在第一个 slot。生产启动探测失败会明确失败，不静默回退；`ram-block-device` feature 仅提供显式 fallback。
+- 平台限制：当前固定窗口扫描只适用于 QEMU virt，是第一版快速打通路径；`rust_main(hartid, dtb_pa)` 尚未解析 `virtio,mmio` 节点。下一步必须从 DTB 获取每个 `reg`/IRQ 后再取消固定地址假设。
+- 持久化验收：`tools/qemu-virtio-blk-smoke.sh` 创建 raw image，宿主向 sector 8 写入 magic；第一次 guest 启动读取 sector 8、写 sector 9 并 flush，宿主读回 sector 9；第二次使用同一镜像启动，guest 输出 `persisted magic ok block=9`。本机 QEMU 7.0 实测通过，探测到 `mmio=0x10008000 blocks=8192`。
+- 回归：`cargo check --target riscv64gc-unknown-none-elf` 与 `--all-features` 通过；`qemu-sync-selftest` 通过新增 FileStorage flush 顺序回归并继续完成真实 `/bin/init`；`bash tools/qemu-smoke.sh` 在挂载临时 virtio-blk raw image 后通过 timer、init 和用户 syscall 闭环；独立 target 的 `kernel-sim cargo test` 通过（unit 1、ELF 3、smoke 84）。
+- 后续：当前 `FileBlockAllocator` 每次启动仍从“全空闲”状态开始，`FNMD` 也没有 mount/反序列化路径，因此重启后不能按路径找回文件且可能覆盖旧块。磁盘格式/mount recovery 应作为独立后续里程碑；PLIC、SEIE、claim/complete、`ack_interrupt()` 和非阻塞请求/WaitToken 唤醒继续排在其后，轮询路径不持锁睡眠。
+
 #### 2026-07-24：删除 CPU0 调度器未启动时的元数据兼容路径
 
 - 范围：只清理 `kernel-qemu` 中阻塞、yield、停止信号、timer 死亡任务和线程/进程退出在 idle-context 调度器尚未初始化时通过修改 `current` / run queue 模拟切换的旧路径；不修改 `kernel-sim` 语义。

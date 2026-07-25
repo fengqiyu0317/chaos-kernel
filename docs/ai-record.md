@@ -1,6 +1,6 @@
 # Chaos AI 工作日志
 
-更新时间：2026-07-20
+更新时间：2026-07-25
 
 ## 维护约定
 
@@ -11,6 +11,31 @@
   - `/home/huawei/.codex/sessions/2026/06/18/rollout-2026-06-18T23-57-15-019edb73-6ad9-7b23-8162-c76a589a57a9.jsonl`
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
+
+## 2026-07-25：kernel-qemu 轮询式 virtio-blk 与 raw sector smoke
+
+目标：先把现有 `FileNode -> BlockCache` 路径接到真实 QEMU raw image，并用独立的扇区级 smoke 证明 flush 后的数据跨重启存在；本轮不实现可挂载磁盘格式或 PLIC 异步 I/O。
+
+已完成修改：
+
+- `BlockDevice` 改为带容量和 flush 的 `Send + Sync` 接口，`dev_id` 只保留为 `BlockCache` key namespace；`FileStorage` / `Kernel` 接受 `Arc<dyn BlockDevice>`，且 FileStorage 按“cache writeback -> device flush”顺序同步。
+- 固定 `virtio-drivers = 0.13.0`，新增复用同一 `FramePool` 的 VirtIO HAL 和轮询式 `VirtIOBlk` backend；DMA 连续页、direct-map vaddr、共享 buffer paddr 和释放都不建立第二套 RAM 所有权。
+- 内核 Sv39 把 QEMU virt 的 8 个固定 virtio-mmio slot 映射为 supervisor RW/NX，并扫描全部 slot 选择 device ID 2；生产启动不再静默使用 RAM disk，fallback 必须显式启用 `ram-block-device`。
+- `tools/qemu-smoke.sh` 给普通 init smoke 挂载临时 raw disk；新增 `tools/qemu-virtio-blk-smoke.sh` 执行宿主预置 magic、guest read/write/flush、宿主读回以及第二次 guest 重启确认。
+
+测试结果：
+
+- `cargo check --target riscv64gc-unknown-none-elf` 与 `--all-features` 通过。
+- `qemu-sync-selftest` 通过 FileStorage flush 顺序回归，并在真实 virtio-blk 后端继续完成 `/bin/init`。
+- raw-sector 双启动 smoke 通过：QEMU 7.0 探测到 `mmio=0x10008000 blocks=8192`，宿主和第二次 guest 都确认 sector 9 的持久化 magic。
+- 普通 `bash tools/qemu-smoke.sh` 通过 VirtIO probe、heap/timer、init 和用户 syscall 闭环。
+- `kernel-sim` 独立 target 完整 `cargo test` 通过：unit 1、ELF 3、smoke 84。
+
+当前边界：
+
+- 固定 MMIO 窗口只是 QEMU virt 第一版平台限制；后续应从 `dtb_pa` 解析 `virtio,mmio` 的 `reg`/IRQ。
+- `FNMD` 尚无反序列化、superblock、块 bitmap、root locator 或 mount 恢复，`FileBlockAllocator` 重启后仍把设备视为空闲；因此 raw sector 持久化不等于文件路径可恢复。
+- PLIC、SEIE、external interrupt、claim/complete、`VirtIOBlk::ack_interrupt()` 和非阻塞请求唤醒留到磁盘格式/mount 之后的独立阶段。
 
 ## 2026-07-20：kernel-qemu ELF 装载区域归一化
 

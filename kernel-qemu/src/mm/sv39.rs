@@ -498,6 +498,7 @@ pub fn build_kernel_page_table(
     ram_start: usize,
     ram_end: usize,
     trampoline_paddr: usize,
+    mmio_regions: &[(usize, usize)],
 ) -> Result<PageTable, &'static str> {
     if ram_start % PAGE_SZ != 0 || ram_end % PAGE_SZ != 0 || ram_end <= ram_start {
         return Err("einval");
@@ -510,6 +511,16 @@ pub fn build_kernel_page_table(
     let flags = PTE_R | PTE_W | PTE_X | PTE_G | PTE_A | PTE_D;
     page_table.map_linear(ram_start, ram_start, len, flags, pool)?;
     page_table.map_linear(p2v(ram_start), ram_start, len, flags, pool)?;
+    // AGENT: identity-map device registers supervisor RW and NX before satp is
+    // enabled; the first VirtIO milestone supplies QEMU's fixed MMIO window,
+    // while a later DTB parser can supply discovered regions through this API.
+    let mmio_flags = PTE_R | PTE_W | PTE_G | PTE_A | PTE_D;
+    for &(paddr, mmio_len) in mmio_regions {
+        if paddr % PAGE_SZ != 0 || mmio_len == 0 || mmio_len % PAGE_SZ != 0 {
+            return Err("einval");
+        }
+        page_table.map_linear(paddr, paddr, mmio_len, mmio_flags, pool)?;
+    }
     // AGENT: give the satp-switching trampoline the same virtual address in
     // the kernel root that each user AddrSpace installs before its first sret.
     page_table.map_leaf(

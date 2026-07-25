@@ -35,8 +35,8 @@ fn boot_kernel_block_cache_chains() -> usize {
     }
 }
 
-// AGENT: keep Kernel as the shared simulator state container and own the first
-// QEMU block backend used by the migrated BlockCache path.
+// AGENT: keep Kernel as the shared simulator state container and own the
+// caller-selected QEMU block backend used by the migrated BlockCache path.
 pub struct Kernel {
     pub tasks: TaskTable,
     pub run_queue: RunQueue,
@@ -98,7 +98,7 @@ impl Kernel {
 
     // AGENT: allow QEMU boot to inject a concrete block backend while preserving
     // the default Kernel construction path used by focused selftests.
-    pub fn new_with_block_device(pool: FramePool, block_device: Arc<RamBlockDevice>) -> Self {
+    pub fn new_with_block_device(pool: FramePool, block_device: Arc<dyn BlockDevice>) -> Self {
         Self::new_with_block_device_and_cache_chains(
             pool,
             block_device,
@@ -110,7 +110,7 @@ impl Kernel {
     // residency while production boot keeps the normal cache width.
     fn new_with_block_device_and_cache_chains(
         pool: FramePool,
-        block_device: Arc<RamBlockDevice>,
+        block_device: Arc<dyn BlockDevice>,
         cache_chains: usize,
     ) -> Self {
         let file_blocks = Arc::new(FileBlockAllocator::new(block_device.block_count()));

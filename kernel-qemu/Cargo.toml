@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+ram-block-device = []
 qemu-boot-smoke = []
+qemu-virtio-blk-smoke = []
 qemu-mm-selftest = []
 qemu-fs-selftest = []
 qemu-proc-selftest = []
@@ -20,6 +22,9 @@ qemu-selftest = [
     "qemu-proc-selftest",
     "qemu-checkpoint-selftest",
 ]
+
+[dependencies]
+virtio-drivers = { version = "=0.13.0", default-features = false }
 
 [profile.dev]
 panic = "abort"
