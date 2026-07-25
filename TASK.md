@@ -535,9 +535,10 @@ cargo test --test pressure
 
 - 语义来源与范围：沿用 `kernel-sim` 的 `sys_open()`、fd entry / open-file-description、共享 `FileNode` 和 open-time status flags；QEMU 侧新增 RISC-V `openat(56)` ABI 入口、真实 Sv39 pathname usercopy 和裸机 fd/path 状态承载。本轮没有修改 `kernel-sim`，也没有引入占位 cwd 或完整 VFS。
 - 已完成：`openat(dirfd, path, flags, mode)` 映射到内部 `SYS_OPENAT(257)` 并保持四参数布局；当前只接受绝对路径，按 Linux 规则忽略其 `dirfd`，相对路径在 cwd/目录 fd 语义迁移前明确返回 `enotsup`。
-- 已完成：open flags 集中解析为 `OpenOptions`，访问模式进入共享 OFD，`FD_CLOEXEC` 留在 fd entry；拒绝未知 flags，移除未生效且常量类型错误的 `AT_NOFOLLOW` 假检查。`mode`/umask/credential 尚未建模，不再保留无效权限位计算。
+- 已完成：open flags 集中解析为 `OpenOptions`，访问模式进入共享 OFD，`FD_CLOEXEC` 留在 fd entry；`O_CREAT`/`O_EXCL` 被收敛为 `OpenExisting`、`CreateIfMissing`、`CreateNew` 三种有效创建策略，单独使用语义未定义的 `O_EXCL` 明确返回 `einval`；拒绝未知 flags，移除未生效且常量类型错误的 `AT_NOFOLLOW` 假检查。`mode`/umask/credential 尚未建模，不再保留无效权限位计算。
+- pathname/FileNode 边界：明确 `FileNode` 是当前共享的 inode-like 文件对象；删除只返回字符串却名为 `lookup_path()` 的模糊接口和无效重复规范化，改由私有 `resolve_path_key()` 只生成规范路径键、`lookup_file_node()` 查找已有共享节点、`open_regular_node()` 解析原始路径并原子查找/创建节点。exec、path-backed write 和 openat 均复用这一边界，不再直接组合路径键与 `file_nodes` 查询。
 - 原子性与失败边界：`Kernel::open_regular_node()` 在同一 path-table 写锁内完成 lookup、`O_EXCL`、已有父目录登记和创建，避免并发 create 覆盖不同 `FileNode`；`FdTable.pending` 在文件创建或截断前预留 fd，构造失败归还，fork 只复制已经提交的 fd，因此 `EMFILE` 不再创建或截断文件。
-- 回归覆盖：`qemu-fs-selftest` 覆盖 ABI 参数、OFD flags、`FD_CLOEXEC`、独立 open offset、`O_EXCL`、writable `O_TRUNC`、相对路径/未知 flags/非法 access mode、目录与非目录父节点错误和 fd 表满时文件内容保持不变。内嵌 `/bin/init` 在真实 U-mode 执行 `openat -> write` 并输出 `[init] openat round-trip passed`。
+- 回归覆盖：`qemu-fs-selftest` 覆盖路径别名规范化、挂载转换、共享 `Arc<FileNode>` 身份、缺失节点 `enoent`，以及 ABI 参数、OFD flags、`FD_CLOEXEC`、独立 open offset、`O_CREAT | O_EXCL` 已存在时的 `eexist`、单独 `O_EXCL` 的 `einval`、writable `O_TRUNC`、相对路径/未知 flags/非法 access mode、目录与非目录父节点错误和 fd 表满时文件内容保持不变。内嵌 `/bin/init` 在真实 U-mode 执行 `openat -> write` 并输出 `[init] openat round-trip passed`。
 - 验证：`cargo fmt --check`、`cargo check --target riscv64gc-unknown-none-elf --all-features` 通过；`cargo run --release --features qemu-selftest,ram-block-device` 的全部 QEMU 自测通过并完成真实用户态 openat round trip；当前 virtio 根块设备配置下 `bash tools/qemu-smoke.sh` 通过；`CARGO_TARGET_DIR=/tmp/chaos-kernel-sim-openat cargo test` 通过（unit 1、ELF 3、smoke 84）。
 - 剩余边界：`mode`/umask/credential、cwd/`AT_FDCWD`/目录 fd、逐分量目录遍历、符号链接、非 UTF-8 pathname 和完整 `EISDIR`/`ENOTDIR`/`ELOOP` 仍待迁移；QEMU `sys_read()` 入口仍为 `enosys`。下方 cwd TODO 保持有效。
 

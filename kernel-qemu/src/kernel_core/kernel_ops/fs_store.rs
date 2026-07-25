@@ -1,34 +1,30 @@
 use super::*;
 
 impl Kernel {
-    pub fn lookup_path(&self, path: &str) -> Result<String, &'static str> {
+    // AGENT: normalize one pathname and translate its longest mount prefix into
+    // the canonical key used by the path-backed FileNode table.
+    fn resolve_path_key(&self, path: &str) -> Result<String, &'static str> {
         if path.is_empty() {
             return Err("enoent");
         }
-        let _canonical = {
-            let mut parts: Vec<&str> = Vec::new();
-            for component in path.split('/') {
-                match component {
-                    "" | "." => {}
-                    ".." => {
-                        parts.pop();
-                    }
-                    c => {
-                        parts.push(c);
-                    }
-                }
-            }
-            let mut canonical = String::from("/");
-            for (idx, part) in parts.iter().enumerate() {
-                if idx > 0 {
-                    canonical.push('/');
-                }
-                canonical.push_str(part);
-            }
-            canonical
-        };
-        let resolved = self.mnt.resolve(path)?;
-        Ok(resolved)
+        self.mnt.resolve(path)
+    }
+
+    // AGENT: resolve an existing pathname to the shared inode-like FileNode
+    // while retaining its canonical namespace key for open and exec state.
+    pub(crate) fn lookup_file_node(&self, path: &str) -> Result<ResolvedFileNode, &'static str> {
+        let resolved = self.resolve_path_key(path)?;
+        let node = self
+            .file_nodes
+            .read()
+            .unwrap()
+            .get(&resolved)
+            .cloned()
+            .ok_or("enoent")?;
+        Ok(ResolvedFileNode {
+            path: resolved,
+            node,
+        })
     }
 
     // AGENT: split a resolved path into its parent directory path and child name.
@@ -62,28 +58,32 @@ impl Kernel {
     }
 
     // AGENT: perform lookup, O_EXCL validation, optional parent-directory
-    // bookkeeping, and creation under one path-table write lock.
+    // bookkeeping, and creation under one path-table write lock; callers pass
+    // the original pathname so an unnormalized key cannot bypass resolution.
     pub(crate) fn open_regular_node(
         &self,
-        resolved_path: &str,
-        create: bool,
-        exclusive: bool,
-    ) -> Result<Arc<FileNode>, &'static str> {
+        path: &str,
+        creation: CreateDisposition,
+    ) -> Result<ResolvedFileNode, &'static str> {
+        let resolved = self.resolve_path_key(path)?;
         let mut nodes = self.file_nodes.write().unwrap();
-        if let Some(node) = nodes.get(resolved_path).cloned() {
-            if create && exclusive {
+        if let Some(node) = nodes.get(&resolved).cloned() {
+            if creation == CreateDisposition::CreateNew {
                 return Err("eexist");
             }
             if node.kind != FileKind::Regular {
                 return Err("eisdir");
             }
-            return Ok(node);
+            return Ok(ResolvedFileNode {
+                path: resolved,
+                node,
+            });
         }
-        if !create {
+        if creation == CreateDisposition::OpenExisting {
             return Err("enoent");
         }
 
-        if let Some((parent, name)) = Self::parent_dir_entry(resolved_path) {
+        if let Some((parent, name)) = Self::parent_dir_entry(&resolved) {
             if let Some(parent_node) = nodes.get(&parent).cloned() {
                 if parent_node.kind != FileKind::Directory {
                     return Err("enotdir");
@@ -93,8 +93,11 @@ impl Kernel {
         }
 
         let node = Arc::new(FileNode::regular(false));
-        nodes.insert(resolved_path.to_string(), node.clone());
-        Ok(node)
+        nodes.insert(resolved.clone(), node.clone());
+        Ok(ResolvedFileNode {
+            path: resolved,
+            node,
+        })
     }
 
     // AGENT: install a regular path-backed file used by both file instances and exec.
@@ -104,7 +107,7 @@ impl Kernel {
         data: Vec<u8>,
         executable: bool,
     ) -> Result<(), &'static str> {
-        let resolved = self.lookup_path(path)?;
+        let resolved = self.resolve_path_key(path)?;
         let storage = self.file_storage();
         let node = Arc::new(FileNode::regular(executable));
         node.write_initial_bytes(&storage, &data)?;
@@ -123,7 +126,7 @@ impl Kernel {
 
     // AGENT: install a directory node so exec can distinguish directories.
     pub fn install_directory(&self, path: &str) -> Result<(), &'static str> {
-        let resolved = self.lookup_path(path)?;
+        let resolved = self.resolve_path_key(path)?;
         self.file_nodes
             .write()
             .unwrap()
@@ -139,18 +142,13 @@ impl Kernel {
         offset: usize,
         data: &[u8],
     ) -> Result<usize, &'static str> {
-        let resolved = self.lookup_path(path)?;
-        let node = self
-            .file_nodes
-            .read()
-            .unwrap()
-            .get(&resolved)
-            .cloned()
-            .ok_or("enoent")?;
-        if node.kind == FileKind::Directory {
+        let resolved = self.lookup_file_node(path)?;
+        if resolved.node.kind == FileKind::Directory {
             return Err("eisdir");
         }
-        node.write_bytes(&self.file_storage(), Some(offset), data)?;
+        resolved
+            .node
+            .write_bytes(&self.file_storage(), Some(offset), data)?;
         Ok(data.len())
     }
 }

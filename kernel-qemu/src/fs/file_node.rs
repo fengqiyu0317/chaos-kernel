@@ -248,8 +248,10 @@ impl FileNodeData {
     }
 }
 
-// AGENT: FileNode owns metadata, directory entries, and the regular-file block
-// map; actual bytes and unified dirty state live in the shared block cache.
+// AGENT: this inode-like shared file object owns file type, metadata, directory
+// entries, byte length, and the regular-file block map; per-open offset and
+// status flags remain in the fd/OFD layer, while actual bytes and unified dirty
+// state live in the shared block cache.
 pub struct FileNode {
     pub kind: FileKind,
     pub executable: AtomicBool,

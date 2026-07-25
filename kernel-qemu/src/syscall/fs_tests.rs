@@ -13,6 +13,7 @@ const OPEN_USER_BASE: usize = 0x4001_0000;
 // real kernel frame pool, current init task, Sv39 mappings, and fd table.
 pub fn run_all(kernel: &Kernel) {
     mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel);
+    pathname_lookup_returns_shared_file_node(kernel);
     openat_uses_transactional_fd_and_path_state(kernel);
 }
 
@@ -125,6 +126,45 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
     );
 }
 
+// AGENT: verify that pathname lookup normalizes aliases, applies mount
+// translation, returns one shared inode-like FileNode, and reports absence.
+#[cfg_attr(test, test)]
+fn pathname_lookup_returns_shared_file_node(kernel: &Kernel) {
+    kernel
+        .install_file("/tmp/qemu-lookup", b"node".to_vec(), false)
+        .expect("lookup test file should install");
+
+    let direct = kernel
+        .lookup_file_node("/tmp/qemu-lookup")
+        .expect("canonical lookup path should resolve");
+    let alias = kernel
+        .lookup_file_node("/tmp//unused/.././qemu-lookup")
+        .expect("normalized lookup alias should resolve");
+    assert_eq!(direct.path, "/tmp/qemu-lookup");
+    assert_eq!(alias.path, direct.path);
+    assert!(Arc::ptr_eq(&direct.node, &alias.node));
+    assert!(matches!(
+        kernel.lookup_file_node("/tmp/qemu-lookup-missing"),
+        Err("enoent")
+    ));
+
+    kernel
+        .mnt
+        .mount("/lookup-mnt", "lookupdev")
+        .expect("lookup test mount should install");
+    kernel
+        .install_file("/lookup-mnt/file", b"mounted".to_vec(), false)
+        .expect("mounted lookup test file should install");
+    let mounted = kernel
+        .lookup_file_node("/lookup-mnt/./file")
+        .expect("mounted lookup path should resolve");
+    assert_eq!(mounted.path, "lookupdev:/file");
+    kernel
+        .mnt
+        .umount("/lookup-mnt")
+        .expect("lookup test mount should uninstall");
+}
+
 // AGENT: verify the live openat ABI, OFD flags, independent open offsets,
 // atomic create errors, narrow absolute-path contract, and EMFILE rollback.
 #[cfg_attr(test, test)]
@@ -197,6 +237,18 @@ fn openat_uses_transactional_fd_and_path_state(kernel: &Kernel) {
         ),
         Err("eexist")
     );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_OPENAT,
+            0,
+            path_addr,
+            O_EXCL | 1,
+            0,
+            0,
+            0,
+        ),
+        Err("einval")
+    );
 
     task.close_fd(fd).expect("first openat fd should close");
     task.close_fd(second_fd)
@@ -204,16 +256,11 @@ fn openat_uses_transactional_fd_and_path_state(kernel: &Kernel) {
     let trunc_fd = kernel
         .dispatch_syscall_without_signal_delivery(SYS_OPENAT, 0, path_addr, O_TRUNC | 1, 0, 0, 0)
         .expect("writable O_TRUNC should reopen the file");
-    let opened_path = kernel
-        .lookup_path("/tmp/qemu-openat")
-        .expect("truncated file path should resolve");
     assert_eq!(
         kernel
-            .file_nodes
-            .read()
-            .unwrap()
-            .get(&opened_path)
+            .lookup_file_node("/tmp/qemu-openat")
             .expect("truncated file should remain registered")
+            .node
             .len(),
         0
     );
@@ -303,16 +350,11 @@ fn openat_uses_transactional_fd_and_path_state(kernel: &Kernel) {
         ),
         Err("emfile")
     );
-    let emfile_path = kernel
-        .lookup_path("/tmp/qemu-emfile")
-        .expect("EMFILE target path should resolve");
     assert_eq!(
         kernel
-            .file_nodes
-            .read()
-            .unwrap()
-            .get(&emfile_path)
+            .lookup_file_node("/tmp/qemu-emfile")
             .expect("EMFILE target should remain registered")
+            .node
             .len(),
         4
     );

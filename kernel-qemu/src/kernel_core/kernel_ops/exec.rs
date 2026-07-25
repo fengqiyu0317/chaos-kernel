@@ -9,22 +9,18 @@ struct PreparedExec {
 }
 
 impl Kernel {
-    // AGENT: read a stable executable snapshot from the unified path file table.
-    fn read_file_for_exec(&self, path: &str) -> Result<Vec<u8>, &'static str> {
-        let node = self
-            .file_nodes
-            .read()
-            .unwrap()
-            .get(path)
-            .cloned()
-            .ok_or("enoent")?;
-        if node.kind != FileKind::Regular {
+    // AGENT: resolve one executable pathname to the shared inode-like FileNode
+    // and return both its canonical key and a stable byte snapshot.
+    fn read_file_for_exec(&self, path: &str) -> Result<(String, Vec<u8>), &'static str> {
+        let resolved = self.lookup_file_node(path)?;
+        if resolved.node.kind != FileKind::Regular {
             return Err("eisdir");
         }
-        if !node.executable.load(Ordering::Relaxed) {
+        if !resolved.node.executable.load(Ordering::Relaxed) {
             return Err("eacces");
         }
-        node.read_all(&self.file_storage())
+        let data = resolved.node.read_all(&self.file_storage())?;
+        Ok((resolved.path, data))
     }
 
     // AGENT: prepare exec from a path-backed executable file snapshot.
@@ -35,8 +31,7 @@ impl Kernel {
         args: Vec<String>,
         envs: Vec<String>,
     ) -> Result<PreparedExec, &'static str> {
-        let exec_path = self.lookup_path(path)?;
-        let elf_data = self.read_file_for_exec(&exec_path)?;
+        let (exec_path, elf_data) = self.read_file_for_exec(path)?;
         // AGENT: delegate ELF mapping and stack construction to the common
         // user-image builder; exec retains only file and commit semantics.
         let image = prepare_user_image(&elf_data, args, envs, &self.pool)?;

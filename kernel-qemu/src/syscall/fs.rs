@@ -11,8 +11,7 @@ const SUPPORTED_OPEN_FLAGS: usize =
 #[derive(Clone, Copy)]
 struct OpenOptions {
     status: FdOpt,
-    create: bool,
-    exclusive: bool,
+    creation: CreateDisposition,
     truncate: bool,
     cloexec: bool,
 }
@@ -30,6 +29,12 @@ impl OpenOptions {
         if flags & !SUPPORTED_OPEN_FLAGS != 0 {
             return Err("enotsup");
         }
+        let creation = match (flags & O_CREAT != 0, flags & O_EXCL != 0) {
+            (false, false) => CreateDisposition::OpenExisting,
+            (true, false) => CreateDisposition::CreateIfMissing,
+            (true, true) => CreateDisposition::CreateNew,
+            (false, true) => return Err("einval"),
+        };
         Ok(Self {
             status: FdOpt {
                 rd,
@@ -37,8 +42,7 @@ impl OpenOptions {
                 ap: flags & O_APPEND != 0,
                 nb: flags & O_NONBLOCK != 0,
             },
-            create: flags & O_CREAT != 0,
-            exclusive: flags & O_EXCL != 0,
+            creation,
             truncate: flags & O_TRUNC != 0,
             cloexec: flags & O_CLOEXEC != 0,
         })
@@ -202,9 +206,9 @@ fn do_open(
     }
     let options = OpenOptions::parse(flags)?;
     task.add_file_with_status_from(options.status, options.cloexec, || {
-        let resolved = kernel.lookup_path(path)?;
-        let node = kernel.open_regular_node(&resolved, options.create, options.exclusive)?;
-        let instance = FInstance::with_node_on_storage(&resolved, node, kernel.file_storage());
+        let resolved = kernel.open_regular_node(path, options.creation)?;
+        let instance =
+            FInstance::with_node_on_storage(&resolved.path, resolved.node, kernel.file_storage());
         if options.truncate && options.status.wr {
             instance.set_len(0)?;
         }
