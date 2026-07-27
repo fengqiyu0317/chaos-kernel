@@ -68,9 +68,8 @@ fn read_user_path(task: &Task, addr: usize) -> Result<String, &'static str> {
     Err("enametoolong")
 }
 
-// AGENT: Mount the current first-stage string-backed source at an absolute
-// target path; filesystem type is validated as user input but not interpreted
-// until real filesystem instances exist.
+// AGENT: attach a fresh first-stage ChaosFs instance at an existing directory;
+// source discovery remains unimplemented and no longer becomes path identity.
 pub(super) fn sys_mount(
     kernel: &Kernel,
     source_addr: usize,
@@ -85,20 +84,21 @@ pub(super) fn sys_mount(
     let task = kernel.cur_task(0).ok_or("esrch")?;
     let source = read_user_path(&task, source_addr)?;
     let target = read_user_path(&task, target_addr)?;
+    if source.is_empty() {
+        return Err("einval");
+    }
     if filesystem_type_addr != 0 {
         let filesystem_type = read_user_path(&task, filesystem_type_addr)?;
         if filesystem_type.is_empty() {
             return Err("einval");
         }
     }
-    kernel.mnt.mount(&target, &source)?;
-    // AGENT: the first-stage string-backed mount has no separate filesystem
-    // loader, so establish its resolved root before any child lookup or create.
-    kernel.install_directory(&target)?;
+    let fs = kernel.vfs.new_filesystem(FileStorage::standalone());
+    kernel.vfs.attach(&target, fs, MountFlags::empty())?;
     Ok(0)
 }
 
-// AGENT: Remove an exact first-stage mount binding; nonzero umount2 flags are
+// AGENT: remove the visible top mount at an exact path; nonzero umount2 flags are
 // rejected until force, detach, expire, and no-follow semantics are modeled.
 pub(super) fn sys_umount2(
     kernel: &Kernel,
@@ -110,7 +110,7 @@ pub(super) fn sys_umount2(
     }
     let task = kernel.cur_task(0).ok_or("esrch")?;
     let target = read_user_path(&task, target_addr)?;
-    kernel.mnt.umount(&target)?;
+    kernel.vfs.detach_top(&target)?;
     Ok(0)
 }
 
@@ -210,8 +210,7 @@ fn do_open(
     let options = OpenOptions::parse(flags)?;
     task.add_file_with_status_from(options.status, options.cloexec, || {
         let resolved = kernel.open_regular_node(path, options.creation)?;
-        let instance =
-            FInstance::with_node_on_storage(&resolved.path, resolved.node, kernel.file_storage());
+        let instance = FInstance::from_resolved(resolved);
         if options.truncate && options.status.wr {
             instance.set_len(0)?;
         }
@@ -285,8 +284,7 @@ pub(super) fn sys_stat(
         if !check_access(path_addr, 4096) {
             return Err("efault");
         } // HUMAN
-        let tbl = kernel.mnt.entries.read().unwrap();
-        tbl.len()
+        kernel.vfs.mounts.mount_count()
     } else {
         let fd = a0;
         fd / 4

@@ -11,13 +11,6 @@ mod runtime;
 mod sched_signal;
 mod tty;
 
-// AGENT: keep the canonical namespace key together with the shared inode-like
-// FileNode returned by pathname lookup or creation.
-pub(crate) struct ResolvedFileNode {
-    pub(crate) path: String,
-    pub(crate) node: Arc<FileNode>,
-}
-
 // AGENT: represent only the three meaningful regular-file creation policies
 // instead of allowing independent O_CREAT/O_EXCL booleans to form an undefined
 // O_EXCL-without-O_CREAT state.

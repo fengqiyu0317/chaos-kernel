@@ -477,8 +477,8 @@ cargo test --test pressure
 - `[M5][普通] TODO`: `kernel-sim` 的 file lock 模型尚未区分 POSIX process-associated record locks、open-file-description locks 和 `flock` locks；真实 fork 中这些锁的继承/不继承规则不同。
 - `[M5][普通] TODO`: `kernel-sim` 尚未建模 directory streams、POSIX message queue descriptors、AIO contexts、io_uring 等对象，因此也没有对应的 fork 继承或清空规则。
 - `[M5][重要] TODO`: `kernel-sim` 的 syscall 文件 I/O 已有 fd entry / open-file description 基础模型，但仍未实现 `readv`/`writev`、`pread`/`pwrite`、`lseek` syscall、目录 fd 语义、权限/credential 检查、真实设备/tty 行规程等更完整文件系统行为。
-- `[M5][M9][重要] DONE`: `kernel-qemu` 已增加 RISC-V `mount(40)` / `umount2(39)` 到内部 syscall 的 ABI 映射和分发，通过当前 task 的 `AddrSpace` 搬运 `source` / `target` / `filesystemtype` 字符串，并接入 `MountTable::{mount,umount}`。第一阶段仅接受零 flags 和空 data，已用 `qemu-fs-selftest` 覆盖 syscall 号映射、Sv39 usercopy、重复挂载替换、非法指针/flag、精确卸载和重复卸载错误。
-- `[M5][M9][重要] TODO`: 继续将当前字符串前缀映射升级为完整 VFS mount 语义：引入文件系统实例/superblock、根挂载、mount flags、busy/reference 检查、namespace 和逐路径分量遍历；本次 syscall 接线不表示这些 VFS 能力已完成。
+- `[M5][M9][重要] DONE`: `kernel-qemu` 的 RISC-V `mount(40)` / `umount2(39)` 已通过当前 task 的 `AddrSpace` 搬运用户字符串并接入对象化 `Vfs::{attach,detach_top}`。目标必须是既有目录；同一挂载点重复 mount 形成 bottom-to-top stack，umount 只摘除可见顶层并恢复下一层。第一阶段仍只接受零 flags 和空 data；`source` 仅校验非空，每次 syscall mount 暂时创建独立的内存 ChaosFs，真实 source/device 发现尚未实现。
+- `[M5][M9][重要] PARTIAL`: 已完成第一个对象 VFS 增量：`FsInstance` 拥有 `FileStorage`、root、文件系统内相对路径节点表和运行期 inode allocator；`MountTable` 以 `(parent MountId, mountpoint InodeId)` 管理 mount stacking；`PathRef { mount, node }` 决定 fd 与 exec 的正确存储来源。后续仍需 superblock/重启恢复、真实逐目录分量 dentry 遍历、mount flags 行为、busy/lazy detach、mount namespace、bind/remount/move 等完整语义。
 - `[M5][重要] TODO`: `kernel-sim/src/kernel/syscall/fs.rs` 的 `sys_open()` 已从用户地址空间读取路径并接入 `FileNode` 表，但路径解析仍是简化绝对路径模型；后续应补齐 cwd 相对路径、目录遍历、符号链接、mode/umask、真实 `EISDIR`/`ENOTDIR`/`ELOOP` 等错误边界。
 - `[M5][重要] TODO`: `kernel-sim` 的 pipe read/write 已走真实 `PipeNode` 队列，但空 pipe 目前直接返回 `again`，尚未实现阻塞等待、`O_NONBLOCK` 差异、关闭写端后的 EOF 唤醒、`SIGPIPE`/`EPIPE` 等完整 pipe 语义。
 - `[M5][重要] TODO`: `kernel-sim` 的 syscall 用户缓冲区复制目前用 contiguous readable/writable prefix 产生 short I/O；后续若实现 lazy page fault，应让 copy-in/copy-out 能触发缺页装入并精确区分 fault 前后已搬运字节。
@@ -556,6 +556,15 @@ cargo test --test pressure
 - 当前边界：与第一阶段 `openat` 一致，`mkdirat` 只支持绝对路径且按 Linux 规则忽略绝对路径的 `dirfd`；相对路径在 cwd/目录 fd 解析迁移前返回 `enotsup`。`mode` 已按 ABI 接收，但权限位、umask、credential 和目录元数据权限尚未建模。
 - 回归覆盖：ABI 自测固定 syscall 号和参数布局；文件系统自测覆盖成功父子目录创建、父目录项可见性、重复创建/普通文件冲突 `eexist`、缺失父目录、非目录父节点、相对路径、空路径和错误用户指针。内嵌 init 通过真实 U-mode `ecall 34` 创建 `/tmp/init-mkdirat`，随后以 `openat` 创建子文件并输出 `[init] mkdirat round-trip passed`。
 - 验证：`cargo check --target riscv64gc-unknown-none-elf --all-features`、`cargo run --release --features qemu-selftest,ram-block-device` 和 VirtIO 后端的 `bash tools/qemu-smoke.sh` 均通过；QEMU selftest、用户态 mkdirat/openat round trip 和 init 正常退出全部完成。独立 target 的 `kernel-sim cargo test` 继续通过（unit 1、ELF 3、smoke 84）。
+
+#### 2026-07-27：文件系统实例、挂载实例与 PathRef 对象模型
+
+- 目标与边界：只完成对象 VFS 的第一阶段所有权重构；不修改 `kernel-sim` 或禁止路径 `kernel/src/kernel.rs`，不实现 cwd/dirfd、符号链接、mount namespace、完整 mount flags、busy/lazy unmount、superblock/inode 持久化或真正的目录 dentry 遍历。
+- 所有权：新增 `FsInstance`，把根 `FileNode`、文件系统内部 `BTreeMap<String, Arc<FileNode>>`、运行期 inode allocator 和唯一 `FileStorage` 收在同一对象；`Kernel` 删除直接的 `file_storage`、`file_nodes` 和 `mnt` 字段，改为 `Kernel -> Vfs -> root Mount -> root FsInstance -> FileStorage/root/nodes`。
+- 挂载拓扑：删除 `MountEntry { prefix, target }` 字符串映射；新增带稳定 `MountId`、`Arc<FsInstance>`、弱父引用、mountpoint inode 和 flags 的 `Mount`。`MountTable` 以 `(parent MountId, InodeId)` 维护 mount stack，检查目录类型、节点所属文件系统与 parent membership，支持同一 FsInstance 多次挂载，并让 `detach_top()` 返回仍可被既有引用持有的 `Arc<Mount>`。
+- 路径与存储：新增 `PathRef { mount, node }` 和仅用于显示的 `ResolvedPath::display_path`；第一阶段 `Vfs` 仍通过各 `FsInstance::lookup()` 的完整内部路径键解析分量并跨越 mount。`FInstance::from_path/from_resolved`、path-backed write 和 exec 都从 `path_ref.mount.fs().storage()` 派生后端，不再使用全局 root storage。
+- 回归覆盖：mount 自测覆盖根挂载、两个 FsInstance 的命名空间隔离、同一 FsInstance 多处挂载、A/B stacking 与 detach 恢复、detach 后 PathRef 继续读取、普通文件 mountpoint 拒绝和 detached parent 拒绝；filesystem syscall 自测覆盖对象 mount/umount stacking，以及挂载文件的 FInstance 与 exec 使用挂载 FsInstance storage。
+- 验证：`cargo fmt --check`、`cargo check --target riscv64gc-unknown-none-elf --all-features`、`cargo run --release --features qemu-selftest,ram-block-device`、VirtIO 后端 `bash tools/qemu-smoke.sh` 和 `git diff --check` 均通过。RAM 全量 selftest 通过 sync/mount/fd/fs syscall/exec 等路径，RAM 与 VirtIO 启动均完成真实用户态 mkdirat/openat round trip 和 init 正常退出；独立 target 的 `kernel-sim cargo test` 继续通过（unit 1、ELF 3、smoke 84）。
 
 #### 2026-07-24：删除 CPU0 调度器未启动时的元数据兼容路径
 

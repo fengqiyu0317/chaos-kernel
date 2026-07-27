@@ -19,6 +19,7 @@ pub fn run_all(kernel: &Kernel) {
     mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel);
     path_creation_requires_an_existing_directory_parent(kernel);
     pathname_lookup_returns_shared_file_node(kernel);
+    mounted_open_and_exec_use_the_mounted_filesystem_storage(kernel);
     mkdirat_creates_only_new_absolute_directories(kernel);
     openat_uses_transactional_fd_and_path_state(kernel);
 }
@@ -36,8 +37,8 @@ fn write_user_string(kernel: &Kernel, task: &Task, addr: usize, value: &str) {
         .expect("test user string should be writable");
 }
 
-// AGENT: Verify RISC-V number mapping, real AddrSpace string copy, mount
-// replacement, unsupported flags, exact unmount, and missing-mount errors.
+// AGENT: verify RISC-V usercopy plus object-mount stacking, top detach, flag
+// rejection, and exact missing-mount errors.
 #[cfg_attr(test, test)]
 fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
     assert_eq!(map_riscv_nr(RISCV_SYS_MOUNT), Some(INTERNAL_SYS_MOUNT));
@@ -60,6 +61,9 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
     write_user_string(kernel, &task, source_addr, "dev0");
     write_user_string(kernel, &task, target_addr, "/mnt");
     write_user_string(kernel, &task, filesystem_type_addr, "chaosfs");
+    kernel
+        .install_directory("/mnt")
+        .expect("mount syscall requires an existing directory mountpoint");
 
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(
@@ -73,18 +77,13 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
         ),
         Ok(0)
     );
-    assert_eq!(
-        kernel.mnt.resolve("/mnt/file"),
-        Ok("dev0:/file".to_string())
-    );
-    assert_eq!(
-        kernel
-            .lookup_file_node("/mnt")
-            .expect("mount should establish its backing namespace root")
-            .node
-            .kind,
-        FileKind::Directory
-    );
+    let first_mount = kernel
+        .lookup_file_node("/mnt")
+        .expect("mount should expose its filesystem root")
+        .path_ref
+        .mount;
+    assert_eq!(first_mount.fs().root().kind, FileKind::Directory);
+    assert_eq!(kernel.vfs.mounts.mount_count(), 1);
 
     write_user_string(kernel, &task, source_addr, "dev1");
     assert_eq!(
@@ -99,18 +98,13 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
         ),
         Ok(0)
     );
-    assert_eq!(
-        kernel.mnt.resolve("/mnt/file"),
-        Ok("dev1:/file".to_string())
-    );
-    assert_eq!(
-        kernel
-            .lookup_file_node("/mnt")
-            .expect("replacement mount should establish its backing root")
-            .node
-            .kind,
-        FileKind::Directory
-    );
+    let second_mount = kernel
+        .lookup_file_node("/mnt")
+        .expect("stacked mount should expose the newest filesystem root")
+        .path_ref
+        .mount;
+    assert!(!Arc::ptr_eq(&first_mount, &second_mount));
+    assert_eq!(kernel.vfs.mounts.mount_count(), 2);
 
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(
@@ -141,7 +135,18 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
         kernel.dispatch_syscall_without_signal_delivery(SYS_UMOUNT2, target_addr, 0, 0, 0, 0, 0,),
         Ok(0)
     );
-    assert_eq!(kernel.mnt.resolve("/mnt/file"), Ok("/mnt/file".to_string()));
+    let revealed = kernel
+        .lookup_file_node("/mnt")
+        .expect("detaching the top mount should reveal the previous layer")
+        .path_ref
+        .mount;
+    assert!(Arc::ptr_eq(&revealed, &first_mount));
+    assert_eq!(kernel.vfs.mounts.mount_count(), 1);
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_UMOUNT2, target_addr, 0, 0, 0, 0, 0,),
+        Ok(0)
+    );
+    assert_eq!(kernel.vfs.mounts.mount_count(), 0);
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(SYS_UMOUNT2, target_addr, 0, 0, 0, 0, 0,),
         Err("einval")
@@ -155,7 +160,7 @@ fn path_creation_requires_an_existing_directory_parent(kernel: &Kernel) {
     let root = kernel
         .lookup_file_node("/")
         .expect("the namespace root should always exist");
-    assert_eq!(root.node.kind, FileKind::Directory);
+    assert_eq!(root.path_ref.node.kind, FileKind::Directory);
 
     assert_eq!(
         kernel.install_file("/qemu-missing-parent/file", Vec::new(), false),
@@ -186,8 +191,11 @@ fn path_creation_requires_an_existing_directory_parent(kernel: &Kernel) {
     let parent = kernel
         .lookup_file_node("/qemu-parent-dir")
         .expect("test parent directory should remain registered");
-    assert_eq!(parent.node.dir_entry_at(0), Ok(String::from("child")));
-    assert_eq!(parent.node.dir_entry_at(1), Err("enoent"));
+    assert_eq!(
+        parent.path_ref.node.dir_entry_at(0),
+        Ok(String::from("child"))
+    );
+    assert_eq!(parent.path_ref.node.dir_entry_at(1), Err("enoent"));
 
     kernel
         .install_directory("/qemu-open-parent")
@@ -204,12 +212,15 @@ fn path_creation_requires_an_existing_directory_parent(kernel: &Kernel) {
             CreateDisposition::CreateIfMissing,
         )
         .expect("reopen should return the existing file node");
-    assert!(Arc::ptr_eq(&created.node, &reopened.node));
+    assert!(Arc::ptr_eq(&created.path_ref.node, &reopened.path_ref.node));
     let open_parent = kernel
         .lookup_file_node("/qemu-open-parent")
         .expect("open test parent should remain registered");
-    assert_eq!(open_parent.node.dir_entry_at(0), Ok(String::from("child")));
-    assert_eq!(open_parent.node.dir_entry_at(1), Err("enoent"));
+    assert_eq!(
+        open_parent.path_ref.node.dir_entry_at(0),
+        Ok(String::from("child"))
+    );
+    assert_eq!(open_parent.path_ref.node.dir_entry_at(1), Err("enoent"));
 
     kernel
         .install_file("/qemu-regular-parent", Vec::new(), false)
@@ -245,32 +256,84 @@ fn pathname_lookup_returns_shared_file_node(kernel: &Kernel) {
     let alias = kernel
         .lookup_file_node("/tmp//unused/.././qemu-lookup")
         .expect("normalized lookup alias should resolve");
-    assert_eq!(direct.path, "/tmp/qemu-lookup");
-    assert_eq!(alias.path, direct.path);
-    assert!(Arc::ptr_eq(&direct.node, &alias.node));
+    assert_eq!(direct.display_path, "/tmp/qemu-lookup");
+    assert_eq!(alias.display_path, direct.display_path);
+    assert!(Arc::ptr_eq(&direct.path_ref.node, &alias.path_ref.node));
     assert!(matches!(
         kernel.lookup_file_node("/tmp/qemu-lookup-missing"),
         Err("enoent")
     ));
 
     kernel
-        .mnt
-        .mount("/lookup-mnt", "lookupdev")
-        .expect("lookup test mount should install");
-    kernel
         .install_directory("/lookup-mnt")
-        .expect("mounted namespace root should install");
+        .expect("lookup test mountpoint should install");
+    let mounted_fs = kernel.vfs.new_filesystem(FileStorage::standalone());
+    kernel
+        .vfs
+        .attach("/lookup-mnt", mounted_fs, MountFlags::empty())
+        .expect("lookup test mount should attach");
     kernel
         .install_file("/lookup-mnt/file", b"mounted".to_vec(), false)
         .expect("mounted lookup test file should install");
     let mounted = kernel
         .lookup_file_node("/lookup-mnt/./file")
         .expect("mounted lookup path should resolve");
-    assert_eq!(mounted.path, "lookupdev:/file");
+    assert_eq!(mounted.display_path, "/lookup-mnt/file");
     kernel
-        .mnt
-        .umount("/lookup-mnt")
+        .vfs
+        .detach_top("/lookup-mnt")
         .expect("lookup test mount should uninstall");
+}
+
+// AGENT: prove both the open-file constructor and exec snapshot select storage
+// from ResolvedPath::path_ref rather than from the root Kernel filesystem.
+#[cfg_attr(test, test)]
+fn mounted_open_and_exec_use_the_mounted_filesystem_storage(kernel: &Kernel) {
+    kernel
+        .install_directory("/storage-mnt")
+        .expect("storage test mountpoint should install");
+    let root_storage = kernel.vfs.root_fs().storage().clone();
+    let mounted_storage = FileStorage::standalone();
+    let mounted_fs = kernel.vfs.new_filesystem(mounted_storage.clone());
+    kernel
+        .vfs
+        .attach("/storage-mnt", mounted_fs.clone(), MountFlags::empty())
+        .expect("storage test filesystem should attach");
+
+    kernel
+        .install_file("/storage-mnt/file", b"mounted-open".to_vec(), false)
+        .expect("mounted regular file should install");
+    let resolved = kernel
+        .lookup_file_node("/storage-mnt/file")
+        .expect("mounted regular file should resolve");
+    assert!(Arc::ptr_eq(resolved.path_ref.mount.fs(), &mounted_fs));
+    let instance = FInstance::from_resolved(resolved);
+    assert!(Arc::ptr_eq(instance.path_ref().mount.fs(), &mounted_fs));
+    assert!(instance.storage().shares_backend_with(&mounted_storage));
+    assert!(!instance.storage().shares_backend_with(&root_storage));
+    let mut bytes = [0u8; 12];
+    assert_eq!(instance.read_at(0, &mut bytes), Ok(bytes.len()));
+    assert_eq!(&bytes, b"mounted-open");
+
+    kernel
+        .install_exec_file("/storage-mnt/exec", b"mounted-exec".to_vec())
+        .expect("mounted exec fixture should install");
+    let (display_path, exec_bytes) = kernel
+        .read_file_for_exec("/storage-mnt/exec")
+        .expect("exec should read through the mounted filesystem storage");
+    assert_eq!(display_path, "/storage-mnt/exec");
+    assert_eq!(exec_bytes, b"mounted-exec");
+
+    kernel
+        .vfs
+        .detach_top("/storage-mnt")
+        .expect("storage test filesystem should detach");
+    let mut bytes_after_detach = [0u8; 12];
+    assert_eq!(
+        instance.read_at(0, &mut bytes_after_detach),
+        Ok(bytes_after_detach.len())
+    );
+    assert_eq!(&bytes_after_detach, b"mounted-open");
 }
 
 // AGENT: verify the live mkdirat ABI, strict EEXIST behavior, parent errors,
@@ -345,9 +408,12 @@ fn mkdirat_creates_only_new_absolute_directories(kernel: &Kernel) {
     let child = kernel
         .lookup_file_node("/qemu-mkdirat-parent/child")
         .expect("mkdirat child should exist");
-    assert_eq!(parent.node.kind, FileKind::Directory);
-    assert_eq!(parent.node.dir_entry_at(0), Ok(String::from("child")));
-    assert_eq!(child.node.kind, FileKind::Directory);
+    assert_eq!(parent.path_ref.node.kind, FileKind::Directory);
+    assert_eq!(
+        parent.path_ref.node.dir_entry_at(0),
+        Ok(String::from("child"))
+    );
+    assert_eq!(child.path_ref.node.kind, FileKind::Directory);
 
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(
@@ -534,6 +600,7 @@ fn openat_uses_transactional_fd_and_path_state(kernel: &Kernel) {
         kernel
             .lookup_file_node("/tmp/qemu-openat")
             .expect("truncated file should remain registered")
+            .path_ref
             .node
             .len(),
         0
@@ -628,6 +695,7 @@ fn openat_uses_transactional_fd_and_path_state(kernel: &Kernel) {
         kernel
             .lookup_file_node("/tmp/qemu-emfile")
             .expect("EMFILE target should remain registered")
+            .path_ref
             .node
             .len(),
         4

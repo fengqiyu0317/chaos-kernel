@@ -6,65 +6,103 @@ use super::*;
 #[derive(Clone)]
 pub struct FInstance {
     pub path: String,
-    pub node: Arc<FileNode>,
-    pub(super) storage: FileStorage,
+    path_ref: PathRef,
 }
 
 impl FInstance {
-    // AGENT: create a fresh standalone regular node for device-like instances.
+    // AGENT: create a fresh managed standalone regular node for device-like
+    // instances without admitting an arbitrary node/storage pairing.
     pub fn new(path: &str) -> Self {
-        let storage = FileStorage::standalone();
-        Self {
-            path: path.to_string(),
-            node: Arc::new(FileNode::regular(false)),
-            storage,
-        }
-    }
-    // AGENT: create an instance over a fresh regular file node.
-    pub fn with_data(path: &str, d: Vec<u8>) -> Self {
-        let storage = FileStorage::standalone();
-        let node = Arc::new(FileNode::regular(false));
-        node.write_initial_bytes(&storage, &d)
-            .expect("standalone RAM file seed should fit");
-        Self {
-            path: path.to_string(),
-            node,
-            storage,
-        }
-    }
-    // AGENT: open a descriptor over an existing shared FileNode.
-    pub fn with_node(path: &str, node: Arc<FileNode>) -> Self {
-        Self::with_node_on_storage(path, node, FileStorage::standalone())
+        Self::with_data(path, Vec::new())
     }
 
-    // AGENT: open a descriptor over an existing FileNode using the Kernel-owned
-    // RAM block backend that stores that node's file contents.
-    pub fn with_node_on_storage(path: &str, node: Arc<FileNode>, storage: FileStorage) -> Self {
+    // AGENT: create a managed standalone filesystem, seed one regular inode,
+    // and derive the handle backend from its root mount.
+    pub fn with_data(path: &str, d: Vec<u8>) -> Self {
+        let storage = FileStorage::standalone();
+        let fs = FsInstance::new(0, storage);
+        let node = fs
+            .install_regular("/file", &d, false)
+            .expect("standalone RAM file seed should fit");
+        let mount = MountTable::new(fs).root();
+        Self::from_resolved(ResolvedPath {
+            path_ref: PathRef { mount, node },
+            display_path: path.to_string(),
+        })
+    }
+
+    // AGENT: create a managed standalone directory instance for focused fd
+    // iteration and fallocate error regressions.
+    pub fn directory(path: &str) -> Self {
+        let fs = FsInstance::new(0, FileStorage::standalone());
+        let node = fs
+            .install_directory("/dir")
+            .expect("standalone directory should install");
+        let mount = MountTable::new(fs).root();
+        Self::from_resolved(ResolvedPath {
+            path_ref: PathRef { mount, node },
+            display_path: path.to_string(),
+        })
+    }
+
+    // AGENT: derive a backing file object only from mount-plus-node identity so
+    // the selected storage always belongs to the node's FsInstance.
+    pub fn from_path(path: PathRef) -> Self {
+        assert!(
+            path.mount.fs().owns_node(&path.node),
+            "PathRef node must belong to its mount filesystem"
+        );
         Self {
-            path: path.to_string(),
-            node,
-            storage,
+            path: String::new(),
+            path_ref: path,
         }
     }
+
+    // AGENT: preserve a canonical external name for diagnostics while deriving
+    // all object and storage identity from ResolvedPath::path_ref.
+    pub fn from_resolved(path: ResolvedPath) -> Self {
+        let display_path = path.display_path;
+        let mut instance = Self::from_path(path.path_ref);
+        instance.path = display_path;
+        instance
+    }
+
+    // AGENT: expose the immutable mount-plus-node identity without flattening it
+    // back into independently replaceable node and storage fields.
+    pub fn path_ref(&self) -> &PathRef {
+        &self.path_ref
+    }
+
+    // AGENT: lend the node through the retained PathRef so every caller keeps
+    // the inode tied to the filesystem instance that owns it.
+    pub fn node(&self) -> &Arc<FileNode> {
+        &self.path_ref.node
+    }
+
+    // AGENT: derive backend identity from the retained mount for each operation
+    // instead of caching a second FileStorage handle in FInstance.
+    pub(crate) fn storage(&self) -> &FileStorage {
+        self.path_ref.mount.fs().storage()
+    }
+
     // AGENT: duplicate only the file object reference; open-description state is
     // intentionally not part of FInstance.
     pub fn dup(&self) -> Self {
         FInstance {
             path: self.path.clone(),
-            node: self.node.clone(),
-            storage: self.storage.clone(),
+            path_ref: self.path_ref.clone(),
         }
     }
 
     // AGENT: expose the FileNode-owned byte-precise EOF through regular instances.
     pub fn len(&self) -> usize {
-        self.node.len()
+        self.node().len()
     }
 
     // AGENT: copy from a regular file node at an explicit offset without
     // touching descriptor state.
     fn copy_from_node_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
-        self.node.read_bytes(&self.storage, off, buf)
+        self.node().read_bytes(self.storage(), off, buf)
     }
 
     // AGENT: direct positioned reads are pure file-object reads; fd permission
@@ -76,7 +114,7 @@ impl FInstance {
     // AGENT: direct positioned writes are pure file-object writes; fd permission
     // checks belong to OpenFileDesc.
     pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
-        self.node.write_bytes(&self.storage, Some(off), buf)?;
+        self.node().write_bytes(self.storage(), Some(off), buf)?;
         Ok(buf.len())
     }
 
@@ -95,13 +133,13 @@ impl FInstance {
     // permission checks belong to OpenFileDesc.
     pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
         let len = usize::try_from(len).map_err(|_| "efbig")?;
-        self.node.set_data_len(&self.storage, len)?;
+        self.node().set_data_len(self.storage(), len)?;
         Ok(())
     }
     // AGENT: direct directory inspection stays stateless and uses the caller's
     // explicit entry index; fd-level iteration advances OpenFileDesc.
     pub fn read_entry(&self, idx: usize) -> Result<String, &'static str> {
-        self.node.dir_entry_at(idx)
+        self.node().dir_entry_at(idx)
     }
     // AGENT: regular files only report supported ioctl results; unknown
     // requests must not be silently treated as success.
@@ -122,14 +160,15 @@ impl FInstance {
     // AGENT: direct allocation validates regular-file semantics and grows the
     // node through the single-lock FileNode helper.
     pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> {
-        if self.node.kind != FileKind::Regular {
+        if self.node().kind != FileKind::Regular {
             return Err("enodev");
         }
         if len == 0 {
             return Err("einval");
         }
         let needed = offset.checked_add(len).ok_or("efbig")?;
-        self.node.ensure_data_len_at_least(&self.storage, needed)?;
+        self.node()
+            .ensure_data_len_at_least(self.storage(), needed)?;
         Ok(())
     }
 }

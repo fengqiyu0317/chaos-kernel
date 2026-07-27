@@ -185,7 +185,8 @@ pub mod tests {
             device.clone(),
             Arc::new(FileBlockAllocator::new(device.block_count())),
         );
-        let node = FileNode::regular(false);
+        let fs = FsInstance::new(0, storage.clone());
+        let node = fs.create_regular("/file", false).unwrap();
 
         node.write_initial_bytes(&storage, b"stable").unwrap();
 

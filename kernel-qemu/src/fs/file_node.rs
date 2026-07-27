@@ -159,6 +159,12 @@ impl FileStorage {
         )
     }
 
+    // AGENT: compare cloneable storage handles by their shared backend identity
+    // so VFS regressions can prove a mounted path did not fall back to root.
+    pub(crate) fn shares_backend_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     // AGENT: allocate an owned backend block tied to this storage's cache,
     // device, and allocator so FileNode truncation can release it by dropping.
     fn allocate_block(&self) -> Result<FileBlock, &'static str> {
@@ -253,6 +259,7 @@ impl FileNodeData {
 // status flags remain in the fd/OFD layer, while actual bytes and unified dirty
 // state live in the shared block cache.
 pub struct FileNode {
+    id: InodeId,
     pub kind: FileKind,
     pub executable: AtomicBool,
     storage: Mutex<FileNodeData>,
@@ -261,10 +268,11 @@ pub struct FileNode {
 }
 
 impl FileNode {
-    // AGENT: create a regular file node whose contents will be read from the
-    // caller-provided FileStorage.
-    pub fn regular(executable: bool) -> Self {
+    // AGENT: construct a regular inode only for FsInstance's inode allocator;
+    // callers obtain managed Arc<FileNode> values from that filesystem object.
+    pub(super) fn regular(id: InodeId, executable: bool) -> Self {
         Self {
+            id,
             kind: FileKind::Regular,
             executable: AtomicBool::new(executable),
             storage: Mutex::new(FileNodeData::empty()),
@@ -273,15 +281,23 @@ impl FileNode {
         }
     }
 
-    // AGENT: create a directory node with a real entry list for read_entry().
-    pub fn directory() -> Self {
+    // AGENT: construct a directory inode only for FsInstance while preserving
+    // the existing directory-entry metadata representation.
+    pub(super) fn directory(id: InodeId) -> Self {
         Self {
+            id,
             kind: FileKind::Directory,
             executable: AtomicBool::new(false),
             storage: Mutex::new(FileNodeData::empty()),
             metadata_blocks: Mutex::new(FileNodeBlocks::empty()),
             dir_entries: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    // AGENT: expose the stable runtime inode identity allocated by FsInstance
+    // for mountpoint keys and object-identity diagnostics.
+    pub fn id(&self) -> InodeId {
+        self.id
     }
 
     // AGENT: add one child name to a directory node without duplicating entries.
@@ -753,6 +769,7 @@ impl fmt::Debug for FileNode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let storage = self.storage.lock().unwrap();
         f.debug_struct("FileNode")
+            .field("id", &self.id)
             .field("kind", &self.kind)
             .field("executable", &self.executable.load(Ordering::Relaxed))
             .field("byte_len", &storage.byte_len)

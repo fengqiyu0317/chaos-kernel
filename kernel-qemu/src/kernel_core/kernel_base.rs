@@ -35,21 +35,18 @@ fn boot_kernel_block_cache_chains() -> usize {
     }
 }
 
-// AGENT: keep Kernel as the shared simulator state container and own the
-// caller-selected QEMU block backend used by the migrated BlockCache path.
+// AGENT: keep Kernel as the shared simulator state container and own filesystem
+// state only through the Vfs -> root Mount -> root FsInstance object chain.
 pub struct Kernel {
     pub tasks: TaskTable,
     pub run_queue: RunQueue,
-    // AGENT: keep the cache, root block device, and file-block allocator in
-    // their existing cloneable storage handle instead of mirroring them here.
-    file_storage: FileStorage,
     pub pool: FramePool,
     // AGENT: keep current-task and idle-context ownership together per hart;
     // only processors[0] is allowed to enter the scheduler in this milestone.
     pub processors: [Mutex<Processor>; MAX_CPU],
-    pub mnt: MountTable,
-    // AGENT: unified path-backed file table shared by open-like handles and exec.
-    pub file_nodes: RwLock<BTreeMap<String, Arc<FileNode>>>,
+    // AGENT: make the object VFS the sole owner of root storage, mounts, and
+    // filesystem-local node namespaces.
+    pub vfs: Vfs,
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
     pub shm_store: RwLock<BTreeMap<usize, Weak<ShmSegment>>>,
     pub tty_buf: Mutex<VecDeque<u8>>,
@@ -119,28 +116,18 @@ impl Kernel {
             block_device,
             file_blocks,
         );
+        let root_fs = FsInstance::new(ROOT_FS_ID, file_storage);
+        let vfs = Vfs::new(root_fs);
         let tasks = TaskTable::new(pool.clone());
-        // AGENT: keep the namespace root present from construction so every
-        // later non-root insertion can require one existing directory parent.
-        let mut file_nodes = BTreeMap::new();
-        file_nodes.insert(String::from("/"), Arc::new(FileNode::directory()));
         Self {
             tasks,
             run_queue: RunQueue::new(),
-            file_storage,
             pool,
             processors: core::array::from_fn(|_| Mutex::new(Processor::new())),
-            mnt: MountTable::new(),
-            file_nodes: RwLock::new(file_nodes),
+            vfs,
             sem_store: RwLock::new(BTreeMap::new()),
             shm_store: RwLock::new(BTreeMap::new()),
             tty_buf: Mutex::new(VecDeque::new()),
         }
-    }
-
-    // AGENT: clone the one Kernel-owned storage handle so every FileNode and
-    // file descriptor shares the same cache, device, and block allocator.
-    pub fn file_storage(&self) -> FileStorage {
-        self.file_storage.clone()
     }
 }

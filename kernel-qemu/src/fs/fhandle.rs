@@ -85,8 +85,8 @@ impl FHandle {
         };
         let end = self
             .instance
-            .node
-            .write_bytes(&self.instance.storage, off, buf)?;
+            .node()
+            .write_bytes(self.instance.storage(), off, buf)?;
         *offset = u64::try_from(end).map_err(|_| "efbig")?;
         Ok(buf.len())
     }
@@ -192,7 +192,7 @@ impl FHandle {
         if !src_status.rd || !dst_status.wr {
             return Err("ebadf");
         }
-        if src.node.kind != FileKind::Regular || dst.node.kind != FileKind::Regular {
+        if src.node().kind != FileKind::Regular || dst.node().kind != FileKind::Regular {
             return Err("enodev");
         }
         if count == 0 {
@@ -211,7 +211,7 @@ impl FHandle {
         } else {
             Some(src_off.checked_add(chunk.len()).ok_or("efbig")?)
         };
-        let end = dst.node.write_bytes(&dst.storage, write_off, &chunk)?;
+        let end = dst.node().write_bytes(dst.storage(), write_off, &chunk)?;
         *offset = u64::try_from(end).map_err(|_| "efbig")?;
         Ok(chunk.len())
     }
@@ -228,7 +228,7 @@ impl FHandle {
         if !src_status.rd || !dst_status.wr {
             return Err("ebadf");
         }
-        if src.node.kind != FileKind::Regular || dst.node.kind != FileKind::Regular {
+        if src.node().kind != FileKind::Regular || dst.node().kind != FileKind::Regular {
             return Err("enodev");
         }
         if count == 0 {
@@ -247,7 +247,7 @@ impl FHandle {
         } else {
             Some(usize::try_from(*dst_offset).map_err(|_| "efbig")?)
         };
-        let end = dst.node.write_bytes(&dst.storage, write_off, &chunk)?;
+        let end = dst.node().write_bytes(dst.storage(), write_off, &chunk)?;
         let moved = u64::try_from(chunk.len()).map_err(|_| "efbig")?;
         *src_offset = src_offset.checked_add(moved).ok_or("efbig")?;
         *dst_offset = u64::try_from(end).map_err(|_| "efbig")?;

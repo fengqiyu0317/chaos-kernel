@@ -48,7 +48,7 @@ fn set_len_tracks_byte_length_and_block_capacity() {
     let instance = FInstance::with_data("/tmp/file", vec![1, 2, 3]);
     let entry = file_entry(&instance, writable_opt());
     assert_eq!(instance.len(), 3);
-    assert_eq!(instance.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE);
+    assert_eq!(instance.node().allocated_len(), BLOCK_CACHE_BLOCK_SIZE);
 
     instance.write_at(1, &[9]).unwrap();
     assert_eq!(file_bytes(&instance, 0, 3).as_slice(), &[1, 9, 3]);
@@ -56,11 +56,11 @@ fn set_len_tracks_byte_length_and_block_capacity() {
 
     entry.set_len(5).unwrap();
     assert_eq!(instance.len(), 5);
-    assert_eq!(instance.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE);
+    assert_eq!(instance.node().allocated_len(), BLOCK_CACHE_BLOCK_SIZE);
 
     entry.set_len((BLOCK_CACHE_BLOCK_SIZE + 1) as u64).unwrap();
     assert_eq!(instance.len(), BLOCK_CACHE_BLOCK_SIZE + 1);
-    assert_eq!(instance.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
+    assert_eq!(instance.node().allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
 
     let ro = FInstance::with_data("/tmp/ro", vec![1, 2, 3]);
     let ro_entry = file_entry(&ro, FdOpt::default());
@@ -77,23 +77,23 @@ fn metadata_blocks_expand_for_large_regular_file() {
     instance.write_at(0, &data).unwrap();
 
     assert_eq!(instance.len(), data.len());
-    assert_eq!(instance.node.allocated_len(), data.len());
-    assert_eq!(instance.node.metadata_block_count(), 2);
+    assert_eq!(instance.node().allocated_len(), data.len());
+    assert_eq!(instance.node().metadata_block_count(), 2);
 }
 
 // AGENT: directory metadata uses the same multi-block payload path as regular
 // files, with entry names contributing to metadata size.
 #[cfg_attr(test, test)]
 fn metadata_blocks_expand_for_large_directory_entry() {
-    let dir = FInstance::with_node("/tmp", Arc::new(FileNode::directory()));
+    let dir = FInstance::directory("/tmp");
     let mut name = String::new();
     for _ in 0..BLOCK_CACHE_BLOCK_SIZE {
         name.push('x');
     }
 
-    dir.node.add_dir_entry(&dir.storage, &name).unwrap();
+    dir.node().add_dir_entry(dir.storage(), &name).unwrap();
 
-    assert_eq!(dir.node.metadata_block_count(), 2);
+    assert_eq!(dir.node().metadata_block_count(), 2);
     assert_eq!(dir.read_entry(0), Ok(name));
 }
 
@@ -107,24 +107,38 @@ fn truncate_releases_blocks_for_reuse_without_old_contents() {
         device.clone(),
         Arc::new(FileBlockAllocator::new(device.block_count())),
     );
-    let first_node = Arc::new(FileNode::regular(false));
-    let first = FInstance::with_node_on_storage("/tmp/first", first_node, storage.clone());
+    let fs = FsInstance::new(0, storage.clone());
+    let mount = MountTable::new(fs.clone()).root();
+    let first_node = fs.create_regular("/first", false).unwrap();
+    let first = FInstance::from_resolved(ResolvedPath {
+        path_ref: PathRef {
+            mount: mount.clone(),
+            node: first_node,
+        },
+        display_path: String::from("/tmp/first"),
+    });
     let first_entry = file_entry(&first, writable_opt());
     first
         .write_at(0, &vec![0x5a; BLOCK_CACHE_BLOCK_SIZE * 2])
         .unwrap();
-    assert_eq!(storage.allocator_stats(), (3, 0));
+    assert_eq!(storage.allocator_stats(), (4, 0));
 
     first_entry.set_len(0).unwrap();
     assert_eq!(first.len(), 0);
-    assert_eq!(first.node.allocated_len(), 0);
-    assert_eq!(storage.allocator_stats(), (3, 2));
+    assert_eq!(first.node().allocated_len(), 0);
+    assert_eq!(storage.allocator_stats(), (4, 2));
 
-    let second_node = Arc::new(FileNode::regular(false));
-    let second = FInstance::with_node_on_storage("/tmp/second", second_node, storage.clone());
+    let second_node = fs.create_regular("/second", false).unwrap();
+    let second = FInstance::from_resolved(ResolvedPath {
+        path_ref: PathRef {
+            mount,
+            node: second_node,
+        },
+        display_path: String::from("/tmp/second"),
+    });
     let second_entry = file_entry(&second, writable_opt());
     second_entry.fallocate(0, BLOCK_CACHE_BLOCK_SIZE).unwrap();
-    assert_eq!(storage.allocator_stats(), (3, 0));
+    assert_eq!(storage.allocator_stats(), (4, 0));
 
     let reused = file_bytes(&second, 0, BLOCK_CACHE_BLOCK_SIZE);
     assert!(reused.iter().all(|&byte| byte == 0));
@@ -138,12 +152,12 @@ fn fallocate_validates_and_only_grows_regular_files() {
 
     entry.fallocate(BLOCK_CACHE_BLOCK_SIZE + 5, 2).unwrap();
     assert_eq!(instance.len(), BLOCK_CACHE_BLOCK_SIZE + 7);
-    assert_eq!(instance.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
+    assert_eq!(instance.node().allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
     assert_eq!(file_bytes(&instance, 0, 3).as_slice(), &[1, 2, 3]);
 
     entry.fallocate(1, 1).unwrap();
     assert_eq!(instance.len(), BLOCK_CACHE_BLOCK_SIZE + 7);
-    assert_eq!(instance.node.allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
+    assert_eq!(instance.node().allocated_len(), BLOCK_CACHE_BLOCK_SIZE * 2);
     assert_eq!(file_bytes(&instance, 0, 3).as_slice(), &[1, 2, 3]);
 
     assert_eq!(entry.fallocate(0, 0), Err("einval"));
@@ -153,7 +167,7 @@ fn fallocate_validates_and_only_grows_regular_files() {
     let ro_entry = file_entry(&ro, FdOpt::default());
     assert_eq!(ro_entry.fallocate(0, 1), Err("ebadf"));
 
-    let dir = FInstance::with_node("/tmp", Arc::new(FileNode::directory()));
+    let dir = FInstance::directory("/tmp");
     let dir_entry = file_entry(&dir, writable_opt());
     assert_eq!(dir_entry.fallocate(0, 1), Err("enodev"));
 }
@@ -162,10 +176,10 @@ fn fallocate_validates_and_only_grows_regular_files() {
 // FInstance reads remain explicit-index helpers.
 #[cfg_attr(test, test)]
 fn read_entry_uses_open_description_offset() {
-    let dir = FInstance::with_node("/tmp", Arc::new(FileNode::directory()));
-    dir.node.add_dir_entry(&dir.storage, "alpha").unwrap();
-    dir.node.add_dir_entry(&dir.storage, "beta").unwrap();
-    dir.node.add_dir_entry(&dir.storage, "gamma").unwrap();
+    let dir = FInstance::directory("/tmp");
+    dir.node().add_dir_entry(dir.storage(), "alpha").unwrap();
+    dir.node().add_dir_entry(dir.storage(), "beta").unwrap();
+    dir.node().add_dir_entry(dir.storage(), "gamma").unwrap();
 
     assert_eq!(dir.read_entry(1), Ok(String::from("beta")));
 

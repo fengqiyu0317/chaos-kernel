@@ -1,239 +1,243 @@
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
+// AGENT: model filesystem attachments by mount and inode identity instead of
+// rewriting absolute path strings into synthetic device-prefixed keys.
+use super::*;
 
-use crate::irq_lock::RwLock;
+pub type MountId = usize;
+const ROOT_MOUNT_ID: MountId = 1;
 
-// AGENT: Keep one canonical mount-point to target binding.
-pub struct MountEntry {
-    pub prefix: String,
-    pub target: String,
+// AGENT: retain an explicit mount-flags value even though the first object-VFS
+// stage accepts only the empty set at the syscall boundary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MountFlags {
+    bits: usize,
 }
 
-// AGENT: Own mount bindings and path-resolution policy independently from I/O
-// scheduling and simulated disk behavior.
+// AGENT: keep flag construction and inspection explicit for later remount and
+// policy work without implementing those semantics in this stage.
+impl MountFlags {
+    // AGENT: construct the only mount flag set supported in this first stage.
+    pub const fn empty() -> Self {
+        Self { bits: 0 }
+    }
+
+    // AGENT: expose the retained flag bits without making the field mutable.
+    pub const fn bits(self) -> usize {
+        self.bits
+    }
+}
+
+// AGENT: represent one attachment of an FsInstance into the mount topology;
+// parent is weak so the topology cannot form an Arc reference cycle.
+pub struct Mount {
+    id: MountId,
+    fs: Arc<FsInstance>,
+    parent: Option<Weak<Mount>>,
+    mountpoint: Option<Arc<FileNode>>,
+    flags: MountFlags,
+}
+
+// AGENT: expose immutable mount identity and ownership links while leaving all
+// topology mutation in MountTable.
+impl Mount {
+    // AGENT: construct the unique root attachment with no parent or mountpoint.
+    fn root(fs: Arc<FsInstance>) -> Arc<Self> {
+        Arc::new(Self {
+            id: ROOT_MOUNT_ID,
+            fs,
+            parent: None,
+            mountpoint: None,
+            flags: MountFlags::empty(),
+        })
+    }
+
+    // AGENT: construct a child attachment whose parent lifetime is controlled
+    // by MountTable or extant PathRef values rather than a strong back-edge.
+    fn attached(
+        id: MountId,
+        fs: Arc<FsInstance>,
+        parent: &Arc<Mount>,
+        mountpoint: Arc<FileNode>,
+        flags: MountFlags,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            fs,
+            parent: Some(Arc::downgrade(parent)),
+            mountpoint: Some(mountpoint),
+            flags,
+        })
+    }
+
+    // AGENT: expose stable attachment identity for topology keys and diagnostics.
+    pub fn id(&self) -> MountId {
+        self.id
+    }
+
+    // AGENT: expose the filesystem shared by every path through this attachment.
+    pub fn fs(&self) -> &Arc<FsInstance> {
+        &self.fs
+    }
+
+    // AGENT: upgrade the non-owning parent edge while the parent remains alive.
+    pub fn parent(&self) -> Option<Arc<Mount>> {
+        self.parent.as_ref().and_then(Weak::upgrade)
+    }
+
+    // AGENT: clone the stable inode object at which this child was attached.
+    pub fn mountpoint(&self) -> Option<Arc<FileNode>> {
+        self.mountpoint.clone()
+    }
+
+    // AGENT: return immutable attachment flags reserved for later VFS stages.
+    pub fn flags(&self) -> MountFlags {
+        self.flags
+    }
+}
+
+// AGENT: key a mount stack by the parent view and stable mountpoint inode rather
+// than by a rename-sensitive full pathname.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct MountPointKey {
+    pub parent_mount: MountId,
+    pub inode: InodeId,
+}
+
+// AGENT: own the root mount and every attached child strongly, with each
+// mountpoint value storing bottom-to-top stacking order.
 pub struct MountTable {
-    pub entries: RwLock<Vec<MountEntry>>,
+    root: Arc<Mount>,
+    children: RwLock<BTreeMap<MountPointKey, Vec<Arc<Mount>>>>,
+    next_mount_id: AtomicUsize,
 }
 
-// AGENT: Preserve the existing mount-table behavior after extracting it from
-// the mixed mount_io_disk module.
+// AGENT: centralize mount membership, stacking, lookup, and detach semantics in
+// an identity-based topology independent from pathname parsing.
 impl MountTable {
-    // AGENT: Construct an empty mount table.
-    pub fn new() -> Self {
+    // AGENT: attach the supplied root filesystem as the topology root.
+    pub fn new(root_fs: Arc<FsInstance>) -> Self {
         Self {
-            entries: RwLock::new(Vec::new()),
+            root: Mount::root(root_fs),
+            children: RwLock::new(BTreeMap::new()),
+            next_mount_id: AtomicUsize::new(ROOT_MOUNT_ID + 1),
         }
     }
 
-    // AGENT: accept only non-root absolute mount points and store them in one
-    // canonical form so bind, unmount, and has_prefix agree.
-    fn normalize_prefix(pfx: &str) -> Option<String> {
-        if !pfx.starts_with('/') {
-            return None;
-        }
-        let normalized = Self::canonicalize_path(pfx);
-        if normalized == "/" {
-            None
-        } else {
-            Some(normalized)
-        }
+    // AGENT: return the stable root attachment used to begin every absolute
+    // path resolution.
+    pub fn root(&self) -> Arc<Mount> {
+        self.root.clone()
     }
 
-    // AGENT: collapse duplicate slashes and dot components before mount lookup.
-    fn canonicalize_path(path: &str) -> String {
-        let absolute = path.starts_with('/');
-        let mut parts: Vec<&str> = Vec::new();
-        for part in path.split('/') {
-            match part {
-                "" | "." => {}
-                ".." => {
-                    if !parts.is_empty() {
-                        parts.pop();
-                    } else if !absolute {
-                        parts.push("..");
-                    }
-                }
-                part => parts.push(part),
-            }
-        }
-
-        let mut normalized = String::new();
-        if absolute {
-            normalized.push('/');
-        }
-        for (idx, part) in parts.iter().enumerate() {
-            if idx > 0 {
-                normalized.push('/');
-            }
-            normalized.push_str(part);
-        }
-        if normalized.is_empty() && absolute {
-            normalized.push('/');
-        }
-        normalized
+    // AGENT: test active membership under the caller-held children lock so a
+    // stale detached parent cannot receive new topology entries.
+    fn contains_mount_locked(
+        &self,
+        children: &BTreeMap<MountPointKey, Vec<Arc<Mount>>>,
+        mount: &Arc<Mount>,
+    ) -> bool {
+        Arc::ptr_eq(&self.root, mount)
+            || children
+                .values()
+                .flatten()
+                .any(|candidate| Arc::ptr_eq(candidate, mount))
     }
 
-    // AGENT: require a directory-boundary match so /mnt does not also match
-    // /mnt2; mount prefixes are already canonical and non-root.
-    fn prefix_matches_path(prefix: &str, path: &str) -> bool {
-        if !path.starts_with(prefix) {
-            return false;
-        }
-        path.len() == prefix.len() || path.as_bytes().get(prefix.len()) == Some(&b'/')
+    // AGENT: allocate monotonically increasing mount identities without using
+    // filesystem IDs or source path strings as attachment identity.
+    fn allocate_mount_id(&self) -> MountId {
+        self.next_mount_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("runtime mount id space exhausted")
     }
 
-    // AGENT: canonicalize mount bindings, keep one target per prefix, preserve
-    // longest-prefix-first lookup, and report invalid syscall-facing inputs.
-    pub fn mount(&self, pfx: &str, tgt: &str) -> Result<(), &'static str> {
-        let prefix = Self::normalize_prefix(pfx).ok_or("einval")?;
-        if tgt.is_empty() {
+    // AGENT: attach one filesystem above a managed directory mountpoint and
+    // push it on the existing stack rather than replacing lower attachments.
+    pub fn attach(
+        &self,
+        parent: &Arc<Mount>,
+        mountpoint: Arc<FileNode>,
+        fs: Arc<FsInstance>,
+        flags: MountFlags,
+    ) -> Result<Arc<Mount>, &'static str> {
+        if mountpoint.kind != FileKind::Directory || fs.root().kind != FileKind::Directory {
+            return Err("enotdir");
+        }
+        if !parent.fs().owns_node(&mountpoint) {
+            return Err("exdev");
+        }
+        let mut children = self.children.write().unwrap();
+        if !self.contains_mount_locked(&children, parent) {
             return Err("einval");
         }
-        let mut e = self.entries.write().unwrap();
-        if let Some(existing) = e.iter_mut().find(|m| m.prefix == prefix) {
-            existing.target = tgt.to_string();
-            return Ok(());
-        }
-        let insert_at = e
-            .iter()
-            .position(|m| m.prefix.len() < prefix.len())
-            .unwrap_or(e.len());
-        e.insert(
-            insert_at,
-            MountEntry {
-                prefix,
-                target: tgt.to_string(),
-            },
+        let mount = Mount::attached(
+            self.allocate_mount_id(),
+            fs,
+            parent,
+            mountpoint.clone(),
+            flags,
         );
-        Ok(())
-    }
-
-    // AGENT: retain the original compatibility helper for in-kernel callers
-    // that intentionally ignore invalid mount requests.
-    pub fn bind(&self, pfx: &str, tgt: &str) {
-        let _ = self.mount(pfx, tgt);
-    }
-
-    // AGENT: Resolve one longest mount prefix without recursively remapping the
-    // remaining path through unrelated mounts.
-    pub fn resolve(&self, path: &str) -> Result<String, &'static str> {
-        let canonical = Self::canonicalize_path(path);
-        let matched = {
-            let tbl = self.entries.read().unwrap();
-            Self::find_mount_id_locked(&tbl, &canonical).map(|idx| {
-                let m = &tbl[idx];
-                let rest = if canonical.len() == m.prefix.len() {
-                    "/".to_string()
-                } else {
-                    canonical[m.prefix.len()..].to_string()
-                };
-                (m.target.clone(), rest)
+        children
+            .entry(MountPointKey {
+                parent_mount: parent.id(),
+                inode: mountpoint.id(),
             })
-        };
-
-        Ok(match matched {
-            Some((dev, rest)) => {
-                let mut result = String::with_capacity(dev.len() + 1 + rest.len());
-                result.push_str(&dev);
-                result.push(':');
-                result.push_str(&rest);
-                result
-            }
-            None => canonical,
-        })
+            .or_default()
+            .push(mount.clone());
+        Ok(mount)
     }
 
-    // AGENT: normalize and remove exactly one syscall-facing mount point,
-    // reporting invalid or absent bindings instead of silently succeeding.
-    pub fn umount(&self, pfx: &str) -> Result<(), &'static str> {
-        let prefix = Self::normalize_prefix(pfx).ok_or("einval")?;
-        let mut e = self.entries.write().unwrap();
-        let before = e.len();
-        let mut index = 0;
-        while index < e.len() {
-            if e[index].prefix == prefix {
-                e.remove(index);
-            } else {
-                index += 1;
-            }
+    // AGENT: return the currently visible top attachment for one parent view and
+    // inode, leaving lower stacked mounts intact.
+    pub fn mounted_on(&self, parent: &Arc<Mount>, node: &Arc<FileNode>) -> Option<Arc<Mount>> {
+        if !parent.fs().owns_node(node) {
+            return None;
         }
-        if e.len() == before {
-            Err("einval")
-        } else {
-            Ok(())
-        }
-    }
-
-    // AGENT: retain the original boolean compatibility helper on top of the
-    // syscall-facing exact unmount operation.
-    pub fn unmount(&self, pfx: &str) -> bool {
-        self.umount(pfx).is_ok()
-    }
-
-    // AGENT: Return a detached snapshot of the current mount bindings.
-    pub fn list_mounts(&self) -> Vec<(String, String)> {
-        let tbl = self.entries.read().unwrap();
-        let mut result = Vec::with_capacity(tbl.len());
-        for m in tbl.iter() {
-            result.push((m.prefix.clone(), m.target.clone()));
-        }
-        result
-    }
-
-    // AGENT: Scan a caller-held mount table snapshot in longest-prefix-first
-    // order, returning the first complete path-component prefix without taking
-    // another lock.
-    fn find_mount_id_locked(tbl: &[MountEntry], path: &str) -> Option<usize> {
-        for (idx, m) in tbl.iter().enumerate() {
-            if Self::prefix_matches_path(&m.prefix, path) {
-                return Some(idx);
-            }
-        }
-        None
-    }
-
-    // AGENT: Keep the legacy helper API while delegating to the non-locking
-    // scanner under a single read guard.
-    fn find_mount_id(&self, path: &str) -> Option<usize> {
-        let canonical = Self::canonicalize_path(path);
-        let tbl = self.entries.read().unwrap();
-        Self::find_mount_id_locked(&tbl, &canonical)
-    }
-
-    // AGENT: Clone the matching mount entry while holding one read lock so the
-    // saved index cannot race with concurrent bind or unmount operations.
-    pub fn find_mount(&self, path: &str) -> Option<MountEntry> {
-        let canonical = Self::canonicalize_path(path);
-        let tbl = self.entries.read().unwrap();
-        let best_match_idx = Self::find_mount_id_locked(&tbl, &canonical);
-        best_match_idx.map(|idx| {
-            let m = &tbl[idx];
-            MountEntry {
-                prefix: m.prefix.clone(),
-                target: m.target.clone(),
-            }
-        })
-    }
-
-    // AGENT: Report the number of active mount bindings.
-    pub fn mount_count(&self) -> usize {
-        self.entries.read().unwrap().len()
-    }
-
-    // AGENT: query prefixes through the same canonical form used by bind.
-    pub fn has_prefix(&self, pfx: &str) -> bool {
-        let Some(prefix) = Self::normalize_prefix(pfx) else {
-            return false;
-        };
-        self.entries
+        self.children
             .read()
             .unwrap()
-            .iter()
-            .any(|m| m.prefix == prefix)
+            .get(&MountPointKey {
+                parent_mount: parent.id(),
+                inode: node.id(),
+            })
+            .and_then(|stack| stack.last().cloned())
+    }
+
+    // AGENT: pop and return only the visible attachment so existing PathRef and
+    // explicit mount holders remain valid after topology removal.
+    pub fn detach_top(
+        &self,
+        parent: &Arc<Mount>,
+        node: &Arc<FileNode>,
+    ) -> Result<Arc<Mount>, &'static str> {
+        if !parent.fs().owns_node(node) {
+            return Err("exdev");
+        }
+        let mut children = self.children.write().unwrap();
+        if !self.contains_mount_locked(&children, parent) {
+            return Err("einval");
+        }
+        let key = MountPointKey {
+            parent_mount: parent.id(),
+            inode: node.id(),
+        };
+        let (mount, remove_key) = {
+            let stack = children.get_mut(&key).ok_or("einval")?;
+            let mount = stack.pop().ok_or("einval")?;
+            (mount, stack.is_empty())
+        };
+        if remove_key {
+            children.remove(&key);
+        }
+        Ok(mount)
+    }
+
+    // AGENT: report active non-root attachments, counting every stacked mount.
+    pub fn mount_count(&self) -> usize {
+        self.children.read().unwrap().values().map(Vec::len).sum()
     }
 }
 
-// AGENT: Keep mount-table regressions next to the extracted mount module.
+// AGENT: keep identity-topology regressions next to the mount implementation.
 #[cfg(any(test, feature = "qemu-sync-selftest"))]
 #[path = "mount_tests.rs"]
 pub mod tests;

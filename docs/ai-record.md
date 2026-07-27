@@ -12,6 +12,52 @@
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
 
+## 2026-07-27：kernel-qemu 第一阶段对象 VFS
+
+目标：建立“文件系统实例—挂载实例—已解析路径”对象模型，把原本由 `Kernel` 分别持有的 `FileStorage`、全局 `file_nodes` 和字符串 `MountTable` 连接成正确所有权链，并让 fd/exec 从已解析路径选择存储后端。
+
+已完成修改：
+
+- 新增 `FsInstance`：拥有唯一 `FileStorage`、root、文件系统内路径节点表和运行期 inode allocator；所有新 `FileNode` 都由该实例分配稳定 `InodeId`。
+- 删除 `MountEntry { prefix, target }`；新增 `Mount` 和按 `(parent MountId, mountpoint InodeId)` 索引的 `MountTable`，支持同一 FsInstance 多次挂载、同挂载点 stacking、top detach、弱父引用与 detached mount 的 `Arc` 生命周期。
+- 新增 `PathRef { mount, node }`、`ResolvedPath` 和 `Vfs`。第一阶段仍使用每个 FsInstance 内部的完整相对路径表，但外部路径解析会按组件跨越可见 mount，不再生成 `device:/path` 全局键。
+- `Kernel` 所有权改为 `Kernel -> Vfs -> root Mount -> root FsInstance -> FileStorage/root/nodes`；移除直接的 `file_storage`、`file_nodes` 和 `mnt` 字段。
+- `FInstance::from_path/from_resolved`、path-backed write 和 exec 从 `PathRef.mount.fs().storage()` 派生后端；挂载文件不会再误用 root storage。
+- `mount/umount2` syscall 改接对象拓扑。目标必须是既有目录；重复 mount 形成 stack，umount 只摘顶层。第一阶段 source 只校验非空并创建独立内存 ChaosFs，真实设备发现仍是 TODO。
+
+关键文件：
+
+- `kernel-qemu/src/fs/fs_instance.rs`
+- `kernel-qemu/src/fs/mount.rs`
+- `kernel-qemu/src/fs/vfs.rs`
+- `kernel-qemu/src/fs/file_node.rs`
+- `kernel-qemu/src/fs/finstance.rs`
+- `kernel-qemu/src/kernel_core/kernel_base.rs`
+- `kernel-qemu/src/kernel_core/kernel_ops/fs_store.rs`
+- `kernel-qemu/src/kernel_core/kernel_ops/exec.rs`
+- `kernel-qemu/src/syscall/fs.rs`
+- `kernel-qemu/src/fs/mount_tests.rs`
+- `kernel-qemu/src/syscall/fs_tests.rs`
+- `TASK.md`
+- `docs/kernel-sim-qemu-migration-design.md`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo check --target riscv64gc-unknown-none-elf --all-features
+cargo run --release --features qemu-selftest,ram-block-device
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check
+```
+
+结果：全部通过。RAM 完整 QEMU selftest 通过 mount/fd/fs syscall/exec storage 选择等新增回归；RAM 与 VirtIO 启动都完成真实 U-mode mkdirat/openat round trip、init 正常退出；独立 target 的 `kernel-sim` 回归为 unit 1、ELF 3、smoke 84 全部通过。没有修改 `kernel-sim` 和 `kernel/src/kernel.rs`。
+
+当前边界：cwd/dirfd、符号链接、真正的目录 dentry 遍历、mount namespace、bind/remount/move、busy/lazy unmount、superblock/inode 持久化和重启恢复仍未实现。
+
 ## 2026-07-27：kernel-qemu RISC-V `mkdirat` 系统调用
 
 目标：在现有严格父目录路径表之上接通 Linux RISC-V `mkdirat` 用户 ABI，并把用户目录创建的 `EEXIST` 语义与内部幂等 `install_directory()` 分开。

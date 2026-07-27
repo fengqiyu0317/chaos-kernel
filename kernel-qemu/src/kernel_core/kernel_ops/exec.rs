@@ -10,17 +10,20 @@ struct PreparedExec {
 
 impl Kernel {
     // AGENT: resolve one executable pathname to the shared inode-like FileNode
-    // and return both its canonical key and a stable byte snapshot.
-    fn read_file_for_exec(&self, path: &str) -> Result<(String, Vec<u8>), &'static str> {
+    // and read it through the FileStorage selected by its PathRef mount.
+    pub(crate) fn read_file_for_exec(&self, path: &str) -> Result<(String, Vec<u8>), &'static str> {
         let resolved = self.lookup_file_node(path)?;
-        if resolved.node.kind != FileKind::Regular {
+        if resolved.path_ref.node.kind != FileKind::Regular {
             return Err("eisdir");
         }
-        if !resolved.node.executable.load(Ordering::Relaxed) {
+        if !resolved.path_ref.node.executable.load(Ordering::Relaxed) {
             return Err("eacces");
         }
-        let data = resolved.node.read_all(&self.file_storage())?;
-        Ok((resolved.path, data))
+        let data = resolved
+            .path_ref
+            .node
+            .read_all(resolved.path_ref.mount.fs().storage())?;
+        Ok((resolved.display_path, data))
     }
 
     // AGENT: prepare exec from a path-backed executable file snapshot.
