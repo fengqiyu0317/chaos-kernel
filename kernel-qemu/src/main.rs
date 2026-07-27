@@ -327,6 +327,10 @@ fn install_embedded_root_init(
     if init_elf.is_empty() {
         return Ok(false);
     }
+    // AGENT: establish the embedded root image's directory skeleton before the
+    // strict path store installs `/bin/init`; init uses `/tmp` for its openat probe.
+    kernel.install_directory("/bin")?;
+    kernel.install_directory("/tmp")?;
     kernel.install_exec_file("/bin/init", Vec::from(init_elf))?;
     Ok(true)
 }

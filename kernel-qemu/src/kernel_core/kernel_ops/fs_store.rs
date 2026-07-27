@@ -27,8 +27,18 @@ impl Kernel {
         })
     }
 
-    // AGENT: split a resolved path into its parent directory path and child name.
+    // AGENT: recognize both the ordinary root and mount-backed namespace roots,
+    // then split every non-root resolved key into its parent and child name.
+    fn is_namespace_root(path: &str) -> bool {
+        path == "/" || path.ends_with(":/")
+    }
+
+    // AGENT: split one non-root resolved key while preserving the slash in a
+    // mount-backed root such as `lookupdev:/`.
     fn parent_dir_entry(path: &str) -> Option<(String, String)> {
+        if Self::is_namespace_root(path) {
+            return None;
+        }
         let path = path.trim_end_matches('/');
         if path.is_empty() || path == "/" {
             return None;
@@ -38,26 +48,48 @@ impl Kernel {
         if name.is_empty() {
             return None;
         }
-        let parent = if slash == 0 { "/" } else { &path[..slash] };
+        let parent = if slash == 0 {
+            "/"
+        } else if path[..slash].ends_with(':') {
+            &path[..=slash]
+        } else {
+            &path[..slash]
+        };
         Some((parent.to_string(), name.to_string()))
     }
 
-    // AGENT: if a real parent directory node exists, expose this path through
-    // its directory-entry list used by FInstance::read_entry().
-    pub(crate) fn note_path_in_parent_dir(&self, resolved_path: &str) -> Result<(), &'static str> {
-        let Some((parent, name)) = Self::parent_dir_entry(resolved_path) else {
-            return Ok(());
-        };
-        let parent_node = self.file_nodes.read().unwrap().get(&parent).cloned();
-        if let Some(node) = parent_node {
-            if node.kind == FileKind::Directory {
-                node.add_dir_entry(&self.file_storage(), &name)?;
-            }
+    // AGENT: require one existing directory parent before a non-root namespace
+    // insertion, returning Linux-style errors for missing and non-directory parents.
+    fn require_parent_dir(
+        nodes: &BTreeMap<String, Arc<FileNode>>,
+        resolved_path: &str,
+    ) -> Result<(Arc<FileNode>, String), &'static str> {
+        let (parent, name) = Self::parent_dir_entry(resolved_path).ok_or("enoent")?;
+        let parent_node = nodes.get(&parent).cloned().ok_or("enoent")?;
+        if parent_node.kind != FileKind::Directory {
+            return Err("enotdir");
         }
+        Ok((parent_node, name))
+    }
+
+    // AGENT: register a new non-root node only after its parent directory entry
+    // succeeds, keeping the path table unchanged on parent validation failures.
+    fn insert_new_child_locked(
+        &self,
+        nodes: &mut BTreeMap<String, Arc<FileNode>>,
+        resolved_path: String,
+        node: Arc<FileNode>,
+    ) -> Result<(), &'static str> {
+        if nodes.contains_key(&resolved_path) {
+            return Err("eexist");
+        }
+        let (parent_node, name) = Self::require_parent_dir(nodes, &resolved_path)?;
+        parent_node.add_dir_entry(&self.file_storage(), &name)?;
+        nodes.insert(resolved_path, node);
         Ok(())
     }
 
-    // AGENT: perform lookup, O_EXCL validation, optional parent-directory
+    // AGENT: perform lookup, O_EXCL validation, strict parent-directory
     // bookkeeping, and creation under one path-table write lock; callers pass
     // the original pathname so an unnormalized key cannot bypass resolution.
     pub(crate) fn open_regular_node(
@@ -83,24 +115,16 @@ impl Kernel {
             return Err("enoent");
         }
 
-        if let Some((parent, name)) = Self::parent_dir_entry(&resolved) {
-            if let Some(parent_node) = nodes.get(&parent).cloned() {
-                if parent_node.kind != FileKind::Directory {
-                    return Err("enotdir");
-                }
-                parent_node.add_dir_entry(&self.file_storage(), &name)?;
-            }
-        }
-
         let node = Arc::new(FileNode::regular(false));
-        nodes.insert(resolved.clone(), node.clone());
+        self.insert_new_child_locked(&mut nodes, resolved.clone(), node.clone())?;
         Ok(ResolvedFileNode {
             path: resolved,
             node,
         })
     }
 
-    // AGENT: install a regular path-backed file used by both file instances and exec.
+    // AGENT: install or replace a regular path-backed file only below an
+    // existing directory, keeping directory nodes from being overwritten.
     pub fn install_file(
         &self,
         path: &str,
@@ -111,11 +135,15 @@ impl Kernel {
         let storage = self.file_storage();
         let node = Arc::new(FileNode::regular(executable));
         node.write_initial_bytes(&storage, &data)?;
-        self.file_nodes
-            .write()
-            .unwrap()
-            .insert(resolved.clone(), node);
-        self.note_path_in_parent_dir(&resolved)?;
+        let mut nodes = self.file_nodes.write().unwrap();
+        if let Some(existing) = nodes.get(&resolved) {
+            if existing.kind != FileKind::Regular {
+                return Err("eisdir");
+            }
+            nodes.insert(resolved, node);
+            return Ok(());
+        }
+        self.insert_new_child_locked(&mut nodes, resolved, node)?;
         Ok(())
     }
 
@@ -124,14 +152,24 @@ impl Kernel {
         self.install_file(path, data, true)
     }
 
-    // AGENT: install a directory node so exec can distinguish directories.
+    // AGENT: install directories parent-first while allowing an internal caller
+    // to establish an ordinary or mount-backed namespace root idempotently.
     pub fn install_directory(&self, path: &str) -> Result<(), &'static str> {
         let resolved = self.resolve_path_key(path)?;
-        self.file_nodes
-            .write()
-            .unwrap()
-            .insert(resolved.clone(), Arc::new(FileNode::directory()));
-        self.note_path_in_parent_dir(&resolved)?;
+        let mut nodes = self.file_nodes.write().unwrap();
+        if let Some(existing) = nodes.get(&resolved) {
+            return if existing.kind == FileKind::Directory {
+                Ok(())
+            } else {
+                Err("eexist")
+            };
+        }
+        let node = Arc::new(FileNode::directory());
+        if Self::is_namespace_root(&resolved) {
+            nodes.insert(resolved, node);
+        } else {
+            self.insert_new_child_locked(&mut nodes, resolved, node)?;
+        }
         Ok(())
     }
 

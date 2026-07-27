@@ -1,6 +1,6 @@
 # Chaos AI 工作日志
 
-更新时间：2026-07-25
+更新时间：2026-07-27
 
 ## 维护约定
 
@@ -11,6 +11,50 @@
   - `/home/huawei/.codex/sessions/2026/06/18/rollout-2026-06-18T23-57-15-019edb73-6ad9-7b23-8162-c76a589a57a9.jsonl`
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
+
+## 2026-07-27：kernel-qemu 路径创建的严格父目录语义
+
+目标：修正 `openat(O_CREAT)` 在父路径不存在时仍创建全局路径节点的问题，在当前完整路径键表架构内建立根目录、直接父目录和目录项的一致性边界。
+
+已完成修改：
+
+- `Kernel` 构造时固定安装 `/` 目录；新文件和新目录统一经过持有 `file_nodes` 写锁的插入入口，缺失父目录返回 `enoent`，普通文件父节点返回 `enotdir`，父目录项成功后才提交路径节点。
+- 路径拆分同时识别 `/` 与 `device:/` 命名空间根，挂载后的 `device:/file` 正确以 `device:/` 为父节点；第一阶段字符串挂载会建立对应后端根。
+- `install_file()` 不再先插入节点再补记父目录，且不会用普通文件覆盖目录；`install_directory()` 支持幂等安装普通根或挂载后端根。
+- 内嵌 root image 在安装 `/bin/init` 前显式建立 `/bin` 和 `/tmp`，保证 init 的 `/tmp/init-openat` 探针满足同一父目录规则。
+- QEMU 文件系统自测覆盖根目录、缺失父目录、普通文件父节点、成功创建、重复打开不重复登记、挂载根和失败后不残留路径节点。
+- `TASK.md` 记录本项只在 QEMU 侧先行补齐；`kernel-sim` 仍是无父目录检查的平面路径表，完整目录模型迁移时需要回填 host 语义源。
+
+关键文件：
+
+- `kernel-qemu/src/kernel_core/kernel_base.rs`
+- `kernel-qemu/src/kernel_core/kernel_ops/fs_store.rs`
+- `kernel-qemu/src/syscall/fs.rs`
+- `kernel-qemu/src/syscall/fs_tests.rs`
+- `kernel-qemu/src/main.rs`
+- `TASK.md`
+- `docs/ai-record.md`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo check --target riscv64gc-unknown-none-elf --all-features
+cargo run --release --features qemu-selftest,ram-block-device
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check
+```
+
+结果：全部通过。组合 QEMU 自测完成 MM、sync、context、sched、proc、fs、checkpoint、user satp 和 signal 回归；RAM fallback 与 VirtIO 普通 smoke 均完成真实 `/bin/init`，并输出 `[init] openat round-trip passed` 和正常 init exit。
+
+当前边界：
+
+- `kernel-sim` 尚未迁移这项父目录语义，本轮按用户要求未修改它。
+- 当前仍是完整路径键表，不包含符号链接、权限、挂载目标目录校验或真正的逐分量 VFS 遍历。
+- 不修改禁止路径 `kernel/src/kernel.rs`。
 
 ## 2026-07-25：kernel-qemu 轮询式 virtio-blk 与 raw sector smoke
 

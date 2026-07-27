@@ -120,6 +120,10 @@ impl Kernel {
             file_blocks,
         );
         let tasks = TaskTable::new(pool.clone());
+        // AGENT: keep the namespace root present from construction so every
+        // later non-root insertion can require one existing directory parent.
+        let mut file_nodes = BTreeMap::new();
+        file_nodes.insert(String::from("/"), Arc::new(FileNode::directory()));
         Self {
             tasks,
             run_queue: RunQueue::new(),
@@ -127,7 +131,7 @@ impl Kernel {
             pool,
             processors: core::array::from_fn(|_| Mutex::new(Processor::new())),
             mnt: MountTable::new(),
-            file_nodes: RwLock::new(BTreeMap::new()),
+            file_nodes: RwLock::new(file_nodes),
             sem_store: RwLock::new(BTreeMap::new()),
             shm_store: RwLock::new(BTreeMap::new()),
             tty_buf: Mutex::new(VecDeque::new()),

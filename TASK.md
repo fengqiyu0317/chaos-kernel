@@ -542,6 +542,13 @@ cargo test --test pressure
 - 验证：`cargo fmt --check`、`cargo check --target riscv64gc-unknown-none-elf --all-features` 通过；`cargo run --release --features qemu-selftest,ram-block-device` 的全部 QEMU 自测通过并完成真实用户态 openat round trip；当前 virtio 根块设备配置下 `bash tools/qemu-smoke.sh` 通过；`CARGO_TARGET_DIR=/tmp/chaos-kernel-sim-openat cargo test` 通过（unit 1、ELF 3、smoke 84）。
 - 剩余边界：`mode`/umask/credential、cwd/`AT_FDCWD`/目录 fd、逐分量目录遍历、符号链接、非 UTF-8 pathname 和完整 `EISDIR`/`ENOTDIR`/`ELOOP` 仍待迁移；QEMU `sys_read()` 入口仍为 `enosys`。下方 cwd TODO 保持有效。
 
+#### 2026-07-26：QEMU 路径创建的严格父目录不变量
+
+- 语义来源与范围：本项按用户要求只修改 `kernel-qemu`；`kernel-sim` 的 `sys_open()` 仍使用不检查父目录的平面路径表，因此该收紧属于 QEMU 侧先行补齐，完整目录模型迁移时必须回填 host 语义源和回归测试。
+- 已完成：`Kernel` 构造时固定安装 `/` 目录；普通路径与 `device:/` 挂载后端根使用统一的父路径拆分；所有新文件/目录通过同一持锁插入入口，缺失父目录返回 `enoent`，普通文件父节点返回 `enotdir`，父目录项成功后才提交全局路径节点。内部目录安装可幂等建立普通根或挂载后端根，但用户态 `openat(O_CREAT)` 不能凭空建立根或父目录。
+- 启动与挂载：内嵌 root image 在安装 `/bin/init` 前显式建立 `/bin` 和 init 的 openat 探针所需 `/tmp`；第一阶段字符串挂载在发布映射后建立对应的 `device:/` 根节点。挂载目标目录存在性、权限和真正文件系统实例仍未建模。
+- 回归覆盖：`qemu-fs-selftest` 新增根目录、缺失父目录、普通文件父节点、成功目录项登记和挂载后端根检查；`cargo fmt --check`、RISC-V `cargo check --all-features`、完整 `qemu-selftest,ram-block-device` 与 VirtIO `tools/qemu-smoke.sh` 验证通过，真实 init 再次输出 `[init] openat round-trip passed`。
+
 #### 2026-07-24：删除 CPU0 调度器未启动时的元数据兼容路径
 
 - 范围：只清理 `kernel-qemu` 中阻塞、yield、停止信号、timer 死亡任务和线程/进程退出在 idle-context 调度器尚未初始化时通过修改 `current` / run queue 模拟切换的旧路径；不修改 `kernel-sim` 语义。

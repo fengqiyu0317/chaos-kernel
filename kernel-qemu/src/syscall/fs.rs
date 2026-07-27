@@ -92,6 +92,9 @@ pub(super) fn sys_mount(
         }
     }
     kernel.mnt.mount(&target, &source)?;
+    // AGENT: the first-stage string-backed mount has no separate filesystem
+    // loader, so establish its resolved root before any child lookup or create.
+    kernel.install_directory(&target)?;
     Ok(0)
 }
 

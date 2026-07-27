@@ -12,7 +12,11 @@ const OPEN_USER_BASE: usize = 0x4001_0000;
 // AGENT: Run filesystem ABI and semantic regressions after QEMU installs the
 // real kernel frame pool, current init task, Sv39 mappings, and fd table.
 pub fn run_all(kernel: &Kernel) {
+    kernel
+        .install_directory("/tmp")
+        .expect("filesystem selftests require /tmp");
     mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel);
+    path_creation_requires_an_existing_directory_parent(kernel);
     pathname_lookup_returns_shared_file_node(kernel);
     openat_uses_transactional_fd_and_path_state(kernel);
 }
@@ -71,6 +75,14 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
         kernel.mnt.resolve("/mnt/file"),
         Ok("dev0:/file".to_string())
     );
+    assert_eq!(
+        kernel
+            .lookup_file_node("/mnt")
+            .expect("mount should establish its backing namespace root")
+            .node
+            .kind,
+        FileKind::Directory
+    );
 
     write_user_string(kernel, &task, source_addr, "dev1");
     assert_eq!(
@@ -88,6 +100,14 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
     assert_eq!(
         kernel.mnt.resolve("/mnt/file"),
         Ok("dev1:/file".to_string())
+    );
+    assert_eq!(
+        kernel
+            .lookup_file_node("/mnt")
+            .expect("replacement mount should establish its backing root")
+            .node
+            .kind,
+        FileKind::Directory
     );
 
     assert_eq!(
@@ -126,6 +146,89 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
     );
 }
 
+// AGENT: enforce the path-table invariant that root exists and every non-root
+// node has one visible, existing directory parent.
+#[cfg_attr(test, test)]
+fn path_creation_requires_an_existing_directory_parent(kernel: &Kernel) {
+    let root = kernel
+        .lookup_file_node("/")
+        .expect("the namespace root should always exist");
+    assert_eq!(root.node.kind, FileKind::Directory);
+
+    assert_eq!(
+        kernel.install_file("/qemu-missing-parent/file", Vec::new(), false),
+        Err("enoent")
+    );
+    assert!(matches!(
+        kernel.lookup_file_node("/qemu-missing-parent/file"),
+        Err("enoent")
+    ));
+    assert!(matches!(
+        kernel.open_regular_node(
+            "/qemu-open-missing-parent/file",
+            CreateDisposition::CreateIfMissing,
+        ),
+        Err("enoent")
+    ));
+    assert!(matches!(
+        kernel.lookup_file_node("/qemu-open-missing-parent/file"),
+        Err("enoent")
+    ));
+
+    kernel
+        .install_directory("/qemu-parent-dir")
+        .expect("test parent directory should install");
+    kernel
+        .install_file("/qemu-parent-dir/child", b"child".to_vec(), false)
+        .expect("child below an existing directory should install");
+    let parent = kernel
+        .lookup_file_node("/qemu-parent-dir")
+        .expect("test parent directory should remain registered");
+    assert_eq!(parent.node.dir_entry_at(0), Ok(String::from("child")));
+    assert_eq!(parent.node.dir_entry_at(1), Err("enoent"));
+
+    kernel
+        .install_directory("/qemu-open-parent")
+        .expect("open test parent directory should install");
+    let created = kernel
+        .open_regular_node(
+            "/qemu-open-parent/child",
+            CreateDisposition::CreateIfMissing,
+        )
+        .expect("open should create below an existing directory");
+    let reopened = kernel
+        .open_regular_node(
+            "/qemu-open-parent/child",
+            CreateDisposition::CreateIfMissing,
+        )
+        .expect("reopen should return the existing file node");
+    assert!(Arc::ptr_eq(&created.node, &reopened.node));
+    let open_parent = kernel
+        .lookup_file_node("/qemu-open-parent")
+        .expect("open test parent should remain registered");
+    assert_eq!(open_parent.node.dir_entry_at(0), Ok(String::from("child")));
+    assert_eq!(open_parent.node.dir_entry_at(1), Err("enoent"));
+
+    kernel
+        .install_file("/qemu-regular-parent", Vec::new(), false)
+        .expect("regular parent fixture should install");
+    assert_eq!(
+        kernel.install_directory("/qemu-regular-parent/child"),
+        Err("enotdir")
+    );
+    assert!(matches!(
+        kernel.open_regular_node(
+            "/qemu-regular-parent/open-child",
+            CreateDisposition::CreateIfMissing,
+        ),
+        Err("enotdir")
+    ));
+    assert!(matches!(
+        kernel.lookup_file_node("/qemu-regular-parent/child"),
+        Err("enoent")
+    ));
+}
+
 // AGENT: verify that pathname lookup normalizes aliases, applies mount
 // translation, returns one shared inode-like FileNode, and reports absence.
 #[cfg_attr(test, test)]
@@ -152,6 +255,9 @@ fn pathname_lookup_returns_shared_file_node(kernel: &Kernel) {
         .mnt
         .mount("/lookup-mnt", "lookupdev")
         .expect("lookup test mount should install");
+    kernel
+        .install_directory("/lookup-mnt")
+        .expect("mounted namespace root should install");
     kernel
         .install_file("/lookup-mnt/file", b"mounted".to_vec(), false)
         .expect("mounted lookup test file should install");
