@@ -4,7 +4,8 @@ use super::*;
 use crate::kernel::allocator::AllocatorState;
 
 const FILE_NODE_METADATA_MAGIC: &[u8; 4] = b"FNMD";
-const FILE_NODE_METADATA_HEADER_LEN: usize = 4 + 1 + 1 + 8 + 8 + 8;
+const FILE_NODE_METADATA_VERSION: u8 = 2;
+const FILE_NODE_METADATA_HEADER_LEN: usize = 4 + 1 + 1 + 1 + 8 + 8 + 8;
 
 // AGENT: keep standalone/test file handles within the 1 MiB QEMU early heap;
 // full-chain writeback preserves correctness when a single chain recycles slots.
@@ -245,6 +246,31 @@ struct FileNodeData {
     byte_len: usize,
 }
 
+// AGENT: bind one visible direct-child name to a filesystem-local inode
+// without storing a rename-sensitive full pathname in directory metadata.
+#[derive(Clone, Debug)]
+pub struct DirEntry {
+    pub name: String,
+    pub inode: InodeId,
+}
+
+// AGENT: preserve insertion order for readdir while indexing direct children
+// by name for component lookup inside the owning FsInstance namespace lock.
+#[derive(Debug)]
+struct DirectoryData {
+    entries: Vec<DirEntry>,
+    by_name: BTreeMap<String, InodeId>,
+}
+
+impl DirectoryData {
+    fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            by_name: BTreeMap::new(),
+        }
+    }
+}
+
 impl FileNodeData {
     fn empty() -> Self {
         Self {
@@ -264,7 +290,7 @@ pub struct FileNode {
     pub executable: AtomicBool,
     storage: Mutex<FileNodeData>,
     metadata_blocks: Mutex<FileNodeBlocks>,
-    dir_entries: Arc<Mutex<Vec<String>>>,
+    directory: Mutex<DirectoryData>,
 }
 
 impl FileNode {
@@ -277,12 +303,12 @@ impl FileNode {
             executable: AtomicBool::new(executable),
             storage: Mutex::new(FileNodeData::empty()),
             metadata_blocks: Mutex::new(FileNodeBlocks::empty()),
-            dir_entries: Arc::new(Mutex::new(Vec::new())),
+            directory: Mutex::new(DirectoryData::empty()),
         }
     }
 
-    // AGENT: construct a directory inode only for FsInstance while preserving
-    // the existing directory-entry metadata representation.
+    // AGENT: construct a directory inode only for FsInstance with an ordered
+    // directory-entry list and a direct-child BTreeMap index.
     pub(super) fn directory(id: InodeId) -> Self {
         Self {
             id,
@@ -290,7 +316,7 @@ impl FileNode {
             executable: AtomicBool::new(false),
             storage: Mutex::new(FileNodeData::empty()),
             metadata_blocks: Mutex::new(FileNodeBlocks::empty()),
-            dir_entries: Arc::new(Mutex::new(Vec::new())),
+            directory: Mutex::new(DirectoryData::empty()),
         }
     }
 
@@ -300,37 +326,117 @@ impl FileNode {
         self.id
     }
 
-    // AGENT: add one child name to a directory node without duplicating entries.
-    pub fn add_dir_entry(&self, backend: &FileStorage, name: &str) -> Result<(), &'static str> {
+    // AGENT: look up one direct child through a component already validated by
+    // the owning FsInstance namespace boundary.
+    pub(super) fn lookup_child_inode(&self, name: ChildName<'_>) -> Result<InodeId, &'static str> {
+        if self.kind != FileKind::Directory {
+            return Err("enotdir");
+        }
+        self.directory
+            .lock()
+            .unwrap()
+            .by_name
+            .get(name.as_str())
+            .copied()
+            .ok_or("enoent")
+    }
+
+    // AGENT: publish one direct child name-to-inode binding and keep ordered
+    // iteration plus persisted metadata consistent on write failure.
+    pub(super) fn insert_child(
+        &self,
+        backend: &FileStorage,
+        name: ChildName<'_>,
+        inode: InodeId,
+    ) -> Result<(), &'static str> {
         if self.kind != FileKind::Directory {
             return Err("enotdir");
         }
         {
-            let data_blocks = self.storage.lock().unwrap().blocks.len();
-            let entries = self.dir_entries.lock().unwrap();
-            if entries.iter().any(|entry| entry == name) {
-                return Ok(());
+            let directory = self.directory.lock().unwrap();
+            if directory.by_name.contains_key(name.as_str()) {
+                return Err("eexist");
             }
-            let entry_name_bytes = Self::entry_name_bytes(&entries)?
-                .checked_add(name.len())
+            let data_blocks = self.storage.lock().unwrap().blocks.len();
+            let entry_name_bytes = Self::entry_name_bytes(&directory.entries)?
+                .checked_add(name.as_str().len())
                 .ok_or("efbig")?;
-            let entry_count = entries.len().checked_add(1).ok_or("efbig")?;
+            let entry_count = directory.entries.len().checked_add(1).ok_or("efbig")?;
             let payload_len =
                 Self::metadata_payload_len(data_blocks, entry_count, entry_name_bytes)?;
-            drop(entries);
+            drop(directory);
             self.ensure_metadata_capacity(backend, payload_len)?;
         }
-        let inserted = {
-            let mut entries = self.dir_entries.lock().unwrap();
-            if entries.iter().any(|entry| entry == name) {
-                false
-            } else {
-                entries.push(name.to_string());
-                true
+        {
+            let mut directory = self.directory.lock().unwrap();
+            if directory.by_name.contains_key(name.as_str()) {
+                return Err("eexist");
             }
-        };
-        if inserted {
-            self.mark_metadata_dirty(backend)?;
+            directory.entries.push(DirEntry {
+                name: name.as_str().to_string(),
+                inode,
+            });
+            directory.by_name.insert(name.as_str().to_string(), inode);
+        }
+        if let Err(error) = self.mark_metadata_dirty(backend) {
+            let mut directory = self.directory.lock().unwrap();
+            directory.by_name.remove(name.as_str());
+            if let Some(index) = directory
+                .entries
+                .iter()
+                .position(|entry| entry.name == name.as_str() && entry.inode == inode)
+            {
+                directory.entries.remove(index);
+            }
+            drop(directory);
+            let _ = self.mark_metadata_dirty(backend);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    // AGENT: atomically retarget one existing direct name to a replacement
+    // inode while preserving its directory iteration position.
+    pub(super) fn replace_child_inode(
+        &self,
+        backend: &FileStorage,
+        name: ChildName<'_>,
+        expected: InodeId,
+        replacement: InodeId,
+    ) -> Result<(), &'static str> {
+        if self.kind != FileKind::Directory {
+            return Err("enotdir");
+        }
+        {
+            let mut directory = self.directory.lock().unwrap();
+            if directory.by_name.get(name.as_str()).copied() != Some(expected) {
+                return Err("eio");
+            }
+            let entry = directory
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == name.as_str() && entry.inode == expected)
+                .ok_or("eio")?;
+            entry.inode = replacement;
+            directory
+                .by_name
+                .insert(name.as_str().to_string(), replacement);
+        }
+        if let Err(error) = self.mark_metadata_dirty(backend) {
+            let mut directory = self.directory.lock().unwrap();
+            if let Some(entry) = directory
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == name.as_str() && entry.inode == replacement)
+            {
+                entry.inode = expected;
+            }
+            directory
+                .by_name
+                .insert(name.as_str().to_string(), expected);
+            drop(directory);
+            let _ = self.mark_metadata_dirty(backend);
+            return Err(error);
         }
         Ok(())
     }
@@ -340,11 +446,12 @@ impl FileNode {
         if self.kind != FileKind::Directory {
             return Err("enotdir");
         }
-        self.dir_entries
+        self.directory
             .lock()
             .unwrap()
+            .entries
             .get(idx)
-            .cloned()
+            .map(|entry| entry.name.clone())
             .ok_or("enoent")
     }
 
@@ -413,10 +520,10 @@ impl FileNode {
         lhs.checked_add(rhs).ok_or("efbig")
     }
 
-    fn entry_name_bytes(entries: &[String]) -> Result<usize, &'static str> {
+    fn entry_name_bytes(entries: &[DirEntry]) -> Result<usize, &'static str> {
         let mut total = 0usize;
         for entry in entries.iter() {
-            total = Self::checked_metadata_add(total, entry.len())?;
+            total = Self::checked_metadata_add(total, entry.name.len())?;
         }
         Ok(total)
     }
@@ -427,9 +534,9 @@ impl FileNode {
         entry_name_bytes: usize,
     ) -> Result<usize, &'static str> {
         let data_block_bytes = data_blocks.checked_mul(8).ok_or("efbig")?;
-        let entry_len_bytes = entry_count.checked_mul(8).ok_or("efbig")?;
+        let entry_metadata_bytes = entry_count.checked_mul(16).ok_or("efbig")?;
         let len = Self::checked_metadata_add(FILE_NODE_METADATA_HEADER_LEN, data_block_bytes)?;
-        let len = Self::checked_metadata_add(len, entry_len_bytes)?;
+        let len = Self::checked_metadata_add(len, entry_metadata_bytes)?;
         Self::checked_metadata_add(len, entry_name_bytes)
     }
 
@@ -444,14 +551,18 @@ impl FileNode {
     }
 
     fn metadata_payload(&self) -> Result<Vec<u8>, &'static str> {
+        let directory = self.directory.lock().unwrap();
         let storage = self.storage.lock().unwrap();
-        let entries = self.dir_entries.lock().unwrap();
-        let entry_name_bytes = Self::entry_name_bytes(&entries)?;
-        let payload_len =
-            Self::metadata_payload_len(storage.blocks.len(), entries.len(), entry_name_bytes)?;
+        let entry_name_bytes = Self::entry_name_bytes(&directory.entries)?;
+        let payload_len = Self::metadata_payload_len(
+            storage.blocks.len(),
+            directory.entries.len(),
+            entry_name_bytes,
+        )?;
         let mut payload = Vec::with_capacity(payload_len);
 
         Self::put_metadata_bytes(&mut payload, FILE_NODE_METADATA_MAGIC);
+        Self::put_metadata_bytes(&mut payload, &[FILE_NODE_METADATA_VERSION]);
         Self::put_metadata_bytes(
             &mut payload,
             &[match self.kind {
@@ -465,15 +576,16 @@ impl FileNode {
         );
         Self::put_metadata_u64(&mut payload, storage.byte_len)?;
         Self::put_metadata_u64(&mut payload, storage.blocks.len())?;
-        Self::put_metadata_u64(&mut payload, entries.len())?;
+        Self::put_metadata_u64(&mut payload, directory.entries.len())?;
 
         for block in storage.blocks.ids() {
             let stored_id = block.checked_add(1).ok_or("efbig")?;
             Self::put_metadata_u64(&mut payload, stored_id)?;
         }
-        for entry in entries.iter() {
-            Self::put_metadata_u64(&mut payload, entry.len())?;
-            Self::put_metadata_bytes(&mut payload, entry.as_bytes());
+        for entry in directory.entries.iter() {
+            Self::put_metadata_bytes(&mut payload, &entry.inode.to_le_bytes());
+            Self::put_metadata_u64(&mut payload, entry.name.len())?;
+            Self::put_metadata_bytes(&mut payload, entry.name.as_bytes());
         }
         debug_assert_eq!(payload.len(), payload_len);
 
@@ -503,10 +615,11 @@ impl FileNode {
         backend: &FileStorage,
         data_blocks: usize,
     ) -> Result<(), &'static str> {
-        let entries = self.dir_entries.lock().unwrap();
-        let entry_name_bytes = Self::entry_name_bytes(&entries)?;
-        let payload_len = Self::metadata_payload_len(data_blocks, entries.len(), entry_name_bytes)?;
-        drop(entries);
+        let directory = self.directory.lock().unwrap();
+        let entry_name_bytes = Self::entry_name_bytes(&directory.entries)?;
+        let payload_len =
+            Self::metadata_payload_len(data_blocks, directory.entries.len(), entry_name_bytes)?;
+        drop(directory);
         self.ensure_metadata_capacity(backend, payload_len)?;
         Ok(())
     }
@@ -767,18 +880,20 @@ impl FileNode {
 
 impl fmt::Debug for FileNode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let storage = self.storage.lock().unwrap();
+        let (byte_len, block_count) = {
+            let storage = self.storage.lock().unwrap();
+            (storage.byte_len, storage.blocks.len())
+        };
+        let metadata_block_count = self.metadata_blocks.lock().unwrap().len();
+        let entry_count = self.directory.lock().unwrap().entries.len();
         f.debug_struct("FileNode")
             .field("id", &self.id)
             .field("kind", &self.kind)
             .field("executable", &self.executable.load(Ordering::Relaxed))
-            .field("byte_len", &storage.byte_len)
-            .field("blocks", &storage.blocks.len())
-            .field(
-                "metadata_blocks",
-                &self.metadata_blocks.lock().unwrap().len(),
-            )
-            .field("entries", &self.dir_entries.lock().unwrap().len())
+            .field("byte_len", &byte_len)
+            .field("blocks", &block_count)
+            .field("metadata_blocks", &metadata_block_count)
+            .field("entries", &entry_count)
             .finish()
     }
 }

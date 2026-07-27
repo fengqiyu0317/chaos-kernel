@@ -1,5 +1,5 @@
-// AGENT: bind one filesystem-local node namespace to exactly one FileStorage
-// while the first VFS stage still indexes nodes by canonical relative paths.
+// AGENT: bind one filesystem-local inode namespace to exactly one FileStorage;
+// directory nodes, rather than canonical full-path strings, own child names.
 use super::*;
 
 pub type FsId = usize;
@@ -8,6 +8,30 @@ pub type InodeId = u64;
 pub const ROOT_FS_ID: FsId = 1;
 const ROOT_INODE_ID: InodeId = 1;
 
+// AGENT: prove that a directory-operation argument is exactly one ordinary
+// child component before FileNode may use it as a namespace key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChildName<'a>(&'a str);
+
+// AGENT: centralize direct-child construction so FsInstance and FileNode
+// operations consume an already-validated component type.
+impl<'a> ChildName<'a> {
+    // AGENT: reject empty, navigation, and multi-component strings before they
+    // can become an unreachable or ambiguous directory entry.
+    pub(crate) fn new(name: &'a str) -> Result<Self, &'static str> {
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err("einval");
+        }
+        Ok(Self(name))
+    }
+
+    // AGENT: lend the validated component bytes without allowing callers to
+    // construct another unchecked ChildName.
+    pub(crate) fn as_str(self) -> &'a str {
+        self.0
+    }
+}
+
 // AGENT: identify the filesystem implementation without conflating it with a
 // particular mount attachment or concrete block-device transport.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,32 +39,32 @@ pub enum FsKind {
     ChaosFs,
 }
 
-// AGENT: represent one filesystem instance and own all FileNodes together with
-// the only FileStorage allowed to back their data and metadata blocks.
+// AGENT: own live runtime inodes by filesystem-local stable identity together
+// with the only FileStorage allowed to back their data and metadata blocks.
 pub struct FsInstance {
     id: FsId,
     kind: FsKind,
     storage: FileStorage,
     root: Arc<FileNode>,
-    nodes: RwLock<BTreeMap<String, Arc<FileNode>>>,
+    inodes: RwLock<BTreeMap<InodeId, Arc<FileNode>>>,
     next_inode: AtomicU64,
 }
 
-// AGENT: centralize filesystem-local lookup, inode allocation, and strict
-// parent-directory insertion behind the FsInstance ownership boundary.
+// AGENT: centralize inode lookup, direct-child traversal, allocation, and
+// namespace mutation behind the FsInstance ownership boundary.
 impl FsInstance {
     // AGENT: construct an empty ChaosFs namespace with a stable root inode and
     // retain the caller-selected storage as this instance's sole backend.
     pub fn new(id: FsId, storage: FileStorage) -> Arc<Self> {
         let root = Arc::new(FileNode::directory(ROOT_INODE_ID));
-        let mut nodes = BTreeMap::new();
-        nodes.insert(String::from("/"), root.clone());
+        let mut inodes = BTreeMap::new();
+        inodes.insert(ROOT_INODE_ID, root.clone());
         Arc::new(Self {
             id,
             kind: FsKind::ChaosFs,
             storage,
             root,
-            nodes: RwLock::new(nodes),
+            inodes: RwLock::new(inodes),
             next_inode: AtomicU64::new(ROOT_INODE_ID + 1),
         })
     }
@@ -67,58 +91,57 @@ impl FsInstance {
         &self.storage
     }
 
-    // AGENT: canonicalize one filesystem-internal absolute path while the first
-    // stage still uses a flat map instead of directory-component dentries.
-    pub(crate) fn normalize_path(path: &str) -> Result<String, &'static str> {
-        if path.is_empty() {
-            return Err("enoent");
-        }
-        if !path.starts_with('/') {
-            return Err("einval");
-        }
-        let mut parts: Vec<&str> = Vec::new();
-        for part in path.split('/') {
-            match part {
-                "" | "." => {}
-                ".." => {
-                    parts.pop();
-                }
-                component => parts.push(component),
-            }
-        }
-        let mut normalized = String::from("/");
-        for (index, component) in parts.iter().enumerate() {
-            if index != 0 {
-                normalized.push('/');
-            }
-            normalized.push_str(component);
-        }
-        Ok(normalized)
-    }
-
-    // AGENT: look up a managed node by its filesystem-internal canonical path.
-    pub fn lookup(&self, path: &str) -> Result<Arc<FileNode>, &'static str> {
-        let path = Self::normalize_path(path)?;
-        self.nodes
+    // AGENT: look up one live managed inode by filesystem-local identity.
+    pub fn lookup_inode(&self, inode: InodeId) -> Result<Arc<FileNode>, &'static str> {
+        self.inodes
             .read()
             .unwrap()
-            .get(&path)
+            .get(&inode)
             .cloned()
             .ok_or("enoent")
     }
 
-    // AGENT: prove that a proposed mountpoint is one of this instance's live
-    // managed inode objects rather than a same-number inode from another fs.
+    // AGENT: validate that a parent object is the live directory registered at
+    // its inode number in this filesystem rather than a foreign lookalike.
+    fn require_owned_directory(
+        inodes: &BTreeMap<InodeId, Arc<FileNode>>,
+        parent: &Arc<FileNode>,
+    ) -> Result<(), &'static str> {
+        let owned = inodes.get(&parent.id()).ok_or("exdev")?;
+        if !Arc::ptr_eq(owned, parent) {
+            return Err("exdev");
+        }
+        if parent.kind != FileKind::Directory {
+            return Err("enotdir");
+        }
+        Ok(())
+    }
+
+    // AGENT: look up exactly one direct child through its parent directory
+    // object without constructing or interpreting a full pathname.
+    pub(crate) fn lookup_child(
+        &self,
+        parent: &Arc<FileNode>,
+        name: ChildName<'_>,
+    ) -> Result<Arc<FileNode>, &'static str> {
+        let inodes = self.inodes.read().unwrap();
+        Self::require_owned_directory(&inodes, parent)?;
+        let inode = parent.lookup_child_inode(name)?;
+        inodes.get(&inode).cloned().ok_or("eio")
+    }
+
+    // AGENT: prove that a proposed mountpoint is the live inode object currently
+    // registered at its identity in this filesystem instance.
     pub(crate) fn owns_node(&self, node: &Arc<FileNode>) -> bool {
-        self.nodes
+        self.inodes
             .read()
             .unwrap()
-            .values()
-            .any(|candidate| Arc::ptr_eq(candidate, node))
+            .get(&node.id())
+            .is_some_and(|owned| Arc::ptr_eq(owned, node))
     }
 
     // AGENT: allocate monotonically increasing runtime inode identities; disk
-    // persistence and recovery deliberately remain outside this first stage.
+    // persistence and recovery deliberately remain outside this VFS stage.
     fn allocate_inode_id(&self) -> InodeId {
         self.next_inode
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -135,137 +158,177 @@ impl FsInstance {
         Arc::new(FileNode::directory(self.allocate_inode_id()))
     }
 
-    // AGENT: split a non-root internal path into its canonical parent key and
-    // direct child name without interpreting symlinks or crossing mounts.
-    fn parent_dir_entry(path: &str) -> Option<(String, String)> {
-        if path == "/" {
-            return None;
-        }
-        let slash = path.rfind('/')?;
-        let name = &path[slash + 1..];
-        if name.is_empty() {
-            return None;
-        }
-        let parent = if slash == 0 { "/" } else { &path[..slash] };
-        Some((parent.to_string(), name.to_string()))
-    }
-
-    // AGENT: validate an existing directory parent while the caller holds the
-    // filesystem node-table write lock.
-    fn require_parent_dir(
-        nodes: &BTreeMap<String, Arc<FileNode>>,
-        path: &str,
-    ) -> Result<(Arc<FileNode>, String), &'static str> {
-        let (parent, name) = Self::parent_dir_entry(path).ok_or("enoent")?;
-        let parent = nodes.get(&parent).cloned().ok_or("enoent")?;
-        if parent.kind != FileKind::Directory {
-            return Err("enotdir");
-        }
-        Ok((parent, name))
-    }
-
-    // AGENT: publish one new node only after its parent metadata is updated
-    // through this same filesystem instance's storage backend.
+    // AGENT: publish a new child binding and then register its inode while the
+    // caller holds the filesystem namespace write lock.
     fn insert_new_child_locked(
         &self,
-        nodes: &mut BTreeMap<String, Arc<FileNode>>,
-        path: String,
+        inodes: &mut BTreeMap<InodeId, Arc<FileNode>>,
+        parent: &Arc<FileNode>,
+        name: ChildName<'_>,
         node: Arc<FileNode>,
     ) -> Result<Arc<FileNode>, &'static str> {
-        if nodes.contains_key(&path) {
-            return Err("eexist");
+        match parent.lookup_child_inode(name) {
+            Ok(_) => return Err("eexist"),
+            Err("enoent") => {}
+            Err(error) => return Err(error),
         }
-        let (parent, name) = Self::require_parent_dir(nodes, &path)?;
-        parent.add_dir_entry(&self.storage, &name)?;
-        nodes.insert(path, node.clone());
+        parent.insert_child(&self.storage, name, node.id())?;
+        let replaced = inodes.insert(node.id(), node.clone());
+        debug_assert!(
+            replaced.is_none(),
+            "fresh inode identity already registered"
+        );
         Ok(node)
     }
 
-    // AGENT: create a new regular inode atomically in this filesystem-local
-    // namespace and reject every pre-existing path.
-    pub fn create_regular(
+    // AGENT: retarget one existing child binding and replace its registered
+    // inode while the caller holds the filesystem namespace write lock.
+    fn replace_child_locked(
         &self,
-        path: &str,
+        inodes: &mut BTreeMap<InodeId, Arc<FileNode>>,
+        parent: &Arc<FileNode>,
+        name: ChildName<'_>,
+        existing: Arc<FileNode>,
+        replacement: Arc<FileNode>,
+    ) -> Result<Arc<FileNode>, &'static str> {
+        parent.replace_child_inode(&self.storage, name, existing.id(), replacement.id())?;
+        let removed = inodes.remove(&existing.id());
+        debug_assert!(
+            removed
+                .as_ref()
+                .is_some_and(|owned| Arc::ptr_eq(owned, &existing)),
+            "replaced inode was not registered"
+        );
+        let replaced = inodes.insert(replacement.id(), replacement.clone());
+        debug_assert!(
+            replaced.is_none(),
+            "fresh replacement inode identity already registered"
+        );
+        Ok(replacement)
+    }
+
+    // AGENT: create a new regular inode atomically under one parent directory
+    // and reject every pre-existing direct-child name.
+    pub(crate) fn create_regular_at(
+        &self,
+        parent: &Arc<FileNode>,
+        name: ChildName<'_>,
         executable: bool,
     ) -> Result<Arc<FileNode>, &'static str> {
-        let path = Self::normalize_path(path)?;
-        let mut nodes = self.nodes.write().unwrap();
+        let mut inodes = self.inodes.write().unwrap();
+        Self::require_owned_directory(&inodes, parent)?;
+        match parent.lookup_child_inode(name) {
+            Ok(_) => return Err("eexist"),
+            Err("enoent") => {}
+            Err(error) => return Err(error),
+        }
         let node = self.new_regular_node(executable);
-        self.insert_new_child_locked(&mut nodes, path, node)
+        self.insert_new_child_locked(&mut inodes, parent, name, node)
     }
 
-    // AGENT: create a new directory inode atomically in this filesystem-local
-    // namespace and preserve strict parent-directory semantics.
-    pub fn create_directory(&self, path: &str) -> Result<Arc<FileNode>, &'static str> {
-        let path = Self::normalize_path(path)?;
-        let mut nodes = self.nodes.write().unwrap();
-        let node = self.new_directory_node();
-        self.insert_new_child_locked(&mut nodes, path, node)
-    }
-
-    // AGENT: combine existing-file checks and optional creation under one
-    // filesystem-local table lock for transactional openat behavior.
-    pub(crate) fn open_regular(
+    // AGENT: create a new directory inode atomically under one live directory
+    // while preserving strict mkdir EEXIST semantics.
+    pub(crate) fn create_directory_at(
         &self,
-        path: &str,
+        parent: &Arc<FileNode>,
+        name: ChildName<'_>,
+    ) -> Result<Arc<FileNode>, &'static str> {
+        let mut inodes = self.inodes.write().unwrap();
+        Self::require_owned_directory(&inodes, parent)?;
+        match parent.lookup_child_inode(name) {
+            Ok(_) => return Err("eexist"),
+            Err("enoent") => {}
+            Err(error) => return Err(error),
+        }
+        let node = self.new_directory_node();
+        self.insert_new_child_locked(&mut inodes, parent, name, node)
+    }
+
+    // AGENT: combine direct-child lookup and optional creation under one
+    // namespace lock for transactional openat and O_EXCL behavior.
+    pub(crate) fn open_regular_at(
+        &self,
+        parent: &Arc<FileNode>,
+        name: ChildName<'_>,
         create: bool,
         exclusive: bool,
     ) -> Result<Arc<FileNode>, &'static str> {
-        let path = Self::normalize_path(path)?;
-        let mut nodes = self.nodes.write().unwrap();
-        if let Some(node) = nodes.get(&path).cloned() {
-            if exclusive {
-                return Err("eexist");
+        let mut inodes = self.inodes.write().unwrap();
+        Self::require_owned_directory(&inodes, parent)?;
+        match parent.lookup_child_inode(name) {
+            Ok(inode) => {
+                let node = inodes.get(&inode).cloned().ok_or("eio")?;
+                if exclusive {
+                    return Err("eexist");
+                }
+                if node.kind != FileKind::Regular {
+                    return Err("eisdir");
+                }
+                Ok(node)
             }
-            if node.kind != FileKind::Regular {
-                return Err("eisdir");
+            Err("enoent") if create => {
+                let node = self.new_regular_node(false);
+                self.insert_new_child_locked(&mut inodes, parent, name, node)
             }
-            return Ok(node);
+            Err(error) => Err(error),
         }
-        if !create {
-            return Err("enoent");
-        }
-        let node = self.new_regular_node(false);
-        self.insert_new_child_locked(&mut nodes, path, node)
     }
 
-    // AGENT: install or replace a regular inode, retaining a newly validated
-    // parent across initial I/O so publication does not repeat the same check.
-    pub(crate) fn install_regular(
+    // AGENT: install or replace one kernel-owned regular inode while retaining
+    // the direct-child iteration position and using this filesystem's backend.
+    pub(crate) fn install_regular_at(
         &self,
-        path: &str,
+        parent: &Arc<FileNode>,
+        name: ChildName<'_>,
         data: &[u8],
         executable: bool,
     ) -> Result<Arc<FileNode>, &'static str> {
-        let path = Self::normalize_path(path)?;
-        let mut nodes = self.nodes.write().unwrap();
-        let new_parent = match nodes.get(&path) {
-            Some(existing) if existing.kind != FileKind::Regular => return Err("eisdir"),
-            Some(_) => None,
-            None => Some(Self::require_parent_dir(&nodes, &path)?),
+        let mut inodes = self.inodes.write().unwrap();
+        Self::require_owned_directory(&inodes, parent)?;
+        let existing = match parent.lookup_child_inode(name) {
+            Ok(inode) => Some(inodes.get(&inode).cloned().ok_or("eio")?),
+            Err("enoent") => None,
+            Err(error) => return Err(error),
         };
+        if existing
+            .as_ref()
+            .is_some_and(|node| node.kind != FileKind::Regular)
+        {
+            return Err("eisdir");
+        }
+
         let node = self.new_regular_node(executable);
         node.write_initial_bytes(&self.storage, data)?;
-        if let Some((parent, name)) = new_parent {
-            parent.add_dir_entry(&self.storage, &name)?;
+        if let Some(existing) = existing {
+            self.replace_child_locked(&mut inodes, parent, name, existing, node)
+        } else {
+            self.insert_new_child_locked(&mut inodes, parent, name, node)
         }
-        nodes.insert(path, node.clone());
-        Ok(node)
     }
 
     // AGENT: establish a directory idempotently for kernel boot fixtures while
-    // keeping user-requested mkdir on the strict create_directory interface.
-    pub(crate) fn install_directory(&self, path: &str) -> Result<Arc<FileNode>, &'static str> {
-        let path = Self::normalize_path(path)?;
-        let mut nodes = self.nodes.write().unwrap();
-        if let Some(existing) = nodes.get(&path).cloned() {
-            return if existing.kind == FileKind::Directory {
-                Ok(existing)
-            } else {
-                Err("eexist")
-            };
+    // keeping user-requested mkdir on create_directory_at.
+    pub(crate) fn install_directory_at(
+        &self,
+        parent: &Arc<FileNode>,
+        name: ChildName<'_>,
+    ) -> Result<Arc<FileNode>, &'static str> {
+        let mut inodes = self.inodes.write().unwrap();
+        Self::require_owned_directory(&inodes, parent)?;
+        match parent.lookup_child_inode(name) {
+            Ok(inode) => {
+                let existing = inodes.get(&inode).cloned().ok_or("eio")?;
+                if existing.kind == FileKind::Directory {
+                    Ok(existing)
+                } else {
+                    Err("eexist")
+                }
+            }
+            Err("enoent") => {
+                let node = self.new_directory_node();
+                self.insert_new_child_locked(&mut inodes, parent, name, node)
+            }
+            Err(error) => Err(error),
         }
-        let node = self.new_directory_node();
-        self.insert_new_child_locked(&mut nodes, path, node)
     }
 }

@@ -186,7 +186,13 @@ pub mod tests {
             Arc::new(FileBlockAllocator::new(device.block_count())),
         );
         let fs = FsInstance::new(0, storage.clone());
-        let node = fs.create_regular("/file", false).unwrap();
+        let node = fs
+            .create_regular_at(
+                &fs.root(),
+                ChildName::new("file").expect("test child name should be valid"),
+                false,
+            )
+            .unwrap();
 
         node.write_initial_bytes(&storage, b"stable").unwrap();
 

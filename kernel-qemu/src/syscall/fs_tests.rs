@@ -238,24 +238,27 @@ fn path_creation_requires_an_existing_directory_parent(kernel: &Kernel) {
     ));
     assert!(matches!(
         kernel.lookup_file_node("/qemu-regular-parent/child"),
-        Err("enoent")
+        Err("enotdir")
     ));
 }
 
-// AGENT: verify that pathname lookup normalizes aliases, applies mount
-// translation, returns one shared inode-like FileNode, and reports absence.
+// AGENT: verify that pathname lookup walks valid aliases in order, crosses
+// mounts, returns one shared inode-like FileNode, and reports absence.
 #[cfg_attr(test, test)]
 fn pathname_lookup_returns_shared_file_node(kernel: &Kernel) {
     kernel
         .install_file("/tmp/qemu-lookup", b"node".to_vec(), false)
         .expect("lookup test file should install");
+    kernel
+        .install_directory("/tmp/qemu-lookup-alias-dir")
+        .expect("lookup alias directory should install");
 
     let direct = kernel
         .lookup_file_node("/tmp/qemu-lookup")
         .expect("canonical lookup path should resolve");
     let alias = kernel
-        .lookup_file_node("/tmp//unused/.././qemu-lookup")
-        .expect("normalized lookup alias should resolve");
+        .lookup_file_node("/tmp//qemu-lookup-alias-dir/.././qemu-lookup")
+        .expect("component-walk lookup alias should resolve");
     assert_eq!(direct.display_path, "/tmp/qemu-lookup");
     assert_eq!(alias.display_path, direct.display_path);
     assert!(Arc::ptr_eq(&direct.path_ref.node, &alias.path_ref.node));

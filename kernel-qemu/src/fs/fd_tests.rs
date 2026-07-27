@@ -2,6 +2,12 @@
 // module path for Rust tests and qemu-sync-selftest.
 use super::*;
 
+// AGENT: make direct FsInstance test fixtures cross the same validated-name
+// boundary as VFS-produced child components.
+fn child_name(name: &str) -> ChildName<'_> {
+    ChildName::new(name).expect("test child name should be one ordinary component")
+}
+
 // AGENT: keep the QEMU boot selftest aggregator in the moved fd test module.
 pub fn run_all() {
     set_len_tracks_byte_length_and_block_capacity();
@@ -32,7 +38,7 @@ fn writable_opt() -> FdOpt {
 fn regular_file(data: Vec<u8>) -> FInstance {
     let fs = FsInstance::new(0, FileStorage::standalone());
     let node = fs
-        .install_regular("/file", &data, false)
+        .install_regular_at(&fs.root(), child_name("file"), &data, false)
         .expect("standalone RAM file seed should fit");
     let mount = MountTable::new(fs).root();
     FInstance::new(mount, node)
@@ -42,7 +48,7 @@ fn regular_file(data: Vec<u8>) -> FInstance {
 fn directory_file() -> FInstance {
     let fs = FsInstance::new(0, FileStorage::standalone());
     let node = fs
-        .install_directory("/dir")
+        .install_directory_at(&fs.root(), child_name("dir"))
         .expect("standalone directory should install");
     let mount = MountTable::new(fs).root();
     FInstance::new(mount, node)
@@ -112,7 +118,9 @@ fn metadata_blocks_expand_for_large_directory_entry() {
         name.push('x');
     }
 
-    dir.node.add_dir_entry(dir.storage(), &name).unwrap();
+    let fs = dir.mount.fs();
+    fs.create_regular_at(&dir.node, child_name(&name), false)
+        .unwrap();
 
     assert_eq!(dir.node.metadata_block_count(), 2);
     assert_eq!(dir.read_entry(0), Ok(name));
@@ -130,7 +138,9 @@ fn truncate_releases_blocks_for_reuse_without_old_contents() {
     );
     let fs = FsInstance::new(0, storage.clone());
     let mount = MountTable::new(fs.clone()).root();
-    let first_node = fs.create_regular("/first", false).unwrap();
+    let first_node = fs
+        .create_regular_at(&fs.root(), child_name("first"), false)
+        .unwrap();
     let first = FInstance::new(mount.clone(), first_node);
     let first_entry = file_entry(&first, writable_opt());
     first
@@ -143,7 +153,9 @@ fn truncate_releases_blocks_for_reuse_without_old_contents() {
     assert_eq!(first.node.allocated_len(), 0);
     assert_eq!(storage.allocator_stats(), (4, 2));
 
-    let second_node = fs.create_regular("/second", false).unwrap();
+    let second_node = fs
+        .create_regular_at(&fs.root(), child_name("second"), false)
+        .unwrap();
     let second = FInstance::new(mount, second_node);
     let second_entry = file_entry(&second, writable_opt());
     second_entry.fallocate(0, BLOCK_CACHE_BLOCK_SIZE).unwrap();
@@ -186,9 +198,13 @@ fn fallocate_validates_and_only_grows_regular_files() {
 #[cfg_attr(test, test)]
 fn read_entry_uses_open_description_offset() {
     let dir = directory_file();
-    dir.node.add_dir_entry(dir.storage(), "alpha").unwrap();
-    dir.node.add_dir_entry(dir.storage(), "beta").unwrap();
-    dir.node.add_dir_entry(dir.storage(), "gamma").unwrap();
+    let fs = dir.mount.fs();
+    fs.create_regular_at(&dir.node, child_name("alpha"), false)
+        .unwrap();
+    fs.create_regular_at(&dir.node, child_name("beta"), false)
+        .unwrap();
+    fs.create_regular_at(&dir.node, child_name("gamma"), false)
+        .unwrap();
 
     assert_eq!(dir.read_entry(1), Ok(String::from("beta")));
 

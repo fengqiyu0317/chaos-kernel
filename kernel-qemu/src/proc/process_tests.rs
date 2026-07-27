@@ -57,7 +57,12 @@ pub fn run_all(pool: &FramePool) {
 fn standalone_regular_file() -> FInstance {
     let fs = FsInstance::new(0, FileStorage::standalone());
     let node = fs
-        .install_regular("/file", &[], false)
+        .install_regular_at(
+            &fs.root(),
+            ChildName::new("file").expect("test child name should be valid"),
+            &[],
+            false,
+        )
         .expect("process file fixture should install");
     let mount = MountTable::new(fs).root();
     FInstance::new(mount, node)
