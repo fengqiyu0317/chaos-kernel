@@ -10,7 +10,7 @@ struct PreparedExec {
 
 impl Kernel {
     // AGENT: resolve one executable pathname to the shared inode-like FileNode
-    // and read it through the FileStorage selected by its PathRef mount.
+    // and read it through the FileStorage selected by its FInstance mount.
     pub(crate) fn read_file_for_exec(&self, path: &str) -> Result<(String, Vec<u8>), &'static str> {
         let resolved = self.lookup_file_node(path)?;
         if resolved.path_ref.node.kind != FileKind::Regular {

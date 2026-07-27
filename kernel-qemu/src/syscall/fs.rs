@@ -209,8 +209,7 @@ fn do_open(
     }
     let options = OpenOptions::parse(flags)?;
     task.add_file_with_status_from(options.status, options.cloexec, || {
-        let resolved = kernel.open_regular_node(path, options.creation)?;
-        let instance = FInstance::from_resolved(resolved);
+        let instance = kernel.open_regular_node(path, options.creation)?.path_ref;
         if options.truncate && options.status.wr {
             instance.set_len(0)?;
         }

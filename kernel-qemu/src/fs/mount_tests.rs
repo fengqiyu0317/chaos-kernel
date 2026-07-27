@@ -1,7 +1,7 @@
 // AGENT: object-VFS topology regressions exercise mount identity, stacking,
 // storage ownership, and post-detach lifetime without pathname-prefix aliases.
 use super::{MountFlags, MountTable};
-use crate::kernel::fs::{FileKind, FileStorage, FsInstance, PathRef};
+use crate::kernel::fs::{FInstance, FileKind, FileStorage, FsInstance};
 use alloc::sync::Arc;
 
 // AGENT: construct one isolated first-stage filesystem for topology tests.
@@ -15,7 +15,7 @@ pub fn run_all() {
     filesystem_namespaces_and_inode_allocators_are_isolated();
     one_filesystem_can_be_attached_multiple_times();
     stacked_mounts_reveal_the_previous_layer_after_detach();
-    path_ref_survives_detach_with_its_storage();
+    finstance_survives_detach_with_its_storage();
     regular_files_cannot_be_mountpoints();
     detached_parents_cannot_receive_new_mounts();
 }
@@ -106,10 +106,10 @@ fn stacked_mounts_reveal_the_previous_layer_after_detach() {
     ));
 }
 
-// AGENT: keep a detached mount and inode usable through PathRef, including its
+// AGENT: keep a detached mount and inode usable through FInstance, including its
 // filesystem-specific storage backend.
 #[cfg_attr(test, test)]
-fn path_ref_survives_detach_with_its_storage() {
+fn finstance_survives_detach_with_its_storage() {
     let root_fs = test_fs(18);
     let mountpoint = root_fs.create_directory("/mnt").unwrap();
     let mounted_fs = test_fs(19);
@@ -121,10 +121,7 @@ fn path_ref_survives_detach_with_its_storage() {
     let mount = table
         .attach(&root, mountpoint.clone(), mounted_fs, MountFlags::empty())
         .unwrap();
-    let path = PathRef {
-        mount: mount.clone(),
-        node: file,
-    };
+    let path = FInstance::new(mount.clone(), file);
 
     table.detach_top(&root, &mountpoint).unwrap();
 

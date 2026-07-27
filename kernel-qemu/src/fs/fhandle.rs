@@ -85,7 +85,7 @@ impl FHandle {
         };
         let end = self
             .instance
-            .node()
+            .node
             .write_bytes(self.instance.storage(), off, buf)?;
         *offset = u64::try_from(end).map_err(|_| "efbig")?;
         Ok(buf.len())
@@ -181,6 +181,8 @@ impl FHandle {
         }
     }
 
+    // AGENT: splice through one shared offset without reintroducing an inode
+    // accessor that duplicates FInstance's public object identity.
     fn splice_same_locked(
         src: &FInstance,
         dst: &FInstance,
@@ -192,7 +194,7 @@ impl FHandle {
         if !src_status.rd || !dst_status.wr {
             return Err("ebadf");
         }
-        if src.node().kind != FileKind::Regular || dst.node().kind != FileKind::Regular {
+        if src.node.kind != FileKind::Regular || dst.node.kind != FileKind::Regular {
             return Err("enodev");
         }
         if count == 0 {
@@ -211,11 +213,13 @@ impl FHandle {
         } else {
             Some(src_off.checked_add(chunk.len()).ok_or("efbig")?)
         };
-        let end = dst.node().write_bytes(dst.storage(), write_off, &chunk)?;
+        let end = dst.node.write_bytes(dst.storage(), write_off, &chunk)?;
         *offset = u64::try_from(end).map_err(|_| "efbig")?;
         Ok(chunk.len())
     }
 
+    // AGENT: splice between distinct offsets using each FInstance's public node
+    // and mount-derived storage backend.
     fn splice_locked(
         src: &FInstance,
         src_offset: &mut u64,
@@ -228,7 +232,7 @@ impl FHandle {
         if !src_status.rd || !dst_status.wr {
             return Err("ebadf");
         }
-        if src.node().kind != FileKind::Regular || dst.node().kind != FileKind::Regular {
+        if src.node.kind != FileKind::Regular || dst.node.kind != FileKind::Regular {
             return Err("enodev");
         }
         if count == 0 {
@@ -247,7 +251,7 @@ impl FHandle {
         } else {
             Some(usize::try_from(*dst_offset).map_err(|_| "efbig")?)
         };
-        let end = dst.node().write_bytes(dst.storage(), write_off, &chunk)?;
+        let end = dst.node.write_bytes(dst.storage(), write_off, &chunk)?;
         let moved = u64::try_from(chunk.len()).map_err(|_| "efbig")?;
         *src_offset = src_offset.checked_add(moved).ok_or("efbig")?;
         *dst_offset = u64::try_from(end).map_err(|_| "efbig")?;

@@ -51,7 +51,7 @@ impl Mount {
     }
 
     // AGENT: construct a child attachment whose parent lifetime is controlled
-    // by MountTable or extant PathRef values rather than a strong back-edge.
+    // by MountTable or extant FInstance values rather than a strong back-edge.
     fn attached(
         id: MountId,
         fs: Arc<FsInstance>,
@@ -202,7 +202,7 @@ impl MountTable {
             .and_then(|stack| stack.last().cloned())
     }
 
-    // AGENT: pop and return only the visible attachment so existing PathRef and
+    // AGENT: pop and return only the visible attachment so existing FInstance and
     // explicit mount holders remain valid after topology removal.
     pub fn detach_top(
         &self,

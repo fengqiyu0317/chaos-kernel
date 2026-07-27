@@ -307,8 +307,8 @@ fn mounted_open_and_exec_use_the_mounted_filesystem_storage(kernel: &Kernel) {
         .lookup_file_node("/storage-mnt/file")
         .expect("mounted regular file should resolve");
     assert!(Arc::ptr_eq(resolved.path_ref.mount.fs(), &mounted_fs));
-    let instance = FInstance::from_resolved(resolved);
-    assert!(Arc::ptr_eq(instance.path_ref().mount.fs(), &mounted_fs));
+    let instance = resolved.path_ref;
+    assert!(Arc::ptr_eq(instance.mount.fs(), &mounted_fs));
     assert!(instance.storage().shares_backend_with(&mounted_storage));
     assert!(!instance.storage().shares_backend_with(&root_storage));
     let mut bytes = [0u8; 12];

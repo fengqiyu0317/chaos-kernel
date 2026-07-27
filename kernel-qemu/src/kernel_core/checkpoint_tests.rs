@@ -7,6 +7,17 @@ pub fn run_all(kernel: &Kernel) {
     checkpoint_round_trip_restores_task_timer(kernel);
 }
 
+// AGENT: keep checkpoint-only regular-file setup out of FInstance's production
+// constructors while preserving the redirected-stdio regression.
+fn standalone_regular_file() -> FInstance {
+    let fs = FsInstance::new(0, FileStorage::standalone());
+    let node = fs
+        .install_regular("/file", &[], false)
+        .expect("checkpoint file fixture should install");
+    let mount = MountTable::new(fs).root();
+    FInstance::new(mount, node)
+}
+
 // AGENT: a delayed wheel pass must keep a periodic timer on its original phase
 // and schedule the first future interval instead of drifting from the late tick.
 #[cfg_attr(test, test)]
@@ -87,7 +98,7 @@ fn checkpoint_stdio_round_trip_preserves_typed_terminal_objects(kernel: &Kernel)
     source.close_fd(1).expect("stdout redirect should close");
     let redirected = source
         .add_file_with_status(
-            FLike::File(FHandle::new(FInstance::new("/tmp/redirected"))),
+            FLike::File(FHandle::new(standalone_regular_file())),
             FdOpt {
                 rd: false,
                 wr: true,

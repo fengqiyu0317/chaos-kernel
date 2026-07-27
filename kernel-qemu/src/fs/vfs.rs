@@ -2,19 +2,11 @@
 // references while retaining flat filesystem-local path tables in stage one.
 use super::*;
 
-// AGENT: identify a resolved inode together with the mount view through which
-// it was reached, preserving both storage ownership and post-detach safety.
-#[derive(Clone)]
-pub struct PathRef {
-    pub mount: Arc<Mount>,
-    pub node: Arc<FileNode>,
-}
-
 // AGENT: retain a canonical external path only for display and exec naming;
-// object identity is exclusively the embedded PathRef.
+// object identity is exclusively the embedded FInstance.
 #[derive(Clone)]
 pub struct ResolvedPath {
-    pub path_ref: PathRef,
+    pub path_ref: FInstance,
     pub display_path: String,
 }
 
@@ -105,7 +97,7 @@ impl Vfs {
 
         Ok(InternalResolution {
             resolved: ResolvedPath {
-                path_ref: PathRef { mount, node },
+                path_ref: FInstance::new(mount, node),
                 display_path,
             },
             fs_path,
@@ -165,7 +157,7 @@ impl Vfs {
                 let (display_path, mount, fs_path) = self.child_location(path)?;
                 let node = mount.fs().open_regular(&fs_path, true, exclusive)?;
                 Ok(ResolvedPath {
-                    path_ref: PathRef { mount, node },
+                    path_ref: FInstance::new(mount, node),
                     display_path,
                 })
             }
@@ -192,7 +184,7 @@ impl Vfs {
         };
         let node = mount.fs().install_regular(&fs_path, data, executable)?;
         Ok(ResolvedPath {
-            path_ref: PathRef { mount, node },
+            path_ref: FInstance::new(mount, node),
             display_path,
         })
     }
@@ -206,7 +198,7 @@ impl Vfs {
                 let (display_path, mount, fs_path) = self.child_location(path)?;
                 let node = mount.fs().create_directory(&fs_path)?;
                 Ok(ResolvedPath {
-                    path_ref: PathRef { mount, node },
+                    path_ref: FInstance::new(mount, node),
                     display_path,
                 })
             }
@@ -229,7 +221,7 @@ impl Vfs {
                 let (display_path, mount, fs_path) = self.child_location(path)?;
                 let node = mount.fs().install_directory(&fs_path)?;
                 Ok(ResolvedPath {
-                    path_ref: PathRef { mount, node },
+                    path_ref: FInstance::new(mount, node),
                     display_path,
                 })
             }
@@ -239,7 +231,7 @@ impl Vfs {
 
     // AGENT: resolve a mountpoint without crossing its final visible attachment
     // so repeated attaches stack on the same parent inode.
-    fn mountpoint(&self, path: &str) -> Result<PathRef, &'static str> {
+    fn mountpoint(&self, path: &str) -> Result<FInstance, &'static str> {
         let canonical = Self::canonicalize(path)?;
         if canonical == "/" {
             return Err("einval");

@@ -56,7 +56,7 @@ impl Kernel {
     }
 
     // AGENT: write a resolved regular node only through the storage owned by its
-    // PathRef mount's filesystem instance.
+    // FInstance mount's filesystem instance.
     pub fn write_file_at(
         &self,
         path: &str,

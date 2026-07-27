@@ -52,6 +52,17 @@ pub fn run_all(pool: &FramePool) {
     release_all_pages_drops_same_space_aliases(pool);
 }
 
+// AGENT: keep process-test file fixtures local instead of retaining a synthetic
+// pathname compatibility constructor on FInstance.
+fn standalone_regular_file() -> FInstance {
+    let fs = FsInstance::new(0, FileStorage::standalone());
+    let node = fs
+        .install_regular("/file", &[], false)
+        .expect("process file fixture should install");
+    let mount = MountTable::new(fs).root();
+    FInstance::new(mount, node)
+}
+
 // AGENT: preserve detailed parser diagnostics for focused parser tests while
 // exposing malformed executable images to callers as Linux ENOEXEC.
 fn prepared_user_image_normalizes_invalid_elf_to_enoexec(pool: &FramePool) {
@@ -923,7 +934,7 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
         )
         .expect("shared child page should map");
     let fd = leader
-        .add_file(FLike::File(FHandle::new(FInstance::new("/thread-exit"))))
+        .add_file(FLike::File(FHandle::new(standalone_regular_file())))
         .expect("shared child fd should install");
 
     leader.set_sched_state(TaskRunState::Runnable);

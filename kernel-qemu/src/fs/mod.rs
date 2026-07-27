@@ -12,9 +12,10 @@ pub mod epoll;
 pub mod fd;
 pub mod fhandle;
 pub mod file_node;
-// AGENT: own each filesystem-local node table and storage backend together.
+// AGENT: identify one mounted filesystem object without pathname or open state.
 pub mod finstance;
 pub mod flike;
+// AGENT: own each filesystem-local node table and storage backend together.
 pub mod fs_instance;
 // AGENT: Isolate the block-I/O request queue from mount and disk behavior.
 pub mod io_queue;
