@@ -12,6 +12,45 @@
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
 
+## 2026-07-27：kernel-qemu 对象 VFS 逐路径分量遍历
+
+目标：在已经统一为 `FInstance { mount, node }` 的对象身份上，删除 `FsInstance` 的完整路径字符串表和 `Vfs` 的 `fs_path` 拼接，改成目录 inode 的 direct-child 查找与原子 parent/name 创建。
+
+已完成修改：
+
+- `FileNode` 目录命名空间改为有序 `Vec<DirEntry { name, inode }>` 和直接索引 `BTreeMap<String, InodeId>`；readdir 保持插入顺序，lookup 不再扫描或保存完整路径。
+- `FsInstance` 改为 `BTreeMap<InodeId, Arc<FileNode>>`，新增 inode/direct-child lookup 和 `create_*_at`、`open_regular_at`、`install_*_at`；创建在 namespace 写锁内验证父目录、检查重名、分配 inode、发布目录项并登记 live inode。
+- `Vfs` 以 `FInstance` 保存 walker 当前状态和祖先栈，逐个调用 `lookup_child(parent, name)` 并跨越 identity-keyed mount；`..` 不再提前规范化，`/missing/../file` 返回 `enoent`，`/regular/../file` 返回 `enotdir`。
+- 新增独立 `resolve_parent()`，创建路径只把最终普通名字交给父目录对象，保留中间 `enoent`/`enotdir`。
+- `FNMD` 目录项元数据升级为 `inode_id + name_len + name`，header 版本为 `2`；反序列化恢复仍是后续范围。
+- 更新 fd、checkpoint、process 和 syscall 自测夹具，增加 direct-child 名字校验、父目录隔离、重复对象身份与嵌套 mount component walk 回归。
+
+关键文件：
+
+- `kernel-qemu/src/fs/file_node.rs`
+- `kernel-qemu/src/fs/fs_instance.rs`
+- `kernel-qemu/src/fs/vfs.rs`
+- `kernel-qemu/src/fs/mount_tests.rs`
+- `kernel-qemu/src/syscall/fs_tests.rs`
+- `TASK.md`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo check --target riscv64gc-unknown-none-elf --all-features
+cargo run --release --features qemu-selftest,ram-block-device
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check
+```
+
+结果：全部通过。RAM 完整 QEMU selftest 通过 sync/mount/fd/fs syscall/checkpoint/user-satp/signal，RAM 与 VirtIO 启动都完成真实 U-mode mkdirat/openat round trip，init 正常退出。没有修改 `kernel-sim` 或 `kernel/src/kernel.rs`。
+
+当前边界：只支持根起点绝对路径；cwd/dirfd、symlink、mount namespace、mount-root 完整 `..` 父 dentry 语义、unlink/rename、权限与磁盘元数据恢复仍未实现。
+
 ## 2026-07-27：kernel-qemu 第一阶段对象 VFS
 
 目标：建立“文件系统实例—挂载实例—已解析路径”对象模型，把原本由 `Kernel` 分别持有的 `FileStorage`、全局 `file_nodes` 和字符串 `MountTable` 连接成正确所有权链，并让 fd/exec 从已解析路径选择存储后端。
@@ -20,9 +59,9 @@
 
 - 新增 `FsInstance`：拥有唯一 `FileStorage`、root、文件系统内路径节点表和运行期 inode allocator；所有新 `FileNode` 都由该实例分配稳定 `InodeId`。
 - 删除 `MountEntry { prefix, target }`；新增 `Mount` 和按 `(parent MountId, mountpoint InodeId)` 索引的 `MountTable`，支持同一 FsInstance 多次挂载、同挂载点 stacking、top detach、弱父引用与 detached mount 的 `Arc` 生命周期。
-- 新增 `PathRef { mount, node }`、`ResolvedPath` 和 `Vfs`。第一阶段仍使用每个 FsInstance 内部的完整相对路径表，但外部路径解析会按组件跨越可见 mount，不再生成 `device:/path` 全局键。
+- `ResolvedPath::path_ref` 使用统一的 `FInstance { mount, node }`，并新增 `Vfs`。第一阶段仍使用每个 FsInstance 内部的完整相对路径表，但外部路径解析会按组件跨越可见 mount，不再生成 `device:/path` 全局键。
 - `Kernel` 所有权改为 `Kernel -> Vfs -> root Mount -> root FsInstance -> FileStorage/root/nodes`；移除直接的 `file_storage`、`file_nodes` 和 `mnt` 字段。
-- `FInstance::from_path/from_resolved`、path-backed write 和 exec 从 `PathRef.mount.fs().storage()` 派生后端；挂载文件不会再误用 root storage。
+- path-backed write、fd 和 exec 从 `FInstance.mount.fs().storage()` 派生后端；挂载文件不会再误用 root storage。
 - `mount/umount2` syscall 改接对象拓扑。目标必须是既有目录；重复 mount 形成 stack，umount 只摘顶层。第一阶段 source 只校验非空并创建独立内存 ChaosFs，真实设备发现仍是 TODO。
 
 关键文件：
@@ -56,7 +95,7 @@ git diff --check
 
 结果：全部通过。RAM 完整 QEMU selftest 通过 mount/fd/fs syscall/exec storage 选择等新增回归；RAM 与 VirtIO 启动都完成真实 U-mode mkdirat/openat round trip、init 正常退出；独立 target 的 `kernel-sim` 回归为 unit 1、ELF 3、smoke 84 全部通过。没有修改 `kernel-sim` 和 `kernel/src/kernel.rs`。
 
-当前边界：cwd/dirfd、符号链接、真正的目录 dentry 遍历、mount namespace、bind/remount/move、busy/lazy unmount、superblock/inode 持久化和重启恢复仍未实现。
+该阶段边界：当时尚未完成真正的目录 dentry 遍历；其后已由上方逐路径分量阶段补齐。cwd/dirfd、符号链接、mount namespace、bind/remount/move、busy/lazy unmount、superblock/inode 持久化和重启恢复仍未实现。
 
 ## 2026-07-27：kernel-qemu RISC-V `mkdirat` 系统调用
 

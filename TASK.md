@@ -557,14 +557,24 @@ cargo test --test pressure
 - 回归覆盖：ABI 自测固定 syscall 号和参数布局；文件系统自测覆盖成功父子目录创建、父目录项可见性、重复创建/普通文件冲突 `eexist`、缺失父目录、非目录父节点、相对路径、空路径和错误用户指针。内嵌 init 通过真实 U-mode `ecall 34` 创建 `/tmp/init-mkdirat`，随后以 `openat` 创建子文件并输出 `[init] mkdirat round-trip passed`。
 - 验证：`cargo check --target riscv64gc-unknown-none-elf --all-features`、`cargo run --release --features qemu-selftest,ram-block-device` 和 VirtIO 后端的 `bash tools/qemu-smoke.sh` 均通过；QEMU selftest、用户态 mkdirat/openat round trip 和 init 正常退出全部完成。独立 target 的 `kernel-sim cargo test` 继续通过（unit 1、ELF 3、smoke 84）。
 
-#### 2026-07-27：文件系统实例、挂载实例与 PathRef 对象模型
+#### 2026-07-27：文件系统实例、挂载实例与 FInstance 对象模型
 
 - 目标与边界：只完成对象 VFS 的第一阶段所有权重构；不修改 `kernel-sim` 或禁止路径 `kernel/src/kernel.rs`，不实现 cwd/dirfd、符号链接、mount namespace、完整 mount flags、busy/lazy unmount、superblock/inode 持久化或真正的目录 dentry 遍历。
 - 所有权：新增 `FsInstance`，把根 `FileNode`、文件系统内部 `BTreeMap<String, Arc<FileNode>>`、运行期 inode allocator 和唯一 `FileStorage` 收在同一对象；`Kernel` 删除直接的 `file_storage`、`file_nodes` 和 `mnt` 字段，改为 `Kernel -> Vfs -> root Mount -> root FsInstance -> FileStorage/root/nodes`。
 - 挂载拓扑：删除 `MountEntry { prefix, target }` 字符串映射；新增带稳定 `MountId`、`Arc<FsInstance>`、弱父引用、mountpoint inode 和 flags 的 `Mount`。`MountTable` 以 `(parent MountId, InodeId)` 维护 mount stack，检查目录类型、节点所属文件系统与 parent membership，支持同一 FsInstance 多次挂载，并让 `detach_top()` 返回仍可被既有引用持有的 `Arc<Mount>`。
-- 路径与存储：新增 `PathRef { mount, node }` 和仅用于显示的 `ResolvedPath::display_path`；第一阶段 `Vfs` 仍通过各 `FsInstance::lookup()` 的完整内部路径键解析分量并跨越 mount。`FInstance::from_path/from_resolved`、path-backed write 和 exec 都从 `path_ref.mount.fs().storage()` 派生后端，不再使用全局 root storage。
-- 回归覆盖：mount 自测覆盖根挂载、两个 FsInstance 的命名空间隔离、同一 FsInstance 多处挂载、A/B stacking 与 detach 恢复、detach 后 PathRef 继续读取、普通文件 mountpoint 拒绝和 detached parent 拒绝；filesystem syscall 自测覆盖对象 mount/umount stacking，以及挂载文件的 FInstance 与 exec 使用挂载 FsInstance storage。
+- 路径与存储：`ResolvedPath::path_ref` 直接保存统一的 `FInstance { mount, node }`，`display_path` 只用于显示和 exec 命名；第一阶段 `Vfs` 仍通过各 `FsInstance::lookup()` 的完整内部路径键解析分量并跨越 mount。path-backed write、fd 和 exec 都从 `FInstance.mount.fs().storage()` 派生后端，不再使用全局 root storage 或第二份 node/storage 字段。
+- 回归覆盖：mount 自测覆盖根挂载、两个 FsInstance 的命名空间隔离、同一 FsInstance 多处挂载、A/B stacking 与 detach 恢复、detach 后 FInstance 继续读取、普通文件 mountpoint 拒绝和 detached parent 拒绝；filesystem syscall 自测覆盖对象 mount/umount stacking，以及挂载文件的 FInstance 与 exec 使用挂载 FsInstance storage。
 - 验证：`cargo fmt --check`、`cargo check --target riscv64gc-unknown-none-elf --all-features`、`cargo run --release --features qemu-selftest,ram-block-device`、VirtIO 后端 `bash tools/qemu-smoke.sh` 和 `git diff --check` 均通过。RAM 全量 selftest 通过 sync/mount/fd/fs syscall/exec 等路径，RAM 与 VirtIO 启动均完成真实用户态 mkdirat/openat round trip 和 init 正常退出；独立 target 的 `kernel-sim cargo test` 继续通过（unit 1、ELF 3、smoke 84）。
+
+#### 2026-07-27：QEMU 对象 VFS 逐路径分量目录遍历
+
+- 目标与边界：在现有 `FInstance { mount, node }`、对象 mount topology 和每文件系统唯一 `FileStorage` 基础上，完成真实“父目录 inode + 单个名字”遍历；仍只支持从根开始的绝对路径，不引入 cwd/dirfd、symlink、mount namespace、mount-root 完整父 dentry 回退或磁盘恢复。
+- 目录命名空间：`FileNode` 的目录数据改为有序 `Vec<DirEntry { name, inode }>` 加 `BTreeMap<String, InodeId> by_name`；前者保持 readdir 插入顺序，后者直接完成单分量查找。空名、带 `/`、`.`、`..` 被直接子项接口拒绝，同名绑定返回 `eexist`。
+- inode 所有权与原子创建：`FsInstance` 删除完整路径键表，改为 `BTreeMap<InodeId, Arc<FileNode>>`，新增 `lookup_inode()`、`lookup_child()`、`create_regular_at()`、`create_directory_at()` 及对应 open/install-at 接口。父对象所属、目录类型、同名检查、inode 分配、目录项发布和 inode 登记都在同一 namespace 写锁内完成；目录项指向缺失 live inode 作为内部损坏返回 `eio`。
+- walker 与创建父解析：`Vfs` 删除 `InternalResolution::fs_path` 和完整路径拼接，按原始分量顺序执行 `lookup_child()` 并在每一步按 mount/inode identity 穿越可见挂载；`..` 只有在前一分量实际存在且当前对象是目录后才回退。独立 `resolve_parent()` 只留下最后一个普通名字，因此中间 `enoent`、中间 `enotdir` 与最终名字缺失不会混淆。
+- 元数据：目录项序列化升级为 `inode_id + name_len + name`，`FNMD` header 增加版本 `2`；当前仍没有元数据反序列化/重启恢复，版本字段用于防止未来读取器把旧布局误判为新格式。
+- 回归覆盖：新增缺失分量后接 `..` 仍为 `enoent`、普通文件后接 `..` 为 `enotdir`、不同父目录同名 inode 隔离、重复 lookup 返回同一对象、direct-child 名字校验、lookup_inode 和嵌套 mount 逐分量穿越；旧 pathname 自测改为只让已经存在的目录参与 `..` alias。
+- 验证：`cargo fmt --check`、`cargo check --target riscv64gc-unknown-none-elf --all-features`、`cargo run --release --features qemu-selftest,ram-block-device`、VirtIO 后端 `bash tools/qemu-smoke.sh` 和 `git diff --check` 通过。RAM 全量 selftest、fs syscall、checkpoint、用户 signal/satp 以及 RAM/VirtIO 真实用户态 mkdirat/openat round trip 和 init 正常退出均通过。
 
 #### 2026-07-24：删除 CPU0 调度器未启动时的元数据兼容路径
 
