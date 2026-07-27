@@ -152,6 +152,14 @@ impl Kernel {
         self.install_file(path, data, true)
     }
 
+    // AGENT: create one user-requested directory atomically and reject every
+    // pre-existing node, keeping mkdirat distinct from idempotent boot install.
+    pub(crate) fn create_directory(&self, path: &str) -> Result<(), &'static str> {
+        let resolved = self.resolve_path_key(path)?;
+        let mut nodes = self.file_nodes.write().unwrap();
+        self.insert_new_child_locked(&mut nodes, resolved, Arc::new(FileNode::directory()))
+    }
+
     // AGENT: install directories parent-first while allowing an internal caller
     // to establish an ordinary or mount-backed namespace root idempotently.
     pub fn install_directory(&self, path: &str) -> Result<(), &'static str> {

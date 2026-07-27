@@ -549,6 +549,14 @@ cargo test --test pressure
 - 启动与挂载：内嵌 root image 在安装 `/bin/init` 前显式建立 `/bin` 和 init 的 openat 探针所需 `/tmp`；第一阶段字符串挂载在发布映射后建立对应的 `device:/` 根节点。挂载目标目录存在性、权限和真正文件系统实例仍未建模。
 - 回归覆盖：`qemu-fs-selftest` 新增根目录、缺失父目录、普通文件父节点、成功目录项登记和挂载后端根检查；`cargo fmt --check`、RISC-V `cargo check --all-features`、完整 `qemu-selftest,ram-block-device` 与 VirtIO `tools/qemu-smoke.sh` 验证通过，真实 init 再次输出 `[init] openat round-trip passed`。
 
+#### 2026-07-27：RISC-V `mkdirat` 系统调用
+
+- 语义来源与范围：`kernel-sim` 当前没有 `mkdir`/`mkdirat` 语义入口或回归测试，本项是用户明确要求的 QEMU 侧新增行为；后续完整目录模型迁移时，需要把严格创建语义补入 host 语义源。QEMU 侧没有新增 host 依赖，也没有可抽入 `kernel-common` 的独立纯逻辑。
+- 已完成：将 Linux asm-generic RISC-V `mkdirat(34)` 映射到内部 x86_64-style `SYS_MKDIRAT(258)`，保持 `dirfd/path/mode` 三参数布局并接入统一 syscall 分发。`Kernel::create_directory()` 在 path-table 写锁内完成规范化后的严格创建：任何既有节点返回 `eexist`，缺失父目录返回 `enoent`，普通文件父节点返回 `enotdir`，成功时同步登记父目录项；内部幂等 `install_directory()` 语义保持不变。
+- 当前边界：与第一阶段 `openat` 一致，`mkdirat` 只支持绝对路径且按 Linux 规则忽略绝对路径的 `dirfd`；相对路径在 cwd/目录 fd 解析迁移前返回 `enotsup`。`mode` 已按 ABI 接收，但权限位、umask、credential 和目录元数据权限尚未建模。
+- 回归覆盖：ABI 自测固定 syscall 号和参数布局；文件系统自测覆盖成功父子目录创建、父目录项可见性、重复创建/普通文件冲突 `eexist`、缺失父目录、非目录父节点、相对路径、空路径和错误用户指针。内嵌 init 通过真实 U-mode `ecall 34` 创建 `/tmp/init-mkdirat`，随后以 `openat` 创建子文件并输出 `[init] mkdirat round-trip passed`。
+- 验证：`cargo check --target riscv64gc-unknown-none-elf --all-features`、`cargo run --release --features qemu-selftest,ram-block-device` 和 VirtIO 后端的 `bash tools/qemu-smoke.sh` 均通过；QEMU selftest、用户态 mkdirat/openat round trip 和 init 正常退出全部完成。独立 target 的 `kernel-sim cargo test` 继续通过（unit 1、ELF 3、smoke 84）。
+
 #### 2026-07-24：删除 CPU0 调度器未启动时的元数据兼容路径
 
 - 范围：只清理 `kernel-qemu` 中阻塞、yield、停止信号、timer 死亡任务和线程/进程退出在 idle-context 调度器尚未初始化时通过修改 `current` / run queue 模拟切换的旧路径；不修改 `kernel-sim` 语义。

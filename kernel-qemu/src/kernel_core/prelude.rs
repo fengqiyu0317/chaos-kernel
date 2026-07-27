@@ -196,6 +196,7 @@ pub const AF_UNIX: u32 = 1;
 pub const SYS_READ: usize = 0;
 pub const SYS_WRITE: usize = 1;
 pub const SYS_OPENAT: usize = 257;
+pub const SYS_MKDIRAT: usize = 258;
 pub const SYS_CLOSE: usize = 3;
 pub const SYS_STAT: usize = 4;
 pub const SYS_FSTAT: usize = 5;

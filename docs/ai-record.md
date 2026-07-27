@@ -12,6 +12,55 @@
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
 
+## 2026-07-27：kernel-qemu RISC-V `mkdirat` 系统调用
+
+目标：在现有严格父目录路径表之上接通 Linux RISC-V `mkdirat` 用户 ABI，并把用户目录创建的 `EEXIST` 语义与内部幂等 `install_directory()` 分开。
+
+已完成修改：
+
+- `syscall_abi.rs` 将 asm-generic RISC-V `mkdirat(34)` 映射到内部 x86_64-style `SYS_MKDIRAT(258)`，保留 `dirfd/path/mode` 参数布局；统一 syscall dispatcher 新增 `sys_mkdirat()` 分支。
+- `sys_mkdirat()` 通过当前任务的 `AddrSpace` 复制用户路径；第一阶段仅支持绝对路径，绝对路径忽略 `dirfd`，相对路径在 cwd/目录 fd 语义迁移前返回 `enotsup`。
+- `Kernel::create_directory()` 复用持有 `file_nodes` 写锁的统一插入入口，规范路径已存在时返回 `eexist`，缺失父目录返回 `enoent`，普通文件父节点返回 `enotdir`，成功后登记父目录项。内部启动和挂载继续使用幂等 `install_directory()`。
+- ABI 与文件系统自测覆盖编号/参数布局、成功父子目录创建、父目录项可见性、重复创建、普通文件冲突、缺失父目录、非目录父节点、相对/空路径和错误用户指针。
+- 内嵌 `/bin/init` 使用真实 U-mode `ecall 34` 创建 `/tmp/init-mkdirat`，再以 `openat` 在其中创建子文件；普通 smoke 新增 `[init] mkdirat round-trip passed` 验收标记。
+- `TASK.md` 记录语义来源和边界：`kernel-sim` 当前没有 `mkdir`/`mkdirat` 语义源；`mode` 已按 ABI 接收，但权限位、umask 和 credential 尚未建模。
+
+关键文件：
+
+- `kernel-qemu/src/syscall_abi.rs`
+- `kernel-qemu/src/syscall/dispatch.rs`
+- `kernel-qemu/src/syscall/fs.rs`
+- `kernel-qemu/src/kernel_core/kernel_ops/fs_store.rs`
+- `kernel-qemu/src/syscall/fs_tests.rs`
+- `kernel-qemu/user/init.rs`
+- `tools/qemu-smoke.sh`
+- `TASK.md`
+- `docs/ai-record.md`
+
+测试结果：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo check --target riscv64gc-unknown-none-elf --all-features
+cargo run --release --features qemu-selftest,ram-block-device
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check
+
+cd kernel-sim
+CARGO_TARGET_DIR=/tmp/chaos-kernel-sim-mkdirat cargo test
+```
+
+结果：全部通过。RAM 后端完整 QEMU selftest 与 VirtIO 普通 smoke 都观测到真实用户态 `[init] mkdirat round-trip passed`、后续 openat round trip 和正常 init exit；`kernel-sim` 回归为 unit 1、ELF 3、smoke 84 全部通过。
+
+当前边界：
+
+- 相对路径、cwd 和目录 fd 解析尚未迁移；`mode` 不产生真实权限元数据。
+- 当前目录模型仍是完整路径键表，不包含逐分量 VFS、符号链接或完整挂载实例语义。
+- 不修改禁止路径 `kernel/src/kernel.rs`，不修改 `kernel-sim` 实现。
+
 ## 2026-07-27：kernel-qemu 路径创建的严格父目录语义
 
 目标：修正 `openat(O_CREAT)` 在父路径不存在时仍创建全局路径节点的问题，在当前完整路径键表架构内建立根目录、直接父目录和目录项的一致性边界。

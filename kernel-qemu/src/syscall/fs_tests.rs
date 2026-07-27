@@ -2,12 +2,13 @@
 // pool, current init task, Sv39 mappings, and authoritative AddrSpace usercopy.
 use super::*;
 use crate::syscall_abi::{
-    map_riscv_nr, INTERNAL_SYS_MOUNT, INTERNAL_SYS_OPENAT, INTERNAL_SYS_UMOUNT2, RISCV_SYS_MOUNT,
-    RISCV_SYS_OPENAT, RISCV_SYS_UMOUNT2,
+    map_riscv_nr, INTERNAL_SYS_MKDIRAT, INTERNAL_SYS_MOUNT, INTERNAL_SYS_OPENAT,
+    INTERNAL_SYS_UMOUNT2, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT, RISCV_SYS_OPENAT, RISCV_SYS_UMOUNT2,
 };
 
 const USER_STRINGS_BASE: usize = 0x4000_0000;
 const OPEN_USER_BASE: usize = 0x4001_0000;
+const MKDIR_USER_BASE: usize = 0x4002_0000;
 
 // AGENT: Run filesystem ABI and semantic regressions after QEMU installs the
 // real kernel frame pool, current init task, Sv39 mappings, and fd table.
@@ -18,6 +19,7 @@ pub fn run_all(kernel: &Kernel) {
     mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel);
     path_creation_requires_an_existing_directory_parent(kernel);
     pathname_lookup_returns_shared_file_node(kernel);
+    mkdirat_creates_only_new_absolute_directories(kernel);
     openat_uses_transactional_fd_and_path_state(kernel);
 }
 
@@ -269,6 +271,172 @@ fn pathname_lookup_returns_shared_file_node(kernel: &Kernel) {
         .mnt
         .umount("/lookup-mnt")
         .expect("lookup test mount should uninstall");
+}
+
+// AGENT: verify the live mkdirat ABI, strict EEXIST behavior, parent errors,
+// absolute-path-only contract, usercopy, and parent directory bookkeeping.
+#[cfg_attr(test, test)]
+fn mkdirat_creates_only_new_absolute_directories(kernel: &Kernel) {
+    assert_eq!(map_riscv_nr(RISCV_SYS_MKDIRAT), Some(INTERNAL_SYS_MKDIRAT));
+
+    let task = kernel.cur_task(0).expect("init task should be current");
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .map_region(
+            VmRegion::new(MKDIR_USER_BASE, PAGE_SZ, VM_READ | VM_WRITE),
+            &kernel.pool,
+        )
+        .expect("mkdirat user page should map");
+
+    let parent_addr = MKDIR_USER_BASE;
+    let child_addr = MKDIR_USER_BASE + 128;
+    let missing_parent_addr = MKDIR_USER_BASE + 256;
+    let regular_addr = MKDIR_USER_BASE + 384;
+    let below_regular_addr = MKDIR_USER_BASE + 512;
+    let relative_addr = MKDIR_USER_BASE + 640;
+    let empty_addr = MKDIR_USER_BASE + 768;
+    write_user_string(kernel, &task, parent_addr, "/qemu-mkdirat-parent");
+    write_user_string(kernel, &task, child_addr, "/qemu-mkdirat-parent/child");
+    write_user_string(
+        kernel,
+        &task,
+        missing_parent_addr,
+        "/qemu-mkdirat-missing/child",
+    );
+    write_user_string(kernel, &task, regular_addr, "/qemu-mkdirat-regular");
+    write_user_string(
+        kernel,
+        &task,
+        below_regular_addr,
+        "/qemu-mkdirat-regular/child",
+    );
+    write_user_string(kernel, &task, relative_addr, "relative-mkdirat");
+    write_user_string(kernel, &task, empty_addr, "");
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MKDIRAT,
+            usize::MAX - 99,
+            parent_addr,
+            0o750,
+            0,
+            0,
+            0,
+        ),
+        Ok(0)
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MKDIRAT,
+            usize::MAX - 99,
+            child_addr,
+            0o700,
+            0,
+            0,
+            0,
+        ),
+        Ok(0)
+    );
+    let parent = kernel
+        .lookup_file_node("/qemu-mkdirat-parent")
+        .expect("mkdirat parent should exist");
+    let child = kernel
+        .lookup_file_node("/qemu-mkdirat-parent/child")
+        .expect("mkdirat child should exist");
+    assert_eq!(parent.node.kind, FileKind::Directory);
+    assert_eq!(parent.node.dir_entry_at(0), Ok(String::from("child")));
+    assert_eq!(child.node.kind, FileKind::Directory);
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MKDIRAT,
+            usize::MAX - 99,
+            child_addr,
+            0o700,
+            0,
+            0,
+            0,
+        ),
+        Err("eexist")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MKDIRAT,
+            usize::MAX - 99,
+            missing_parent_addr,
+            0o700,
+            0,
+            0,
+            0,
+        ),
+        Err("enoent")
+    );
+
+    kernel
+        .install_file("/qemu-mkdirat-regular", Vec::new(), false)
+        .expect("mkdirat regular-file fixture should install");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MKDIRAT,
+            usize::MAX - 99,
+            regular_addr,
+            0o700,
+            0,
+            0,
+            0,
+        ),
+        Err("eexist")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MKDIRAT,
+            usize::MAX - 99,
+            below_regular_addr,
+            0o700,
+            0,
+            0,
+            0,
+        ),
+        Err("enotdir")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MKDIRAT,
+            usize::MAX - 99,
+            relative_addr,
+            0o700,
+            0,
+            0,
+            0,
+        ),
+        Err("enotsup")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MKDIRAT,
+            usize::MAX - 99,
+            empty_addr,
+            0o700,
+            0,
+            0,
+            0,
+        ),
+        Err("enoent")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MKDIRAT,
+            usize::MAX - 99,
+            MKDIR_USER_BASE + PAGE_SZ * 2,
+            0o700,
+            0,
+            0,
+            0,
+        ),
+        Err("efault")
+    );
 }
 
 // AGENT: verify the live openat ABI, OFD flags, independent open offsets,

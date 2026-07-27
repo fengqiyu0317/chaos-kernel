@@ -44,6 +44,8 @@ grep -F "[kernel-qemu] timer wheel target observed" "$LOG"
 grep -F "[kernel-qemu] installed embedded /bin/init" "$LOG"
 grep -F "[kernel-qemu] CPU0 scheduler start" "$LOG"
 grep -F "[init] userspace /bin/init reached" "$LOG"
+# AGENT: require a real U-mode mkdirat ecall before openat creates its child.
+grep -F "[init] mkdirat round-trip passed" "$LOG"
 # AGENT: require the real U-mode openat -> regular-file write round trip.
 grep -F "[init] openat round-trip passed" "$LOG"
 grep -F "[kernel-qemu] init process exited" "$LOG"

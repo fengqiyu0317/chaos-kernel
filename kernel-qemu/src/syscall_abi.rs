@@ -5,6 +5,7 @@ use crate::trap::TrapFrame;
 pub const ENOSYS_RET: usize = (-38isize) as usize;
 
 // AGENT: Linux asm-generic syscall numbers used by the RISC-V ABI.
+pub const RISCV_SYS_MKDIRAT: usize = 34;
 pub const RISCV_SYS_UMOUNT2: usize = 39;
 pub const RISCV_SYS_MOUNT: usize = 40;
 pub const RISCV_SYS_OPENAT: usize = 56;
@@ -26,6 +27,7 @@ pub const INTERNAL_SYS_EXIT: usize = 60;
 pub const INTERNAL_SYS_EXIT_GROUP: usize = 231;
 pub const INTERNAL_SYS_GETPID: usize = 39;
 pub const INTERNAL_SYS_KILL: usize = 62;
+pub const INTERNAL_SYS_MKDIRAT: usize = 258;
 pub const INTERNAL_SYS_MOUNT: usize = 165;
 pub const INTERNAL_SYS_RT_SIGACTION: usize = 13;
 pub const INTERNAL_SYS_RT_SIGPROCMASK: usize = 14;
@@ -44,6 +46,7 @@ pub struct SyscallRequest {
 // AGENT: Convert the small first-stage RISC-V syscall set to kernel-sim-style ids.
 pub fn map_riscv_nr(nr: usize) -> Option<usize> {
     match nr {
+        RISCV_SYS_MKDIRAT => Some(INTERNAL_SYS_MKDIRAT),
         RISCV_SYS_UMOUNT2 => Some(INTERNAL_SYS_UMOUNT2),
         RISCV_SYS_MOUNT => Some(INTERNAL_SYS_MOUNT),
         RISCV_SYS_OPENAT => Some(INTERNAL_SYS_OPENAT),
@@ -197,6 +200,7 @@ pub mod tests {
 
     pub fn run_all() {
         standard_errno_names_use_linux_riscv_numbers();
+        mkdirat_maps_to_the_three_argument_internal_entry();
         openat_maps_to_the_four_argument_internal_entry();
         signal_syscalls_map_to_migrated_semantics();
     }
@@ -216,6 +220,19 @@ pub mod tests {
         ] {
             assert_eq!(errno_ret(name), (-(errno as isize)) as usize);
         }
+    }
+
+    // AGENT: preserve mkdirat's dirfd/path/mode layout while translating the
+    // Linux asm-generic RISC-V number into the internal syscall namespace.
+    #[cfg_attr(test, test)]
+    fn mkdirat_maps_to_the_three_argument_internal_entry() {
+        let mut frame = TrapFrame::new();
+        frame.regs[10..16].copy_from_slice(&[usize::MAX - 99, 0x3000, 0o750, 4, 5, 6]);
+        frame.regs[17] = RISCV_SYS_MKDIRAT;
+
+        let request = decode_from_trap_frame(&frame);
+        assert_eq!(request.internal_nr, Some(INTERNAL_SYS_MKDIRAT));
+        assert_eq!(request.args, [usize::MAX - 99, 0x3000, 0o750, 4, 5, 6]);
     }
 
     // AGENT: preserve openat's dirfd/path/flags/mode argument layout while the

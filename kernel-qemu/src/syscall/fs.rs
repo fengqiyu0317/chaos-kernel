@@ -233,6 +233,26 @@ pub(super) fn sys_openat(
     do_open(kernel, &task, &path, flags, mode)
 }
 
+// AGENT: expose Linux RISC-V mkdirat while the first pathname stage supports
+// absolute paths only; mode is accepted but permission metadata is not modeled.
+pub(super) fn sys_mkdirat(
+    kernel: &Kernel,
+    _dirfd: usize,
+    path_addr: usize,
+    _mode: usize,
+) -> Result<usize, &'static str> {
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    let path = read_user_path(&task, path_addr)?;
+    if path.is_empty() {
+        return Err("enoent");
+    }
+    if !path.starts_with('/') {
+        return Err("enotsup");
+    }
+    kernel.create_directory(&path)?;
+    Ok(0)
+}
+
 pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
     let fd = a0;
     // AGENT: use the fd limit instead of the process-count constant.
