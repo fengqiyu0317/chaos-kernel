@@ -82,6 +82,10 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     // still-non-mountable FileNode metadata format.
     #[cfg(feature = "qemu-virtio-blk-smoke")]
     run_virtio_blk_raw_smoke(frame_pool.as_ref().clone());
+    // AGENT: keep recoverable ChaosFs validation separate from the raw-sector
+    // transport smoke and exercise two boots through an explicit format/mount split.
+    #[cfg(feature = "qemu-chaosfs-smoke")]
+    run_chaosfs_persistence_smoke(frame_pool.as_ref().clone());
     #[cfg(feature = "qemu-boot-smoke")]
     heap::smoke_check();
     kernel::kernel_core::init_timer_wheel();
@@ -281,6 +285,101 @@ fn run_virtio_blk_raw_smoke(frame_pool: kernel::FramePool) {
     sbi::shutdown()
 }
 
+// AGENT: format only a blank VirtIO device on the first boot, then require the
+// second boot to mount its superblock, recover a nested file, and allocate new
+// blocks without overwriting the recovered file.
+#[cfg(feature = "qemu-chaosfs-smoke")]
+fn run_chaosfs_persistence_smoke(frame_pool: kernel::FramePool) {
+    const SOURCE: &str = "virtio0";
+    const TARGET: &str = "/mnt";
+    const OLD_FILE: &str = "/mnt/a/file";
+    const NEW_FILE: &str = "/mnt/a/new";
+    const OLD_MAGIC: &[u8] = b"CHAOSFS-PERSIST-v1";
+
+    let device = drivers::virtio_blk::probe_root_block(frame_pool)
+        .expect("ChaosFs persistence smoke requires a block device");
+    let recovered = match kernel::ChaosFs::mount(kernel::ROOT_FS_ID, device.clone(), 1) {
+        Ok(fs) => Some(fs),
+        Err("enodev") => None,
+        Err(error) => panic!("ChaosFs smoke mount failed: {}", error),
+    };
+    let fs = match recovered {
+        Some(fs) => fs,
+        None => {
+            assert!(
+                kernel::ChaosFs::superblock_is_blank(device.as_ref())
+                    .expect("ChaosFs smoke should read its blank superblock"),
+                "ChaosFs smoke refuses to format a nonblank unknown device"
+            );
+            let fs = kernel::ChaosFs::format(kernel::ROOT_FS_ID, device, 1)
+                .expect("blank ChaosFs smoke device should format");
+            println!("[chaosfs-smoke] formatted source={}", SOURCE);
+            fs
+        }
+    };
+
+    let namespace_root = kernel::FsInstance::new(2, kernel::FileStorage::standalone());
+    let vfs = kernel::Vfs::new(namespace_root);
+    vfs.install_directory(TARGET)
+        .expect("ChaosFs smoke mountpoint should install");
+    vfs.register_source(SOURCE, fs.clone())
+        .expect("ChaosFs smoke source should register");
+    vfs.mount_source(
+        SOURCE,
+        TARGET,
+        kernel::FsKind::ChaosFs,
+        kernel::MountFlags::empty(),
+    )
+    .expect("ChaosFs smoke source should mount");
+
+    if vfs.resolve(OLD_FILE).is_err() {
+        vfs.create_directory("/mnt/a")
+            .expect("ChaosFs smoke directory should create");
+        let mut old_data = alloc::vec![0x5a; kernel::BLOCK_CACHE_BLOCK_SIZE * 3 + 37];
+        old_data[..OLD_MAGIC.len()].copy_from_slice(OLD_MAGIC);
+        vfs.install_regular(OLD_FILE, &old_data, false)
+            .expect("ChaosFs smoke file should create");
+        fs.flush()
+            .expect("ChaosFs smoke first boot should flush filesystem metadata");
+        println!(
+            "[chaosfs-smoke] persisted file written bytes={}",
+            old_data.len()
+        );
+        sbi::shutdown()
+    }
+
+    let mut expected = alloc::vec![0x5a; kernel::BLOCK_CACHE_BLOCK_SIZE * 3 + 37];
+    expected[..OLD_MAGIC.len()].copy_from_slice(OLD_MAGIC);
+    let recovered_file = vfs
+        .resolve(OLD_FILE)
+        .expect("ChaosFs smoke persisted file should resolve");
+    let mut actual = alloc::vec![0u8; expected.len()];
+    assert_eq!(
+        recovered_file.path_ref.read_at(0, &mut actual),
+        Ok(expected.len()),
+        "ChaosFs smoke persisted file length mismatch"
+    );
+    assert_eq!(actual, expected, "ChaosFs smoke persisted bytes mismatch");
+    println!("[chaosfs-smoke] recovered file bytes={}", actual.len());
+
+    let new_data = alloc::vec![0xa5; kernel::BLOCK_CACHE_BLOCK_SIZE * 2 + 19];
+    vfs.install_regular(NEW_FILE, &new_data, false)
+        .expect("ChaosFs smoke new file should allocate after recovery");
+    fs.flush()
+        .expect("ChaosFs smoke second boot should flush new allocation");
+    let mut old_after_new = alloc::vec![0u8; expected.len()];
+    assert_eq!(
+        vfs.resolve(OLD_FILE)
+            .expect("ChaosFs smoke old file should remain reachable")
+            .path_ref
+            .read_at(0, &mut old_after_new),
+        Ok(expected.len())
+    );
+    assert_eq!(old_after_new, expected);
+    println!("[chaosfs-smoke] allocator preserved recovered file");
+    sbi::shutdown()
+}
+
 // AGENT: provide a disposable installed Kernel for boot selftests that require
 // live usercopy or checkpoint state without contaminating production scheduling.
 #[cfg(any(feature = "qemu-fs-selftest", feature = "qemu-checkpoint-selftest"))]
@@ -332,6 +431,9 @@ fn install_embedded_root_init(
     kernel.install_directory("/bin")?;
     kernel.install_directory("/tmp")?;
     kernel.install_exec_file("/bin/init", Vec::from(init_elf))?;
+    // AGENT: publish the complete boot namespace through the ChaosFs inode table
+    // and bitmap before init begins, so a later boot can mount rather than rebuild it.
+    kernel.vfs.root_fs().flush()?;
     Ok(true)
 }
 

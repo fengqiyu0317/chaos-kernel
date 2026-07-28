@@ -29,6 +29,8 @@ pub fn run_all(pool: &FramePool) {
     crate::kernel::fs::block_device::tests::run_all();
     #[cfg(feature = "qemu-sync-selftest")]
     crate::kernel::fs::block_cache::tests::run_all();
+    #[cfg(feature = "qemu-sync-selftest")]
+    crate::kernel::fs::fs_instance::tests::run_all();
     crate::kernel::fs::fd::tests::run_all();
     // AGENT: Follow the mount-table selftests to their dedicated module after
     // splitting mount_io_disk into separate responsibilities.

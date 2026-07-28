@@ -1,5 +1,6 @@
 // AGENT: isolate the FileNode metadata image format and its backend block
 // ownership from live inode, directory, and regular-file mutation semantics.
+use super::super::le_codec::LeReader;
 use super::*;
 
 const FILE_NODE_METADATA_MAGIC: &[u8; 4] = b"FNMD";
@@ -85,6 +86,34 @@ impl FileMetadata {
         }
     }
 
+    // AGENT: adopt validated metadata locators from the inode table without
+    // allocating new blocks or treating locator ids as FNMD payload fields.
+    pub(super) fn from_ids(backend: &FileStorage, ids: &[usize]) -> Result<Self, &'static str> {
+        if ids.is_empty() {
+            return Err("eio");
+        }
+        Ok(Self {
+            blocks: Mutex::new(FileNodeBlocks::from_ids(backend, ids)?),
+        })
+    }
+
+    // AGENT: read and decode the complete zero-padded FNMD block sequence named
+    // by one inode-table entry.
+    pub(super) fn decode_from_blocks(
+        backend: &FileStorage,
+        ids: &[usize],
+    ) -> Result<RecoveredNodeState, &'static str> {
+        if ids.is_empty() {
+            return Err("eio");
+        }
+        let capacity = ids.len().checked_mul(BLOCK_CACHE_BLOCK_SIZE).ok_or("eio")?;
+        let mut payload = Vec::with_capacity(capacity);
+        for &id in ids {
+            payload.extend_from_slice(&backend.read_block(id)?);
+        }
+        decode_metadata_payload(&payload)
+    }
+
     // AGENT: size a current or prospective metadata image without allocating;
     // callers can release live-state locks before reserving backend blocks.
     fn encoded_len_for_state(
@@ -147,6 +176,12 @@ impl FileMetadata {
     // and focused QEMU regressions, without leaking backend locator ids.
     pub(super) fn block_count(&self) -> usize {
         self.blocks.lock().unwrap().len()
+    }
+
+    // AGENT: snapshot metadata locators only for filesystem-wide inode-table
+    // persistence; FNMD itself remains free of self-referential block ids.
+    pub(super) fn block_ids(&self) -> Vec<usize> {
+        self.blocks.lock().unwrap().ids().collect()
     }
 }
 
@@ -254,7 +289,7 @@ impl FileNode {
 
     // AGENT: calculate a prospective regular-file image under the directory
     // lock, then release live state before fallible metadata-block allocation.
-    fn reserve_data_layout(
+    pub(super) fn reserve_data_layout(
         &self,
         backend: &FileStorage,
         data_blocks: usize,
@@ -308,4 +343,86 @@ fn put_metadata_u64(payload: &mut Vec<u8>, value: usize) -> Result<(), &'static 
     let value = u64::try_from(value).map_err(|_| "efbig")?;
     put_metadata_bytes(payload, &value.to_le_bytes());
     Ok(())
+}
+
+// AGENT: decode the stable little-endian FNMD v2 image with strict bounds,
+// flag, kind, UTF-8, block-count, and zero-padding validation.
+fn decode_metadata_payload(payload: &[u8]) -> Result<RecoveredNodeState, &'static str> {
+    let mut reader = LeReader::new(payload);
+    if reader.take(FILE_NODE_METADATA_MAGIC.len())? != FILE_NODE_METADATA_MAGIC {
+        return Err("eio");
+    }
+    if reader.u8()? != FILE_NODE_METADATA_VERSION {
+        return Err("eio");
+    }
+    let kind = match reader.u8()? {
+        1 => FileKind::Regular,
+        2 => FileKind::Directory,
+        _ => return Err("eio"),
+    };
+    let executable = match reader.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err("eio"),
+    };
+    let byte_len = usize::try_from(reader.u64()?).map_err(|_| "eio")?;
+    let data_block_count = usize::try_from(reader.u64()?).map_err(|_| "eio")?;
+    let entry_count = usize::try_from(reader.u64()?).map_err(|_| "eio")?;
+
+    if data_block_count > reader.remaining() / 8 {
+        return Err("eio");
+    }
+    let mut data_blocks = Vec::with_capacity(data_block_count);
+    for _ in 0..data_block_count {
+        let stored = reader.u64()?;
+        let block = stored.checked_sub(1).ok_or("eio")?;
+        data_blocks.push(usize::try_from(block).map_err(|_| "eio")?);
+    }
+
+    if entry_count > reader.remaining() / 16 {
+        return Err("eio");
+    }
+    let mut entries = Vec::with_capacity(entry_count);
+    let mut names = BTreeSet::new();
+    for _ in 0..entry_count {
+        let inode = reader.u64()?;
+        if inode == 0 {
+            return Err("eio");
+        }
+        let name_len = usize::try_from(reader.u64()?).map_err(|_| "eio")?;
+        let name = core::str::from_utf8(reader.take(name_len)?)
+            .map_err(|_| "eio")?
+            .to_string();
+        ChildName::new(&name).map_err(|_| "eio")?;
+        if !names.insert(name.clone()) {
+            return Err("eio");
+        }
+        entries.push(DirEntry { name, inode });
+    }
+
+    if reader.remaining_bytes().iter().any(|&byte| byte != 0) {
+        return Err("eio");
+    }
+    match kind {
+        FileKind::Regular => {
+            if !entries.is_empty()
+                || blocks_for_len(byte_len).map_err(|_| "eio")? != data_blocks.len()
+            {
+                return Err("eio");
+            }
+        }
+        FileKind::Directory => {
+            if executable || byte_len != 0 || !data_blocks.is_empty() {
+                return Err("eio");
+            }
+        }
+    }
+
+    Ok(RecoveredNodeState {
+        kind,
+        executable,
+        byte_len,
+        data_blocks,
+        entries,
+    })
 }

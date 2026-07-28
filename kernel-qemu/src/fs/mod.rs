@@ -19,6 +19,9 @@ pub mod flike;
 pub mod fs_instance;
 // AGENT: Isolate the block-I/O request queue from mount and disk behavior.
 pub mod io_queue;
+// AGENT: share checked little-endian disk reads and fixed-region writes without
+// coupling inode metadata to filesystem-instance recovery.
+mod le_codec;
 // AGENT: Isolate mount-table path resolution from I/O scheduling and devices.
 pub mod mount;
 pub mod pipe;

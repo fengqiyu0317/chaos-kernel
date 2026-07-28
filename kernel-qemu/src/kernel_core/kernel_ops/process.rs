@@ -22,7 +22,7 @@ impl Kernel {
         self.finish_process_exit(cpu, task, &process, thread_ids);
     }
 
-    // AGENT: shut down when the designated init reaches process-wide exit;
+    // AGENT: flush the persistent root namespace before init-triggered shutdown;
     // otherwise retire every Task, release shared state, reparent, publish
     // Zombie, and notify both the old parent and init about adopted zombies.
     pub(crate) fn finish_process_exit(
@@ -37,6 +37,9 @@ impl Kernel {
             .init_process()
             .is_some_and(|init| Arc::ptr_eq(&init, process))
         {
+            if let Err(error) = self.vfs.root_fs().flush() {
+                crate::println!("[kernel-qemu] root filesystem flush failed: {}", error);
+            }
             crate::println!("[kernel-qemu] init process exited");
             crate::sbi::shutdown();
         }

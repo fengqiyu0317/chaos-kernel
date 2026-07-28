@@ -32,6 +32,20 @@ impl FileBlockAllocator {
         }
     }
 
+    // AGENT: rebuild exact block ownership from a validated on-disk bitmap so
+    // later allocations cannot reuse superblock, metadata, or file-data blocks.
+    pub(crate) fn from_allocated(limit: usize, allocated: &[usize]) -> Result<Self, &'static str> {
+        let mut state = AllocatorState::new(limit);
+        for &block in allocated {
+            if state.reserve(block).is_none() {
+                return Err("eio");
+            }
+        }
+        Ok(Self {
+            state: Mutex::new(state),
+        })
+    }
+
     // AGENT: prefer cleared blocks returned by FileBlock RAII drops, falling
     // back to the next never-used block inside the fixed RAM-device capacity.
     fn allocate_id(&self) -> Result<usize, &'static str> {
@@ -49,6 +63,17 @@ impl FileBlockAllocator {
         );
     }
 
+    // AGENT: require recovered FileBlock wrappers to correspond to bitmap-owned
+    // ids before live inode state adopts them.
+    fn owns(&self, block: usize) -> bool {
+        self.state.lock().unwrap().is_allocated(block)
+    }
+
+    // AGENT: snapshot current ownership for a stable block-bitmap commit.
+    pub(crate) fn allocated_ids(&self) -> Vec<usize> {
+        self.state.lock().unwrap().allocated_ids()
+    }
+
     // AGENT: expose allocator reuse to focused fd/qemu-sync regressions without
     // making the free-list shape part of the normal filesystem API.
     #[cfg(any(test, feature = "qemu-sync-selftest"))]
@@ -63,6 +88,7 @@ struct FileStorageInner {
     cache: Arc<BlockCache>,
     device: Arc<dyn BlockDevice>,
     allocator: Arc<FileBlockAllocator>,
+    reclaim_on_drop: AtomicBool,
 }
 
 impl FileStorageInner {
@@ -77,6 +103,7 @@ impl FileStorageInner {
             cache,
             device,
             allocator,
+            reclaim_on_drop: AtomicBool::new(true),
         }
     }
 }
@@ -118,7 +145,8 @@ impl Drop for FileBlock {
     // AGENT: make block release RAII-based; if best-effort clearing fails during
     // an implicit drop, leak the block instead of reusing stale contents.
     fn drop(&mut self) {
-        if self.clear_for_release().is_ok() {
+        if self.storage.reclaim_on_drop.load(Ordering::Acquire) && self.clear_for_release().is_ok()
+        {
             self.storage.allocator.release_owned(self.id);
         }
     }
@@ -173,14 +201,23 @@ impl FileStorage {
         Ok(FileBlock::new(id, self.inner.clone()))
     }
 
-    fn read_block(&self, block: usize) -> Result<Vec<u8>, &'static str> {
+    // AGENT: adopt one block already reserved by a recovered bitmap without
+    // allocating it a second time or creating a second storage backend.
+    fn adopt_block(&self, id: usize) -> Result<FileBlock, &'static str> {
+        if id >= self.inner.device.block_count() || !self.inner.allocator.owns(id) {
+            return Err("eio");
+        }
+        Ok(FileBlock::new(id, self.inner.clone()))
+    }
+
+    pub(crate) fn read_block(&self, block: usize) -> Result<Vec<u8>, &'static str> {
         self.inner
             .cache
             .read_block_cached(self.inner.device.as_ref(), ROOT_BLOCK_DEVICE, block)
     }
 
     // AGENT: route file-block writes through BlockCache's write-back path.
-    fn write_block(&self, block: usize, data: &[u8]) -> Result<(), &'static str> {
+    pub(crate) fn write_block(&self, block: usize, data: &[u8]) -> Result<(), &'static str> {
         self.inner.cache.write_block_cached(
             self.inner.device.as_ref(),
             ROOT_BLOCK_DEVICE,
@@ -191,10 +228,27 @@ impl FileStorage {
 
     // AGENT: write every dirty cache slot to the device before issuing the
     // backend flush that makes completed writes stable across guest restart.
-    fn flush(&self) -> Result<usize, &'static str> {
+    pub(crate) fn flush(&self) -> Result<usize, &'static str> {
         let flushed = self.inner.cache.flush_dirty(self.inner.device.as_ref())?;
         self.inner.device.flush()?;
         Ok(flushed)
+    }
+
+    // AGENT: expose device capacity to the persistent-layout validator without
+    // leaking the concrete RAM or VirtIO transport.
+    pub(crate) fn block_count(&self) -> usize {
+        self.inner.device.block_count()
+    }
+
+    // AGENT: preserve persistent disk contents when the final live FsInstance
+    // is torn down; unlink/truncate reclamation still occurs while it is active.
+    pub(crate) fn disarm_reclamation(&self) {
+        self.inner.reclaim_on_drop.store(false, Ordering::Release);
+    }
+
+    // AGENT: snapshot the one allocator shared by all nodes in this filesystem.
+    pub(crate) fn allocated_block_ids(&self) -> Vec<usize> {
+        self.inner.allocator.allocated_ids()
     }
 
     // AGENT: expose allocator reuse to fd regressions without leaking raw block
@@ -236,6 +290,16 @@ impl FileNodeBlocks {
     fn ids(&self) -> impl Iterator<Item = usize> + '_ {
         self.blocks.iter().map(FileBlock::id)
     }
+
+    // AGENT: reconstruct RAII block wrappers only after mount-time validation
+    // has reserved every referenced id in the shared allocator bitmap.
+    fn from_ids(backend: &FileStorage, ids: &[usize]) -> Result<Self, &'static str> {
+        let mut blocks = Vec::with_capacity(ids.len());
+        for &id in ids {
+            blocks.push(backend.adopt_block(id)?);
+        }
+        Ok(Self { blocks })
+    }
 }
 
 // AGENT: share one overflow-checked byte-to-block conversion between regular
@@ -265,6 +329,16 @@ pub struct DirEntry {
     pub inode: InodeId,
 }
 
+// AGENT: carry one fully decoded FNMD image through mount-time validation before
+// any live FileNode adopts its data or metadata block ownership.
+pub(crate) struct RecoveredNodeState {
+    pub(crate) kind: FileKind,
+    pub(crate) executable: bool,
+    pub(crate) byte_len: usize,
+    pub(crate) data_blocks: Vec<usize>,
+    pub(crate) entries: Vec<DirEntry>,
+}
+
 // AGENT: preserve insertion order for readdir while indexing direct children
 // by name for component lookup inside the owning FsInstance namespace lock.
 #[derive(Debug)]
@@ -279,6 +353,18 @@ impl DirectoryData {
             entries: Vec::new(),
             by_name: BTreeMap::new(),
         }
+    }
+
+    // AGENT: rebuild both ordered and indexed directory views from one validated
+    // disk image while rejecting duplicate child names.
+    fn from_entries(entries: Vec<DirEntry>) -> Result<Self, &'static str> {
+        let mut by_name = BTreeMap::new();
+        for entry in entries.iter() {
+            if by_name.insert(entry.name.clone(), entry.inode).is_some() {
+                return Err("eio");
+            }
+        }
+        Ok(Self { entries, by_name })
     }
 }
 
@@ -331,6 +417,50 @@ impl FileNode {
             metadata: FileMetadata::empty(),
             directory: Mutex::new(DirectoryData::empty()),
         }
+    }
+
+    // AGENT: decode one inode image through the private FNMD implementation while
+    // leaving cross-inode ownership and reachability checks to ChaosFs::mount.
+    pub(crate) fn decode_persisted(
+        backend: &FileStorage,
+        metadata_blocks: &[usize],
+    ) -> Result<RecoveredNodeState, &'static str> {
+        FileMetadata::decode_from_blocks(backend, metadata_blocks)
+    }
+
+    // AGENT: construct one live inode only after the mount loader has validated
+    // every block reference, directory edge, and bitmap ownership relation.
+    pub(crate) fn recover(
+        id: InodeId,
+        backend: &FileStorage,
+        metadata_blocks: &[usize],
+        state: RecoveredNodeState,
+    ) -> Result<Arc<Self>, &'static str> {
+        let storage = FileNodeData {
+            blocks: FileNodeBlocks::from_ids(backend, &state.data_blocks)?,
+            byte_len: state.byte_len,
+        };
+        let directory = DirectoryData::from_entries(state.entries)?;
+        let metadata = FileMetadata::from_ids(backend, metadata_blocks)?;
+        Ok(Arc::new(Self {
+            id,
+            kind: state.kind,
+            executable: AtomicBool::new(state.executable),
+            mutation: Mutex::new(()),
+            storage: Mutex::new(storage),
+            metadata,
+            directory: Mutex::new(directory),
+        }))
+    }
+
+    // AGENT: serialize a stable inode image and return its backend locators for
+    // the filesystem-wide inode table committed by FsInstance::flush.
+    pub(crate) fn sync_metadata(&self, backend: &FileStorage) -> Result<Vec<usize>, &'static str> {
+        let _mutation = self.mutation.lock().unwrap();
+        let data_blocks = self.storage.lock().unwrap().blocks.len();
+        self.reserve_data_layout(backend, data_blocks)?;
+        self.persist_state(backend)?;
+        Ok(self.metadata.block_ids())
     }
 
     // AGENT: expose the stable runtime inode identity allocated by FsInstance

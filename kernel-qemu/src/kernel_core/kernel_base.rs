@@ -110,13 +110,18 @@ impl Kernel {
         block_device: Arc<dyn BlockDevice>,
         cache_chains: usize,
     ) -> Self {
-        let file_blocks = Arc::new(FileBlockAllocator::new(block_device.block_count()));
-        let file_storage = FileStorage::new(
-            Arc::new(BlockCache::new(cache_chains)),
-            block_device,
-            file_blocks,
-        );
-        let root_fs = FsInstance::new(ROOT_FS_ID, file_storage);
+        // AGENT: mount an existing ChaosFs without formatting it; only a device
+        // with no ChaosFs magic follows the caller-visible empty-device policy.
+        let root_fs = match ChaosFs::mount(ROOT_FS_ID, block_device.clone(), cache_chains) {
+            Ok(fs) => fs,
+            Err("enodev")
+                if ChaosFs::superblock_is_blank(block_device.as_ref()).unwrap_or(false) =>
+            {
+                ChaosFs::format(ROOT_FS_ID, block_device, cache_chains)
+                    .expect("blank root block device should format as ChaosFs")
+            }
+            Err(error) => panic!("root ChaosFs recovery failed: {}", error),
+        };
         let vfs = Vfs::new(root_fs.clone());
         // AGENT: Publish the already-live root filesystem under an explicit
         // runtime source name without pretending that a /dev node exists.

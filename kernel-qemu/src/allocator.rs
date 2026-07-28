@@ -1,6 +1,7 @@
 // AGENT: keep the original BTreeSet-backed recycled-id policy for upper-layer
 // resources now that physical frames use independent preallocated metadata.
 use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
 
 // AGENT: keep the exclusive resource limit beside the bump cursor and returned
 // ids so one allocator cannot be called with inconsistent bounds.
@@ -63,6 +64,20 @@ impl AllocatorState {
     // AGENT: query availability across recycled and never-used resources.
     fn is_free(&self, id: usize) -> bool {
         id < self.limit && (self.free.contains(&id) || id >= self.next)
+    }
+
+    // AGENT: expose exact ownership to persistent allocators so a recovered
+    // bitmap can be validated without reimplementing bump/free-set semantics.
+    pub(crate) fn is_allocated(&self, id: usize) -> bool {
+        id < self.limit && !self.is_free(id)
+    }
+
+    // AGENT: snapshot allocated ids in stable order for on-disk bitmap encoding;
+    // never-used and explicitly released ids remain clear.
+    pub(crate) fn allocated_ids(&self) -> Vec<usize> {
+        (0..self.next)
+            .filter(|id| !self.free.contains(id))
+            .collect()
     }
 
     // AGENT: expose compact allocator statistics only to focused regression

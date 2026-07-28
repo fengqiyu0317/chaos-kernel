@@ -356,8 +356,10 @@ QEMU 侧的上下文所有权按下列边界固定，不再保留从 simulator
 - 内存 `FileNode` 或 initramfs 支撑 init。
 - 迁移 `kernel-sim` 的 fd/open-file-description 共享 offset、cloexec、dup/dup2/fcntl 等语义。
 - 后续把 pipe readiness、epoll ready list、waiter 唤醒路径接到 QEMU 调度等待队列。
-- 第一阶段对象 VFS 已建立 `Kernel -> Vfs -> Mount -> FsInstance -> FileStorage/root/nodes` 所有权；已解析路径使用 `PathRef { mount, node }`，挂载表按 parent mount 与 mountpoint inode 管理 stacking，不再把 source 设备名拼入全局路径键。
-- 当前 `FsInstance::lookup()` 内部仍是完整相对路径键表；后续目录迁移应在不改变调用者 `PathRef` 边界的前提下替换为逐 dentry 分量遍历。source/device 发现、superblock/重启恢复、mount flags、busy/lazy detach 和 mount namespace 仍属于后续阶段。
+- 对象 VFS 已建立 `Kernel -> Vfs -> Mount -> FsInstance -> FileStorage/root/inodes` 所有权；已解析路径使用 `PathRef { mount, node }`，挂载表按 parent mount 与 mountpoint inode 管理 stacking，目录以 inode 的 direct-child 表逐分量遍历，不再把 source 设备名拼入全局路径键。
+- `source` registry 保存唯一的 live `Arc<FsInstance>`；`mount_source()` 只新增挂载实例，因此同一 source 的重复挂载共享 inode namespace、cache、device 和 allocator。当前启动只把根块设备实例注册为 `rootfs`，尚未把 `/dev/vda` 等路径解析为设备对象。
+- ChaosFs v1 已区分显式 `format(device)` 与只读现有格式的 `mount(device)`：固定 superblock 记录版本、块大小、root inode、inode table、bitmap 和设备容量；mount 恢复 FNMD v2、目录项、数据块所有权和 inode allocator，并拒绝损坏或不一致的已知格式。正常 init 退出会先 flush 根文件系统，独立 VirtIO 双启动 smoke 验证同一 raw image 的目录/文件恢复和新分配不覆盖旧块。
+- 当前落盘顺序只承诺 clean flush/reboot，不具备 journal、copy-on-write metadata、checksum 或断电原子性；bitmap-only orphan 先保留为不可复用泄漏，fsck/回收属于后续。mount flags、busy/lazy detach、mount namespace、bind/remount/move、cwd/dirfd 和 symlink 也仍属于后续阶段。
 
 长期路线：
 

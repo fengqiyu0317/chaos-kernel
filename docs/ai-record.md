@@ -1,6 +1,6 @@
 # Chaos AI 工作日志
 
-更新时间：2026-07-27
+更新时间：2026-07-28
 
 ## 维护约定
 
@@ -11,6 +11,52 @@
   - `/home/huawei/.codex/sessions/2026/06/18/rollout-2026-06-18T23-57-15-019edb73-6ad9-7b23-8162-c76a589a57a9.jsonl`
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
+
+## 2026-07-28：kernel-qemu ChaosFs v1 磁盘恢复
+
+目标：在 source registry 已能选择唯一 live `FsInstance` 的基础上，补齐可从真实块设备恢复的 ChaosFs 格式，并用同一个 VirtIO raw image 跨两次 QEMU 启动验证目录、文件内容和 allocator 所有权。
+
+已完成修改：
+
+- 新增明确分离的 `ChaosFs::format()` / `ChaosFs::mount()`。块 0 superblock 固定 magic、版本、512 字节块大小、root inode、inode table、block bitmap 和设备容量；空白设备只能由调用方显式选择 format，已知格式损坏返回 `eio`，未知非空格式返回 `enodev` 且不会被启动路径覆盖。
+- inode table 保存稳定 inode id 到 FNMD metadata blocks 的定位；FNMD v2 新增严格反序列化，恢复 regular/directory、executable、EOF、数据块和 direct-child 目录项，并校验 UTF-8、名字、计数、块数和 zero padding。
+- mount 交叉校验 bitmap、metadata/data block 唯一所有权、root 类型、目录项目标、单父目录、环和 root 可达性；`FileBlockAllocator` 从 bitmap 恢复，后续新文件不会重复分配旧文件块。bitmap-only orphan 暂时保留为不可复用泄漏。
+- `FsInstance::flush()` 同步所有 inode metadata，再写 inode table、bitmap、superblock，最后执行 cache/device flush；持久 FsInstance 析构不把“丢弃内存对象”误当成删除所有磁盘文件。内嵌 root image 安装完成及 init 正常退出前都会 flush。
+- 根块设备启动优先 mount；只在 superblock 全零时显式 format，并把唯一实例注册为 `rootfs`。专用跨重启 smoke 另以 `virtio0` 注册同一实例，通过 `mount_source()` 挂到 `/mnt`，证明 source 层没有重建 cache 或 allocator。
+- 新增 RAM 三阶段恢复回归和 blank/未知/损坏格式错误边界；新增 `qemu-chaosfs-smoke` feature 与 `tools/qemu-chaosfs-smoke.sh`，第一次启动写入 1573 字节嵌套文件，第二次启动恢复内容、新建 1043 字节文件并复查旧文件未被覆盖。
+
+关键文件：
+
+- `kernel-qemu/src/fs/fs_instance/disk.rs`
+- `kernel-qemu/src/fs/fs_instance.rs`
+- `kernel-qemu/src/fs/file_node.rs`
+- `kernel-qemu/src/fs/file_node/metadata.rs`
+- `kernel-qemu/src/allocator.rs`
+- `kernel-qemu/src/kernel_core/kernel_base.rs`
+- `kernel-qemu/src/kernel_core/kernel_ops/process.rs`
+- `kernel-qemu/src/main.rs`
+- `tools/qemu-chaosfs-smoke.sh`
+- `TASK.md`
+- `docs/kernel-sim-qemu-migration-design.md`
+
+验收命令：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo check --target riscv64gc-unknown-none-elf --all-features
+cargo run --release --features qemu-selftest,ram-block-device
+
+cd ..
+bash tools/qemu-chaosfs-smoke.sh
+bash tools/qemu-smoke.sh
+bash tools/qemu-virtio-blk-smoke.sh
+git diff --check
+```
+
+结果：全部通过。RAM 全量 QEMU selftest 覆盖恢复、损坏格式与 allocator 回归并继续完成真实用户态 mkdirat/openat；ChaosFs VirtIO smoke 的第二次启动恢复 1573 字节旧文件且新建文件未覆盖旧块；普通 VirtIO init smoke 与原始扇区双启动 smoke 继续通过。
+
+当前边界：ChaosFs v1 只承诺显式 flush 后的 clean reboot 恢复，不具备 journal、checksum、copy-on-write metadata 或断电原子性；没有 fsck/orphan 回收、在线并发 flush 事务、通用设备发现、`/dev` 节点和完整 mount flags/namespace。没有修改 `kernel-sim` 或 `kernel/src/kernel.rs`。
 
 ## 2026-07-27：kernel-qemu 对象 VFS 逐路径分量遍历
 

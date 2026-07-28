@@ -477,8 +477,8 @@ cargo test --test pressure
 - `[M5][普通] TODO`: `kernel-sim` 的 file lock 模型尚未区分 POSIX process-associated record locks、open-file-description locks 和 `flock` locks；真实 fork 中这些锁的继承/不继承规则不同。
 - `[M5][普通] TODO`: `kernel-sim` 尚未建模 directory streams、POSIX message queue descriptors、AIO contexts、io_uring 等对象，因此也没有对应的 fork 继承或清空规则。
 - `[M5][重要] TODO`: `kernel-sim` 的 syscall 文件 I/O 已有 fd entry / open-file description 基础模型，但仍未实现 `readv`/`writev`、`pread`/`pwrite`、`lseek` syscall、目录 fd 语义、权限/credential 检查、真实设备/tty 行规程等更完整文件系统行为。
-- `[M5][M9][重要] DONE`: `kernel-qemu` 的 RISC-V `mount(40)` / `umount2(39)` 已通过当前 task 的 `AddrSpace` 搬运用户字符串并接入对象化 `Vfs::{attach,detach_top}`。目标必须是既有目录；同一挂载点重复 mount 形成 bottom-to-top stack，umount 只摘除可见顶层并恢复下一层。第一阶段仍只接受零 flags 和空 data；`source` 仅校验非空，每次 syscall mount 暂时创建独立的内存 ChaosFs，真实 source/device 发现尚未实现。
-- `[M5][M9][重要] PARTIAL`: 已完成第一个对象 VFS 增量：`FsInstance` 拥有 `FileStorage`、root、文件系统内相对路径节点表和运行期 inode allocator；`MountTable` 以 `(parent MountId, mountpoint InodeId)` 管理 mount stacking；`PathRef { mount, node }` 决定 fd 与 exec 的正确存储来源。后续仍需 superblock/重启恢复、真实逐目录分量 dentry 遍历、mount flags 行为、busy/lazy detach、mount namespace、bind/remount/move 等完整语义。
+- `[M5][M9][重要] DONE`: `kernel-qemu` 的 RISC-V `mount(40)` / `umount2(39)` 已通过当前 task 的 `AddrSpace` 搬运用户字符串并接入对象化 VFS。`FsKind::from_name()` 解析 `chaosfs`；source registry 把用户可见名称绑定到唯一 live `Arc<FsInstance>`，`mount_source()` 重复挂载同一 source 时只创建不同 `Mount`，共享 inode、storage、cache 和 allocator。目标必须是既有目录；同一挂载点形成 bottom-to-top stack，umount 只摘除可见顶层。当前仍只接受零 flags 和空 data，启动注册名为 `rootfs`，尚未把 `/dev/vda` 路径解析成设备节点。
+- `[M5][M9][重要] PARTIAL`: 对象 VFS 已使用 `BTreeMap<InodeId, Arc<FileNode>>` 和 direct-child 目录项逐分量遍历；ChaosFs v1 已提供显式 format/mount、superblock、inode table、block bitmap、FNMD v2 解码、根目录/目录树完整性检查和 allocator 恢复，并通过同一 VirtIO raw image 双启动验证。当前只承诺 clean flush/reboot；journal/checksum/断电事务、orphan 回收/fsck、mount flags、busy/lazy detach、mount namespace、bind/remount/move、cwd/dirfd 和 symlink 仍未完成。
 - `[M5][重要] TODO`: `kernel-sim/src/kernel/syscall/fs.rs` 的 `sys_open()` 已从用户地址空间读取路径并接入 `FileNode` 表，但路径解析仍是简化绝对路径模型；后续应补齐 cwd 相对路径、目录遍历、符号链接、mode/umask、真实 `EISDIR`/`ENOTDIR`/`ELOOP` 等错误边界。
 - `[M5][重要] TODO`: `kernel-sim` 的 pipe read/write 已走真实 `PipeNode` 队列，但空 pipe 目前直接返回 `again`，尚未实现阻塞等待、`O_NONBLOCK` 差异、关闭写端后的 EOF 唤醒、`SIGPIPE`/`EPIPE` 等完整 pipe 语义。
 - `[M5][重要] TODO`: `kernel-sim` 的 syscall 用户缓冲区复制目前用 contiguous readable/writable prefix 产生 short I/O；后续若实现 lazy page fault，应让 copy-in/copy-out 能触发缺页装入并精确区分 fault 前后已搬运字节。
@@ -575,6 +575,15 @@ cargo test --test pressure
 - 元数据：目录项序列化升级为 `inode_id + name_len + name`，`FNMD` header 增加版本 `2`；当前仍没有元数据反序列化/重启恢复，版本字段用于防止未来读取器把旧布局误判为新格式。
 - 回归覆盖：新增缺失分量后接 `..` 仍为 `enoent`、普通文件后接 `..` 为 `enotdir`、不同父目录同名 inode 隔离、重复 lookup 返回同一对象、direct-child 名字校验、lookup_inode 和嵌套 mount 逐分量穿越；旧 pathname 自测改为只让已经存在的目录参与 `..` alias。
 - 验证：`cargo fmt --check`、`cargo check --target riscv64gc-unknown-none-elf --all-features`、`cargo run --release --features qemu-selftest,ram-block-device`、VirtIO 后端 `bash tools/qemu-smoke.sh` 和 `git diff --check` 通过。RAM 全量 selftest、fs syscall、checkpoint、用户 signal/satp 以及 RAM/VirtIO 真实用户态 mkdirat/openat round trip 和 init 正常退出均通过。
+
+#### 2026-07-28：ChaosFs v1 磁盘格式与跨重启恢复
+
+- 目标与边界：把前一阶段的运行期 source registry 延伸为真正可从块设备恢复的 ChaosFs；`format()` 只初始化明确空白的设备，`mount()` 只读取已有格式，绝不把损坏或未知的非空设备隐式格式化。本轮只修改 `kernel-qemu`，不修改 `kernel-sim` 或禁止路径 `kernel/src/kernel.rs`。
+- 磁盘布局：块 0 保存带 magic/version/block size/root inode/设备容量和固定区域位置的 superblock；后续固定区域保存 block bitmap 与 inode table；inode table 将稳定 inode id 映射到 FNMD v2 metadata blocks。每个 FNMD 恢复类型、executable、精确 EOF、数据块和 `inode + name` 目录项。
+- mount 校验与恢复：校验所有固定区域、zero padding、bitmap 越界位、metadata/data block 的范围/bitmap 所有权/唯一引用、root 类型、direct-child 目标、单父目录约束、环和 root 可达性；随后重建唯一 `FileStorage`、`FileBlockAllocator`、inode map、root 和 next inode。bitmap-only block 作为可能的 orphan 保留为不可复用泄漏，避免误覆盖未知旧数据。
+- flush 与启动：`FsInstance::flush()` 先同步所有 FNMD，再发布 inode table、allocator bitmap、superblock，最后执行 cache writeback 和设备 flush。根块设备启动先尝试 mount，只在 superblock 全零时显式 format；内嵌 root image 安装完成以及 init 正常退出前都会 flush。root FsInstance 注册为 `rootfs`，重复 source mount 继续共享同一实例。
+- 回归：`qemu-sync-selftest` 在一个 RAM device 上执行 format -> 创建嵌套文件 -> flush/drop -> mount/read -> 新分配 -> 再次 mount/read，并覆盖 blank/未知 magic/已知格式损坏错误边界；`tools/qemu-chaosfs-smoke.sh` 用同一个 VirtIO raw image 双启动，第二次必须恢复 1573 字节旧文件且新分配不能覆盖它。继续保留普通 VirtIO 启动与 raw-sector smoke，避免回归设备传输层。
+- 剩余边界：该版本只承诺 clean flush/reboot，不提供 journal、checksum、copy-on-write metadata 或断电原子性；尚无 fsck/orphan 回收、在线并发 flush 事务、通用 block-device source discovery、`/dev` 节点和完整 mount namespace/flags。
 
 #### 2026-07-24：删除 CPU0 调度器未启动时的元数据兼容路径
 

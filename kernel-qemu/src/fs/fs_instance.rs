@@ -2,6 +2,10 @@
 // directory nodes, rather than canonical full-path strings, own child names.
 use super::*;
 
+mod disk;
+
+pub use disk::ChaosFs;
+
 pub type FsId = usize;
 pub type InodeId = u64;
 
@@ -59,6 +63,7 @@ pub struct FsInstance {
     root: Arc<FileNode>,
     inodes: RwLock<BTreeMap<InodeId, Arc<FileNode>>>,
     next_inode: AtomicU64,
+    disk: Option<disk::ChaosFsLayout>,
 }
 
 // AGENT: centralize inode lookup, direct-child traversal, allocation, and
@@ -77,6 +82,7 @@ impl FsInstance {
             root,
             inodes: RwLock::new(inodes),
             next_inode: AtomicU64::new(ROOT_INODE_ID + 1),
+            disk: None,
         })
     }
 
@@ -100,6 +106,15 @@ impl FsInstance {
     // cache, device, or allocator ownership back into Kernel.
     pub fn storage(&self) -> &FileStorage {
         &self.storage
+    }
+
+    // AGENT: commit every live inode image, inode-table locator, allocator
+    // bitmap, and superblock before flushing the shared cache/device backend.
+    pub fn flush(&self) -> Result<usize, &'static str> {
+        match self.disk {
+            Some(layout) => disk::flush_filesystem(self, layout),
+            None => self.storage.flush(),
+        }
     }
 
     // AGENT: look up one live managed inode by filesystem-local identity.
@@ -341,5 +356,137 @@ impl FsInstance {
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+// AGENT: dropping the final in-memory filesystem view is not unlinking every
+// inode; disarm FileBlock reclamation before fields release persistent wrappers.
+impl Drop for FsInstance {
+    // AGENT: preserve on-disk ownership while persistent FileBlock wrappers are
+    // released as part of the final in-memory instance teardown.
+    fn drop(&mut self) {
+        self.storage.disarm_reclamation();
+    }
+}
+
+// AGENT: expose recoverable-filesystem regressions through qemu-sync-selftest so
+// they execute with the real no_std allocator, locks, cache, and VFS walker.
+#[cfg(feature = "qemu-sync-selftest")]
+pub mod tests {
+    use super::*;
+
+    // AGENT: run recovery, allocator, and mount-error regressions in the QEMU
+    // synchronization selftest stage.
+    pub fn run_all() {
+        format_flush_mount_recovers_tree_and_allocator();
+        mount_rejects_corrupt_superblock_without_formatting();
+    }
+
+    // AGENT: simulate two clean boots on one RAM block device and prove both
+    // namespace/data recovery and non-overwriting allocation after remount.
+    fn format_flush_mount_recovers_tree_and_allocator() {
+        let device = Arc::new(RamBlockDevice::empty());
+        assert!(matches!(
+            ChaosFs::mount(80, device.clone(), 1),
+            Err("enodev")
+        ));
+
+        let first = ChaosFs::format(80, device.clone(), 1).unwrap();
+        let first_vfs = Vfs::new(first.clone());
+        first_vfs.create_directory("/a").unwrap();
+        let old_data = vec![0x5a; BLOCK_CACHE_BLOCK_SIZE * 3 + 37];
+        first_vfs
+            .install_regular("/a/file", &old_data, false)
+            .unwrap();
+        let old_inode = first_vfs.resolve("/a/file").unwrap().path_ref.node.id();
+        first.flush().unwrap();
+        drop(first_vfs);
+        drop(first);
+
+        let second = ChaosFs::mount(81, device.clone(), 1).unwrap();
+        let second_vfs = Vfs::new(second.clone());
+        let recovered = second_vfs.resolve("/a/file").unwrap();
+        assert_eq!(recovered.path_ref.node.id(), old_inode);
+        let mut recovered_data = vec![0u8; old_data.len()];
+        assert_eq!(
+            recovered.path_ref.read_at(0, &mut recovered_data),
+            Ok(old_data.len())
+        );
+        assert_eq!(recovered_data, old_data);
+
+        let new_data = vec![0xa5; BLOCK_CACHE_BLOCK_SIZE * 2 + 19];
+        second_vfs
+            .install_regular("/a/new", &new_data, false)
+            .unwrap();
+        let new_inode = second_vfs.resolve("/a/new").unwrap().path_ref.node.id();
+        assert!(new_inode > old_inode);
+        second.flush().unwrap();
+
+        let mut old_after_allocation = vec![0u8; old_data.len()];
+        assert_eq!(
+            second_vfs
+                .resolve("/a/file")
+                .unwrap()
+                .path_ref
+                .read_at(0, &mut old_after_allocation),
+            Ok(old_data.len())
+        );
+        assert_eq!(old_after_allocation, old_data);
+        drop(second_vfs);
+        drop(second);
+
+        let third = ChaosFs::mount(82, device, 1).unwrap();
+        let third_vfs = Vfs::new(third);
+        let mut old_after_second_mount = vec![0u8; old_data.len()];
+        assert_eq!(
+            third_vfs
+                .resolve("/a/file")
+                .unwrap()
+                .path_ref
+                .read_at(0, &mut old_after_second_mount),
+            Ok(old_data.len())
+        );
+        assert_eq!(old_after_second_mount, old_data);
+        let mut new_after_second_mount = vec![0u8; new_data.len()];
+        assert_eq!(
+            third_vfs
+                .resolve("/a/new")
+                .unwrap()
+                .path_ref
+                .read_at(0, &mut new_after_second_mount),
+            Ok(new_data.len())
+        );
+        assert_eq!(new_after_second_mount, new_data);
+    }
+
+    // AGENT: distinguish an absent filesystem from a recognized but corrupt
+    // superblock and prove mount never rewrites the latter as a blank image.
+    fn mount_rejects_corrupt_superblock_without_formatting() {
+        let device = Arc::new(RamBlockDevice::empty());
+        assert_eq!(ChaosFs::superblock_is_blank(device.as_ref()), Ok(true));
+        let fs = ChaosFs::format(83, device.clone(), 1).unwrap();
+        drop(fs);
+
+        let mut superblock = device.read_block(0).unwrap();
+        superblock[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        device.write_block(0, &superblock).unwrap();
+        device.flush().unwrap();
+
+        assert!(matches!(ChaosFs::mount(84, device.clone(), 1), Err("eio")));
+        assert_eq!(
+            &device.read_block(0).unwrap()[8..12],
+            &u32::MAX.to_le_bytes()
+        );
+        assert_eq!(ChaosFs::superblock_is_blank(device.as_ref()), Ok(false));
+
+        let unrelated = Arc::new(RamBlockDevice::empty());
+        let mut unrelated_superblock = vec![0u8; BLOCK_CACHE_BLOCK_SIZE];
+        unrelated_superblock[..8].copy_from_slice(b"NOTCHAOS");
+        unrelated.write_block(0, &unrelated_superblock).unwrap();
+        assert!(matches!(
+            ChaosFs::mount(85, unrelated.clone(), 1),
+            Err("enodev")
+        ));
+        assert_eq!(ChaosFs::superblock_is_blank(unrelated.as_ref()), Ok(false));
     }
 }
