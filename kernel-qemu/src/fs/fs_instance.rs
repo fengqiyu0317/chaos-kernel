@@ -39,6 +39,17 @@ pub enum FsKind {
     ChaosFs,
 }
 
+// AGENT: Parse the userspace filesystem type without coupling it to a
+// particular device or mount attachment.
+impl FsKind {
+    pub fn from_name(name: &str) -> Result<Self, &'static str> {
+        match name {
+            "chaosfs" => Ok(Self::ChaosFs),
+            _ => Err("enodev"),
+        }
+    }
+}
+
 // AGENT: own live runtime inodes by filesystem-local stable identity together
 // with the only FileStorage allowed to back their data and metadata blocks.
 pub struct FsInstance {

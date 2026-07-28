@@ -117,7 +117,11 @@ impl Kernel {
             file_blocks,
         );
         let root_fs = FsInstance::new(ROOT_FS_ID, file_storage);
-        let vfs = Vfs::new(root_fs);
+        let vfs = Vfs::new(root_fs.clone());
+        // AGENT: Publish the already-live root filesystem under an explicit
+        // runtime source name without pretending that a /dev node exists.
+        vfs.register_source("rootfs", root_fs)
+            .expect("root filesystem source should register");
         let tasks = TaskTable::new(pool.clone());
         Self {
             tasks,

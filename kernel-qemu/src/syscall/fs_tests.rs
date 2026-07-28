@@ -37,8 +37,9 @@ fn write_user_string(kernel: &Kernel, task: &Task, addr: usize, value: &str) {
         .expect("test user string should be writable");
 }
 
-// AGENT: verify RISC-V usercopy plus object-mount stacking, top detach, flag
-// rejection, and exact missing-mount errors.
+// AGENT: verify source-aware RISC-V mounts reuse one live FsInstance per source,
+// isolate distinct sources, preserve mount stacking, and leave topology unchanged
+// across all rejected source, type, target, flag, and usercopy boundaries.
 #[cfg_attr(test, test)]
 fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
     assert_eq!(map_riscv_nr(RISCV_SYS_MOUNT), Some(INTERNAL_SYS_MOUNT));
@@ -58,12 +59,39 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
     let source_addr = USER_STRINGS_BASE;
     let target_addr = USER_STRINGS_BASE + 64;
     let filesystem_type_addr = USER_STRINGS_BASE + 128;
+    let missing_target_addr = USER_STRINGS_BASE + 192;
+    let regular_target_addr = USER_STRINGS_BASE + 256;
+    let unknown_type_addr = USER_STRINGS_BASE + 320;
+    let empty_addr = USER_STRINGS_BASE + 384;
     write_user_string(kernel, &task, source_addr, "dev0");
     write_user_string(kernel, &task, target_addr, "/mnt");
     write_user_string(kernel, &task, filesystem_type_addr, "chaosfs");
+    write_user_string(kernel, &task, missing_target_addr, "/mount-missing");
+    write_user_string(kernel, &task, regular_target_addr, "/mount-regular");
+    write_user_string(kernel, &task, unknown_type_addr, "unknownfs");
+    write_user_string(kernel, &task, empty_addr, "");
     kernel
         .install_directory("/mnt")
         .expect("mount syscall requires an existing directory mountpoint");
+    kernel
+        .install_file("/mount-regular", Vec::new(), false)
+        .expect("mount syscall regular-target fixture should install");
+
+    let dev0 = kernel.vfs.new_filesystem(FileStorage::standalone());
+    let dev1 = kernel.vfs.new_filesystem(FileStorage::standalone());
+    assert_eq!(kernel.vfs.register_source("", dev0.clone()), Err("einval"));
+    kernel
+        .vfs
+        .register_source("dev0", dev0.clone())
+        .expect("dev0 source should register");
+    assert_eq!(
+        kernel.vfs.register_source("dev0", dev0.clone()),
+        Err("eexist")
+    );
+    kernel
+        .vfs
+        .register_source("dev1", dev1.clone())
+        .expect("dev1 source should register");
 
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(
@@ -82,10 +110,20 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
         .expect("mount should expose its filesystem root")
         .path_ref
         .mount;
+    assert!(Arc::ptr_eq(first_mount.fs(), &dev0));
     assert_eq!(first_mount.fs().root().kind, FileKind::Directory);
     assert_eq!(kernel.vfs.mounts.mount_count(), 1);
+    kernel
+        .install_file("/mnt/file", b"dev0".to_vec(), false)
+        .expect("dev0 file should install through the first mount");
+    let dev0_file = kernel
+        .lookup_file_node("/mnt/file")
+        .expect("dev0 file should resolve through the first mount")
+        .path_ref
+        .node;
 
-    write_user_string(kernel, &task, source_addr, "dev1");
+    // Mounting dev0 again creates a distinct attachment but selects the exact
+    // same filesystem, inode namespace, storage, cache, and allocator state.
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(
             SYS_MOUNT,
@@ -100,12 +138,159 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
     );
     let second_mount = kernel
         .lookup_file_node("/mnt")
-        .expect("stacked mount should expose the newest filesystem root")
+        .expect("stacked mount should expose the repeated filesystem root")
         .path_ref
         .mount;
     assert!(!Arc::ptr_eq(&first_mount, &second_mount));
+    assert!(Arc::ptr_eq(first_mount.fs(), second_mount.fs()));
+    assert!(Arc::ptr_eq(second_mount.fs(), &dev0));
+    let remounted_file = kernel
+        .lookup_file_node("/mnt/file")
+        .expect("the repeated dev0 mount should expose its existing inode")
+        .path_ref
+        .node;
+    assert!(Arc::ptr_eq(&dev0_file, &remounted_file));
     assert_eq!(kernel.vfs.mounts.mount_count(), 2);
 
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_UMOUNT2, target_addr, 0, 0, 0, 0, 0,),
+        Ok(0)
+    );
+    let revealed_first = kernel
+        .lookup_file_node("/mnt")
+        .expect("detaching the repeated mount should reveal the first attachment")
+        .path_ref
+        .mount;
+    assert!(Arc::ptr_eq(&revealed_first, &first_mount));
+    assert_eq!(kernel.vfs.mounts.mount_count(), 1);
+
+    // A distinct source selects a distinct filesystem and hides dev0's inode
+    // namespace until the dev1 attachment is removed.
+    write_user_string(kernel, &task, source_addr, "dev1");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MOUNT,
+            source_addr,
+            target_addr,
+            filesystem_type_addr,
+            0,
+            0,
+            0,
+        ),
+        Ok(0)
+    );
+    let dev1_mount = kernel
+        .lookup_file_node("/mnt")
+        .expect("dev1 mount should expose its filesystem root")
+        .path_ref
+        .mount;
+    assert!(Arc::ptr_eq(dev1_mount.fs(), &dev1));
+    assert!(!Arc::ptr_eq(first_mount.fs(), dev1_mount.fs()));
+    assert!(matches!(
+        kernel.lookup_file_node("/mnt/file"),
+        Err("enoent")
+    ));
+    assert_eq!(kernel.vfs.mounts.mount_count(), 2);
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_UMOUNT2, target_addr, 0, 0, 0, 0, 0,),
+        Ok(0)
+    );
+    let revealed = kernel
+        .lookup_file_node("/mnt/file")
+        .expect("detaching dev1 should reveal dev0's existing file");
+    assert!(Arc::ptr_eq(&revealed.path_ref.node, &dev0_file));
+    assert!(Arc::ptr_eq(revealed.path_ref.mount.fs(), &dev0));
+    assert_eq!(kernel.vfs.mounts.mount_count(), 1);
+
+    // Every failed mount below must leave the one live dev0 attachment intact.
+    write_user_string(kernel, &task, source_addr, "missing");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MOUNT,
+            source_addr,
+            target_addr,
+            filesystem_type_addr,
+            0,
+            0,
+            0,
+        ),
+        Err("enodev")
+    );
+
+    write_user_string(kernel, &task, source_addr, "dev0");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MOUNT,
+            source_addr,
+            target_addr,
+            unknown_type_addr,
+            0,
+            0,
+            0,
+        ),
+        Err("enodev")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MOUNT,
+            empty_addr,
+            target_addr,
+            filesystem_type_addr,
+            0,
+            0,
+            0,
+        ),
+        Err("einval")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MOUNT,
+            source_addr,
+            target_addr,
+            empty_addr,
+            0,
+            0,
+            0,
+        ),
+        Err("einval")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MOUNT,
+            source_addr,
+            target_addr,
+            0,
+            0,
+            0,
+            0,
+        ),
+        Err("einval")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MOUNT,
+            source_addr,
+            missing_target_addr,
+            filesystem_type_addr,
+            0,
+            0,
+            0,
+        ),
+        Err("enoent")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MOUNT,
+            source_addr,
+            regular_target_addr,
+            filesystem_type_addr,
+            0,
+            0,
+            0,
+        ),
+        Err("enotdir")
+    );
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(
             SYS_MOUNT,
@@ -114,6 +299,18 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
             filesystem_type_addr,
             1,
             0,
+            0,
+        ),
+        Err("enotsup")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_MOUNT,
+            source_addr,
+            target_addr,
+            filesystem_type_addr,
+            0,
+            1,
             0,
         ),
         Err("enotsup")
@@ -130,18 +327,14 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
         ),
         Err("efault")
     );
+    assert_eq!(kernel.vfs.mounts.mount_count(), 1);
 
-    assert_eq!(
-        kernel.dispatch_syscall_without_signal_delivery(SYS_UMOUNT2, target_addr, 0, 0, 0, 0, 0,),
-        Ok(0)
-    );
-    let revealed = kernel
+    let still_mounted = kernel
         .lookup_file_node("/mnt")
-        .expect("detaching the top mount should reveal the previous layer")
+        .expect("failed mounts must not replace the existing attachment")
         .path_ref
         .mount;
-    assert!(Arc::ptr_eq(&revealed, &first_mount));
-    assert_eq!(kernel.vfs.mounts.mount_count(), 1);
+    assert!(Arc::ptr_eq(&still_mounted, &first_mount));
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(SYS_UMOUNT2, target_addr, 0, 0, 0, 0, 0,),
         Ok(0)

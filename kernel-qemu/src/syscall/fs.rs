@@ -68,8 +68,8 @@ fn read_user_path(task: &Task, addr: usize) -> Result<String, &'static str> {
     Err("enametoolong")
 }
 
-// AGENT: attach a fresh first-stage ChaosFs instance at an existing directory;
-// source discovery remains unimplemented and no longer becomes path identity.
+// AGENT: resolve source and filesystem type to one registered live FsInstance,
+// then attach that shared instance without implying any on-disk recovery.
 pub(super) fn sys_mount(
     kernel: &Kernel,
     source_addr: usize,
@@ -81,20 +81,22 @@ pub(super) fn sys_mount(
     if mount_flags != 0 || data_addr != 0 {
         return Err("enotsup");
     }
+    if filesystem_type_addr == 0 {
+        return Err("einval");
+    }
+
     let task = kernel.cur_task(0).ok_or("esrch")?;
     let source = read_user_path(&task, source_addr)?;
     let target = read_user_path(&task, target_addr)?;
-    if source.is_empty() {
+    let filesystem_type = read_user_path(&task, filesystem_type_addr)?;
+    if source.is_empty() || filesystem_type.is_empty() {
         return Err("einval");
     }
-    if filesystem_type_addr != 0 {
-        let filesystem_type = read_user_path(&task, filesystem_type_addr)?;
-        if filesystem_type.is_empty() {
-            return Err("einval");
-        }
-    }
-    let fs = kernel.vfs.new_filesystem(FileStorage::standalone());
-    kernel.vfs.attach(&target, fs, MountFlags::empty())?;
+
+    let kind = FsKind::from_name(&filesystem_type)?;
+    kernel
+        .vfs
+        .mount_source(&source, &target, kind, MountFlags::empty())?;
     Ok(0)
 }
 

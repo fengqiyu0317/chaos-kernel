@@ -34,11 +34,12 @@ struct ParentResolution<'a> {
     display_path: String,
 }
 
-// AGENT: own the process-wide mount topology and allocate runtime filesystem
-// identities for syscall-created ChaosFs instances.
+// AGENT: own the process-wide mount topology, runtime filesystem identity
+// allocator, and userspace-visible names for already-live filesystem instances.
 pub struct Vfs {
     pub mounts: MountTable,
     next_fs_id: AtomicUsize,
+    sources: RwLock<BTreeMap<String, Arc<FsInstance>>>,
 }
 
 // AGENT: resolve absolute paths across identity-keyed mounts, then delegate all
@@ -51,6 +52,7 @@ impl Vfs {
         Self {
             mounts: MountTable::new(root_fs),
             next_fs_id: AtomicUsize::new(next_fs_id),
+            sources: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -60,13 +62,53 @@ impl Vfs {
     }
 
     // AGENT: allocate one runtime filesystem instance for a caller-selected
-    // storage backend; source/device discovery remains a later VFS stage.
+    // storage backend without implicitly publishing it under a source name.
     pub fn new_filesystem(&self, storage: FileStorage) -> Arc<FsInstance> {
         let id = self
             .next_fs_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("runtime filesystem id space exhausted");
         FsInstance::new(id, storage)
+    }
+
+    // AGENT: Bind one userspace-visible mount source name to one live filesystem
+    // instance so repeated mounts share inode, storage, cache, and allocator state.
+    pub fn register_source(&self, source: &str, fs: Arc<FsInstance>) -> Result<(), &'static str> {
+        if source.is_empty() {
+            return Err("einval");
+        }
+
+        let mut sources = self.sources.write().unwrap();
+        if sources.contains_key(source) {
+            return Err("eexist");
+        }
+
+        sources.insert(source.to_string(), fs);
+        Ok(())
+    }
+
+    // AGENT: Resolve a named source to one existing filesystem instance and
+    // attach that same instance instead of constructing an unrelated empty one.
+    pub fn mount_source(
+        &self,
+        source: &str,
+        target: &str,
+        kind: FsKind,
+        flags: MountFlags,
+    ) -> Result<Arc<Mount>, &'static str> {
+        let fs = self
+            .sources
+            .read()
+            .unwrap()
+            .get(source)
+            .cloned()
+            .ok_or("enodev")?;
+
+        if fs.kind() != kind {
+            return Err("enodev");
+        }
+
+        self.attach(target, fs, flags)
     }
 
     // AGENT: parse one absolute path into parent markers and validated child
