@@ -1,11 +1,11 @@
-// AGENT: keep shared path-file metadata in FileNode while storing file bytes
-// in the QEMU block backend instead of duplicating contents in the node.
+// AGENT: keep live inode state in FileNode while delegating encoded metadata
+// images to a private component and file bytes to the QEMU block backend.
 use super::*;
 use crate::kernel::allocator::AllocatorState;
 
-const FILE_NODE_METADATA_MAGIC: &[u8; 4] = b"FNMD";
-const FILE_NODE_METADATA_VERSION: u8 = 2;
-const FILE_NODE_METADATA_HEADER_LEN: usize = 4 + 1 + 1 + 1 + 8 + 8 + 8;
+mod metadata;
+
+use metadata::FileMetadata;
 
 // AGENT: keep standalone/test file handles within the 1 MiB QEMU early heap;
 // full-chain writeback preserves correctness when a single chain recycles slots.
@@ -238,6 +238,17 @@ impl FileNodeBlocks {
     }
 }
 
+// AGENT: share one overflow-checked byte-to-block conversion between regular
+// file allocation and the private metadata block store.
+fn blocks_for_len(len: usize) -> Result<usize, &'static str> {
+    if len == 0 {
+        return Ok(0);
+    }
+    len.checked_add(BLOCK_CACHE_BLOCK_SIZE - 1)
+        .map(|rounded| rounded / BLOCK_CACHE_BLOCK_SIZE)
+        .ok_or("efbig")
+}
+
 // AGENT: keep the visible regular-file EOF under the same lock as its data
 // blocks so readers never observe a length before the backing blocks exist.
 #[derive(Debug)]
@@ -280,16 +291,16 @@ impl FileNodeData {
     }
 }
 
-// AGENT: this inode-like shared file object owns file type, metadata, directory
-// entries, byte length, and the regular-file block map; per-open offset and
-// status flags remain in the fd/OFD layer, while actual bytes and unified dirty
-// state live in the shared block cache.
+// AGENT: this inode-like object owns live file and directory state, serializes
+// each capacity-preflight/mutation/metadata-commit sequence, and delegates
+// encoded metadata blocks to FileMetadata and file bytes to BlockCache.
 pub struct FileNode {
     id: InodeId,
     pub kind: FileKind,
     pub executable: AtomicBool,
+    mutation: Mutex<()>,
     storage: Mutex<FileNodeData>,
-    metadata_blocks: Mutex<FileNodeBlocks>,
+    metadata: FileMetadata,
     directory: Mutex<DirectoryData>,
 }
 
@@ -301,8 +312,9 @@ impl FileNode {
             id,
             kind: FileKind::Regular,
             executable: AtomicBool::new(executable),
+            mutation: Mutex::new(()),
             storage: Mutex::new(FileNodeData::empty()),
-            metadata_blocks: Mutex::new(FileNodeBlocks::empty()),
+            metadata: FileMetadata::empty(),
             directory: Mutex::new(DirectoryData::empty()),
         }
     }
@@ -314,8 +326,9 @@ impl FileNode {
             id,
             kind: FileKind::Directory,
             executable: AtomicBool::new(false),
+            mutation: Mutex::new(()),
             storage: Mutex::new(FileNodeData::empty()),
-            metadata_blocks: Mutex::new(FileNodeBlocks::empty()),
+            metadata: FileMetadata::empty(),
             directory: Mutex::new(DirectoryData::empty()),
         }
     }
@@ -341,8 +354,8 @@ impl FileNode {
             .ok_or("enoent")
     }
 
-    // AGENT: publish one direct child name-to-inode binding and keep ordered
-    // iteration plus persisted metadata consistent on write failure.
+    // AGENT: serialize metadata reservation, child publication, persistence,
+    // and rollback while keeping ordered directory indexes consistent.
     pub(super) fn insert_child(
         &self,
         backend: &FileStorage,
@@ -352,21 +365,8 @@ impl FileNode {
         if self.kind != FileKind::Directory {
             return Err("enotdir");
         }
-        {
-            let directory = self.directory.lock().unwrap();
-            if directory.by_name.contains_key(name.as_str()) {
-                return Err("eexist");
-            }
-            let data_blocks = self.storage.lock().unwrap().blocks.len();
-            let entry_name_bytes = Self::entry_name_bytes(&directory.entries)?
-                .checked_add(name.as_str().len())
-                .ok_or("efbig")?;
-            let entry_count = directory.entries.len().checked_add(1).ok_or("efbig")?;
-            let payload_len =
-                Self::metadata_payload_len(data_blocks, entry_count, entry_name_bytes)?;
-            drop(directory);
-            self.ensure_metadata_capacity(backend, payload_len)?;
-        }
+        let _mutation = self.mutation.lock().unwrap();
+        self.prepare_child_insert(backend, name)?;
         {
             let mut directory = self.directory.lock().unwrap();
             if directory.by_name.contains_key(name.as_str()) {
@@ -378,7 +378,7 @@ impl FileNode {
             });
             directory.by_name.insert(name.as_str().to_string(), inode);
         }
-        if let Err(error) = self.mark_metadata_dirty(backend) {
+        if let Err(error) = self.persist_state(backend) {
             let mut directory = self.directory.lock().unwrap();
             directory.by_name.remove(name.as_str());
             if let Some(index) = directory
@@ -389,14 +389,14 @@ impl FileNode {
                 directory.entries.remove(index);
             }
             drop(directory);
-            let _ = self.mark_metadata_dirty(backend);
+            let _ = self.persist_state(backend);
             return Err(error);
         }
         Ok(())
     }
 
-    // AGENT: atomically retarget one existing direct name to a replacement
-    // inode while preserving its directory iteration position.
+    // AGENT: serialize retarget, persistence, and rollback for one existing
+    // child while preserving its directory iteration position.
     pub(super) fn replace_child_inode(
         &self,
         backend: &FileStorage,
@@ -407,6 +407,7 @@ impl FileNode {
         if self.kind != FileKind::Directory {
             return Err("enotdir");
         }
+        let _mutation = self.mutation.lock().unwrap();
         {
             let mut directory = self.directory.lock().unwrap();
             if directory.by_name.get(name.as_str()).copied() != Some(expected) {
@@ -422,7 +423,7 @@ impl FileNode {
                 .by_name
                 .insert(name.as_str().to_string(), replacement);
         }
-        if let Err(error) = self.mark_metadata_dirty(backend) {
+        if let Err(error) = self.persist_state(backend) {
             let mut directory = self.directory.lock().unwrap();
             if let Some(entry) = directory
                 .entries
@@ -435,7 +436,7 @@ impl FileNode {
                 .by_name
                 .insert(name.as_str().to_string(), expected);
             drop(directory);
-            let _ = self.mark_metadata_dirty(backend);
+            let _ = self.persist_state(backend);
             return Err(error);
         }
         Ok(())
@@ -475,16 +476,7 @@ impl FileNode {
     // without leaking backend block ids into normal filesystem code.
     #[cfg(any(test, feature = "qemu-sync-selftest"))]
     pub(crate) fn metadata_block_count(&self) -> usize {
-        self.metadata_blocks.lock().unwrap().len()
-    }
-
-    fn blocks_for_len(len: usize) -> Result<usize, &'static str> {
-        if len == 0 {
-            return Ok(0);
-        }
-        len.checked_add(BLOCK_CACHE_BLOCK_SIZE - 1)
-            .map(|rounded| rounded / BLOCK_CACHE_BLOCK_SIZE)
-            .ok_or("efbig")
+        self.metadata.block_count()
     }
 
     fn zero_range_locked(
@@ -514,153 +506,6 @@ impl FileNode {
             copied += n;
         }
         Ok(())
-    }
-
-    fn checked_metadata_add(lhs: usize, rhs: usize) -> Result<usize, &'static str> {
-        lhs.checked_add(rhs).ok_or("efbig")
-    }
-
-    fn entry_name_bytes(entries: &[DirEntry]) -> Result<usize, &'static str> {
-        let mut total = 0usize;
-        for entry in entries.iter() {
-            total = Self::checked_metadata_add(total, entry.name.len())?;
-        }
-        Ok(total)
-    }
-
-    fn metadata_payload_len(
-        data_blocks: usize,
-        entry_count: usize,
-        entry_name_bytes: usize,
-    ) -> Result<usize, &'static str> {
-        let data_block_bytes = data_blocks.checked_mul(8).ok_or("efbig")?;
-        let entry_metadata_bytes = entry_count.checked_mul(16).ok_or("efbig")?;
-        let len = Self::checked_metadata_add(FILE_NODE_METADATA_HEADER_LEN, data_block_bytes)?;
-        let len = Self::checked_metadata_add(len, entry_metadata_bytes)?;
-        Self::checked_metadata_add(len, entry_name_bytes)
-    }
-
-    fn put_metadata_bytes(payload: &mut Vec<u8>, bytes: &[u8]) {
-        payload.extend_from_slice(bytes);
-    }
-
-    fn put_metadata_u64(payload: &mut Vec<u8>, value: usize) -> Result<(), &'static str> {
-        let value = u64::try_from(value).map_err(|_| "efbig")?;
-        Self::put_metadata_bytes(payload, &value.to_le_bytes());
-        Ok(())
-    }
-
-    fn metadata_payload(&self) -> Result<Vec<u8>, &'static str> {
-        let directory = self.directory.lock().unwrap();
-        let storage = self.storage.lock().unwrap();
-        let entry_name_bytes = Self::entry_name_bytes(&directory.entries)?;
-        let payload_len = Self::metadata_payload_len(
-            storage.blocks.len(),
-            directory.entries.len(),
-            entry_name_bytes,
-        )?;
-        let mut payload = Vec::with_capacity(payload_len);
-
-        Self::put_metadata_bytes(&mut payload, FILE_NODE_METADATA_MAGIC);
-        Self::put_metadata_bytes(&mut payload, &[FILE_NODE_METADATA_VERSION]);
-        Self::put_metadata_bytes(
-            &mut payload,
-            &[match self.kind {
-                FileKind::Regular => 1,
-                FileKind::Directory => 2,
-            }],
-        );
-        Self::put_metadata_bytes(
-            &mut payload,
-            &[self.executable.load(Ordering::Relaxed) as u8],
-        );
-        Self::put_metadata_u64(&mut payload, storage.byte_len)?;
-        Self::put_metadata_u64(&mut payload, storage.blocks.len())?;
-        Self::put_metadata_u64(&mut payload, directory.entries.len())?;
-
-        for block in storage.blocks.ids() {
-            let stored_id = block.checked_add(1).ok_or("efbig")?;
-            Self::put_metadata_u64(&mut payload, stored_id)?;
-        }
-        for entry in directory.entries.iter() {
-            Self::put_metadata_bytes(&mut payload, &entry.inode.to_le_bytes());
-            Self::put_metadata_u64(&mut payload, entry.name.len())?;
-            Self::put_metadata_bytes(&mut payload, entry.name.as_bytes());
-        }
-        debug_assert_eq!(payload.len(), payload_len);
-
-        Ok(payload)
-    }
-
-    fn ensure_metadata_capacity(
-        &self,
-        backend: &FileStorage,
-        payload_len: usize,
-    ) -> Result<usize, &'static str> {
-        let needed_blocks = Self::blocks_for_len(payload_len.max(1))?;
-        let mut metadata_blocks = self.metadata_blocks.lock().unwrap();
-        if metadata_blocks.len() >= needed_blocks {
-            return Ok(needed_blocks);
-        }
-        let mut allocated = Vec::new();
-        while metadata_blocks.len() + allocated.len() < needed_blocks {
-            allocated.push(backend.allocate_block()?);
-        }
-        metadata_blocks.blocks.append(&mut allocated);
-        Ok(needed_blocks)
-    }
-
-    fn ensure_metadata_capacity_for_data_blocks(
-        &self,
-        backend: &FileStorage,
-        data_blocks: usize,
-    ) -> Result<(), &'static str> {
-        let directory = self.directory.lock().unwrap();
-        let entry_name_bytes = Self::entry_name_bytes(&directory.entries)?;
-        let payload_len =
-            Self::metadata_payload_len(data_blocks, directory.entries.len(), entry_name_bytes)?;
-        drop(directory);
-        self.ensure_metadata_capacity(backend, payload_len)?;
-        Ok(())
-    }
-
-    // AGENT: encode FileNode-owned metadata through BlockCache so metadata
-    // changes use the same dirty state as regular file-block writes, spanning
-    // as many backend blocks as the serialized metadata needs.
-    fn mark_metadata_dirty(&self, backend: &FileStorage) -> Result<(), &'static str> {
-        let payload = self.metadata_payload()?;
-        let needed_blocks = self.ensure_metadata_capacity(backend, payload.len())?;
-        let extra_blocks = {
-            let mut metadata_blocks = self.metadata_blocks.lock().unwrap();
-            for idx in 0..needed_blocks {
-                let start = idx * BLOCK_CACHE_BLOCK_SIZE;
-                let end = min(start + BLOCK_CACHE_BLOCK_SIZE, payload.len());
-                let mut block_payload = [0u8; BLOCK_CACHE_BLOCK_SIZE];
-                if start < end {
-                    block_payload[..end - start].copy_from_slice(&payload[start..end]);
-                }
-                backend.write_block(metadata_blocks.blocks[idx].id(), &block_payload)?;
-            }
-            if metadata_blocks.len() > needed_blocks {
-                metadata_blocks.split_off(needed_blocks)
-            } else {
-                Vec::new()
-            }
-        };
-        drop(extra_blocks);
-        Ok(())
-    }
-
-    fn write_may_change_metadata(
-        storage: &FileNodeData,
-        start: usize,
-        len: usize,
-    ) -> Result<bool, &'static str> {
-        let end = start.checked_add(len).ok_or("efbig")?;
-        if len == 0 {
-            return Ok(false);
-        }
-        Ok(Self::blocks_for_len(end)? > storage.blocks.len() || end > storage.byte_len)
     }
 
     // AGENT: read bytes from the contiguous block map while clipping at the
@@ -703,8 +548,8 @@ impl FileNode {
         Ok(data)
     }
 
-    // AGENT: write a byte range through the block cache, zero any newly visible
-    // hole, and update the FileNode-owned byte length under the storage lock.
+    // AGENT: serialize metadata preflight, block-cache writes, EOF publication,
+    // and metadata commit while zeroing any newly visible hole.
     pub(crate) fn write_bytes(
         &self,
         backend: &FileStorage,
@@ -714,29 +559,21 @@ impl FileNode {
         if self.kind != FileKind::Regular {
             return Err("eisdir");
         }
-        {
-            let storage = self.storage.lock().unwrap();
-            let start = offset.unwrap_or(storage.byte_len);
-            if Self::write_may_change_metadata(&storage, start, buf.len())? {
-                let end = start.checked_add(buf.len()).ok_or("efbig")?;
-                let needed_blocks = Self::blocks_for_len(end)?;
-                drop(storage);
-                self.ensure_metadata_capacity_for_data_blocks(backend, needed_blocks)?;
-            }
-        }
+        let _mutation = self.mutation.lock().unwrap();
+        self.prepare_write(backend, offset, buf.len())?;
         let mut storage = self.storage.lock().unwrap();
         let start = offset.unwrap_or(storage.byte_len);
         if buf.is_empty() {
             return Ok(start);
         }
         let end = start.checked_add(buf.len()).ok_or("efbig")?;
-        let needed_blocks = Self::blocks_for_len(end)?;
+        let needed_blocks = blocks_for_len(end)?;
         let old_len = storage.byte_len;
-        let mut metadata_changed = false;
+        let mut layout_changed = false;
 
         while storage.blocks.len() < needed_blocks {
             storage.blocks.push(backend.allocate_block()?);
-            metadata_changed = true;
+            layout_changed = true;
         }
         if start > old_len {
             Self::zero_range_locked(&storage, backend, old_len, start)?;
@@ -760,12 +597,12 @@ impl FileNode {
         }
         if end > storage.byte_len {
             storage.byte_len = end;
-            metadata_changed = true;
+            layout_changed = true;
         }
         drop(storage);
 
-        if metadata_changed {
-            self.mark_metadata_dirty(backend)?;
+        if layout_changed {
+            self.persist_state(backend)?;
         }
         Ok(end)
     }
@@ -781,8 +618,8 @@ impl FileNode {
         Ok(())
     }
 
-    // AGENT: resize visible EOF and the contiguous block map together so
-    // truncation releases blocks while in-block shrink/grow keeps byte precision.
+    // AGENT: serialize resize preflight through metadata commit so truncation
+    // cannot invalidate another mutation's reserved metadata capacity.
     pub(crate) fn set_data_len(
         &self,
         backend: &FileStorage,
@@ -791,18 +628,13 @@ impl FileNode {
         if self.kind != FileKind::Regular {
             return Err("eisdir");
         }
-        let keep_blocks = Self::blocks_for_len(len)?;
-        {
-            let storage = self.storage.lock().unwrap();
-            if storage.blocks.len() != keep_blocks || storage.byte_len != len {
-                drop(storage);
-                self.ensure_metadata_capacity_for_data_blocks(backend, keep_blocks)?;
-            }
-        }
+        let _mutation = self.mutation.lock().unwrap();
+        let keep_blocks = blocks_for_len(len)?;
+        self.prepare_resize(backend, keep_blocks, len)?;
         let changed = {
             let mut storage = self.storage.lock().unwrap();
             let old_len = storage.byte_len;
-            let mut metadata_changed = false;
+            let mut layout_changed = false;
             if storage.blocks.len() == keep_blocks {
                 // Keep existing allocation for byte-precise shrink/grow inside
                 // the same final block.
@@ -817,25 +649,25 @@ impl FileNode {
                         storage.blocks.push(backend.allocate_block()?);
                     }
                 }
-                metadata_changed = true;
+                layout_changed = true;
             }
             if len > old_len {
                 Self::zero_range_locked(&storage, backend, old_len, len)?;
             }
             if storage.byte_len != len {
                 storage.byte_len = len;
-                metadata_changed = true;
+                layout_changed = true;
             }
-            metadata_changed
+            layout_changed
         };
         if changed {
-            self.mark_metadata_dirty(backend)?;
+            self.persist_state(backend)?;
         }
         Ok(())
     }
 
-    // AGENT: grow visible EOF and the contiguous block map eagerly, zeroing newly
-    // visible bytes before publishing the longer byte length.
+    // AGENT: serialize growth preflight through metadata commit, eagerly
+    // zeroing newly visible bytes before publishing the longer byte length.
     pub(crate) fn ensure_data_len_at_least(
         &self,
         backend: &FileStorage,
@@ -844,47 +676,37 @@ impl FileNode {
         if self.kind != FileKind::Regular {
             return Err("eisdir");
         }
-        let needed_blocks = Self::blocks_for_len(len)?;
-        {
-            let storage = self.storage.lock().unwrap();
-            if storage.byte_len >= len {
-                return Ok(());
-            }
-            if storage.blocks.len() < needed_blocks || storage.byte_len < len {
-                drop(storage);
-                self.ensure_metadata_capacity_for_data_blocks(backend, needed_blocks)?;
-            }
+        let _mutation = self.mutation.lock().unwrap();
+        let needed_blocks = blocks_for_len(len)?;
+        if !self.prepare_growth(backend, needed_blocks, len)? {
+            return Ok(());
         }
-        let grew = {
+        {
             let mut storage = self.storage.lock().unwrap();
             if storage.byte_len >= len {
                 return Ok(());
             }
             let old_len = storage.byte_len;
-            let mut metadata_changed = false;
             while storage.blocks.len() < needed_blocks {
                 storage.blocks.push(backend.allocate_block()?);
-                metadata_changed = true;
             }
             Self::zero_range_locked(&storage, backend, old_len, len)?;
             storage.byte_len = len;
-            metadata_changed = true;
-            metadata_changed
-        };
-        if grew {
-            self.mark_metadata_dirty(backend)?;
         }
+        self.persist_state(backend)?;
         Ok(())
     }
 }
 
+// AGENT: retain FileNode diagnostics while delegating metadata allocation
+// details to the private FileMetadata component.
 impl fmt::Debug for FileNode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let (byte_len, block_count) = {
             let storage = self.storage.lock().unwrap();
             (storage.byte_len, storage.blocks.len())
         };
-        let metadata_block_count = self.metadata_blocks.lock().unwrap().len();
+        let metadata_block_count = self.metadata.block_count();
         let entry_count = self.directory.lock().unwrap().entries.len();
         f.debug_struct("FileNode")
             .field("id", &self.id)
