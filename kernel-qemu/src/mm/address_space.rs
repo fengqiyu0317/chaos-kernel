@@ -480,6 +480,58 @@ impl AddrSpace {
         Ok(checked)
     }
 
+    // AGENT: report the contiguous writable userspace prefix before read-like
+    // syscalls consume file or pipe state; software COW pages remain writable.
+    pub fn writable_user_prefix_len(&self, addr: usize, len: usize) -> Result<usize, &'static str> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let end = Self::checked_user_end(addr, len)?;
+        let mut checked = 0usize;
+        while checked < len {
+            let cur = addr + checked;
+            let Some(region) = self.vm_map.find(cur) else {
+                return if checked == 0 {
+                    Err("efault")
+                } else {
+                    Ok(checked)
+                };
+            };
+            if region.flags & VM_WRITE == 0 {
+                return if checked == 0 {
+                    Err("efault")
+                } else {
+                    Ok(checked)
+                };
+            }
+
+            let page_addr = align_down(cur, PAGE_SZ);
+            let page_off = cur & (PAGE_SZ - 1);
+            let page_writable = match (
+                self.resident_pages.entries.get(&page_addr),
+                self.sv39.leaf_mapping(page_addr),
+            ) {
+                (Some(resident), Ok(leaf)) => {
+                    let hardware_writable = leaf.flags & PTE_W != 0;
+                    let valid_write_state = (!resident.cow && hardware_writable)
+                        || (resident.cow && !hardware_writable);
+                    leaf.paddr == resident.paddr() && leaf.flags & PTE_U != 0 && valid_write_state
+                }
+                _ => false,
+            };
+            if !page_writable {
+                return if checked == 0 {
+                    Err("efault")
+                } else {
+                    Ok(checked)
+                };
+            }
+
+            checked += min(end - cur, min(PAGE_SZ - page_off, region.end() - cur));
+        }
+        Ok(checked)
+    }
+
     // AGENT: read scalar user data through the unified byte-copy path.
     pub fn read_user_usize(&self, addr: usize) -> Result<usize, &'static str> {
         let mut bytes = [0u8; mem::size_of::<usize>()];

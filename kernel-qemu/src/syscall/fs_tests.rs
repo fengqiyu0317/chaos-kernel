@@ -2,13 +2,15 @@
 // pool, current init task, Sv39 mappings, and authoritative AddrSpace usercopy.
 use super::*;
 use crate::syscall_abi::{
-    map_riscv_nr, INTERNAL_SYS_MKDIRAT, INTERNAL_SYS_MOUNT, INTERNAL_SYS_OPENAT,
-    INTERNAL_SYS_UMOUNT2, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT, RISCV_SYS_OPENAT, RISCV_SYS_UMOUNT2,
+    map_riscv_nr, INTERNAL_SYS_MKDIRAT, INTERNAL_SYS_MOUNT, INTERNAL_SYS_OPENAT, INTERNAL_SYS_READ,
+    INTERNAL_SYS_UMOUNT2, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT, RISCV_SYS_OPENAT, RISCV_SYS_READ,
+    RISCV_SYS_UMOUNT2,
 };
 
 const USER_STRINGS_BASE: usize = 0x4000_0000;
 const OPEN_USER_BASE: usize = 0x4001_0000;
 const MKDIR_USER_BASE: usize = 0x4002_0000;
+const READ_USER_BASE: usize = 0x4003_0000;
 
 // AGENT: Run filesystem ABI and semantic regressions after QEMU installs the
 // real kernel frame pool, current init task, Sv39 mappings, and fd table.
@@ -22,6 +24,8 @@ pub fn run_all(kernel: &Kernel) {
     mounted_open_and_exec_use_the_mounted_filesystem_storage(kernel);
     mkdirat_creates_only_new_absolute_directories(kernel);
     openat_uses_transactional_fd_and_path_state(kernel);
+    read_uses_usercopy_and_shared_open_file_offsets(kernel);
+    read_moves_pipe_bytes_and_reports_empty_states(kernel);
 }
 
 // AGENT: Write one NUL-terminated syscall string through the active address
@@ -899,4 +903,258 @@ fn openat_uses_transactional_fd_and_path_state(kernel: &Kernel) {
     for fd in fillers {
         task.close_fd(fd).expect("filler fd should close");
     }
+}
+
+// AGENT: verify the live read ABI, writable-prefix short I/O, fd errors, shared
+// OFD offsets, EOF, and COW-safe copy-out through the installed address space.
+#[cfg_attr(test, test)]
+fn read_uses_usercopy_and_shared_open_file_offsets(kernel: &Kernel) {
+    assert_eq!(map_riscv_nr(RISCV_SYS_READ), Some(INTERNAL_SYS_READ));
+
+    let task = kernel.cur_task(0).expect("init task should be current");
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .map_region(
+            VmRegion::new(READ_USER_BASE, PAGE_SZ, VM_READ | VM_WRITE),
+            &kernel.pool,
+        )
+        .expect("read syscall writable user page should map");
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .map_region(
+            VmRegion::new(READ_USER_BASE + PAGE_SZ, PAGE_SZ, VM_READ),
+            &kernel.pool,
+        )
+        .expect("read syscall read-only user page should map");
+
+    let path_addr = READ_USER_BASE;
+    let buf_addr = READ_USER_BASE + 512;
+    let readonly_addr = READ_USER_BASE + PAGE_SZ;
+    let partial_addr = READ_USER_BASE + PAGE_SZ - 2;
+    let unmapped_addr = READ_USER_BASE + 2 * PAGE_SZ;
+    write_user_string(kernel, &task, path_addr, "/tmp/qemu-sys-read");
+    kernel
+        .install_file("/tmp/qemu-sys-read", b"abcdef".to_vec(), false)
+        .expect("read syscall fixture should install");
+
+    let fd = kernel
+        .dispatch_syscall_without_signal_delivery(SYS_OPENAT, 0, path_addr, 0, 0, 0, 0)
+        .expect("read syscall fixture should open");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_READ, fd, buf_addr, 3, 0, 0, 0),
+        Ok(3)
+    );
+    let mut bytes = [0u8; 3];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(buf_addr, &mut bytes)
+        .expect("first read result should be copied to userspace");
+    assert_eq!(&bytes, b"abc");
+
+    let dup_fd = kernel
+        .dispatch_syscall_without_signal_delivery(SYS_DUP, fd, 0, 0, 0, 0, 0)
+        .expect("dup should share the read open-file description");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_READ, dup_fd, buf_addr, 3, 0, 0, 0),
+        Ok(3)
+    );
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(buf_addr, &mut bytes)
+        .expect("dup read result should be copied to userspace");
+    assert_eq!(&bytes, b"def");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_READ, fd, buf_addr, 1, 0, 0, 0),
+        Ok(0)
+    );
+    task.close_fd(fd).expect("read fixture fd should close");
+    task.close_fd(dup_fd)
+        .expect("dup read fixture fd should close");
+
+    let write_only_fd = kernel
+        .dispatch_syscall_without_signal_delivery(SYS_OPENAT, 0, path_addr, 1, 0, 0, 0)
+        .expect("write-only read fixture should open");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_READ,
+            write_only_fd,
+            buf_addr,
+            1,
+            0,
+            0,
+            0,
+        ),
+        Err("ebadf")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_READ,
+            write_only_fd + MAX_FD,
+            buf_addr,
+            1,
+            0,
+            0,
+            0,
+        ),
+        Err("ebadf")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_READ,
+            write_only_fd,
+            unmapped_addr,
+            1,
+            0,
+            0,
+            0,
+        ),
+        Err("efault")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_READ,
+            write_only_fd,
+            readonly_addr,
+            1,
+            0,
+            0,
+            0,
+        ),
+        Err("efault")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_READ,
+            write_only_fd + MAX_FD,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ),
+        Ok(0)
+    );
+    task.close_fd(write_only_fd)
+        .expect("write-only read fixture fd should close");
+
+    let partial_fd = kernel
+        .dispatch_syscall_without_signal_delivery(SYS_OPENAT, 0, path_addr, 0, 0, 0, 0)
+        .expect("short-read fixture should open");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_READ,
+            partial_fd,
+            partial_addr,
+            4,
+            0,
+            0,
+            0,
+        ),
+        Ok(2)
+    );
+    let mut partial = [0u8; 2];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(partial_addr, &mut partial)
+        .expect("short read prefix should be copied to userspace");
+    assert_eq!(&partial, b"ab");
+    assert_eq!(
+        kernel
+            .dispatch_syscall_without_signal_delivery(SYS_READ, partial_fd, buf_addr, 2, 0, 0, 0,),
+        Ok(2)
+    );
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(buf_addr, &mut partial)
+        .expect("read after short prefix should continue at the shared offset");
+    assert_eq!(&partial, b"cd");
+    task.close_fd(partial_fd)
+        .expect("short-read fixture fd should close");
+
+    let cow_fd = kernel
+        .dispatch_syscall_without_signal_delivery(SYS_OPENAT, 0, path_addr, 0, 0, 0, 0)
+        .expect("COW read fixture should open");
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .write_user_bytes(buf_addr, &[0u8; 3], &kernel.pool)
+        .expect("COW destination should start cleared");
+    let child_addr_space = {
+        let mut parent = task.process.addr_space.lock().unwrap();
+        AddrSpace::fork_from(&mut parent, &kernel.pool)
+            .expect("read destination should become a COW mapping")
+    };
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_READ, cow_fd, buf_addr, 3, 0, 0, 0),
+        Ok(3)
+    );
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(buf_addr, &mut bytes)
+        .expect("sys_read should resolve the parent COW destination");
+    assert_eq!(&bytes, b"abc");
+    let mut child_bytes = [1u8; 3];
+    child_addr_space
+        .read_user_bytes(buf_addr, &mut child_bytes)
+        .expect("child should retain the pre-read COW bytes");
+    assert_eq!(child_bytes, [0u8; 3]);
+    task.close_fd(cow_fd)
+        .expect("COW read fixture fd should close");
+}
+
+// AGENT: verify that sys_read consumes queued pipe bytes, reports EAGAIN while
+// an empty pipe still has a writer, and returns EOF after the last writer closes.
+#[cfg_attr(test, test)]
+fn read_moves_pipe_bytes_and_reports_empty_states(kernel: &Kernel) {
+    let task = kernel.cur_task(0).expect("init task should be current");
+    let buf_addr = READ_USER_BASE + 768;
+    let (read_end, write_end) = PipeNode::pair();
+    let (read_fd, write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(read_end), FLike::Pipe(write_end), false)
+        .expect("pipe read fixture should allocate two descriptors");
+    assert_eq!(
+        task.get_fd_entry(write_fd)
+            .expect("pipe write descriptor should exist")
+            .write(b"pipe"),
+        Ok(4)
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_READ, read_fd, buf_addr, 8, 0, 0, 0),
+        Ok(4)
+    );
+    let mut bytes = [0u8; 4];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(buf_addr, &mut bytes)
+        .expect("pipe read bytes should be copied to userspace");
+    assert_eq!(&bytes, b"pipe");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_READ, read_fd, buf_addr, 1, 0, 0, 0),
+        Err("eagain")
+    );
+    task.close_fd(write_fd)
+        .expect("closing the last pipe writer should succeed");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_READ, read_fd, buf_addr, 1, 0, 0, 0),
+        Ok(0)
+    );
+    task.close_fd(read_fd)
+        .expect("pipe read descriptor should close");
 }

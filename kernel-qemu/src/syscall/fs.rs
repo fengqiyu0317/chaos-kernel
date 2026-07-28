@@ -149,14 +149,43 @@ fn write_user_i32(
     )
 }
 
-// AGENT: keep the read syscall entry while standard QEMU usercopy-backed I/O is pending.
+// AGENT: preflight a bounded writable userspace prefix, read through the current
+// task's shared open-file description, then copy the returned bytes to userspace.
 pub(super) fn sys_read(
-    _kernel: &Kernel,
-    _a0: usize,
-    _a1: usize,
-    _a2: usize,
+    kernel: &Kernel,
+    a0: usize,
+    a1: usize,
+    a2: usize,
 ) -> Result<usize, &'static str> {
-    Err("enosys")
+    let fd = a0;
+    let buf_addr = a1;
+    let count = a2;
+    if count == 0 {
+        return Ok(0);
+    }
+    if buf_addr == 0 {
+        return Err("efault");
+    }
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    let request_len = min(count, MAX_RW_COUNT);
+    let writable_len = {
+        let addr_space = task.process.addr_space.lock().unwrap();
+        addr_space.writable_user_prefix_len(buf_addr, request_len)?
+    };
+    let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
+    let mut tmp = vec![0u8; writable_len];
+    let nread = entry.read(&mut tmp)?;
+    if nread > tmp.len() {
+        return Err("eio");
+    }
+    if nread != 0 {
+        task.process.addr_space.lock().unwrap().write_user_bytes(
+            buf_addr,
+            &tmp[..nread],
+            &kernel.pool,
+        )?;
+    }
+    Ok(nread)
 }
 
 // AGENT: copy a bounded readable userspace prefix into kernel memory before
