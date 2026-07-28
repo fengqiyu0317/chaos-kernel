@@ -100,19 +100,21 @@ pub(super) fn sys_mount(
     Ok(0)
 }
 
-// AGENT: remove the visible top mount at an exact path; nonzero umount2 flags are
-// rejected until force, detach, expire, and no-follow semantics are modeled.
+// AGENT: map Linux's zero and MNT_DETACH flag sets onto explicit mount lifecycle
+// modes while continuing to reject force, expire, no-follow, and unknown bits.
 pub(super) fn sys_umount2(
     kernel: &Kernel,
     target_addr: usize,
     flags: usize,
 ) -> Result<usize, &'static str> {
-    if flags != 0 {
-        return Err("enotsup");
-    }
+    let mode = match flags {
+        0 => UnmountMode::Normal,
+        MNT_DETACH => UnmountMode::Lazy,
+        _ => return Err("enotsup"),
+    };
     let task = kernel.cur_task(0).ok_or("esrch")?;
     let target = read_user_path(&task, target_addr)?;
-    kernel.vfs.detach_top(&target)?;
+    kernel.vfs.unmount(&target, mode)?;
     Ok(0)
 }
 

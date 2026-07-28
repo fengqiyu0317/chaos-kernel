@@ -7,6 +7,7 @@ use super::*;
 pub struct FInstance {
     pub mount: Arc<Mount>,
     pub node: Arc<FileNode>,
+    mount_pin: MountPin,
 }
 
 // AGENT: keep stateless inode operations on stable file-object identity so
@@ -18,7 +19,42 @@ impl FInstance {
             mount.fs().owns_node(&node),
             "FInstance node must belong to its mount filesystem"
         );
-        Self { mount, node }
+        let mount_pin = MountPin::try_new(mount.clone())
+            .expect("FInstance mount must still be attached when first pinned");
+        Self {
+            mount,
+            node,
+            mount_pin,
+        }
+    }
+
+    // AGENT: consume the pin acquired under MountTable's read lock so crossing
+    // a visible mount never releases topology protection before active_refs rises.
+    pub(crate) fn from_mount_pin(mount_pin: MountPin, node: Arc<FileNode>) -> Self {
+        let mount = mount_pin.mount().clone();
+        assert!(
+            mount.fs().owns_node(&node),
+            "FInstance node must belong to its mount filesystem"
+        );
+        Self {
+            mount,
+            node,
+            mount_pin,
+        }
+    }
+
+    // AGENT: derive another inode identity inside an already-pinned mount even
+    // after lazy detach; cloning the existing pin avoids a detach race window.
+    pub(crate) fn with_node(&self, node: Arc<FileNode>) -> Self {
+        assert!(
+            self.mount.fs().owns_node(&node),
+            "FInstance node must belong to its mount filesystem"
+        );
+        Self {
+            mount: self.mount.clone(),
+            node,
+            mount_pin: self.mount_pin.clone(),
+        }
     }
 
     // AGENT: lend the only storage backend permitted to serve this filesystem's

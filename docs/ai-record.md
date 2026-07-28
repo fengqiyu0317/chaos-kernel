@@ -12,6 +12,47 @@
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
 
+## 2026-07-28：kernel-qemu 普通卸载与 lazy detach
+
+目标：修复 `MountTable::detach_top()` 无条件摘除导致子挂载不可达但仍被强引用的幽灵拓扑，并在 cwd/目录 fd 迁移前建立可复用的 mount busy pin、普通卸载、lazy detach 和 flush 事务边界。
+
+已完成修改：
+
+- `Mount` 新增显式 `active_refs` 与 `Attached / Unmounting / Detached` 状态；RAII `MountPin` 由 `FInstance` 持有，路径对象 clone/drop 与长期 `FHandle` fd 引用会精确影响普通卸载的 `ebusy`，不再依赖混杂拓扑和临时引用的 `Arc::strong_count()`。
+- 路径跨 mount 改为在 `MountTable.children` 读锁内同时完成可见顶层查找和 pin；同一 mount 内继续遍历时 clone 既有 pin。无锁初始 pin 使用 state/increment/state 的顺序一致性握手，普通卸载先切换 `Unmounting` 再检查计数。
+- `MountTable::unmount_top()` 明确接受 `UnmountMode`。普通卸载拒绝 active pin 和直接子挂载，释放拓扑锁后执行 `FsInstance::flush()`，失败恢复 `Attached`，成功才提交单个可见顶层摘除。
+- lazy detach 使用锁内 BFS 收集目标完整子树。本阶段明确选择同步 flush 整棵子树：任一文件系统 flush 失败时拓扑完全不变；全部成功后在一个写锁临界区删除 descendant keys、弹出目标顶层并把整棵子树置为 `Detached`。已有 fd/FInstance 仍可访问，新路径不可见，`mount_count()` 不再统计不可达子挂载。
+- `Vfs::detach_top()` 被 `Vfs::unmount(target, mode)` 替换；RISC-V `umount2(39)` 接受 `0` 和 `MNT_DETACH(2)`，继续拒绝 force、expire、no-follow、组合及未知 flags。
+- mount 与 syscall 自测补齐普通卸载 EBUSY/最后 fd 关闭、子挂载拓扑不变、lazy 子树摘除、旧 fd/object 存活、stack reveal、busy 下层不阻止顶层、flush 失败回滚、非法 flags 和读锁内 pin 竞态边界。
+
+关键文件：
+
+- `kernel-qemu/src/fs/mount.rs`
+- `kernel-qemu/src/fs/finstance.rs`
+- `kernel-qemu/src/fs/vfs.rs`
+- `kernel-qemu/src/fs/mount_tests.rs`
+- `kernel-qemu/src/syscall/fs.rs`
+- `kernel-qemu/src/syscall/fs_tests.rs`
+- `TASK.md`
+- `docs/ai-record.md`
+
+验收命令：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo check --target riscv64gc-unknown-none-elf --all-features
+cargo run --release --features qemu-selftest,ram-block-device
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check
+```
+
+结果：全部通过。RAM QEMU 依次输出 `sync selftest passed`、`fs syscall selftest passed`，随后真实用户态 init 的 mkdirat/openat round trip 继续通过并正常退出；默认 VirtIO smoke 也完成双次启动、timer、init 和用户 syscall 闭环。
+
+当前边界：lazy detach 暂时同步等待子树 flush；尚未实现异步 final-put 回收、共享 FsInstance 的跨挂载写入冻结、cwd/root/dirfd pin、mount namespace 或真正多 hart 并发压测。没有修改 `kernel-sim` 或 `kernel/src/kernel.rs`。
+
 ## 2026-07-28：kernel-qemu ChaosFs v1 磁盘恢复
 
 目标：在 source registry 已能选择唯一 live `FsInstance` 的基础上，补齐可从真实块设备恢复的 ChaosFs 格式，并用同一个 VirtIO raw image 跨两次 QEMU 启动验证目录、文件内容和 allocator 所有权。

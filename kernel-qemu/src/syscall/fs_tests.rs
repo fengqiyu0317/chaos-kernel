@@ -11,6 +11,7 @@ const USER_STRINGS_BASE: usize = 0x4000_0000;
 const OPEN_USER_BASE: usize = 0x4001_0000;
 const MKDIR_USER_BASE: usize = 0x4002_0000;
 const READ_USER_BASE: usize = 0x4003_0000;
+const UNMOUNT_USER_BASE: usize = 0x4004_0000;
 
 // AGENT: Run filesystem ABI and semantic regressions after QEMU installs the
 // real kernel frame pool, current init task, Sv39 mappings, and fd table.
@@ -19,6 +20,7 @@ pub fn run_all(kernel: &Kernel) {
         .install_directory("/tmp")
         .expect("filesystem selftests require /tmp");
     mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel);
+    umount2_enforces_busy_close_and_lazy_subtree_lifecycles(kernel);
     path_creation_requires_an_existing_directory_parent(kernel);
     pathname_lookup_returns_shared_file_node(kernel);
     mounted_open_and_exec_use_the_mounted_filesystem_storage(kernel);
@@ -206,6 +208,7 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
     assert!(Arc::ptr_eq(&revealed.path_ref.node, &dev0_file));
     assert!(Arc::ptr_eq(revealed.path_ref.mount.fs(), &dev0));
     assert_eq!(kernel.vfs.mounts.mount_count(), 1);
+    drop(revealed);
 
     // Every failed mount below must leave the one live dev0 attachment intact.
     write_user_string(kernel, &task, source_addr, "missing");
@@ -339,6 +342,21 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
         .path_ref
         .mount;
     assert!(Arc::ptr_eq(&still_mounted, &first_mount));
+    for unsupported in [0x1, 0x4, 0x8, 0x10, MNT_DETACH | 0x1] {
+        assert_eq!(
+            kernel.dispatch_syscall_without_signal_delivery(
+                SYS_UMOUNT2,
+                target_addr,
+                unsupported,
+                0,
+                0,
+                0,
+                0,
+            ),
+            Err("enotsup")
+        );
+        assert_eq!(kernel.vfs.mounts.mount_count(), 1);
+    }
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(SYS_UMOUNT2, target_addr, 0, 0, 0, 0, 0,),
         Ok(0)
@@ -347,6 +365,116 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(SYS_UMOUNT2, target_addr, 0, 0, 0, 0, 0,),
         Err("einval")
+    );
+}
+
+// AGENT: exercise the user-visible distinction between busy-checked ordinary
+// unmount and subtree-wide MNT_DETACH while preserving open-file usability.
+#[cfg_attr(test, test)]
+fn umount2_enforces_busy_close_and_lazy_subtree_lifecycles(kernel: &Kernel) {
+    let task = kernel.cur_task(0).expect("init task should be current");
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .map_region(
+            VmRegion::new(UNMOUNT_USER_BASE, PAGE_SZ, VM_READ | VM_WRITE),
+            &kernel.pool,
+        )
+        .expect("unmount lifecycle user page should map");
+    let target_addr = UNMOUNT_USER_BASE;
+    let file_addr = UNMOUNT_USER_BASE + 128;
+    let baseline = kernel.vfs.mounts.mount_count();
+
+    kernel
+        .install_directory("/umount-busy")
+        .expect("busy-unmount mountpoint should install");
+    let busy_fs = kernel.vfs.new_filesystem(FileStorage::standalone());
+    kernel
+        .vfs
+        .attach("/umount-busy", busy_fs, MountFlags::empty())
+        .expect("busy-unmount filesystem should attach");
+    kernel
+        .install_file("/umount-busy/file", b"busy".to_vec(), false)
+        .expect("busy-unmount file should install");
+    write_user_string(kernel, &task, file_addr, "/umount-busy/file");
+    let busy_fd = kernel
+        .dispatch_syscall_without_signal_delivery(SYS_OPENAT, 0, file_addr, 0, 0, 0, 0)
+        .expect("open file should pin its mount");
+    write_user_string(kernel, &task, target_addr, "/umount-busy");
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_UMOUNT2, target_addr, 0, 0, 0, 0, 0,),
+        Err("ebusy")
+    );
+    assert_eq!(kernel.vfs.mounts.mount_count(), baseline + 1);
+    assert!(kernel.lookup_file_node("/umount-busy/file").is_ok());
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_CLOSE, busy_fd, 0, 0, 0, 0, 0),
+        Ok(0)
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_UMOUNT2, target_addr, 0, 0, 0, 0, 0,),
+        Ok(0)
+    );
+    assert_eq!(kernel.vfs.mounts.mount_count(), baseline);
+
+    kernel
+        .install_directory("/umount-lazy")
+        .expect("lazy-unmount mountpoint should install");
+    let parent_fs = kernel.vfs.new_filesystem(FileStorage::standalone());
+    parent_fs
+        .create_directory_at(
+            &parent_fs.root(),
+            ChildName::new("sub").expect("sub should be a valid child name"),
+        )
+        .expect("lazy-unmount child mountpoint should install");
+    kernel
+        .vfs
+        .attach("/umount-lazy", parent_fs, MountFlags::empty())
+        .expect("lazy-unmount parent filesystem should attach");
+    let child_fs = kernel.vfs.new_filesystem(FileStorage::standalone());
+    kernel
+        .vfs
+        .attach("/umount-lazy/sub", child_fs, MountFlags::empty())
+        .expect("lazy-unmount child filesystem should attach");
+    kernel
+        .install_file("/umount-lazy/sub/file", b"lazy-open".to_vec(), false)
+        .expect("lazy-unmount file should install");
+    write_user_string(kernel, &task, file_addr, "/umount-lazy/sub/file");
+    let lazy_fd = kernel
+        .dispatch_syscall_without_signal_delivery(SYS_OPENAT, 0, file_addr, 0, 0, 0, 0)
+        .expect("open child file should pin the descendant mount");
+    write_user_string(kernel, &task, target_addr, "/umount-lazy");
+    assert_eq!(kernel.vfs.mounts.mount_count(), baseline + 2);
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_UMOUNT2,
+            target_addr,
+            MNT_DETACH,
+            0,
+            0,
+            0,
+            0,
+        ),
+        Ok(0)
+    );
+    assert_eq!(kernel.vfs.mounts.mount_count(), baseline);
+    assert!(matches!(
+        kernel.lookup_file_node("/umount-lazy/sub/file"),
+        Err("enoent")
+    ));
+    let entry = task
+        .get_fd_entry(lazy_fd)
+        .expect("lazy-detached open fd should remain installed");
+    let mut bytes = [0u8; 9];
+    assert_eq!(entry.read(&mut bytes), Ok(bytes.len()));
+    assert_eq!(&bytes, b"lazy-open");
+    drop(entry);
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_CLOSE, lazy_fd, 0, 0, 0, 0, 0),
+        Ok(0)
     );
 }
 
@@ -479,9 +607,10 @@ fn pathname_lookup_returns_shared_file_node(kernel: &Kernel) {
         .lookup_file_node("/lookup-mnt/./file")
         .expect("mounted lookup path should resolve");
     assert_eq!(mounted.display_path, "/lookup-mnt/file");
+    drop(mounted);
     kernel
         .vfs
-        .detach_top("/lookup-mnt")
+        .unmount("/lookup-mnt", UnmountMode::Normal)
         .expect("lookup test mount should uninstall");
 }
 
@@ -526,7 +655,7 @@ fn mounted_open_and_exec_use_the_mounted_filesystem_storage(kernel: &Kernel) {
 
     kernel
         .vfs
-        .detach_top("/storage-mnt")
+        .unmount("/storage-mnt", UnmountMode::Lazy)
         .expect("storage test filesystem should detach");
     let mut bytes_after_detach = [0u8; 12];
     assert_eq!(

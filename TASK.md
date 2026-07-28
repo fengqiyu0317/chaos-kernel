@@ -585,6 +585,17 @@ cargo test --test pressure
 - 回归：`qemu-sync-selftest` 在一个 RAM device 上执行 format -> 创建嵌套文件 -> flush/drop -> mount/read -> 新分配 -> 再次 mount/read，并覆盖 blank/未知 magic/已知格式损坏错误边界；`tools/qemu-chaosfs-smoke.sh` 用同一个 VirtIO raw image 双启动，第二次必须恢复 1573 字节旧文件且新分配不能覆盖它。继续保留普通 VirtIO 启动与 raw-sector smoke，避免回归设备传输层。
 - 剩余边界：该版本只承诺 clean flush/reboot，不提供 journal、checksum、copy-on-write metadata 或断电原子性；尚无 fsck/orphan 回收、在线并发 flush 事务、通用 block-device source discovery、`/dev` 节点和完整 mount namespace/flags。
 
+#### 2026-07-28：普通卸载与 lazy detach 生命周期
+
+- 目标与边界：只修改 `kernel-qemu`，把原来无条件弹出一个挂载栈项的 `detach_top()` 替换为 `UnmountMode::{Normal, Lazy}`；不提前引入 cwd、进程 root、目录 fd、symlink 或 mount namespace，也不修改 `kernel-sim` 与禁止路径 `kernel/src/kernel.rs`。
+- 显式引用：`Mount` 新增 `active_refs` 和 `MountState::{Attached, Unmounting, Detached}`；`FInstance` 内含 RAII `MountPin`，创建、clone 和 drop 精确维护 active pin，fd 内的 `FHandle -> FInstance` 因而会让普通卸载返回 `ebusy`。mount table 的拓扑 `Arc`、临时裸 `Arc<Mount>` 和测试诊断引用不计入 busy 判定。
+- 路径竞态：跨越可见 mount 时，`MountTable::mounted_on()` 在持有 `children` 读锁期间完成查找和 pin；同一 mount 内的后续分量从既有 pin 派生，避免“已经解析成功、尚未计入 active_refs”窗口。无锁构造采用 state/increment/state 的顺序一致性握手，与写锁内的 `Unmounting` 转换配合。
+- 普通卸载：写锁内只选择可见顶层并先置为 `Unmounting`，存在 active pin 或任何以该 mount id 为父节点的子挂载时恢复 `Attached` 并返回 `ebusy`；通过检查后释放拓扑锁执行 `FsInstance::flush()`，flush 失败回滚，成功才重新加锁弹出顶层并置 `Detached`。被覆盖的 busy 下层 mount 不影响不 busy 顶层卸载。
+- lazy detach：锁内 BFS 收集目标 mount 的完整子树并统一置为 `Unmounting`；本阶段明确采用“整棵子树同步 flush 后提交”的策略，而不是静默丢弃 dirty cache。任一 flush 失败恢复整棵子树为 `Attached`；全部成功后在同一个 `children.write()` 临界区删除所有 descendant key、弹出目标顶层并统一置 `Detached`。已有 pin/fd 继续持有和访问旧对象，新路径不可见，`mount_count()` 不再包含幽灵子挂载。
+- ABI：RISC-V `umount2(39)` 的 `flags == 0` 映射普通卸载，`flags == MNT_DETACH(2)` 映射 lazy detach；`MNT_FORCE`、`MNT_EXPIRE`、`UMOUNT_NOFOLLOW`、组合和未知 flags 继续返回 `enotsup`。
+- 回归与验证：mount 自测覆盖 active pin/clone、关闭式释放、子挂载 EBUSY、整树 lazy detach、旧对象读取、stack reveal、busy 下层、flush 失败回滚和读锁内 pin 边界；fs syscall 自测覆盖打开 fd 后普通卸载 EBUSY、关闭后成功、非法 flags 不改 topology，以及 lazy detach 后路径消失、旧 fd 可读、子树计数归零。`cargo fmt --check`、RISC-V `cargo check --all-features`、RAM `qemu-selftest` 和默认 VirtIO `tools/qemu-smoke.sh` 通过；QEMU 输出 sync/fs syscall selftest passed，并继续完成真实用户态 mkdirat/openat round trip。
+- 剩余边界：lazy detach 当前同步等待子树 flush，不是 Linux 的低延迟异步回收实现；没有 per-mount 写入冻结、共享 FsInstance 的跨挂载 quiescence、后台 final-put flush、cwd/root/dirfd busy pin 或真正并发 hart 压测。后续 cwd 应直接复用 `MountPin`。
+
 #### 2026-07-24：删除 CPU0 调度器未启动时的元数据兼容路径
 
 - 范围：只清理 `kernel-qemu` 中阻塞、yield、停止信号、timer 死亡任务和线程/进程退出在 idle-context 调度器尚未初始化时通过修改 `current` / run queue 模拟切换的旧路径；不修改 `kernel-sim` 语义。

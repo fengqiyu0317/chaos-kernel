@@ -155,10 +155,11 @@ impl Vfs {
         follow_mount: bool,
     ) -> Result<FInstance, &'static str> {
         let node = current.mount.fs().lookup_child(&current.node, name)?;
-        let mut next = FInstance::new(current.mount.clone(), node);
+        let mut next = current.with_node(node);
         if follow_mount {
-            if let Some(child_mount) = self.mounts.mounted_on(&next.mount, &next.node) {
-                next = FInstance::new(child_mount.clone(), child_mount.fs().root());
+            if let Some(child_mount) = self.mounts.mounted_on(&next.mount, &next.node)? {
+                let root = child_mount.fs().root();
+                next = FInstance::from_mount_pin(child_mount, root);
             }
         }
         Ok(next)
@@ -283,7 +284,7 @@ impl Vfs {
                     exclusive,
                 )?;
                 Ok(ResolvedPath {
-                    path_ref: FInstance::new(parent.parent.mount, node),
+                    path_ref: parent.parent.with_node(node),
                     display_path: parent.display_path,
                 })
             }
@@ -312,7 +313,7 @@ impl Vfs {
             executable,
         )?;
         Ok(ResolvedPath {
-            path_ref: FInstance::new(parent.parent.mount, node),
+            path_ref: parent.parent.with_node(node),
             display_path: parent.display_path,
         })
     }
@@ -332,7 +333,7 @@ impl Vfs {
             .fs()
             .create_directory_at(&parent.parent.node, parent.name)?;
         Ok(ResolvedPath {
-            path_ref: FInstance::new(parent.parent.mount, node),
+            path_ref: parent.parent.with_node(node),
             display_path: parent.display_path,
         })
     }
@@ -358,7 +359,7 @@ impl Vfs {
             .fs()
             .install_directory_at(&parent.parent.node, parent.name)?;
         Ok(ResolvedPath {
-            path_ref: FInstance::new(parent.parent.mount, node),
+            path_ref: parent.parent.with_node(node),
             display_path: parent.display_path,
         })
     }
@@ -385,9 +386,12 @@ impl Vfs {
             .attach(&mountpoint.mount, mountpoint.node, fs, flags)
     }
 
-    // AGENT: detach and return the visible top mount at an exact external path.
-    pub fn detach_top(&self, target: &str) -> Result<Arc<Mount>, &'static str> {
+    // AGENT: resolve the underlying mountpoint without pinning the target mount,
+    // then delegate its explicit normal-or-lazy lifecycle to MountTable.
+    pub fn unmount(&self, target: &str, mode: UnmountMode) -> Result<(), &'static str> {
         let mountpoint = self.mountpoint(target)?;
-        self.mounts.detach_top(&mountpoint.mount, &mountpoint.node)
+        self.mounts
+            .unmount_top(&mountpoint.mount, &mountpoint.node, mode)?;
+        Ok(())
     }
 }
