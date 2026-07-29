@@ -258,7 +258,7 @@ fn read_entry_uses_open_description_offset() {
 }
 
 // AGENT: regular-file poll follows open-description access flags, while ioctl
-// observes FileNode's byte-precise visible length.
+// observes byte-precise EOF and rejects directory objects.
 #[cfg_attr(test, test)]
 fn regular_file_poll_and_ioctl_are_explicit() {
     let file = regular_file(vec![1, 2, 3, 4]);
@@ -291,6 +291,13 @@ fn regular_file_poll_and_ioctl_are_explicit() {
     assert_eq!(entry.read(0, &mut buf), Ok(2));
     assert_eq!(entry.io_ctl(TIOCINQ), Ok(2));
     assert_eq!(entry.io_ctl(0xDEAD), Err("enotty"));
+
+    let directory = directory_file();
+    let directory_entry = file_entry(&directory, FdOpt::default());
+    assert_eq!(directory_entry.io_ctl(FIONREAD), Err("enotty"));
+
+    let epoll_entry = FdEntry::new(FLike::Ep(EpInst::new()));
+    assert_eq!(epoll_entry.io_ctl(FIONREAD), Err("enotty"));
 }
 
 // AGENT: verify that terminal behavior follows the concrete FLike variant and

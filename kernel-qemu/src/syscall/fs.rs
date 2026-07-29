@@ -337,8 +337,8 @@ pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static st
     Ok(0)
 }
 
-// AGENT: validate the fd once, keep descriptor-wide ioctls here, and delegate
-// object-specific queries such as pipe FIONREAD through FdEntry::io_ctl.
+// AGENT: keep descriptor/OFD ioctls at this boundary, use authoritative
+// usercopy for integer arguments, and reject unmigrated device requests.
 pub(super) fn sys_ioctl(
     kernel: &Kernel,
     a0: usize,
@@ -354,36 +354,6 @@ pub(super) fn sys_ioctl(
     let task = kernel.cur_task(0).ok_or("esrch")?;
     let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
     match cmd {
-        TCGETS => {
-            if !check_access(arg, mem::size_of::<TrmIO>()) {
-                return Err("efault");
-            }
-            Ok(0)
-        }
-        TCSETS => {
-            if !check_access(arg, mem::size_of::<TrmIO>()) {
-                return Err("efault");
-            }
-            Ok(0)
-        }
-        TIOCGPGRP => {
-            if !check_access(arg, 4) {
-                return Err("efault");
-            }
-            Ok(0)
-        }
-        TIOCSPGRP => {
-            if !check_access(arg, 4) {
-                return Err("efault");
-            }
-            Ok(0)
-        }
-        TIOCGWINSZ => {
-            if !check_access(arg, mem::size_of::<WinSz>()) {
-                return Err("efault");
-            }
-            Ok(0)
-        }
         FIONCLEX => {
             task.set_cloexec(fd, false)?;
             Ok(0)
@@ -394,17 +364,12 @@ pub(super) fn sys_ioctl(
         }
         FIONBIO => {
             let nonblock = read_user_i32(&task, arg)? != 0;
-            let mut flags = entry.status_flags_bits();
-            if nonblock {
-                flags |= O_NONBLOCK;
-            } else {
-                flags &= !O_NONBLOCK;
-            }
-            entry.set_status_flags(flags)?;
+            entry.set_nonblocking(nonblock);
             Ok(0)
         }
-        FIONREAD | TIOCINQ => {
-            let readable = entry.io_ctl(cmd)?;
+        // TIOCINQ is the same numeric request as FIONREAD.
+        FIONREAD => {
+            let readable = entry.io_ctl(FIONREAD)?;
             let readable = i32::try_from(readable).map_err(|_| "eoverflow")?;
             write_user_i32(kernel, &task, arg, readable)?;
             Ok(0)

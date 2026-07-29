@@ -125,8 +125,12 @@ impl FInstance {
         cmd: usize,
         offset: u64,
     ) -> Result<usize, &'static str> {
+        if self.node.kind != FileKind::Regular {
+            return Err("enotty");
+        }
         match cmd {
-            FIONREAD | TIOCINQ => {
+            // TIOCINQ aliases the same numeric request.
+            FIONREAD => {
                 let len = self.len() as u64;
                 usize::try_from(len.saturating_sub(offset)).map_err(|_| "eoverflow")
             }

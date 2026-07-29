@@ -7,6 +7,8 @@ pub const ENOSYS_RET: usize = (-38isize) as usize;
 // AGENT: Linux asm-generic syscall numbers used by the RISC-V ABI.
 pub const RISCV_SYS_DUP: usize = 23;
 pub const RISCV_SYS_DUP3: usize = 24;
+// AGENT: Linux asm-generic ioctl number used by the RV64 userspace ABI.
+pub const RISCV_SYS_IOCTL: usize = 29;
 pub const RISCV_SYS_MKDIRAT: usize = 34;
 pub const RISCV_SYS_UMOUNT2: usize = 39;
 pub const RISCV_SYS_MOUNT: usize = 40;
@@ -33,6 +35,8 @@ pub const INTERNAL_SYS_WRITE: usize = 1;
 pub const INTERNAL_SYS_CLOSE: usize = 3;
 pub const INTERNAL_SYS_FSTAT: usize = 5;
 pub const INTERNAL_SYS_BRK: usize = 12;
+// AGENT: retain the migrated internal ioctl id while mapping Linux RV64 29.
+pub const INTERNAL_SYS_IOCTL: usize = 16;
 pub const INTERNAL_SYS_PIPE: usize = 22;
 // AGENT: retain the migrated internal syscall namespace while mapping RV64 76.
 pub const INTERNAL_SYS_SPLICE: usize = 275;
@@ -64,6 +68,7 @@ pub fn map_riscv_nr(nr: usize) -> Option<usize> {
     match nr {
         RISCV_SYS_DUP => Some(INTERNAL_SYS_DUP),
         RISCV_SYS_DUP3 => Some(INTERNAL_SYS_DUP3),
+        RISCV_SYS_IOCTL => Some(INTERNAL_SYS_IOCTL),
         RISCV_SYS_MKDIRAT => Some(INTERNAL_SYS_MKDIRAT),
         RISCV_SYS_UMOUNT2 => Some(INTERNAL_SYS_UMOUNT2),
         RISCV_SYS_MOUNT => Some(INTERNAL_SYS_MOUNT),
@@ -225,6 +230,7 @@ pub mod tests {
     // six-argument splice adapter.
     pub fn run_all() {
         standard_errno_names_use_linux_riscv_numbers();
+        ioctl_maps_three_arguments_to_the_internal_entry();
         mkdirat_maps_to_the_three_argument_internal_entry();
         openat_maps_to_the_four_argument_internal_entry();
         dup_maps_to_the_one_argument_internal_entry();
@@ -251,6 +257,19 @@ pub mod tests {
         ] {
             assert_eq!(errno_ret(name), (-(errno as isize)) as usize);
         }
+    }
+
+    // AGENT: preserve fd, command, and the native-width third argument while
+    // translating Linux RV64 ioctl number 29 into the migrated internal id.
+    #[cfg_attr(test, test)]
+    fn ioctl_maps_three_arguments_to_the_internal_entry() {
+        let mut frame = TrapFrame::new();
+        frame.regs[10..16].copy_from_slice(&[7, 0x541B, 0x5000, 3, 4, 5]);
+        frame.regs[17] = RISCV_SYS_IOCTL;
+
+        let request = decode_from_trap_frame(&frame);
+        assert_eq!(request.internal_nr, Some(INTERNAL_SYS_IOCTL));
+        assert_eq!(request.args, [7, 0x541B, 0x5000, 3, 4, 5]);
     }
 
     // AGENT: preserve mkdirat's dirfd/path/mode layout while translating the

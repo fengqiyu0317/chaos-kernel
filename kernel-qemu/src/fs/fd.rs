@@ -197,7 +197,7 @@ impl OpenFileDesc {
                 FIONREAD => Ok(p.readable_len()),
                 _ => Err("enotty"),
             },
-            FLike::Ep(_) => Err("enosys"),
+            FLike::Ep(_) => Err("enotty"),
             // AGENT: do not pretend that the minimal SBI terminal implements
             // termios ioctls before its input and line discipline are migrated.
             FLike::Tty(_) => Err("enotty"),
@@ -273,6 +273,12 @@ impl OpenFileDesc {
         let mut status = self.status.write().unwrap();
         status.apply_status_flags(flags);
         Ok(())
+    }
+
+    // AGENT: update only O_NONBLOCK under the shared OFD status lock so a
+    // concurrent status operation cannot lose an unrelated O_APPEND change.
+    pub fn set_nonblocking(&self, nonblocking: bool) {
+        self.status.write().unwrap().nb = nonblocking;
     }
 
     // AGENT: checkpoint only needs to reject non-regular fd objects here; avoid
@@ -632,6 +638,11 @@ impl FdEntry {
 
     pub fn set_status_flags(&self, flags: usize) -> Result<(), &'static str> {
         self.desc.set_status_flags(flags)
+    }
+
+    // AGENT: forward FIONBIO to the shared open-file-description status owner.
+    pub fn set_nonblocking(&self, nonblocking: bool) {
+        self.desc.set_nonblocking(nonblocking);
     }
 
     // AGENT: expose regular-file object classification without cloning the

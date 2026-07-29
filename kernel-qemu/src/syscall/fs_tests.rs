@@ -2,11 +2,12 @@
 // pool, current init task, Sv39 mappings, and authoritative AddrSpace usercopy.
 use super::*;
 use crate::syscall_abi::{
-    map_riscv_nr, INTERNAL_SYS_DUP, INTERNAL_SYS_DUP3, INTERNAL_SYS_FSTAT, INTERNAL_SYS_MKDIRAT,
-    INTERNAL_SYS_MOUNT, INTERNAL_SYS_NEWFSTATAT, INTERNAL_SYS_OPENAT, INTERNAL_SYS_PIPE,
-    INTERNAL_SYS_READ, INTERNAL_SYS_SPLICE, INTERNAL_SYS_UMOUNT2, RISCV_SYS_DUP, RISCV_SYS_DUP3,
-    RISCV_SYS_FSTAT, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT, RISCV_SYS_NEWFSTATAT, RISCV_SYS_OPENAT,
-    RISCV_SYS_PIPE2, RISCV_SYS_READ, RISCV_SYS_SPLICE, RISCV_SYS_UMOUNT2,
+    map_riscv_nr, INTERNAL_SYS_DUP, INTERNAL_SYS_DUP3, INTERNAL_SYS_FSTAT, INTERNAL_SYS_IOCTL,
+    INTERNAL_SYS_MKDIRAT, INTERNAL_SYS_MOUNT, INTERNAL_SYS_NEWFSTATAT, INTERNAL_SYS_OPENAT,
+    INTERNAL_SYS_PIPE, INTERNAL_SYS_READ, INTERNAL_SYS_SPLICE, INTERNAL_SYS_UMOUNT2, RISCV_SYS_DUP,
+    RISCV_SYS_DUP3, RISCV_SYS_FSTAT, RISCV_SYS_IOCTL, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT,
+    RISCV_SYS_NEWFSTATAT, RISCV_SYS_OPENAT, RISCV_SYS_PIPE2, RISCV_SYS_READ, RISCV_SYS_SPLICE,
+    RISCV_SYS_UMOUNT2,
 };
 
 const USER_STRINGS_BASE: usize = 0x4000_0000;
@@ -17,6 +18,7 @@ const UNMOUNT_USER_BASE: usize = 0x4004_0000;
 const STAT_USER_BASE: usize = 0x4005_0000;
 const PIPE_USER_BASE: usize = 0x4006_0000;
 const SPLICE_USER_BASE: usize = 0x4007_0000;
+const IOCTL_USER_BASE: usize = 0x4008_0000;
 
 // AGENT: Run filesystem ABI and semantic regressions after QEMU installs the
 // real kernel frame pool, current init task, Sv39 mappings, and fd table.
@@ -33,6 +35,7 @@ pub fn run_all(kernel: &Kernel) {
     mkdirat_creates_only_new_absolute_directories(kernel);
     openat_uses_transactional_fd_and_path_state(kernel);
     pipe2_copies_fds_and_publishes_them_transactionally(kernel);
+    ioctl_uses_usercopy_and_correct_fd_ownership(kernel);
     dup3_uses_the_shared_exact_target_implementation(kernel);
     read_uses_usercopy_and_shared_open_file_offsets(kernel);
     read_moves_pipe_bytes_and_reports_empty_states(kernel);
@@ -102,6 +105,29 @@ fn read_user_off(task: &Task, addr: usize) -> i64 {
         .read_user_bytes(addr, &mut bytes)
         .expect("splice offset should be readable in userspace");
     i64::from_ne_bytes(bytes)
+}
+
+// AGENT: seed one ioctl int through the active address space instead of using
+// a raw pointer into the QEMU user's virtual range.
+fn write_user_ioctl_int(kernel: &Kernel, task: &Task, addr: usize, value: i32) {
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .write_user_bytes(addr, &value.to_ne_bytes(), &kernel.pool)
+        .expect("ioctl integer argument should be writable");
+}
+
+// AGENT: observe one ioctl int result through authoritative Sv39 usercopy.
+fn read_user_ioctl_int(task: &Task, addr: usize) -> i32 {
+    let mut bytes = [0u8; mem::size_of::<i32>()];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(addr, &mut bytes)
+        .expect("ioctl integer result should be readable");
+    i32::from_ne_bytes(bytes)
 }
 
 // AGENT: decode one little-endian u32 from the fixed RV64 stat regression image.
@@ -1493,6 +1519,172 @@ fn pipe2_copies_fds_and_publishes_them_transactionally(kernel: &Kernel) {
     for fd in fillers {
         task.close_fd(fd).expect("pipe2 filler fd should close");
     }
+}
+
+// AGENT: prove ioctl is RV64-reachable, uses Sv39-backed integer usercopy,
+// shares FIONBIO through the OFD, and keeps close-on-exec descriptor-local.
+#[cfg_attr(test, test)]
+fn ioctl_uses_usercopy_and_correct_fd_ownership(kernel: &Kernel) {
+    assert_eq!(map_riscv_nr(RISCV_SYS_IOCTL), Some(INTERNAL_SYS_IOCTL));
+
+    let task = kernel.cur_task(0).expect("init task should be current");
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(IOCTL_USER_BASE, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("ioctl read-write user page should map");
+        addr_space
+            .map_region(
+                VmRegion::new(IOCTL_USER_BASE + PAGE_SZ, PAGE_SZ, VM_READ),
+                &kernel.pool,
+            )
+            .expect("ioctl read-only user page should map");
+    }
+    let flag_addr = IOCTL_USER_BASE;
+    let result_addr = IOCTL_USER_BASE + mem::size_of::<i32>();
+
+    let (read_end, write_end) = PipeNode::pair();
+    let (read_fd, write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(read_end), FLike::Pipe(write_end), false)
+        .expect("ioctl pipe fixture should allocate descriptors");
+    assert_eq!(
+        task.get_fd_entry(write_fd)
+            .expect("ioctl pipe writer should exist")
+            .write(task.id(), b"abc"),
+        Ok(FdWriteOutcome::Written(3))
+    );
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_IOCTL,
+            read_fd,
+            FIONREAD,
+            result_addr,
+            0,
+            0,
+            0,
+        ),
+        Ok(0)
+    );
+    assert_eq!(read_user_ioctl_int(&task, result_addr), 3);
+    for bad_output in [IOCTL_USER_BASE + PAGE_SZ, IOCTL_USER_BASE + 2 * PAGE_SZ] {
+        assert_eq!(
+            kernel.dispatch_syscall_without_signal_delivery(
+                SYS_IOCTL, read_fd, FIONREAD, bad_output, 0, 0, 0,
+            ),
+            Err("efault")
+        );
+    }
+
+    let dup_fd = task
+        .dup_fd(read_fd, false)
+        .expect("ioctl OFD-sharing probe should duplicate the read descriptor");
+    write_user_ioctl_int(kernel, &task, flag_addr, 1);
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_IOCTL, read_fd, FIONBIO, flag_addr, 0, 0, 0,
+        ),
+        Ok(0)
+    );
+    assert!(
+        task.get_fd_entry(dup_fd)
+            .expect("duplicated ioctl descriptor should remain installed")
+            .status_flags()
+            .nb
+    );
+    assert!(
+        !task
+            .get_fd_entry(write_fd)
+            .expect("separate pipe write OFD should remain installed")
+            .status_flags()
+            .nb
+    );
+    write_user_ioctl_int(kernel, &task, flag_addr, 0);
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_IOCTL, dup_fd, FIONBIO, flag_addr, 0, 0, 0,
+        ),
+        Ok(0)
+    );
+    assert!(
+        !task
+            .get_fd_entry(read_fd)
+            .expect("original ioctl descriptor should remain installed")
+            .status_flags()
+            .nb
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_IOCTL,
+            read_fd,
+            FIONBIO,
+            IOCTL_USER_BASE + 2 * PAGE_SZ,
+            0,
+            0,
+            0,
+        ),
+        Err("efault")
+    );
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_IOCTL, read_fd, FIOCLEX, 0, 0, 0, 0,),
+        Ok(0)
+    );
+    assert!(task
+        .get_fd_entry(read_fd)
+        .expect("FIOCLEX target should remain installed")
+        .is_cloexec());
+    assert!(!task
+        .get_fd_entry(dup_fd)
+        .expect("FIOCLEX duplicate should remain installed")
+        .is_cloexec());
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_IOCTL, read_fd, FIONCLEX, 0, 0, 0, 0,),
+        Ok(0)
+    );
+    assert!(!task
+        .get_fd_entry(read_fd)
+        .expect("FIONCLEX target should remain installed")
+        .is_cloexec());
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_IOCTL, 0, TCGETS, 0, 0, 0, 0),
+        Err("enotty")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_IOCTL,
+            read_fd,
+            0xDEAD,
+            result_addr,
+            0,
+            0,
+            0,
+        ),
+        Err("enotty")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_IOCTL,
+            MAX_FD,
+            FIONREAD,
+            IOCTL_USER_BASE + 2 * PAGE_SZ,
+            0,
+            0,
+            0,
+        ),
+        Err("ebadf")
+    );
+
+    task.close_fd(read_fd)
+        .expect("ioctl read descriptor should close");
+    task.close_fd(write_fd)
+        .expect("ioctl write descriptor should close");
+    task.close_fd(dup_fd)
+        .expect("ioctl duplicated descriptor should close");
 }
 
 // AGENT: verify Linux RV64 dup3 mapping, exact-target replacement, OFD sharing,
