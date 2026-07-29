@@ -38,7 +38,6 @@ impl Kernel {
             SYS_IOCTL => returning(sys_ioctl(self, a0, a1, a2)),
             SYS_PIPE => returning(sys_pipe(self, a0, a1)),
             SYS_DUP => returning(sys_dup(self, a0)),
-            SYS_DUP2 => returning(sys_dup2(self, a0, a1)),
             SYS_DUP3 => returning(sys_dup3(self, a0, a1, a2)),
             SYS_FORK => returning(sys_fork(self, caller_frame)),
             SYS_EXEC => sys_exec(self, a0, a1, a2),

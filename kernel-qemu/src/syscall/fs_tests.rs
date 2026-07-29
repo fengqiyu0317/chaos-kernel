@@ -32,7 +32,7 @@ pub fn run_all(kernel: &Kernel) {
     mkdirat_creates_only_new_absolute_directories(kernel);
     openat_uses_transactional_fd_and_path_state(kernel);
     pipe2_copies_fds_and_publishes_them_transactionally(kernel);
-    dup2_and_dup3_share_one_exact_target_implementation(kernel);
+    dup3_uses_the_shared_exact_target_implementation(kernel);
     read_uses_usercopy_and_shared_open_file_offsets(kernel);
     read_moves_pipe_bytes_and_reports_empty_states(kernel);
     write_to_pipe_without_readers_returns_epipe_and_queues_sigpipe(kernel);
@@ -1469,10 +1469,10 @@ fn pipe2_copies_fds_and_publishes_them_transactionally(kernel: &Kernel) {
     }
 }
 
-// AGENT: verify the internal dup2 semantic entry and Linux RV64 dup3 mapping,
-// exact-target replacement, OFD sharing, per-fd cloexec, and rejection ordering.
+// AGENT: verify Linux RV64 dup3 mapping, exact-target replacement, OFD sharing,
+// per-fd cloexec, and rejection ordering without exposing an unreachable dup2 ABI.
 #[cfg_attr(test, test)]
-fn dup2_and_dup3_share_one_exact_target_implementation(kernel: &Kernel) {
+fn dup3_uses_the_shared_exact_target_implementation(kernel: &Kernel) {
     assert_eq!(map_riscv_nr(RISCV_SYS_DUP3), Some(INTERNAL_SYS_DUP3));
 
     let task = kernel.cur_task(0).expect("init task should be current");
@@ -1482,15 +1482,6 @@ fn dup2_and_dup3_share_one_exact_target_implementation(kernel: &Kernel) {
     task.set_cloexec(source_fd, true)
         .expect("dup3 source cloexec should set");
 
-    assert_eq!(
-        kernel
-            .dispatch_syscall_without_signal_delivery(SYS_DUP2, source_fd, source_fd, 0, 0, 0, 0,),
-        Ok(source_fd)
-    );
-    assert!(task
-        .get_fd_entry(source_fd)
-        .expect("same-fd dup2 source should remain installed")
-        .is_cloexec());
     assert_eq!(
         kernel
             .dispatch_syscall_without_signal_delivery(SYS_DUP3, source_fd, source_fd, 0, 0, 0, 0,),
@@ -1544,7 +1535,7 @@ fn dup2_and_dup3_share_one_exact_target_implementation(kernel: &Kernel) {
 
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(
-            SYS_DUP2,
+            SYS_DUP3,
             source_fd,
             occupied_fd,
             0,
@@ -1556,7 +1547,7 @@ fn dup2_and_dup3_share_one_exact_target_implementation(kernel: &Kernel) {
     );
     assert!(!task
         .get_fd_entry(occupied_fd)
-        .expect("dup2 replacement should remain installed")
+        .expect("dup3 replacement without O_CLOEXEC should remain installed")
         .is_cloexec());
 
     let exact_fd = MAX_FD - 1;
