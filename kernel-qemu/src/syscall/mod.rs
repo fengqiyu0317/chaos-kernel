@@ -8,6 +8,7 @@ mod fs;
 mod mm;
 mod proc;
 mod signal;
+mod stat;
 mod sync;
 // AGENT: Expose usercopy-backed filesystem syscall regressions to a focused
 // post-frame-pool QEMU boot selftest.
@@ -22,6 +23,7 @@ pub(crate) use self::fs::*;
 pub(crate) use self::mm::*;
 pub(crate) use self::proc::*;
 pub(crate) use self::signal::*;
+pub(crate) use self::stat::*;
 pub(crate) use self::sync::*;
 pub(crate) use self::time::*;
 

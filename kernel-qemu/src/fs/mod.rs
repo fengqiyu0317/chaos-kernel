@@ -5,6 +5,8 @@ pub mod block_cache;
 pub mod block_device;
 pub mod channel;
 pub mod circ_buf;
+// AGENT: expose ABI-neutral file attributes to path and fd stat callers.
+pub mod attributes;
 // AGENT: Keep the fault-injectable simulated disk separate from block-device
 // backends, mount resolution, and request scheduling.
 pub mod disk;
@@ -29,6 +31,7 @@ pub mod tty;
 // AGENT: connect filesystem instances and mounts to resolved path identity.
 pub mod vfs;
 
+pub use self::attributes::*;
 pub use self::block_cache::*;
 pub use self::block_device::*;
 pub use self::channel::*;

@@ -50,7 +50,7 @@ impl OpenOptions {
 }
 
 // AGENT: read a NUL-terminated path from the current user address space.
-fn read_user_path(task: &Task, addr: usize) -> Result<String, &'static str> {
+pub(super) fn read_user_path(task: &Task, addr: usize) -> Result<String, &'static str> {
     if addr == 0 {
         return Err("efault");
     }
@@ -294,33 +294,6 @@ pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static st
     // AGENT: close only releases the process fd; block-cache keys are device
     // blocks, not process-local descriptor numbers.
     t.close_fd(fd)?;
-    Ok(0)
-}
-
-pub(super) fn sys_stat(
-    kernel: &Kernel,
-    nr: usize,
-    a0: usize,
-    a1: usize,
-) -> Result<usize, &'static str> {
-    let stat_buf = a1;
-    if stat_buf == 0 {
-        return Err("efault");
-    }
-    let stat_size = 144;
-    if !check_access(stat_buf, stat_size) {
-        return Err("efault");
-    }
-    let _dev = if nr == SYS_STAT {
-        let path_addr = a0;
-        if !check_access(path_addr, 4096) {
-            return Err("efault");
-        } // HUMAN
-        kernel.vfs.mounts.mount_count()
-    } else {
-        let fd = a0;
-        fd / 4
-    };
     Ok(0)
 }
 

@@ -469,6 +469,43 @@ impl FileNode {
         self.id
     }
 
+    // AGENT: snapshot the stat fields supported by the current ChaosFs inode
+    // model while making every not-yet-persisted field's zero policy explicit.
+    pub fn file_attr(&self, fs_id: FsId) -> Result<FileAttr, &'static str> {
+        let (byte_len, block_count) = {
+            let storage = self.storage.lock().unwrap();
+            (storage.byte_len, storage.blocks.len())
+        };
+        let mode = match self.kind {
+            FileKind::Regular => {
+                let permissions = if self.executable.load(Ordering::Relaxed) {
+                    0o755
+                } else {
+                    0o644
+                };
+                S_IFREG | permissions
+            }
+            FileKind::Directory => S_IFDIR | 0o755,
+        };
+        Ok(FileAttr {
+            dev: u64::try_from(fs_id).map_err(|_| "eoverflow")?,
+            ino: self.id,
+            mode,
+            // ChaosFs has no hard-link operation yet, so every reachable inode
+            // owns exactly one namespace binding in the first-stage model.
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            size: u64::try_from(byte_len).map_err(|_| "eoverflow")?,
+            block_size: u32::try_from(BLOCK_CACHE_BLOCK_SIZE).map_err(|_| "eoverflow")?,
+            blocks: u64::try_from(block_count).map_err(|_| "eoverflow")?,
+            atime: FileTime::default(),
+            mtime: FileTime::default(),
+            ctime: FileTime::default(),
+        })
+    }
+
     // AGENT: look up one direct child through a component already validated by
     // the owning FsInstance namespace boundary.
     pub(super) fn lookup_child_inode(&self, name: ChildName<'_>) -> Result<InodeId, &'static str> {

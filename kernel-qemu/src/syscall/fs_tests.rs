@@ -2,9 +2,10 @@
 // pool, current init task, Sv39 mappings, and authoritative AddrSpace usercopy.
 use super::*;
 use crate::syscall_abi::{
-    map_riscv_nr, INTERNAL_SYS_MKDIRAT, INTERNAL_SYS_MOUNT, INTERNAL_SYS_OPENAT, INTERNAL_SYS_READ,
-    INTERNAL_SYS_UMOUNT2, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT, RISCV_SYS_OPENAT, RISCV_SYS_READ,
-    RISCV_SYS_UMOUNT2,
+    map_riscv_nr, INTERNAL_SYS_FSTAT, INTERNAL_SYS_MKDIRAT, INTERNAL_SYS_MOUNT,
+    INTERNAL_SYS_NEWFSTATAT, INTERNAL_SYS_OPENAT, INTERNAL_SYS_READ, INTERNAL_SYS_UMOUNT2,
+    RISCV_SYS_FSTAT, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT, RISCV_SYS_NEWFSTATAT, RISCV_SYS_OPENAT,
+    RISCV_SYS_READ, RISCV_SYS_UMOUNT2,
 };
 
 const USER_STRINGS_BASE: usize = 0x4000_0000;
@@ -12,6 +13,7 @@ const OPEN_USER_BASE: usize = 0x4001_0000;
 const MKDIR_USER_BASE: usize = 0x4002_0000;
 const READ_USER_BASE: usize = 0x4003_0000;
 const UNMOUNT_USER_BASE: usize = 0x4004_0000;
+const STAT_USER_BASE: usize = 0x4005_0000;
 
 // AGENT: Run filesystem ABI and semantic regressions after QEMU installs the
 // real kernel frame pool, current init task, Sv39 mappings, and fd table.
@@ -20,6 +22,7 @@ pub fn run_all(kernel: &Kernel) {
         .install_directory("/tmp")
         .expect("filesystem selftests require /tmp");
     mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel);
+    stat_syscalls_copy_real_inode_attributes_to_userspace(kernel);
     umount2_enforces_busy_close_and_lazy_subtree_lifecycles(kernel);
     path_creation_requires_an_existing_directory_parent(kernel);
     pathname_lookup_returns_shared_file_node(kernel);
@@ -41,6 +44,245 @@ fn write_user_string(kernel: &Kernel, task: &Task, addr: usize, value: &str) {
         .unwrap()
         .write_user_bytes(addr, &bytes, &kernel.pool)
         .expect("test user string should be writable");
+}
+
+// AGENT: decode one little-endian u32 from the fixed RV64 stat regression image.
+fn stat_u32(bytes: &[u8; RISCV64_STAT_SIZE], offset: usize) -> u32 {
+    u32::from_le_bytes(
+        bytes[offset..offset + mem::size_of::<u32>()]
+            .try_into()
+            .expect("stat u32 field should fit"),
+    )
+}
+
+// AGENT: decode one little-endian u64 from the fixed RV64 stat regression image.
+fn stat_u64(bytes: &[u8; RISCV64_STAT_SIZE], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        bytes[offset..offset + mem::size_of::<u64>()]
+            .try_into()
+            .expect("stat u64 field should fit"),
+    )
+}
+
+// AGENT: copy one complete stat image back through AddrSpace so assertions audit
+// the same Sv39 usercopy result returned to a real user ecall.
+fn read_user_stat(task: &Task, addr: usize) -> [u8; RISCV64_STAT_SIZE] {
+    let mut bytes = [0u8; RISCV64_STAT_SIZE];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(addr, &mut bytes)
+        .expect("stat result should be readable");
+    bytes
+}
+
+// AGENT: prove RV64 fstat/newfstatat reach distinct entries, return live ChaosFs
+// identity and size fields, and reject every unsupported or invalid user boundary.
+#[cfg_attr(test, test)]
+fn stat_syscalls_copy_real_inode_attributes_to_userspace(kernel: &Kernel) {
+    assert_eq!(map_riscv_nr(RISCV_SYS_FSTAT), Some(INTERNAL_SYS_FSTAT));
+    assert_eq!(
+        map_riscv_nr(RISCV_SYS_NEWFSTATAT),
+        Some(INTERNAL_SYS_NEWFSTATAT)
+    );
+
+    let task = kernel.cur_task(0).expect("init task should be current");
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(STAT_USER_BASE, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("stat read-write user page should map");
+        addr_space
+            .map_region(
+                VmRegion::new(STAT_USER_BASE + PAGE_SZ * 2, PAGE_SZ, VM_READ),
+                &kernel.pool,
+            )
+            .expect("stat read-only user page should map");
+    }
+
+    let path_addr = STAT_USER_BASE;
+    let relative_addr = STAT_USER_BASE + 64;
+    let missing_addr = STAT_USER_BASE + 96;
+    let directory_addr = STAT_USER_BASE + 128;
+    let stat_addr = STAT_USER_BASE + 256;
+    write_user_string(kernel, &task, path_addr, "/tmp/qemu-stat");
+    write_user_string(kernel, &task, relative_addr, "relative-stat");
+    write_user_string(kernel, &task, missing_addr, "/tmp/qemu-stat-missing");
+    write_user_string(kernel, &task, directory_addr, "/tmp");
+    kernel
+        .install_file("/tmp/qemu-stat", vec![0x5a; 513], false)
+        .expect("stat fixture should install");
+
+    let resolved = kernel
+        .vfs
+        .resolve("/tmp/qemu-stat")
+        .expect("stat fixture should resolve");
+    let expected_dev = resolved.path_ref.mount.fs().id() as u64;
+    let expected_ino = resolved.path_ref.node.id();
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_NEWFSTATAT,
+            usize::MAX - 99,
+            path_addr,
+            stat_addr,
+            0,
+            0,
+            0,
+        ),
+        Ok(0)
+    );
+    let path_stat = read_user_stat(&task, stat_addr);
+    assert_eq!(stat_u64(&path_stat, 0), expected_dev);
+    assert_eq!(stat_u64(&path_stat, 8), expected_ino);
+    assert_eq!(stat_u32(&path_stat, 16) & S_IFMT, S_IFREG);
+    assert_eq!(stat_u32(&path_stat, 20), 1);
+    assert_eq!(stat_u32(&path_stat, 24), 0);
+    assert_eq!(stat_u32(&path_stat, 28), 0);
+    assert_eq!(stat_u64(&path_stat, 32), 0);
+    assert!(path_stat[40..48].iter().all(|byte| *byte == 0));
+    assert_eq!(stat_u64(&path_stat, 48), 513);
+    assert_eq!(stat_u32(&path_stat, 56), BLOCK_CACHE_BLOCK_SIZE as u32);
+    assert!(path_stat[60..64].iter().all(|byte| *byte == 0));
+    assert_eq!(stat_u64(&path_stat, 64), 2);
+    assert!(path_stat[72..].iter().all(|byte| *byte == 0));
+
+    let fd = kernel
+        .dispatch_syscall_without_signal_delivery(SYS_OPENAT, 0, path_addr, 0, 0, 0, 0)
+        .expect("stat fixture should open");
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .write_user_bytes(stat_addr, &[0xa5; RISCV64_STAT_SIZE], &kernel.pool)
+        .expect("fstat result should start poisoned");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_FSTAT, fd, stat_addr, 0, 0, 0, 0,),
+        Ok(0)
+    );
+    assert_eq!(read_user_stat(&task, stat_addr), path_stat);
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_NEWFSTATAT,
+            usize::MAX - 99,
+            directory_addr,
+            stat_addr,
+            0,
+            0,
+            0,
+        ),
+        Ok(0)
+    );
+    let directory_stat = read_user_stat(&task, stat_addr);
+    assert_eq!(stat_u32(&directory_stat, 16) & S_IFMT, S_IFDIR);
+    assert_eq!(stat_u64(&directory_stat, 48), 0);
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_NEWFSTATAT,
+            usize::MAX - 99,
+            missing_addr,
+            stat_addr,
+            0,
+            0,
+            0,
+        ),
+        Err("enoent")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_NEWFSTATAT,
+            usize::MAX - 99,
+            relative_addr,
+            stat_addr,
+            0,
+            0,
+            0,
+        ),
+        Err("enotsup")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_NEWFSTATAT,
+            usize::MAX - 99,
+            path_addr,
+            stat_addr,
+            1,
+            0,
+            0,
+        ),
+        Err("enotsup")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_FSTAT, MAX_FD, stat_addr, 0, 0, 0, 0,),
+        Err("ebadf")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_FSTAT, fd, 0, 0, 0, 0, 0),
+        Err("efault")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_FSTAT,
+            fd,
+            STAT_USER_BASE + PAGE_SZ,
+            0,
+            0,
+            0,
+            0,
+        ),
+        Err("efault")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_FSTAT,
+            fd,
+            STAT_USER_BASE + PAGE_SZ * 2,
+            0,
+            0,
+            0,
+            0,
+        ),
+        Err("efault")
+    );
+
+    let partial_addr = STAT_USER_BASE + PAGE_SZ - 64;
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .write_user_bytes(partial_addr, &[0x3c; 64], &kernel.pool)
+        .expect("partial stat prefix should start poisoned");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_FSTAT, fd, partial_addr, 0, 0, 0, 0,),
+        Err("efault")
+    );
+    let mut partial = [0u8; 64];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(partial_addr, &mut partial)
+        .expect("failed stat should leave the writable prefix readable");
+    assert_eq!(partial, [0x3c; 64]);
+
+    let (read_end, write_end) = PipeNode::pair();
+    let (read_fd, write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(read_end), FLike::Pipe(write_end), false)
+        .expect("stat pipe fixture should allocate descriptors");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_FSTAT, read_fd, stat_addr, 0, 0, 0, 0,),
+        Err("enotsup")
+    );
+    task.close_fd(read_fd)
+        .expect("stat pipe reader should close");
+    task.close_fd(write_fd)
+        .expect("stat pipe writer should close");
+    task.close_fd(fd).expect("stat fixture fd should close");
 }
 
 // AGENT: verify source-aware RISC-V mounts reuse one live FsInstance per source,
@@ -127,6 +369,9 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
         .expect("dev0 file should resolve through the first mount")
         .path_ref
         .node;
+    let first_attr = FInstance::new(first_mount.clone(), dev0_file.clone())
+        .file_attr()
+        .expect("first attachment should expose file attributes");
 
     // Mounting dev0 again creates a distinct attachment but selects the exact
     // same filesystem, inode namespace, storage, cache, and allocator state.
@@ -156,6 +401,11 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
         .path_ref
         .node;
     assert!(Arc::ptr_eq(&dev0_file, &remounted_file));
+    let repeated_attr = FInstance::new(second_mount.clone(), remounted_file.clone())
+        .file_attr()
+        .expect("repeated attachment should expose file attributes");
+    assert_eq!(repeated_attr.dev, first_attr.dev);
+    assert_eq!(repeated_attr.ino, first_attr.ino);
     assert_eq!(kernel.vfs.mounts.mount_count(), 2);
 
     assert_eq!(
@@ -192,6 +442,10 @@ fn mount_and_umount2_use_usercopy_and_mutate_mount_table(kernel: &Kernel) {
         .mount;
     assert!(Arc::ptr_eq(dev1_mount.fs(), &dev1));
     assert!(!Arc::ptr_eq(first_mount.fs(), dev1_mount.fs()));
+    let dev1_attr = FInstance::new(dev1_mount.clone(), dev1_mount.fs().root())
+        .file_attr()
+        .expect("distinct filesystem should expose root attributes");
+    assert_ne!(dev1_attr.dev, first_attr.dev);
     assert!(matches!(
         kernel.lookup_file_node("/mnt/file"),
         Err("enoent")

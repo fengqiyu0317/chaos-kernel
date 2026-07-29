@@ -37,6 +37,15 @@ impl FLike {
         }
     }
 
+    // AGENT: route fstat through concrete object metadata and reject anonymous
+    // objects until pipe, epoll, and TTY gain stable inode/device identities.
+    pub fn file_attr(&self) -> Result<FileAttr, &'static str> {
+        match self {
+            FLike::File(file) => file.file_attr(),
+            FLike::Pipe(_) | FLike::Ep(_) | FLike::Tty(_) => Err("enotsup"),
+        }
+    }
+
     // AGENT: register an epoll readiness callback when this file-like object
     // exposes a cancellable source; regular files remain level-polled.
     pub fn register_epoll(&self, key: &EpKey, ep: &EpInst, ev: &EpEvent) -> Option<usize> {

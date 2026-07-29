@@ -68,6 +68,12 @@ impl FInstance {
         self.node.len()
     }
 
+    // AGENT: bind stat device identity to the shared filesystem rather than one
+    // mount attachment, then delegate inode-owned fields to FileNode.
+    pub fn file_attr(&self) -> Result<FileAttr, &'static str> {
+        self.node.file_attr(self.mount.fs().id())
+    }
+
     // AGENT: copy from a regular node at an explicit offset without touching
     // open-file-description state.
     fn copy_from_node_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {

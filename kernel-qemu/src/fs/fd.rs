@@ -63,6 +63,12 @@ impl OpenFileDesc {
         &self.file
     }
 
+    // AGENT: keep object-type dispatch below the syscall layer so every fd stat
+    // observes the same open-file-description target as read, write, and ioctl.
+    pub fn file_attr(&self) -> Result<FileAttr, &'static str> {
+        self.file.file_attr()
+    }
+
     // AGENT: enforce open-file-description access flags before dispatching to
     // the concrete file-like object.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
@@ -467,6 +473,12 @@ impl FdEntry {
 
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
         self.desc.write(buf)
+    }
+
+    // AGENT: forward stat through the shared open-file description without
+    // treating descriptor flags or the current file offset as inode metadata.
+    pub fn file_attr(&self) -> Result<FileAttr, &'static str> {
+        self.desc.file_attr()
     }
 
     // AGENT: forward explicit poll status through the descriptor entry layer.

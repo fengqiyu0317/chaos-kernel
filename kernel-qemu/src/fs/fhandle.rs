@@ -43,6 +43,12 @@ impl FHandle {
         self.instance.len()
     }
 
+    // AGENT: expose backing inode attributes without mixing the per-open offset
+    // into stat results shared by every handle for this file.
+    pub fn file_attr(&self) -> Result<FileAttr, &'static str> {
+        self.instance.file_attr()
+    }
+
     pub fn offset(&self) -> u64 {
         *self.offset.read().unwrap()
     }
