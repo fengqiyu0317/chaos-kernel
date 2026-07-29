@@ -5,6 +5,7 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 
 const SYS_WRITE: usize = 64;
+const SYS_DUP: usize = 23;
 const SYS_MKDIRAT: usize = 34;
 const SYS_OPENAT: usize = 56;
 const SYS_CLOSE: usize = 57;
@@ -20,6 +21,7 @@ const STDOUT_FILENO: usize = 1;
 const INIT_MESSAGE: &[u8] = b"[init] userspace /bin/init reached\n";
 const MKDIR_MESSAGE: &[u8] = b"[init] mkdirat round-trip passed\n";
 const OPEN_MESSAGE: &[u8] = b"[init] openat round-trip passed\n";
+const DUP_MESSAGE: &[u8] = b"[init] dup round-trip passed\n";
 const PIPE_MESSAGE: &[u8] = b"[init] pipe2 round-trip passed\n";
 const STAT_MESSAGE: &[u8] = b"[init] stat round-trip passed\n";
 const CLOSE_MESSAGE: &[u8] = b"[init] close round-trip passed\n";
@@ -83,8 +85,8 @@ unsafe fn syscall3(number: usize, arg0: usize, arg1: usize, arg2: usize) -> isiz
     result as isize
 }
 
-// AGENT: issue the non-returning exit syscall while retaining a return value
-// only for the defensive fallback when a broken kernel returns unexpectedly.
+// AGENT: issue one-argument dup/close/exit syscalls while retaining a return
+// value for ordinary fd operations and a defensive broken-exit fallback.
 #[inline(always)]
 unsafe fn syscall1(number: usize, arg0: usize) -> isize {
     let mut result = arg0;
@@ -124,8 +126,8 @@ fn stat_u64(bytes: &[u8; RISCV64_STAT_SIZE], offset: usize) -> u64 {
     ])
 }
 
-// AGENT: prove user-mode mkdirat/openat/pipe2/fstat/newfstatat/close, including
-// real descriptor/stat copyout and OFD teardown, then report failures via status.
+// AGENT: prove user-mode mkdirat/openat/dup/pipe2/fstat/newfstatat/close,
+// including descriptor survival, real copyout, and OFD teardown.
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -188,11 +190,21 @@ pub extern "C" fn _start() -> ! {
     } else {
         file_written
     };
-    let mut fd_stat = [0u8; RISCV64_STAT_SIZE];
-    let fstat_result = if file_written == OPEN_PAYLOAD.len() as isize {
-        unsafe { syscall2(SYS_FSTAT, opened as usize, fd_stat.as_mut_ptr() as usize) }
+    let duplicated = if file_written == OPEN_PAYLOAD.len() as isize {
+        unsafe { syscall1(SYS_DUP, opened as usize) }
     } else {
         file_written
+    };
+    let source_close_result = if duplicated >= 0 {
+        unsafe { syscall1(SYS_CLOSE, opened as usize) }
+    } else {
+        duplicated
+    };
+    let mut fd_stat = [0u8; RISCV64_STAT_SIZE];
+    let fstat_result = if source_close_result == 0 {
+        unsafe { syscall2(SYS_FSTAT, duplicated as usize, fd_stat.as_mut_ptr() as usize) }
+    } else {
+        source_close_result
     };
     let mut path_stat = [0u8; RISCV64_STAT_SIZE];
     let newfstatat_result = if fstat_result == 0 {
@@ -216,6 +228,22 @@ pub extern "C" fn _start() -> ! {
         && stat_u32(&fd_stat, 56) == 512
         && stat_u64(&fd_stat, 64) == 1
         && fd_stat == path_stat;
+    let dup_round_trip_ok = duplicated >= 0
+        && duplicated != opened
+        && source_close_result == 0
+        && stat_round_trip_ok;
+    let dup_message_written = if dup_round_trip_ok {
+        unsafe {
+            syscall3(
+                SYS_WRITE,
+                STDOUT_FILENO,
+                DUP_MESSAGE.as_ptr() as usize,
+                DUP_MESSAGE.len(),
+            )
+        }
+    } else {
+        -1
+    };
     let stat_message_written = if stat_round_trip_ok {
         unsafe {
             syscall3(
@@ -287,10 +315,11 @@ pub extern "C" fn _start() -> ! {
     } else {
         -1
     };
-    let close_result = if file_written == OPEN_PAYLOAD.len() as isize {
-        unsafe { syscall1(SYS_CLOSE, opened as usize) }
+    let close_fd = if duplicated >= 0 { duplicated } else { opened };
+    let close_result = if close_fd >= 0 {
+        unsafe { syscall1(SYS_CLOSE, close_fd as usize) }
     } else {
-        file_written
+        close_fd
     };
     let close_message_written = if close_result == 0 {
         unsafe {
@@ -310,6 +339,8 @@ pub extern "C" fn _start() -> ! {
             || mkdir_message_written != MKDIR_MESSAGE.len() as isize
             || file_written != OPEN_PAYLOAD.len() as isize
             || open_message_written != OPEN_MESSAGE.len() as isize
+            || !dup_round_trip_ok
+            || dup_message_written != DUP_MESSAGE.len() as isize
             || !stat_round_trip_ok
             || stat_message_written != STAT_MESSAGE.len() as isize
             || !pipe_round_trip_ok

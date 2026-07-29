@@ -2,9 +2,9 @@
 // pool, current init task, Sv39 mappings, and authoritative AddrSpace usercopy.
 use super::*;
 use crate::syscall_abi::{
-    map_riscv_nr, INTERNAL_SYS_FSTAT, INTERNAL_SYS_MKDIRAT, INTERNAL_SYS_MOUNT,
+    map_riscv_nr, INTERNAL_SYS_DUP, INTERNAL_SYS_FSTAT, INTERNAL_SYS_MKDIRAT, INTERNAL_SYS_MOUNT,
     INTERNAL_SYS_NEWFSTATAT, INTERNAL_SYS_OPENAT, INTERNAL_SYS_PIPE, INTERNAL_SYS_READ,
-    INTERNAL_SYS_UMOUNT2, RISCV_SYS_FSTAT, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT,
+    INTERNAL_SYS_UMOUNT2, RISCV_SYS_DUP, RISCV_SYS_FSTAT, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT,
     RISCV_SYS_NEWFSTATAT, RISCV_SYS_OPENAT, RISCV_SYS_PIPE2, RISCV_SYS_READ, RISCV_SYS_UMOUNT2,
 };
 
@@ -1463,11 +1463,12 @@ fn pipe2_copies_fds_and_publishes_them_transactionally(kernel: &Kernel) {
     }
 }
 
-// AGENT: verify the live read ABI, writable-prefix short I/O, fd errors, shared
-// OFD offsets, EOF, and COW-safe copy-out through the installed address space.
+// AGENT: verify the live read/dup ABI, lowest-fd allocation, per-fd cloexec,
+// shared OFD offsets, fd errors, EOF, and COW-safe copy-out.
 #[cfg_attr(test, test)]
 fn read_uses_usercopy_and_shared_open_file_offsets(kernel: &Kernel) {
     assert_eq!(map_riscv_nr(RISCV_SYS_READ), Some(INTERNAL_SYS_READ));
+    assert_eq!(map_riscv_nr(RISCV_SYS_DUP), Some(INTERNAL_SYS_DUP));
 
     let task = kernel.cur_task(0).expect("init task should be current");
     task.process
@@ -1515,9 +1516,26 @@ fn read_uses_usercopy_and_shared_open_file_offsets(kernel: &Kernel) {
         .expect("first read result should be copied to userspace");
     assert_eq!(&bytes, b"abc");
 
+    let lowest_free_fd = task
+        .add_file(FLike::Tty(TtyDevice))
+        .expect("dup lowest-fd probe should allocate");
+    task.close_fd(lowest_free_fd)
+        .expect("dup lowest-fd probe should close");
+    task.set_cloexec(fd, true)
+        .expect("dup source should accept FD_CLOEXEC");
     let dup_fd = kernel
         .dispatch_syscall_without_signal_delivery(SYS_DUP, fd, 0, 0, 0, 0, 0)
         .expect("dup should share the read open-file description");
+    assert_eq!(dup_fd, lowest_free_fd);
+    let source_entry = task
+        .get_fd_entry(fd)
+        .expect("dup source should remain installed");
+    let dup_entry = task
+        .get_fd_entry(dup_fd)
+        .expect("dup target should be installed");
+    assert!(source_entry.same_open_description(&dup_entry));
+    assert!(source_entry.is_cloexec());
+    assert!(!dup_entry.is_cloexec());
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(SYS_READ, dup_fd, buf_addr, 3, 0, 0, 0),
         Ok(3)
@@ -1533,6 +1551,36 @@ fn read_uses_usercopy_and_shared_open_file_offsets(kernel: &Kernel) {
         kernel.dispatch_syscall_without_signal_delivery(SYS_READ, fd, buf_addr, 1, 0, 0, 0),
         Ok(0)
     );
+
+    let missing_fd = task
+        .add_file(FLike::Tty(TtyDevice))
+        .expect("missing dup source probe should allocate");
+    task.close_fd(missing_fd)
+        .expect("missing dup source probe should close");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_DUP, missing_fd, 0, 0, 0, 0, 0),
+        Err("ebadf")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_DUP, MAX_FD, 0, 0, 0, 0, 0),
+        Err("ebadf")
+    );
+
+    let mut dup_fillers = Vec::new();
+    loop {
+        match task.add_file(FLike::Tty(TtyDevice)) {
+            Ok(filler) => dup_fillers.push(filler),
+            Err("emfile") => break,
+            Err(err) => panic!("unexpected dup fd fill error: {err}"),
+        }
+    }
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_DUP, fd, 0, 0, 0, 0, 0),
+        Err("emfile")
+    );
+    for filler in dup_fillers {
+        task.close_fd(filler).expect("dup filler fd should close");
+    }
     task.close_fd(fd).expect("read fixture fd should close");
     task.close_fd(dup_fd)
         .expect("dup read fixture fd should close");

@@ -5,6 +5,7 @@ use crate::trap::TrapFrame;
 pub const ENOSYS_RET: usize = (-38isize) as usize;
 
 // AGENT: Linux asm-generic syscall numbers used by the RISC-V ABI.
+pub const RISCV_SYS_DUP: usize = 23;
 pub const RISCV_SYS_MKDIRAT: usize = 34;
 pub const RISCV_SYS_UMOUNT2: usize = 39;
 pub const RISCV_SYS_MOUNT: usize = 40;
@@ -30,6 +31,7 @@ pub const INTERNAL_SYS_CLOSE: usize = 3;
 pub const INTERNAL_SYS_FSTAT: usize = 5;
 pub const INTERNAL_SYS_BRK: usize = 12;
 pub const INTERNAL_SYS_PIPE: usize = 22;
+pub const INTERNAL_SYS_DUP: usize = 32;
 pub const INTERNAL_SYS_EXIT: usize = 60;
 pub const INTERNAL_SYS_EXIT_GROUP: usize = 231;
 pub const INTERNAL_SYS_GETPID: usize = 39;
@@ -54,6 +56,7 @@ pub struct SyscallRequest {
 // AGENT: Convert the small first-stage RISC-V syscall set to kernel-sim-style ids.
 pub fn map_riscv_nr(nr: usize) -> Option<usize> {
     match nr {
+        RISCV_SYS_DUP => Some(INTERNAL_SYS_DUP),
         RISCV_SYS_MKDIRAT => Some(INTERNAL_SYS_MKDIRAT),
         RISCV_SYS_UMOUNT2 => Some(INTERNAL_SYS_UMOUNT2),
         RISCV_SYS_MOUNT => Some(INTERNAL_SYS_MOUNT),
@@ -210,10 +213,12 @@ pub fn write_return(frame: &mut TrapFrame, value: usize) {
 pub mod tests {
     use super::*;
 
+    // AGENT: run every focused RISC-V ABI mapping regression, including dup.
     pub fn run_all() {
         standard_errno_names_use_linux_riscv_numbers();
         mkdirat_maps_to_the_three_argument_internal_entry();
         openat_maps_to_the_four_argument_internal_entry();
+        dup_maps_to_the_one_argument_internal_entry();
         close_maps_to_the_one_argument_internal_entry();
         pipe2_maps_to_the_two_argument_internal_entry();
         stat_syscalls_map_to_their_distinct_internal_entries();
@@ -261,6 +266,19 @@ pub mod tests {
         let request = decode_from_trap_frame(&frame);
         assert_eq!(request.internal_nr, Some(INTERNAL_SYS_OPENAT));
         assert_eq!(request.args, [usize::MAX - 99, 0x4000, 0x81, 0o640, 5, 6]);
+    }
+
+    // AGENT: preserve dup's oldfd argument while translating Linux RV64
+    // syscall 23 into the migrated internal dup semantic id.
+    #[cfg_attr(test, test)]
+    fn dup_maps_to_the_one_argument_internal_entry() {
+        let mut frame = TrapFrame::new();
+        frame.regs[10..16].copy_from_slice(&[7, 1, 2, 3, 4, 5]);
+        frame.regs[17] = RISCV_SYS_DUP;
+
+        let request = decode_from_trap_frame(&frame);
+        assert_eq!(request.internal_nr, Some(INTERNAL_SYS_DUP));
+        assert_eq!(request.args, [7, 1, 2, 3, 4, 5]);
     }
 
     // AGENT: preserve close's single fd argument while translating Linux RISC-V
