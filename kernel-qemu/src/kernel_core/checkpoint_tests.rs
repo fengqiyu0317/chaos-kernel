@@ -89,14 +89,14 @@ fn checkpoint_stdio_round_trip_preserves_typed_terminal_objects(kernel: &Kernel)
         restored
             .get_fd_entry(0)
             .expect("restored stdin should exist")
-            .read(&mut stdin_byte),
+            .read(restored.id(), &mut stdin_byte),
         Ok(0)
     );
     assert_eq!(
         restored
             .get_fd_entry(1)
             .expect("restored stdout should exist")
-            .read(&mut stdin_byte),
+            .read(restored.id(), &mut stdin_byte),
         Err("ebadf")
     );
 

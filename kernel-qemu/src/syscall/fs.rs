@@ -179,7 +179,7 @@ pub(super) fn sys_read(
     };
     let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
     let mut tmp = vec![0u8; writable_len];
-    let nread = entry.read(&mut tmp)?;
+    let nread = entry.read(task.id(), &mut tmp)?;
     if nread > tmp.len() {
         return Err("eio");
     }
@@ -225,7 +225,17 @@ pub(super) fn sys_write(
             .read_user_bytes(buf_addr, &mut tmp)?;
     }
     let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
-    entry.write(&tmp)
+    match entry.write(task.id(), &tmp)? {
+        FdWriteOutcome::Written(n) => Ok(n),
+        FdWriteOutcome::BrokenPipe { written } => {
+            kernel.send_signal_to_task(&task, SIGPIPE as i32, 0);
+            if written == 0 {
+                Err("epipe")
+            } else {
+                Ok(written)
+            }
+        }
+    }
 }
 
 // AGENT: install one absolute path through a descriptor reservation so EMFILE

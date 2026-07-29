@@ -129,11 +129,11 @@ impl WaitToken {
         }
     }
 
-    // AGENT: park the owning task in scheduler state; with CPU0 scheduling
-    // active, this returns only after a wakeup requeues and resumes the task.
-    fn block_waiter_task(&self) {
+    // AGENT: park the owning task only if this token and any interrupting signal
+    // are still pending at the scheduler's final interrupt-masked check.
+    fn block_waiter_task(&self, interruptible: bool) {
         if let Some(kernel) = global_kernel() {
-            kernel.block_task_for_wait(self.state.task_id);
+            kernel.block_task_for_wait(self.state.task_id, self, interruptible);
         }
     }
 
@@ -190,7 +190,7 @@ impl WaitToken {
             // while its outcome is still pending. Re-enter Sleeping after every
             // such spurious wake instead of spinning forever after the first
             // block round trip.
-            self.block_waiter_task();
+            self.block_waiter_task(interruptible);
             if self.is_woken() {
                 break;
             }

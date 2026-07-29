@@ -269,7 +269,7 @@ fn regular_file_poll_and_ioctl_are_explicit() {
 
     assert_eq!(entry.io_ctl(FIONREAD), Ok(4));
     let mut buf = [0; 2];
-    assert_eq!(entry.read(&mut buf), Ok(2));
+    assert_eq!(entry.read(0, &mut buf), Ok(2));
     assert_eq!(entry.io_ctl(TIOCINQ), Ok(2));
     assert_eq!(entry.io_ctl(0xDEAD), Err("enotty"));
 }
@@ -283,11 +283,11 @@ fn terminal_is_a_typed_nonseekable_fd_object() {
     assert!(!read_only.is_regular_file());
     assert_eq!(read_only.offset(), 0);
     assert_eq!(read_only.seek(FSeek::Start(0)), Err("espipe"));
-    assert_eq!(read_only.write(b"x"), Err("ebadf"));
+    assert_eq!(read_only.write(0, b"x"), Err("ebadf"));
     assert_eq!(read_only.io_ctl(TCGETS), Err("enotty"));
 
     let mut buf = [0xaa; 4];
-    assert_eq!(read_only.read(&mut buf), Ok(0));
+    assert_eq!(read_only.read(0, &mut buf), Ok(0));
     assert_eq!(buf, [0xaa; 4]);
 
     let poll = read_only.poll();
@@ -306,7 +306,7 @@ fn typed_regular_file_stays_a_regular_file() {
 
     assert!(entry.is_regular_file());
     assert!(!entry.is_tty());
-    assert_eq!(entry.write(b"file-data"), Ok(9));
+    assert_eq!(entry.write(0, b"file-data"), Ok(FdWriteOutcome::Written(9)));
     assert_eq!(entry.offset(), 9);
     assert_eq!(file_bytes(&instance, 0, 9), b"file-data");
 }

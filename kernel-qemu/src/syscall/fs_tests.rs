@@ -35,6 +35,7 @@ pub fn run_all(kernel: &Kernel) {
     dup2_and_dup3_share_one_exact_target_implementation(kernel);
     read_uses_usercopy_and_shared_open_file_offsets(kernel);
     read_moves_pipe_bytes_and_reports_empty_states(kernel);
+    write_to_pipe_without_readers_returns_epipe_and_queues_sigpipe(kernel);
 }
 
 // AGENT: Write one NUL-terminated syscall string through the active address
@@ -754,7 +755,7 @@ fn umount2_enforces_busy_close_and_lazy_subtree_lifecycles(kernel: &Kernel) {
         .get_fd_entry(lazy_fd)
         .expect("lazy-detached open fd should remain installed");
     let mut bytes = [0u8; 9];
-    assert_eq!(entry.read(&mut bytes), Ok(bytes.len()));
+    assert_eq!(entry.read(task.id(), &mut bytes), Ok(bytes.len()));
     assert_eq!(&bytes, b"lazy-open");
     drop(entry);
     assert_eq!(
@@ -1168,7 +1169,10 @@ fn openat_uses_transactional_fd_and_path_state(kernel: &Kernel) {
     assert!(status.ap);
     assert!(status.nb);
     assert!(entry.is_cloexec());
-    assert_eq!(entry.write(b"abc"), Ok(3));
+    assert_eq!(
+        entry.write(task.id(), b"abc"),
+        Ok(FdWriteOutcome::Written(3))
+    );
 
     let second_fd = kernel
         .dispatch_syscall_without_signal_delivery(SYS_OPENAT, 0, path_addr, 0, 0, 0, 0)
@@ -1177,7 +1181,7 @@ fn openat_uses_transactional_fd_and_path_state(kernel: &Kernel) {
         .get_fd_entry(second_fd)
         .expect("second openat fd should be installed");
     let mut bytes = [0u8; 3];
-    assert_eq!(second.read(&mut bytes), Ok(3));
+    assert_eq!(second.read(task.id(), &mut bytes), Ok(3));
     assert_eq!(&bytes, b"abc");
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(
@@ -1871,8 +1875,8 @@ fn read_moves_pipe_bytes_and_reports_empty_states(kernel: &Kernel) {
     assert_eq!(
         task.get_fd_entry(write_fd)
             .expect("pipe write descriptor should exist")
-            .write(b"pipe"),
-        Ok(4)
+            .write(task.id(), b"pipe"),
+        Ok(FdWriteOutcome::Written(4))
     );
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(SYS_READ, read_fd, buf_addr, 8, 0, 0, 0),
@@ -1886,6 +1890,10 @@ fn read_moves_pipe_bytes_and_reports_empty_states(kernel: &Kernel) {
         .read_user_bytes(buf_addr, &mut bytes)
         .expect("pipe read bytes should be copied to userspace");
     assert_eq!(&bytes, b"pipe");
+    task.get_fd_entry(read_fd)
+        .expect("pipe read descriptor should remain installed")
+        .set_status_flags(O_NONBLOCK)
+        .expect("pipe read descriptor should become nonblocking");
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(SYS_READ, read_fd, buf_addr, 1, 0, 0, 0),
         Err("eagain")
@@ -1898,4 +1906,52 @@ fn read_moves_pipe_bytes_and_reports_empty_states(kernel: &Kernel) {
     );
     task.close_fd(read_fd)
         .expect("pipe read descriptor should close");
+}
+
+// AGENT: sys_write owns the ABI-visible EPIPE plus SIGPIPE pairing; PipeNode
+// only reports a broken peer and must not reach into process signal state.
+#[cfg_attr(test, test)]
+fn write_to_pipe_without_readers_returns_epipe_and_queues_sigpipe(kernel: &Kernel) {
+    let task = kernel.cur_task(0).expect("init task should be current");
+    let buf_addr = READ_USER_BASE + 896;
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .write_user_bytes(buf_addr, b"x", &kernel.pool)
+        .expect("pipe write source should be writable");
+    task.process
+        .sig_queue
+        .lock()
+        .unwrap()
+        .retain(|(signo, _)| *signo != SIGPIPE as i32);
+
+    let (read_end, write_end) = PipeNode::pair();
+    let (read_fd, write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(read_end), FLike::Pipe(write_end), false)
+        .expect("broken pipe fixture should allocate two descriptors");
+    task.close_fd(read_fd)
+        .expect("broken pipe fixture should close its last reader");
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_WRITE, write_fd, buf_addr, 1, 0, 0, 0,),
+        Err("epipe")
+    );
+    assert!(
+        task.process
+            .sig_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(signo, _)| *signo == SIGPIPE as i32),
+        "broken pipe write should queue SIGPIPE"
+    );
+
+    task.process
+        .sig_queue
+        .lock()
+        .unwrap()
+        .retain(|(signo, _)| *signo != SIGPIPE as i32);
+    task.close_fd(write_fd)
+        .expect("broken pipe write descriptor should close");
 }

@@ -8,8 +8,8 @@ use crate::kernel::kernel_core::{
 };
 use crate::kernel::{
     clear_global_kernel_for_test, epoll_ready_events, install_kernel, signal_bit, EpCtlOp, EpData,
-    EpEvent, EpInst, EpKey, FLike, FdEntry, FramePool, Kernel, PipeNode, TaskRunState, VmRegion,
-    CLK, SIGUSR1,
+    EpEvent, EpInst, EpKey, FLike, FdEntry, FdWriteOutcome, FramePool, Kernel, PipeNode,
+    PipeWriteOutcome, TaskRunState, VmRegion, CLK, PIPE_BUF, SIGUSR1,
 };
 
 // AGENT: share one token/result slot with the real task-stack wait regressions;
@@ -21,6 +21,12 @@ static WAIT_ROUND_TRIP_OUTCOME: Mutex<Option<WaitOutcome>> = Mutex::new(None);
 static FUTEX_ROUND_TRIP_BUCKET: Mutex<Option<Arc<FutexBucket>>> = Mutex::new(None);
 static FUTEX_ROUND_TRIP_RESULT: Mutex<Option<Result<(), &'static str>>> = Mutex::new(None);
 const FUTEX_ROUND_TRIP_ADDR: usize = 0xB000;
+// AGENT: share pipe endpoints and results with task-stack blocking regressions;
+// each test installs one pair and clears it before replacing the global kernel.
+static PIPE_ROUND_TRIP_PAIR: Mutex<Option<(PipeNode, PipeNode)>> = Mutex::new(None);
+static PIPE_READ_ROUND_TRIP_RESULT: Mutex<Option<Result<usize, &'static str>>> = Mutex::new(None);
+static PIPE_WRITE_ROUND_TRIP_RESULT: Mutex<Option<Result<PipeWriteOutcome, &'static str>>> =
+    Mutex::new(None);
 
 // AGENT: include futex requeue/user-mapping and storage/fd regressions, using
 // the boot-discovered physical pool whenever tests allocate mapped task pages.
@@ -57,6 +63,13 @@ pub fn run_all(pool: &FramePool) {
     futex_requeue_skips_completed_waiters_when_moving();
     futex_requeue_syscalls_reject_unmapped_destination(pool);
     pipe_uses_bounded_ring_buffer_and_reports_writable();
+    pipe_nonblocking_small_write_is_atomic();
+    pipe_nonblocking_large_write_can_be_partial();
+    pipe_buffered_bytes_precede_eof_and_missing_reader_breaks_write();
+    pipe_blocking_read_sleeps_until_data_arrives(pool);
+    pipe_blocking_read_wakes_for_eof(pool);
+    pipe_blocking_large_write_resumes_until_complete(pool);
+    pipe_blocking_write_wakes_for_broken_peer(pool);
     pipe_rejects_wrong_direction_direct_io();
     pipe_epoll_closed_status_reports_hup_and_err();
     fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool);
@@ -835,10 +848,8 @@ fn fd_close_detaches_epoll_subscription_before_reuse(pool: &FramePool) {
         .get_fd_entry(write_fd)
         .expect("old writer fd should still exist");
     assert_eq!(
-        old_writer
-            .write(b"x")
-            .expect_err("old pipe should be broken"),
-        "epipe"
+        old_writer.write(task.id(), b"x"),
+        Ok(FdWriteOutcome::BrokenPipe { written: 0 })
     );
     assert_eq!(
         epoll.ready_len(),
@@ -919,7 +930,7 @@ fn fd_alias_keeps_epoll_source_across_number_reuse(pool: &FramePool) {
 
     task.get_fd_entry(old_write_fd)
         .expect("old writer should remain open")
-        .write(b"x")
+        .write(task.id(), b"x")
         .expect("old writer should wake the old OFD registration");
     let (ready_key, ready_event) = epoll
         .pop_ready()
@@ -1040,15 +1051,296 @@ fn pipe_uses_bounded_ring_buffer_and_reports_writable() {
     let payload = vec![0xA5; 4 * 1024];
 
     assert!(write_end.poll().writable);
-    assert_eq!(write_end.write_at(&payload), Ok(payload.len()));
+    assert_eq!(
+        write_end.write_at(0, true, &payload),
+        Ok(PipeWriteOutcome::Written(payload.len()))
+    );
     assert!(!write_end.poll().writable);
-    assert_eq!(write_end.write_at(b"x"), Err("eagain"));
+    assert_eq!(write_end.write_at(0, true, b"x"), Err("eagain"));
     assert_eq!(read_end.readable_len(), payload.len());
 
     let mut out = [0u8; 4];
-    assert_eq!(read_end.read_at(&mut out), Ok(out.len()));
+    assert_eq!(read_end.read_at(0, true, &mut out), Ok(out.len()));
     assert_eq!(out, [0xA5; 4]);
     assert!(write_end.poll().writable);
+}
+
+// AGENT: a nonblocking write no larger than PIPE_BUF must publish either the
+// whole record or no bytes, even when the ring has some but insufficient room.
+#[cfg_attr(test, test)]
+fn pipe_nonblocking_small_write_is_atomic() {
+    let (read_end, write_end) = PipeNode::pair();
+    let fill = vec![0x31; PIPE_BUF - 1];
+
+    assert_eq!(
+        write_end.write_at(0, true, &fill),
+        Ok(PipeWriteOutcome::Written(fill.len()))
+    );
+    assert_eq!(write_end.write_at(0, true, b"xy"), Err("eagain"));
+    assert_eq!(read_end.readable_len(), fill.len());
+
+    let mut actual = vec![0; fill.len()];
+    assert_eq!(read_end.read_at(0, true, &mut actual), Ok(fill.len()));
+    assert_eq!(actual, fill);
+}
+
+// AGENT: nonblocking writes larger than PIPE_BUF may consume available room
+// and report partial progress instead of rolling the complete request back.
+#[cfg_attr(test, test)]
+fn pipe_nonblocking_large_write_can_be_partial() {
+    let (read_end, write_end) = PipeNode::pair();
+    let payload = vec![0x62; PIPE_BUF + 7];
+
+    assert_eq!(
+        write_end.write_at(0, true, &payload),
+        Ok(PipeWriteOutcome::Written(PIPE_BUF))
+    );
+    assert_eq!(read_end.readable_len(), PIPE_BUF);
+}
+
+// AGENT: closing the final writer preserves already-buffered data before EOF;
+// closing the final reader turns the next write into a broken-pipe outcome.
+#[cfg_attr(test, test)]
+fn pipe_buffered_bytes_precede_eof_and_missing_reader_breaks_write() {
+    let (read_end, write_end) = PipeNode::pair();
+    assert_eq!(
+        write_end.write_at(0, true, b"end"),
+        Ok(PipeWriteOutcome::Written(3))
+    );
+    drop(write_end);
+
+    let mut actual = [0; 3];
+    assert_eq!(read_end.read_at(0, true, &mut actual), Ok(3));
+    assert_eq!(&actual, b"end");
+    assert_eq!(read_end.read_at(0, true, &mut actual), Ok(0));
+
+    let (last_reader, lone_writer) = PipeNode::pair();
+    drop(last_reader);
+    assert_eq!(
+        lone_writer.write_at(0, true, b"x"),
+        Ok(PipeWriteOutcome::Broken { written: 0 })
+    );
+}
+
+// AGENT: exercise an empty blocking read on a real task stack; a producer wake
+// must move the task Sleeping -> Runnable and make it recheck the pipe state.
+fn pipe_blocking_read_sleeps_until_data_arrives(pool: &FramePool) {
+    reset_wait_token_state();
+    *PIPE_ROUND_TRIP_PAIR.lock().unwrap() = Some(PipeNode::pair());
+    *PIPE_READ_ROUND_TRIP_RESULT.lock().unwrap() = None;
+
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init task should be current");
+    task.install_test_kernel_entry(pipe_read_round_trip_test_task)
+        .expect("pipe read test task should receive kernel entry");
+    install_kernel(kernel);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    assert_eq!(*PIPE_READ_ROUND_TRIP_RESULT.lock().unwrap(), None);
+    assert_eq!(
+        PIPE_ROUND_TRIP_PAIR
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("pipe pair should remain installed")
+            .1
+            .write_at(0, true, b"r"),
+        Ok(PipeWriteOutcome::Written(1))
+    );
+    assert_eq!(task.sched_state(), TaskRunState::Runnable);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(*PIPE_READ_ROUND_TRIP_RESULT.lock().unwrap(), Some(Ok(1)));
+    assert!(task.done());
+
+    *PIPE_ROUND_TRIP_PAIR.lock().unwrap() = None;
+    *PIPE_READ_ROUND_TRIP_RESULT.lock().unwrap() = None;
+    clear_wait_token_state();
+}
+
+// AGENT: dropping the final writer is itself a read condition transition; an
+// empty blocking reader must wake and finish with EOF instead of sleeping forever.
+fn pipe_blocking_read_wakes_for_eof(pool: &FramePool) {
+    reset_wait_token_state();
+    *PIPE_ROUND_TRIP_PAIR.lock().unwrap() = Some(PipeNode::pair());
+    *PIPE_READ_ROUND_TRIP_RESULT.lock().unwrap() = None;
+
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init task should be current");
+    task.install_test_kernel_entry(pipe_read_round_trip_test_task)
+        .expect("pipe EOF test task should receive kernel entry");
+    install_kernel(kernel);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    let sleeping_pair = PIPE_ROUND_TRIP_PAIR
+        .lock()
+        .unwrap()
+        .replace(PipeNode::pair())
+        .expect("sleeping pipe pair should remain installed");
+    drop(sleeping_pair);
+    assert_eq!(task.sched_state(), TaskRunState::Runnable);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(*PIPE_READ_ROUND_TRIP_RESULT.lock().unwrap(), Some(Ok(0)));
+    assert!(task.done());
+
+    *PIPE_ROUND_TRIP_PAIR.lock().unwrap() = None;
+    *PIPE_READ_ROUND_TRIP_RESULT.lock().unwrap() = None;
+    clear_wait_token_state();
+}
+
+// AGENT: a blocking write larger than PIPE_BUF may first fill the ring, but it
+// must sleep and resume until the complete request is written after space frees.
+fn pipe_blocking_large_write_resumes_until_complete(pool: &FramePool) {
+    reset_wait_token_state();
+    *PIPE_ROUND_TRIP_PAIR.lock().unwrap() = Some(PipeNode::pair());
+    *PIPE_WRITE_ROUND_TRIP_RESULT.lock().unwrap() = None;
+
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init task should be current");
+    task.install_test_kernel_entry(pipe_write_round_trip_test_task)
+        .expect("pipe write test task should receive kernel entry");
+    install_kernel(kernel);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    assert_eq!(
+        PIPE_ROUND_TRIP_PAIR
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("pipe pair should remain installed")
+            .0
+            .readable_len(),
+        PIPE_BUF
+    );
+
+    let mut first = [0; 1];
+    assert_eq!(
+        PIPE_ROUND_TRIP_PAIR
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("pipe pair should remain installed")
+            .0
+            .read_at(0, true, &mut first),
+        Ok(1)
+    );
+    assert_eq!(task.sched_state(), TaskRunState::Runnable);
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(
+        *PIPE_WRITE_ROUND_TRIP_RESULT.lock().unwrap(),
+        Some(Ok(PipeWriteOutcome::Written(PIPE_BUF + 1)))
+    );
+    assert!(task.done());
+
+    let mut remaining = vec![0; PIPE_BUF];
+    assert_eq!(
+        PIPE_ROUND_TRIP_PAIR
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("pipe pair should remain installed")
+            .0
+            .read_at(0, true, &mut remaining),
+        Ok(PIPE_BUF)
+    );
+    assert!(remaining.iter().all(|byte| *byte == 0x5a));
+
+    *PIPE_ROUND_TRIP_PAIR.lock().unwrap() = None;
+    *PIPE_WRITE_ROUND_TRIP_RESULT.lock().unwrap() = None;
+    clear_wait_token_state();
+}
+
+// AGENT: dropping the final reader must wake a writer that already made large-
+// write progress, preserving that progress while reporting the broken peer.
+fn pipe_blocking_write_wakes_for_broken_peer(pool: &FramePool) {
+    reset_wait_token_state();
+    *PIPE_ROUND_TRIP_PAIR.lock().unwrap() = Some(PipeNode::pair());
+    *PIPE_WRITE_ROUND_TRIP_RESULT.lock().unwrap() = None;
+
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init task should be current");
+    task.install_test_kernel_entry(pipe_write_round_trip_test_task)
+        .expect("broken pipe test task should receive kernel entry");
+    install_kernel(kernel);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    let sleeping_pair = PIPE_ROUND_TRIP_PAIR
+        .lock()
+        .unwrap()
+        .replace(PipeNode::pair())
+        .expect("sleeping pipe pair should remain installed");
+    drop(sleeping_pair);
+    assert_eq!(task.sched_state(), TaskRunState::Runnable);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(
+        *PIPE_WRITE_ROUND_TRIP_RESULT.lock().unwrap(),
+        Some(Ok(PipeWriteOutcome::Broken { written: PIPE_BUF }))
+    );
+    assert!(task.done());
+
+    *PIPE_ROUND_TRIP_PAIR.lock().unwrap() = None;
+    *PIPE_WRITE_ROUND_TRIP_RESULT.lock().unwrap() = None;
+    clear_wait_token_state();
+}
+
+// AGENT: task-stack entry used by pipe_blocking_read_sleeps_until_data_arrives.
+extern "C" fn pipe_read_round_trip_test_task() -> ! {
+    let read_end = PIPE_ROUND_TRIP_PAIR
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("pipe pair should be installed")
+        .0
+        .clone();
+    let kernel = crate::kernel::global_kernel().expect("pipe test kernel should be installed");
+    let task = kernel
+        .cur_task(0)
+        .expect("pipe read task should be current");
+    let mut byte = [0; 1];
+    *PIPE_READ_ROUND_TRIP_RESULT.lock().unwrap() =
+        Some(read_end.read_at(task.id(), false, &mut byte));
+
+    task.mark_thread_exited();
+    drop(task);
+    kernel.switch_current_to_idle(0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+// AGENT: task-stack entry used by pipe_blocking_large_write_resumes_until_complete.
+extern "C" fn pipe_write_round_trip_test_task() -> ! {
+    let write_end = PIPE_ROUND_TRIP_PAIR
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("pipe pair should be installed")
+        .1
+        .clone();
+    let kernel = crate::kernel::global_kernel().expect("pipe test kernel should be installed");
+    let task = kernel
+        .cur_task(0)
+        .expect("pipe write task should be current");
+    let payload = [0x5a; PIPE_BUF + 1];
+    *PIPE_WRITE_ROUND_TRIP_RESULT.lock().unwrap() =
+        Some(write_end.write_at(task.id(), false, &payload));
+
+    task.mark_thread_exited();
+    drop(task);
+    kernel.switch_current_to_idle(0);
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 // AGENT: pipe endpoints reject wrong-direction direct I/O even when a caller
@@ -1058,8 +1350,8 @@ fn pipe_rejects_wrong_direction_direct_io() {
     let (read_end, write_end) = PipeNode::pair();
     let mut out = [0u8; 1];
 
-    assert_eq!(write_end.read_at(&mut out), Err("ebadf"));
-    assert_eq!(read_end.write_at(b"x"), Err("ebadf"));
+    assert_eq!(write_end.read_at(0, true, &mut out), Err("ebadf"));
+    assert_eq!(read_end.write_at(0, true, b"x"), Err("ebadf"));
 }
 
 // AGENT: pipe peer-close state must wake epoll and also survive the level scan

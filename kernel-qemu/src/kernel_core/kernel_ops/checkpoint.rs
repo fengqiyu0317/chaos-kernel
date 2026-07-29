@@ -54,7 +54,17 @@ impl Kernel {
         let bytes = image
             .encode_first_version()
             .map_err(checkpoint_error_to_errno)?;
-        output.write(&bytes)
+        match output.write(task.id(), &bytes)? {
+            FdWriteOutcome::Written(n) => Ok(n),
+            FdWriteOutcome::BrokenPipe { written } => {
+                self.send_signal_to_task(&task, SIGPIPE as i32, 0);
+                if written == 0 {
+                    Err("epipe")
+                } else {
+                    Ok(written)
+                }
+            }
+        }
     }
 
     // AGENT: decode a checkpoint image and restore it as a fresh runnable
@@ -95,7 +105,7 @@ impl Kernel {
     pub fn restore_process_from_fd(&self, cpu: usize, fd: usize) -> Result<usize, &'static str> {
         let task = self.cur_task(cpu).ok_or("esrch")?;
         let input = task.get_fd_entry(fd).ok_or("ebadf")?;
-        let bytes = read_fd_to_end(&input)?;
+        let bytes = read_fd_to_end(&input, task.id())?;
         let image =
             CheckpointImage::decode_first_version(&bytes).map_err(checkpoint_error_to_errno)?;
         self.restore_process_from_image(image)
@@ -104,11 +114,11 @@ impl Kernel {
 
 // AGENT: read checkpoint payloads through the fd abstraction so future file
 // implementations can own blocking and offset behavior.
-fn read_fd_to_end(fd: &FdEntry) -> Result<Vec<u8>, &'static str> {
+fn read_fd_to_end(fd: &FdEntry, task_id: usize) -> Result<Vec<u8>, &'static str> {
     let mut out = Vec::new();
     let mut buf = vec![0u8; PAGE_SZ];
     loop {
-        let n = fd.read(&mut buf)?;
+        let n = fd.read(task_id, &mut buf)?;
         if n == 0 {
             break;
         }

@@ -28,6 +28,14 @@ impl FdOpt {
     }
 }
 
+// AGENT: keep broken-pipe notification distinct from errno so a large write
+// can both report partial progress and request SIGPIPE generation at syscall ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FdWriteOutcome {
+    Written(usize),
+    BrokenPipe { written: usize },
+}
+
 // AGENT: shared open-file description; dup/fork clone FdEntry while sharing
 // this object, so status flags, file handles, and pipe endpoint lifetime remain shared.
 pub struct OpenFileDesc {
@@ -71,24 +79,22 @@ impl OpenFileDesc {
 
     // AGENT: enforce open-file-description access flags before dispatching to
     // the concrete file-like object.
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+    pub fn read(&self, task_id: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
         if buf.is_empty() {
             return Ok(0);
         }
+        let status = self.status_flags();
         match &self.file {
-            FLike::File(f) => {
-                let status = self.status_flags();
-                f.read_with_status(status, buf)
-            }
+            FLike::File(f) => f.read_with_status(status, buf),
             FLike::Pipe(p) => {
-                if !self.status_flags().rd {
+                if !status.rd {
                     return Err("ebadf");
                 }
-                p.read_at(buf)
+                p.read_at(task_id, status.nb, buf)
             }
             FLike::Ep(_) => Err("enosys"),
             FLike::Tty(tty) => {
-                if !self.status_flags().rd {
+                if !status.rd {
                     return Err("ebadf");
                 }
                 Ok(tty.read(buf))
@@ -98,30 +104,36 @@ impl OpenFileDesc {
 
     // AGENT: keep append/write permission checks in the shared open-file
     // description instead of duplicating mutable status in FInstance.
-    pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
+    pub fn write(&self, task_id: usize, buf: &[u8]) -> Result<FdWriteOutcome, &'static str> {
         if buf.is_empty() {
-            return Ok(0);
+            return Ok(FdWriteOutcome::Written(0));
         }
+        let status = self.status_flags();
         match &self.file {
             FLike::File(f) => {
-                let status = self.status_flags();
                 if !status.wr {
                     return Err("ebadf");
                 }
                 f.write_with_status(status, buf)
+                    .map(FdWriteOutcome::Written)
             }
             FLike::Pipe(p) => {
-                if !self.status_flags().wr {
+                if !status.wr {
                     return Err("ebadf");
                 }
-                p.write_at(buf)
+                match p.write_at(task_id, status.nb, buf)? {
+                    PipeWriteOutcome::Written(n) => Ok(FdWriteOutcome::Written(n)),
+                    PipeWriteOutcome::Broken { written } => {
+                        Ok(FdWriteOutcome::BrokenPipe { written })
+                    }
+                }
             }
             FLike::Ep(_) => Err("enosys"),
             FLike::Tty(tty) => {
-                if !self.status_flags().wr {
+                if !status.wr {
                     return Err("ebadf");
                 }
-                Ok(tty.write(buf))
+                Ok(FdWriteOutcome::Written(tty.write(buf)))
             }
         }
     }
@@ -467,12 +479,16 @@ impl FdEntry {
         self.desc.file().unregister_epoll(sub_id)
     }
 
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        self.desc.read(buf)
+    // AGENT: carry the calling task identity down to potentially blocking file
+    // implementations without making FdEntry depend on scheduler globals.
+    pub fn read(&self, task_id: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
+        self.desc.read(task_id, buf)
     }
 
-    pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        self.desc.write(buf)
+    // AGENT: preserve typed broken-pipe progress until syscall glue can pair
+    // the return value with process signal generation.
+    pub fn write(&self, task_id: usize, buf: &[u8]) -> Result<FdWriteOutcome, &'static str> {
+        self.desc.write(task_id, buf)
     }
 
     // AGENT: forward stat through the shared open-file description without

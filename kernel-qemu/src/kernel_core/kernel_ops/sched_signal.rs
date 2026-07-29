@@ -63,27 +63,41 @@ impl Kernel {
         true
     }
 
-    // AGENT: common QEMU wait-token block path. Only the current CPU0 task may
-    // block itself, and it always returns through the initialized idle context.
-    pub(crate) fn block_task_for_wait(&self, task_id: usize) -> bool {
+    // AGENT: close the enqueue-to-sleep lost-wakeup window with one final token
+    // and signal check while local interrupts are masked, then publish Sleeping
+    // before switching through the initialized CPU0 idle context.
+    pub(crate) fn block_task_for_wait(
+        &self,
+        task_id: usize,
+        token: &WaitToken,
+        interruptible: bool,
+    ) -> bool {
+        let restore_interrupts = crate::csr::read_sstatus() & crate::csr::SSTATUS_SIE != 0;
+        crate::csr::disable_interrupts();
         let Some(task) = self.tasks.find_task(task_id) else {
+            if restore_interrupts {
+                crate::csr::enable_interrupts();
+            }
             return false;
         };
-        if task.done() {
-            return false;
-        }
-        if task.process.is_job_stopped() {
-            return false;
-        }
-        if !self.is_current_task_on_cpu0(task_id) {
-            return false;
-        }
-        if task.sched_state() != TaskRunState::Running {
+        if task.done()
+            || task.process.is_job_stopped()
+            || !self.is_current_task_on_cpu0(task_id)
+            || task.sched_state() != TaskRunState::Running
+            || token.is_woken()
+            || (interruptible && task.has_interrupting_signal())
+        {
+            if restore_interrupts {
+                crate::csr::enable_interrupts();
+            }
             return false;
         }
         task.set_sched_state(TaskRunState::Sleeping);
         self.run_queue.remove(task_id);
         self.switch_current_to_idle(0);
+        if restore_interrupts {
+            crate::csr::enable_interrupts();
+        }
         true
     }
 
