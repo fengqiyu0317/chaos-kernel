@@ -461,6 +461,27 @@ pub(super) fn sys_dup2(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
     task.dup2_fd(old_fd, new_fd)
 }
 
+// AGENT: implement Linux dup3 flags and same-fd rules before delegating exact
+// target replacement to the authoritative per-process fd table.
+pub(super) fn sys_dup3(
+    kernel: &Kernel,
+    a0: usize,
+    a1: usize,
+    a2: usize,
+) -> Result<usize, &'static str> {
+    let old_fd = a0;
+    let new_fd = a1;
+    let flags = a2;
+    if flags & !O_CLOEXEC != 0 || old_fd == new_fd {
+        return Err("einval");
+    }
+    if old_fd >= MAX_FD || new_fd >= MAX_FD {
+        return Err("ebadf");
+    }
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    task.dup3_fd(old_fd, new_fd, flags & O_CLOEXEC != 0)
+}
+
 // AGENT: TODO(M9-splice): implement Linux splice(2) through real pipe buffers,
 // user off_t pointer copy-in/copy-out, blocking/nonblocking waits, and pipe/file
 // direction checks. This stub only reserves the syscall surface and rejects

@@ -705,6 +705,33 @@ fn fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool: &FramePool) 
         .expect("next exact-range fd allocation should succeed");
     assert_eq!(next_exact_fd, 3);
 
+    let dup3_fd = task
+        .dup3_fd(source_fd, 4, true)
+        .expect("dup3 exact fd allocation should succeed");
+    assert_eq!(dup3_fd, 4);
+    let dup3_entry = task
+        .get_fd_entry(dup3_fd)
+        .expect("dup3 exact target should be installed");
+    assert!(dup3_entry.same_open_description(
+        &task
+            .get_fd_entry(source_fd)
+            .expect("dup3 source should remain open")
+    ));
+    assert!(dup3_entry.is_cloexec());
+    assert_eq!(task.dup3_fd(source_fd, source_fd, false), Err("einval"));
+
+    let pending_pair = task
+        .add_file_pair_transaction(
+            FdEntry::new(FLike::Ep(EpInst::new())),
+            FdEntry::new(FLike::Ep(EpInst::new())),
+            |first_fd, second_fd| {
+                assert_eq!(task.dup2_fd(source_fd, first_fd), Err("ebusy"));
+                assert_eq!(task.dup3_fd(source_fd, second_fd, true), Err("ebusy"));
+                Ok(())
+            },
+        )
+        .expect("pending pair should commit after dup target collisions");
+
     task.set_cloexec(high_fd, true)
         .expect("target cloexec update should succeed");
     let previous_target = task
@@ -734,6 +761,9 @@ fn fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool: &FramePool) 
     let _ = task.close_fd(low_fd);
     let _ = task.close_fd(exact_fd);
     let _ = task.close_fd(next_exact_fd);
+    let _ = task.close_fd(dup3_fd);
+    let _ = task.close_fd(pending_pair.0);
+    let _ = task.close_fd(pending_pair.1);
     let _ = task.close_fd(high_fd);
     let _ = task.close_fd(next_high_fd);
 }

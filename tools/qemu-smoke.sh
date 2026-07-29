@@ -50,10 +50,12 @@ grep -F "[init] mkdirat round-trip passed" "$LOG"
 grep -F "[init] openat round-trip passed" "$LOG"
 # AGENT: require real U-mode dup plus source-close descriptor survival.
 grep -F "[init] dup round-trip passed" "$LOG"
+# AGENT: require real U-mode dup3 exact-target replacement plus alias survival.
+grep -F "[init] dup3 round-trip passed" "$LOG"
 # AGENT: require real U-mode fstat/newfstatat copyout before descriptor teardown.
 grep -F "[init] stat round-trip passed" "$LOG"
 # AGENT: require real U-mode pipe2 fd copyout plus write/read/close traversal.
 grep -F "[init] pipe2 round-trip passed" "$LOG"
-# AGENT: require the real U-mode close ecall to release the surviving dup fd.
+# AGENT: require the real U-mode close ecall to release the surviving dup3 fd.
 grep -F "[init] close round-trip passed" "$LOG"
 grep -F "[kernel-qemu] init process exited" "$LOG"

@@ -259,6 +259,14 @@ pub(crate) fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str
     Ok(())
 }
 
+// AGENT: distinguish dup2 same-fd success from dup3 same-fd rejection while
+// keeping exact-target replacement in one fd-table implementation.
+#[derive(Clone, Copy)]
+enum SameFdBehavior {
+    ReturnTarget,
+    Reject,
+}
+
 // AGENT: implement the complete Task fd-table surface in the descriptor module.
 impl Task {
     // AGENT: install a new entry with a fresh shared open-file description.
@@ -481,8 +489,32 @@ impl Task {
         Ok(new_fd)
     }
 
-    // AGENT: replace a dup2 target through the same epoll-aware close path.
+    // AGENT: implement dup2 same-fd success and clear close-on-exec on a new
+    // descriptor while sharing the source open-file description.
     pub fn dup2_fd(&self, old_fd: usize, new_fd: usize) -> Result<usize, &'static str> {
+        self.dup_to_fd(old_fd, new_fd, false, SameFdBehavior::ReturnTarget)
+    }
+
+    // AGENT: implement dup3 exact-target duplication with caller-selected
+    // close-on-exec state and Linux same-fd rejection.
+    pub fn dup3_fd(
+        &self,
+        old_fd: usize,
+        new_fd: usize,
+        cloexec: bool,
+    ) -> Result<usize, &'static str> {
+        self.dup_to_fd(old_fd, new_fd, cloexec, SameFdBehavior::Reject)
+    }
+
+    // AGENT: atomically replace one exact fd target, report pending open/pipe
+    // reservations as EBUSY, and defer replaced-OFD cleanup until after unlock.
+    fn dup_to_fd(
+        &self,
+        old_fd: usize,
+        new_fd: usize,
+        cloexec: bool,
+        same_fd: SameFdBehavior,
+    ) -> Result<usize, &'static str> {
         if old_fd >= MAX_FD || new_fd >= MAX_FD {
             return Err("ebadf");
         }
@@ -490,17 +522,23 @@ impl Task {
             let mut table = self.process.fd_table.lock().unwrap();
             let entry = table.entries.get(&old_fd).cloned().ok_or("ebadf")?;
             if old_fd == new_fd {
-                return Ok(new_fd);
+                return match same_fd {
+                    SameFdBehavior::ReturnTarget => Ok(new_fd),
+                    SameFdBehavior::Reject => Err("einval"),
+                };
             }
             let cleanup = if table.entries.contains_key(&new_fd) {
                 Some(table.remove_fd_locked(new_fd)?)
             } else {
+                if table.pending.contains(&new_fd) {
+                    return Err("ebusy");
+                }
+                let reserved = table.allocator.reserve(new_fd);
+                debug_assert_eq!(reserved, Some(new_fd));
+                reserved.ok_or("ebusy")?;
                 None
             };
-            if cleanup.is_none() && table.allocator.reserve(new_fd).is_none() {
-                return Err("ebadf");
-            }
-            table.install_entry(new_fd, entry.dup(false));
+            table.install_entry(new_fd, entry.dup(cloexec));
             cleanup
         };
         if let Some(cleanup) = cleanup {

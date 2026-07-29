@@ -208,6 +208,7 @@ pub const SYS_IOCTL: usize = 16;
 pub const SYS_PIPE: usize = 22;
 pub const SYS_DUP: usize = 32;
 pub const SYS_DUP2: usize = 33;
+pub const SYS_DUP3: usize = 292;
 pub const SYS_FORK: usize = 57;
 pub const SYS_EXEC: usize = 59;
 pub const SYS_EXIT: usize = 60;

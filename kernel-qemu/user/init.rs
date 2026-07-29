@@ -6,6 +6,7 @@ use core::panic::PanicInfo;
 
 const SYS_WRITE: usize = 64;
 const SYS_DUP: usize = 23;
+const SYS_DUP3: usize = 24;
 const SYS_MKDIRAT: usize = 34;
 const SYS_OPENAT: usize = 56;
 const SYS_CLOSE: usize = 57;
@@ -17,11 +18,14 @@ const SYS_EXIT: usize = 93;
 const AT_FDCWD: usize = (-100isize) as usize;
 const O_WRONLY: usize = 1;
 const O_CREAT: usize = 0o100;
+const O_CLOEXEC: usize = 0o2000000;
 const STDOUT_FILENO: usize = 1;
+const DUP3_TARGET_FD: usize = 100;
 const INIT_MESSAGE: &[u8] = b"[init] userspace /bin/init reached\n";
 const MKDIR_MESSAGE: &[u8] = b"[init] mkdirat round-trip passed\n";
 const OPEN_MESSAGE: &[u8] = b"[init] openat round-trip passed\n";
 const DUP_MESSAGE: &[u8] = b"[init] dup round-trip passed\n";
+const DUP3_MESSAGE: &[u8] = b"[init] dup3 round-trip passed\n";
 const PIPE_MESSAGE: &[u8] = b"[init] pipe2 round-trip passed\n";
 const STAT_MESSAGE: &[u8] = b"[init] stat round-trip passed\n";
 const CLOSE_MESSAGE: &[u8] = b"[init] close round-trip passed\n";
@@ -126,8 +130,8 @@ fn stat_u64(bytes: &[u8; RISCV64_STAT_SIZE], offset: usize) -> u64 {
     ])
 }
 
-// AGENT: prove user-mode mkdirat/openat/dup/pipe2/fstat/newfstatat/close,
-// including descriptor survival, real copyout, and OFD teardown.
+// AGENT: prove user-mode mkdirat/openat/dup/dup3/pipe2/fstat/newfstatat/close,
+// including exact-target descriptor survival, real copyout, and OFD teardown.
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -200,11 +204,28 @@ pub extern "C" fn _start() -> ! {
     } else {
         duplicated
     };
-    let mut fd_stat = [0u8; RISCV64_STAT_SIZE];
-    let fstat_result = if source_close_result == 0 {
-        unsafe { syscall2(SYS_FSTAT, duplicated as usize, fd_stat.as_mut_ptr() as usize) }
+    let dup3_result = if source_close_result == 0 {
+        unsafe {
+            syscall3(
+                SYS_DUP3,
+                duplicated as usize,
+                DUP3_TARGET_FD,
+                O_CLOEXEC,
+            )
+        }
     } else {
         source_close_result
+    };
+    let duplicate_close_result = if dup3_result == DUP3_TARGET_FD as isize {
+        unsafe { syscall1(SYS_CLOSE, duplicated as usize) }
+    } else {
+        dup3_result
+    };
+    let mut fd_stat = [0u8; RISCV64_STAT_SIZE];
+    let fstat_result = if duplicate_close_result == 0 {
+        unsafe { syscall2(SYS_FSTAT, DUP3_TARGET_FD, fd_stat.as_mut_ptr() as usize) }
+    } else {
+        duplicate_close_result
     };
     let mut path_stat = [0u8; RISCV64_STAT_SIZE];
     let newfstatat_result = if fstat_result == 0 {
@@ -228,9 +249,10 @@ pub extern "C" fn _start() -> ! {
         && stat_u32(&fd_stat, 56) == 512
         && stat_u64(&fd_stat, 64) == 1
         && fd_stat == path_stat;
-    let dup_round_trip_ok = duplicated >= 0
-        && duplicated != opened
-        && source_close_result == 0
+    let dup_round_trip_ok = duplicated >= 0 && duplicated != opened && source_close_result == 0;
+    let dup3_round_trip_ok = dup_round_trip_ok
+        && dup3_result == DUP3_TARGET_FD as isize
+        && duplicate_close_result == 0
         && stat_round_trip_ok;
     let dup_message_written = if dup_round_trip_ok {
         unsafe {
@@ -239,6 +261,18 @@ pub extern "C" fn _start() -> ! {
                 STDOUT_FILENO,
                 DUP_MESSAGE.as_ptr() as usize,
                 DUP_MESSAGE.len(),
+            )
+        }
+    } else {
+        -1
+    };
+    let dup3_message_written = if dup3_round_trip_ok {
+        unsafe {
+            syscall3(
+                SYS_WRITE,
+                STDOUT_FILENO,
+                DUP3_MESSAGE.as_ptr() as usize,
+                DUP3_MESSAGE.len(),
             )
         }
     } else {
@@ -315,7 +349,13 @@ pub extern "C" fn _start() -> ! {
     } else {
         -1
     };
-    let close_fd = if duplicated >= 0 { duplicated } else { opened };
+    let close_fd = if dup3_result == DUP3_TARGET_FD as isize {
+        dup3_result
+    } else if duplicated >= 0 {
+        duplicated
+    } else {
+        opened
+    };
     let close_result = if close_fd >= 0 {
         unsafe { syscall1(SYS_CLOSE, close_fd as usize) }
     } else {
@@ -341,6 +381,8 @@ pub extern "C" fn _start() -> ! {
             || open_message_written != OPEN_MESSAGE.len() as isize
             || !dup_round_trip_ok
             || dup_message_written != DUP_MESSAGE.len() as isize
+            || !dup3_round_trip_ok
+            || dup3_message_written != DUP3_MESSAGE.len() as isize
             || !stat_round_trip_ok
             || stat_message_written != STAT_MESSAGE.len() as isize
             || !pipe_round_trip_ok

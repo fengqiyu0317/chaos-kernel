@@ -2,10 +2,11 @@
 // pool, current init task, Sv39 mappings, and authoritative AddrSpace usercopy.
 use super::*;
 use crate::syscall_abi::{
-    map_riscv_nr, INTERNAL_SYS_DUP, INTERNAL_SYS_FSTAT, INTERNAL_SYS_MKDIRAT, INTERNAL_SYS_MOUNT,
-    INTERNAL_SYS_NEWFSTATAT, INTERNAL_SYS_OPENAT, INTERNAL_SYS_PIPE, INTERNAL_SYS_READ,
-    INTERNAL_SYS_UMOUNT2, RISCV_SYS_DUP, RISCV_SYS_FSTAT, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT,
-    RISCV_SYS_NEWFSTATAT, RISCV_SYS_OPENAT, RISCV_SYS_PIPE2, RISCV_SYS_READ, RISCV_SYS_UMOUNT2,
+    map_riscv_nr, INTERNAL_SYS_DUP, INTERNAL_SYS_DUP3, INTERNAL_SYS_FSTAT, INTERNAL_SYS_MKDIRAT,
+    INTERNAL_SYS_MOUNT, INTERNAL_SYS_NEWFSTATAT, INTERNAL_SYS_OPENAT, INTERNAL_SYS_PIPE,
+    INTERNAL_SYS_READ, INTERNAL_SYS_UMOUNT2, RISCV_SYS_DUP, RISCV_SYS_DUP3, RISCV_SYS_FSTAT,
+    RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT, RISCV_SYS_NEWFSTATAT, RISCV_SYS_OPENAT, RISCV_SYS_PIPE2,
+    RISCV_SYS_READ, RISCV_SYS_UMOUNT2,
 };
 
 const USER_STRINGS_BASE: usize = 0x4000_0000;
@@ -31,6 +32,7 @@ pub fn run_all(kernel: &Kernel) {
     mkdirat_creates_only_new_absolute_directories(kernel);
     openat_uses_transactional_fd_and_path_state(kernel);
     pipe2_copies_fds_and_publishes_them_transactionally(kernel);
+    dup2_and_dup3_share_one_exact_target_implementation(kernel);
     read_uses_usercopy_and_shared_open_file_offsets(kernel);
     read_moves_pipe_bytes_and_reports_empty_states(kernel);
 }
@@ -1461,6 +1463,139 @@ fn pipe2_copies_fds_and_publishes_them_transactionally(kernel: &Kernel) {
     for fd in fillers {
         task.close_fd(fd).expect("pipe2 filler fd should close");
     }
+}
+
+// AGENT: verify the internal dup2 semantic entry and Linux RV64 dup3 mapping,
+// exact-target replacement, OFD sharing, per-fd cloexec, and rejection ordering.
+#[cfg_attr(test, test)]
+fn dup2_and_dup3_share_one_exact_target_implementation(kernel: &Kernel) {
+    assert_eq!(map_riscv_nr(RISCV_SYS_DUP3), Some(INTERNAL_SYS_DUP3));
+
+    let task = kernel.cur_task(0).expect("init task should be current");
+    let source_fd = task
+        .add_file(FLike::Ep(EpInst::new()))
+        .expect("dup3 source should allocate");
+    task.set_cloexec(source_fd, true)
+        .expect("dup3 source cloexec should set");
+
+    assert_eq!(
+        kernel
+            .dispatch_syscall_without_signal_delivery(SYS_DUP2, source_fd, source_fd, 0, 0, 0, 0,),
+        Ok(source_fd)
+    );
+    assert!(task
+        .get_fd_entry(source_fd)
+        .expect("same-fd dup2 source should remain installed")
+        .is_cloexec());
+    assert_eq!(
+        kernel
+            .dispatch_syscall_without_signal_delivery(SYS_DUP3, source_fd, source_fd, 0, 0, 0, 0,),
+        Err("einval")
+    );
+
+    let occupied_fd = task
+        .add_file(FLike::Tty(TtyDevice))
+        .expect("dup3 occupied target should allocate");
+    let occupied_before = task
+        .get_fd_entry(occupied_fd)
+        .expect("dup3 occupied target should exist");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_DUP3,
+            source_fd,
+            occupied_fd,
+            O_NONBLOCK,
+            0,
+            0,
+            0,
+        ),
+        Err("einval")
+    );
+    assert!(task
+        .get_fd_entry(occupied_fd)
+        .expect("invalid dup3 flags must preserve the target")
+        .same_open_description(&occupied_before));
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_DUP3,
+            source_fd,
+            occupied_fd,
+            O_CLOEXEC,
+            0,
+            0,
+            0,
+        ),
+        Ok(occupied_fd)
+    );
+    let cloexec_target = task
+        .get_fd_entry(occupied_fd)
+        .expect("dup3 occupied target should be replaced");
+    assert!(cloexec_target.same_open_description(
+        &task
+            .get_fd_entry(source_fd)
+            .expect("dup3 source should remain installed")
+    ));
+    assert!(cloexec_target.is_cloexec());
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_DUP2,
+            source_fd,
+            occupied_fd,
+            0,
+            0,
+            0,
+            0,
+        ),
+        Ok(occupied_fd)
+    );
+    assert!(!task
+        .get_fd_entry(occupied_fd)
+        .expect("dup2 replacement should remain installed")
+        .is_cloexec());
+
+    let exact_fd = MAX_FD - 1;
+    assert!(task.get_fd_entry(exact_fd).is_none());
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_DUP3, source_fd, exact_fd, O_CLOEXEC, 0, 0, 0,
+        ),
+        Ok(exact_fd)
+    );
+    let exact_entry = task
+        .get_fd_entry(exact_fd)
+        .expect("dup3 unused exact target should be installed");
+    assert!(exact_entry.same_open_description(
+        &task
+            .get_fd_entry(source_fd)
+            .expect("dup3 exact source should remain installed")
+    ));
+    assert!(exact_entry.is_cloexec());
+
+    let exact_before = exact_entry.clone();
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_DUP3,
+            source_fd + MAX_FD,
+            exact_fd,
+            0,
+            0,
+            0,
+            0,
+        ),
+        Err("ebadf")
+    );
+    assert!(task
+        .get_fd_entry(exact_fd)
+        .expect("invalid dup3 source must preserve the target")
+        .same_open_description(&exact_before));
+
+    task.close_fd(source_fd).expect("dup3 source should close");
+    task.close_fd(occupied_fd)
+        .expect("dup3 occupied target should close");
+    task.close_fd(exact_fd)
+        .expect("dup3 exact target should close");
 }
 
 // AGENT: verify the live read/dup ABI, lowest-fd allocation, per-fd cloexec,
