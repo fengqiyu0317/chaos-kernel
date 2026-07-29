@@ -6,19 +6,19 @@
 
 ### 概述
 - **仓库**: `chaos/` — 基于 rCore 的内核调试与重写作业
-- **当前目标目录**: `kernel-sim/`
-- **任务**: 修 bug → 通过全部测试 → 重写提升代码质量
-- **kernel-sim 当前验收目标**: 以通过 `chaos-tests` 测试为目标定位与阶段性完成标准
+- **当前目标目录**: `kernel-qemu/`
+- **当前工作边界**: 默认只分析、修改和验证 `kernel-qemu/`；除非用户明确要求，不需要检查、修改、同步或回归 `kernel-sim/`
+- **任务**: 完善 QEMU/RISC-V 裸机内核实现 → 通过对应的目标架构检查与 QEMU 测试 → 重写提升代码质量
+- **kernel-qemu 当前验收目标**: 以 RISC-V 目标检查以及相关 QEMU selftest/smoke 测试为阶段性完成标准
 - **M9 迁移目标**: 以 `docs/kernel-sim-qemu-migration-design.md` 为准，把 `kernel-sim` 已稳定的内核语义迁移到 QEMU 裸机环境，而不是重新设计一套新内核
 
 ### 测试
-- 当前 `kernel-sim` 的实现与重写优先围绕 `chaos-tests` 的 basic 测试收敛；除非任务明确改变边界，不把目标转回旧 `kernel/src/kernel.rs`。注意在修改 `kernel-sim` 时也要修改 `kernel-qemu` 相应部分的代码以对齐，但修改  `kernel-qemu` 时不需要同步修改 `kernel-sim`，因为 `kernel-qemu` 不以通过 basic 测试为目标。
+- 当前实现与重写只围绕 `kernel-qemu/` 收敛；根据具体改动运行 RISC-V target check、QEMU selftest 和 smoke 测试。除非用户明确要求，不运行 `kernel-sim` 或 `chaos-tests` 回归，也不为了对齐而修改 `kernel-sim/`。
 
 ```bash
-cargo test --test basic     # 基础测试
-cargo test --test advanced  # 进阶测试
-cargo test --test pressure  # 压力测试
-cargo test --test basic -- group_01  # 按组运行
+cargo check --manifest-path kernel-qemu/Cargo.toml --target riscv64gc-unknown-none-elf
+cargo build --manifest-path kernel-qemu/Cargo.toml --release --features qemu-selftest
+bash tools/qemu-smoke.sh
 ```
 
 ### 内核结构
@@ -30,8 +30,8 @@ cargo test --test basic -- group_01  # 按组运行
 ```
 chaos/
 ├── kernel/src/kernel.rs  # 待调试/重写的内核
-├── kernel-sim/           # 当前主要修改目标：host userspace 内核模拟器
-├── kernel-qemu/          # M9 新增目标：RISC-V QEMU no_std 承载层
+├── kernel-sim/           # host userspace 内核模拟器；当前不作为修改或回归目标
+├── kernel-qemu/          # 当前主要修改目标：RISC-V QEMU no_std 内核
 ├── kernel-common/        # 可选共享 crate：仅放 no_std/alloc 纯逻辑
 ├── docs/                 # 设计文档、AI 记录和交接材料
 ├── chaos-tests/tests/    # 测试用例（basic/advanced/pressure）
@@ -44,7 +44,8 @@ chaos/
 
 ### 注意
 - 一定不要修改 `chaos/kernel/src/kernel.rs`
-- 对 `kernel-sim` 相关问题，修改目标是 `chaos/kernel-sim/`，不要改 `chaos/kernel/`
+- 当前默认只处理 `chaos/kernel-qemu/`；不要修改 `chaos/kernel-sim/`，除非用户明确要求
+- 下方 M9 章节中对 `kernel-sim` 的描述仅作为迁移背景，不代表当前需要检查、修改或运行其测试；本条当前工作边界优先
 - 修改后要保留 AI 对话日志作为提交材料
 - 代码中需要标注 `// HUMAN` 和 `// AGENT` 区分人写/AI 生成，注意 `// AGENT` 不能只写在一个文件开头，而是在每个修改的函数或结构体等块结构前写上 `// AGENT` 以及修改的内容
 
