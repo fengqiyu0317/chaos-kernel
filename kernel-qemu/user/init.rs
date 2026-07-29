@@ -8,6 +8,8 @@ const SYS_WRITE: usize = 64;
 const SYS_MKDIRAT: usize = 34;
 const SYS_OPENAT: usize = 56;
 const SYS_CLOSE: usize = 57;
+const SYS_PIPE2: usize = 59;
+const SYS_READ: usize = 63;
 const SYS_NEWFSTATAT: usize = 79;
 const SYS_FSTAT: usize = 80;
 const SYS_EXIT: usize = 93;
@@ -18,11 +20,13 @@ const STDOUT_FILENO: usize = 1;
 const INIT_MESSAGE: &[u8] = b"[init] userspace /bin/init reached\n";
 const MKDIR_MESSAGE: &[u8] = b"[init] mkdirat round-trip passed\n";
 const OPEN_MESSAGE: &[u8] = b"[init] openat round-trip passed\n";
+const PIPE_MESSAGE: &[u8] = b"[init] pipe2 round-trip passed\n";
 const STAT_MESSAGE: &[u8] = b"[init] stat round-trip passed\n";
 const CLOSE_MESSAGE: &[u8] = b"[init] close round-trip passed\n";
 const MKDIR_PATH: &[u8] = b"/tmp/init-mkdirat\0";
 const OPEN_PATH: &[u8] = b"/tmp/init-mkdirat/file\0";
 const OPEN_PAYLOAD: &[u8] = b"openat-ok";
+const PIPE_PAYLOAD: &[u8] = b"pipe2-ok";
 const RISCV64_STAT_SIZE: usize = 128;
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
@@ -120,8 +124,8 @@ fn stat_u64(bytes: &[u8; RISCV64_STAT_SIZE], offset: usize) -> u64 {
     ])
 }
 
-// AGENT: prove user-mode mkdirat/openat/fstat/newfstatat/close, including real
-// stat copyout and regular-file OFD teardown, then report failures via status.
+// AGENT: prove user-mode mkdirat/openat/pipe2/fstat/newfstatat/close, including
+// real descriptor/stat copyout and OFD teardown, then report failures via status.
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -224,6 +228,65 @@ pub extern "C" fn _start() -> ! {
     } else {
         -1
     };
+    let mut pipe_fds = [-1i32; 2];
+    let pipe_result = if stat_round_trip_ok {
+        unsafe { syscall2(SYS_PIPE2, pipe_fds.as_mut_ptr() as usize, 0) }
+    } else {
+        -1
+    };
+    let pipe_written = if pipe_result == 0 && pipe_fds[1] >= 0 {
+        unsafe {
+            syscall3(
+                SYS_WRITE,
+                pipe_fds[1] as usize,
+                PIPE_PAYLOAD.as_ptr() as usize,
+                PIPE_PAYLOAD.len(),
+            )
+        }
+    } else {
+        pipe_result
+    };
+    let mut pipe_output = [0u8; PIPE_PAYLOAD.len()];
+    let pipe_read = if pipe_written == PIPE_PAYLOAD.len() as isize && pipe_fds[0] >= 0 {
+        unsafe {
+            syscall3(
+                SYS_READ,
+                pipe_fds[0] as usize,
+                pipe_output.as_mut_ptr() as usize,
+                pipe_output.len(),
+            )
+        }
+    } else {
+        pipe_written
+    };
+    let pipe_read_close = if pipe_result == 0 && pipe_fds[0] >= 0 {
+        unsafe { syscall1(SYS_CLOSE, pipe_fds[0] as usize) }
+    } else {
+        pipe_result
+    };
+    let pipe_write_close = if pipe_result == 0 && pipe_fds[1] >= 0 {
+        unsafe { syscall1(SYS_CLOSE, pipe_fds[1] as usize) }
+    } else {
+        pipe_result
+    };
+    let pipe_round_trip_ok = pipe_result == 0
+        && pipe_written == PIPE_PAYLOAD.len() as isize
+        && pipe_read == PIPE_PAYLOAD.len() as isize
+        && pipe_output == PIPE_PAYLOAD
+        && pipe_read_close == 0
+        && pipe_write_close == 0;
+    let pipe_message_written = if pipe_round_trip_ok {
+        unsafe {
+            syscall3(
+                SYS_WRITE,
+                STDOUT_FILENO,
+                PIPE_MESSAGE.as_ptr() as usize,
+                PIPE_MESSAGE.len(),
+            )
+        }
+    } else {
+        -1
+    };
     let close_result = if file_written == OPEN_PAYLOAD.len() as isize {
         unsafe { syscall1(SYS_CLOSE, opened as usize) }
     } else {
@@ -249,6 +312,8 @@ pub extern "C" fn _start() -> ! {
             || open_message_written != OPEN_MESSAGE.len() as isize
             || !stat_round_trip_ok
             || stat_message_written != STAT_MESSAGE.len() as isize
+            || !pipe_round_trip_ok
+            || pipe_message_written != PIPE_MESSAGE.len() as isize
             || close_result != 0
             || close_message_written != CLOSE_MESSAGE.len() as isize,
     );

@@ -5,6 +5,9 @@ const MAX_RW_COUNT: usize = PAGE_SZ * 16;
 const O_ACCMODE: usize = 0x3;
 const SUPPORTED_OPEN_FLAGS: usize =
     O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_NONBLOCK | O_APPEND | O_CLOEXEC;
+// AGENT: support the two ordinary Linux pipe2 creation flags while rejecting
+// packet-mode and notification-pipe behavior that this pipe layer lacks.
+const SUPPORTED_PIPE_FLAGS: usize = O_NONBLOCK | O_CLOEXEC;
 
 // AGENT: keep the first-stage supported open flags explicit instead of
 // accepting unimplemented path, durability, or directory semantics silently.
@@ -373,34 +376,67 @@ pub(super) fn sys_ioctl(
     }
 }
 
-// AGENT: allocate pipe endpoints through one fd allocator transaction.
+// AGENT: implement Linux RV64 pipe2 by copying int[2] to the active address
+// space before atomically publishing two fully initialized fd entries.
 pub(super) fn sys_pipe(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &'static str> {
     let fds_addr = a0;
     let pipe_flags = a1;
+    if pipe_flags & !SUPPORTED_PIPE_FLAGS != 0 {
+        return Err("einval");
+    }
     if fds_addr == 0 {
         return Err("efault");
     }
-    if !check_access(fds_addr, 2 * mem::size_of::<i32>()) {
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    let output_len = 2 * mem::size_of::<i32>();
+    let writable_len = task
+        .process
+        .addr_space
+        .lock()
+        .unwrap()
+        .writable_user_prefix_len(fds_addr, output_len)?;
+    if writable_len != output_len {
         return Err("efault");
     }
-    let cur = kernel.cur_task(0);
-    if let Some(t) = cur {
-        let (rd, wr) = PipeNode::pair();
-        let _nonblock = (pipe_flags & O_NONBLOCK) != 0;
-        let _cloexec = (pipe_flags & O_CLOEXEC) != 0;
-        let (rd_fd, wr_fd) =
-            t.add_file_pair_with_cloexec(FLike::Pipe(rd), FLike::Pipe(wr), _cloexec)?;
-        if _nonblock {
-            for pipe_fd in [rd_fd, wr_fd] {
-                t.get_fd_entry(pipe_fd)
-                    .ok_or("ebadf")?
-                    .set_status_flags(O_NONBLOCK)?;
-            }
-        }
-        Ok(rd_fd | (wr_fd << 32))
-    } else {
-        Err("esrch")
-    }
+
+    let nonblock = pipe_flags & O_NONBLOCK != 0;
+    let cloexec = pipe_flags & O_CLOEXEC != 0;
+    let (read_end, write_end) = PipeNode::pair();
+    let read_entry = FdEntry::with_status(
+        FLike::Pipe(read_end),
+        FdOpt {
+            rd: true,
+            wr: false,
+            ap: false,
+            nb: nonblock,
+        },
+        cloexec,
+    );
+    let write_entry = FdEntry::with_status(
+        FLike::Pipe(write_end),
+        FdOpt {
+            rd: false,
+            wr: true,
+            ap: false,
+            nb: nonblock,
+        },
+        cloexec,
+    );
+
+    task.add_file_pair_transaction(read_entry, write_entry, |read_fd, write_fd| {
+        let read_fd = i32::try_from(read_fd).map_err(|_| "eoverflow")?;
+        let write_fd = i32::try_from(write_fd).map_err(|_| "eoverflow")?;
+        let fd_size = mem::size_of::<i32>();
+        let mut output = [0u8; 2 * mem::size_of::<i32>()];
+        output[..fd_size].copy_from_slice(&read_fd.to_ne_bytes());
+        output[fd_size..].copy_from_slice(&write_fd.to_ne_bytes());
+        task.process
+            .addr_space
+            .lock()
+            .unwrap()
+            .write_user_bytes(fds_addr, &output, &kernel.pool)
+    })?;
+    Ok(0)
 }
 
 pub(super) fn sys_dup(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {

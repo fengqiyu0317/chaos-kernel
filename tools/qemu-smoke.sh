@@ -50,6 +50,8 @@ grep -F "[init] mkdirat round-trip passed" "$LOG"
 grep -F "[init] openat round-trip passed" "$LOG"
 # AGENT: require real U-mode fstat/newfstatat copyout before descriptor teardown.
 grep -F "[init] stat round-trip passed" "$LOG"
+# AGENT: require real U-mode pipe2 fd copyout plus write/read/close traversal.
+grep -F "[init] pipe2 round-trip passed" "$LOG"
 # AGENT: require the real U-mode close ecall to release the opened descriptor.
 grep -F "[init] close round-trip passed" "$LOG"
 grep -F "[kernel-qemu] init process exited" "$LOG"

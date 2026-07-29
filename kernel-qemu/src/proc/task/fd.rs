@@ -47,6 +47,21 @@ impl FdTable {
         Ok(fd)
     }
 
+    // AGENT: reserve both pipe-style descriptors before running fallible work,
+    // and return the first reservation if the second descriptor cannot fit.
+    fn reserve_pending_pair(&mut self) -> Result<(usize, usize), &'static str> {
+        let first_fd = self.reserve_pending_from(0)?;
+        let second_fd = match self.reserve_pending_from(0) {
+            Ok(fd) => fd,
+            Err(err) => {
+                let cancelled = self.cancel_pending(first_fd);
+                debug_assert!(cancelled);
+                return Err(err);
+            }
+        };
+        Ok((first_fd, second_fd))
+    }
+
     // AGENT: publish a fully built entry only if the same table still owns its
     // pending reservation; process teardown may replace the whole table.
     fn commit_pending(&mut self, fd: usize, entry: FdEntry) -> Result<(), &'static str> {
@@ -57,9 +72,37 @@ impl FdTable {
         Ok(())
     }
 
+    // AGENT: validate both reservations before publishing either descriptor so
+    // a pipe pair can never become half-visible in the shared fd table.
+    fn commit_pending_pair(
+        &mut self,
+        fds: (usize, usize),
+        first: FdEntry,
+        second: FdEntry,
+    ) -> Result<(), &'static str> {
+        let (first_fd, second_fd) = fds;
+        if !self.pending.contains(&first_fd) || !self.pending.contains(&second_fd) {
+            return Err("esrch");
+        }
+        let first_pending = self.pending.remove(&first_fd);
+        let second_pending = self.pending.remove(&second_fd);
+        debug_assert!(first_pending && second_pending);
+        self.install_entry(first_fd, first);
+        self.install_entry(second_fd, second);
+        Ok(())
+    }
+
     // AGENT: return an uncommitted reservation after constructor failure.
     fn cancel_pending(&mut self, fd: usize) -> bool {
         self.pending.remove(&fd) && self.allocator.release(fd)
+    }
+
+    // AGENT: cancel both sides without short-circuiting so every surviving
+    // reservation is returned after a failed pipe copy-out.
+    fn cancel_pending_pair(&mut self, fds: (usize, usize)) -> bool {
+        let first_cancelled = self.cancel_pending(fds.0);
+        let second_cancelled = self.cancel_pending(fds.1);
+        first_cancelled && second_cancelled
     }
 
     // AGENT: count only actual map slots as user-visible descriptor references;
@@ -291,6 +334,37 @@ impl Task {
         table.install_entry(first_fd, FdEntry::with_cloexec(first, cloexec));
         table.install_entry(second_fd, FdEntry::with_cloexec(second, cloexec));
         Ok((first_fd, second_fd))
+    }
+
+    // AGENT: keep pipe fd numbers pending while a caller performs fallible ABI
+    // publication, then install both fully initialized entries in one commit.
+    pub fn add_file_pair_transaction<F>(
+        &self,
+        first: FdEntry,
+        second: FdEntry,
+        before_commit: F,
+    ) -> Result<(usize, usize), &'static str>
+    where
+        F: FnOnce(usize, usize) -> Result<(), &'static str>,
+    {
+        let fds = {
+            let mut table = self.process.fd_table.lock().unwrap();
+            table.reserve_pending_pair()?
+        };
+        if let Err(err) = before_commit(fds.0, fds.1) {
+            let mut table = self.process.fd_table.lock().unwrap();
+            let cancelled = table.cancel_pending_pair(fds);
+            debug_assert!(cancelled || self.process.is_terminating() || self.process.is_zombie());
+            return Err(err);
+        }
+
+        let mut table = self.process.fd_table.lock().unwrap();
+        if let Err(err) = table.commit_pending_pair(fds, first, second) {
+            let cancelled = table.cancel_pending_pair(fds);
+            debug_assert!(cancelled || self.process.is_terminating() || self.process.is_zombie());
+            return Err(err);
+        }
+        Ok(fds)
     }
 
     // AGENT: clone an entry while preserving shared open-description semantics.

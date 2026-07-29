@@ -3,9 +3,9 @@
 use super::*;
 use crate::syscall_abi::{
     map_riscv_nr, INTERNAL_SYS_FSTAT, INTERNAL_SYS_MKDIRAT, INTERNAL_SYS_MOUNT,
-    INTERNAL_SYS_NEWFSTATAT, INTERNAL_SYS_OPENAT, INTERNAL_SYS_READ, INTERNAL_SYS_UMOUNT2,
-    RISCV_SYS_FSTAT, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT, RISCV_SYS_NEWFSTATAT, RISCV_SYS_OPENAT,
-    RISCV_SYS_READ, RISCV_SYS_UMOUNT2,
+    INTERNAL_SYS_NEWFSTATAT, INTERNAL_SYS_OPENAT, INTERNAL_SYS_PIPE, INTERNAL_SYS_READ,
+    INTERNAL_SYS_UMOUNT2, RISCV_SYS_FSTAT, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT,
+    RISCV_SYS_NEWFSTATAT, RISCV_SYS_OPENAT, RISCV_SYS_PIPE2, RISCV_SYS_READ, RISCV_SYS_UMOUNT2,
 };
 
 const USER_STRINGS_BASE: usize = 0x4000_0000;
@@ -14,6 +14,7 @@ const MKDIR_USER_BASE: usize = 0x4002_0000;
 const READ_USER_BASE: usize = 0x4003_0000;
 const UNMOUNT_USER_BASE: usize = 0x4004_0000;
 const STAT_USER_BASE: usize = 0x4005_0000;
+const PIPE_USER_BASE: usize = 0x4006_0000;
 
 // AGENT: Run filesystem ABI and semantic regressions after QEMU installs the
 // real kernel frame pool, current init task, Sv39 mappings, and fd table.
@@ -29,6 +30,7 @@ pub fn run_all(kernel: &Kernel) {
     mounted_open_and_exec_use_the_mounted_filesystem_storage(kernel);
     mkdirat_creates_only_new_absolute_directories(kernel);
     openat_uses_transactional_fd_and_path_state(kernel);
+    pipe2_copies_fds_and_publishes_them_transactionally(kernel);
     read_uses_usercopy_and_shared_open_file_offsets(kernel);
     read_moves_pipe_bytes_and_reports_empty_states(kernel);
 }
@@ -44,6 +46,33 @@ fn write_user_string(kernel: &Kernel, task: &Task, addr: usize, value: &str) {
         .unwrap()
         .write_user_bytes(addr, &bytes, &kernel.pool)
         .expect("test user string should be writable");
+}
+
+// AGENT: decode the two native-width Linux int descriptors copied out by the
+// RV64 pipe2 syscall instead of relying on the removed packed return value.
+fn read_user_pipe_fds(task: &Task, addr: usize) -> (usize, usize) {
+    let fd_size = mem::size_of::<i32>();
+    let mut bytes = [0u8; 2 * mem::size_of::<i32>()];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(addr, &mut bytes)
+        .expect("pipe2 descriptor pair should be readable from userspace");
+    let read_fd = i32::from_ne_bytes(
+        bytes[..fd_size]
+            .try_into()
+            .expect("pipe2 read fd should occupy one int"),
+    );
+    let write_fd = i32::from_ne_bytes(
+        bytes[fd_size..]
+            .try_into()
+            .expect("pipe2 write fd should occupy one int"),
+    );
+    (
+        usize::try_from(read_fd).expect("pipe2 read fd should be non-negative"),
+        usize::try_from(write_fd).expect("pipe2 write fd should be non-negative"),
+    )
 }
 
 // AGENT: decode one little-endian u32 from the fixed RV64 stat regression image.
@@ -1285,6 +1314,152 @@ fn openat_uses_transactional_fd_and_path_state(kernel: &Kernel) {
     );
     for fd in fillers {
         task.close_fd(fd).expect("filler fd should close");
+    }
+}
+
+// AGENT: verify RV64 pipe2 mapping, int[2] copy-out, initial OFD/fd flags,
+// invalid-user/flag rejection, pending-pair cancellation, and EMFILE rollback.
+#[cfg_attr(test, test)]
+fn pipe2_copies_fds_and_publishes_them_transactionally(kernel: &Kernel) {
+    assert_eq!(map_riscv_nr(RISCV_SYS_PIPE2), Some(INTERNAL_SYS_PIPE));
+
+    let task = kernel.cur_task(0).expect("init task should be current");
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(PIPE_USER_BASE, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("pipe2 writable user page should map");
+        addr_space
+            .map_region(
+                VmRegion::new(PIPE_USER_BASE + PAGE_SZ, PAGE_SZ, VM_READ),
+                &kernel.pool,
+            )
+            .expect("pipe2 read-only user page should map");
+    }
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_PIPE,
+            PIPE_USER_BASE,
+            O_NONBLOCK | O_CLOEXEC,
+            0,
+            0,
+            0,
+            0,
+        ),
+        Ok(0)
+    );
+    let first_pair = read_user_pipe_fds(&task, PIPE_USER_BASE);
+    let read_entry = task
+        .get_fd_entry(first_pair.0)
+        .expect("pipe2 read fd should be installed");
+    let read_status = read_entry.status_flags();
+    assert!(read_status.rd);
+    assert!(!read_status.wr);
+    assert!(read_status.nb);
+    assert!(read_entry.is_cloexec());
+    let write_entry = task
+        .get_fd_entry(first_pair.1)
+        .expect("pipe2 write fd should be installed");
+    let write_status = write_entry.status_flags();
+    assert!(!write_status.rd);
+    assert!(write_status.wr);
+    assert!(write_status.nb);
+    assert!(write_entry.is_cloexec());
+    task.close_fd(first_pair.0)
+        .expect("pipe2 read fd should close");
+    task.close_fd(first_pair.1)
+        .expect("pipe2 write fd should close");
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_PIPE,
+            PIPE_USER_BASE,
+            O_APPEND,
+            0,
+            0,
+            0,
+            0,
+        ),
+        Err("einval")
+    );
+    for bad_addr in [
+        0,
+        PIPE_USER_BASE + PAGE_SZ,
+        PIPE_USER_BASE + PAGE_SZ - mem::size_of::<i32>(),
+        PIPE_USER_BASE + 2 * PAGE_SZ,
+    ] {
+        assert_eq!(
+            kernel.dispatch_syscall_without_signal_delivery(SYS_PIPE, bad_addr, 0, 0, 0, 0, 0,),
+            Err("efault")
+        );
+    }
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_PIPE, PIPE_USER_BASE, 0, 0, 0, 0, 0,),
+        Ok(0)
+    );
+    let reused_pair = read_user_pipe_fds(&task, PIPE_USER_BASE);
+    assert_eq!(reused_pair, first_pair);
+    task.close_fd(reused_pair.0)
+        .expect("reused pipe2 read fd should close");
+    task.close_fd(reused_pair.1)
+        .expect("reused pipe2 write fd should close");
+
+    let (failed_read, failed_write) = PipeNode::pair();
+    let mut pending_pair = None;
+    assert_eq!(
+        task.add_file_pair_transaction(
+            FdEntry::new(FLike::Pipe(failed_read)),
+            FdEntry::new(FLike::Pipe(failed_write)),
+            |read_fd, write_fd| {
+                pending_pair = Some((read_fd, write_fd));
+                Err("efault")
+            },
+        ),
+        Err("efault")
+    );
+    let pending_pair = pending_pair.expect("failed transaction should reserve two fds");
+    let (replacement_read, replacement_write) = PipeNode::pair();
+    let replacement_pair = task
+        .add_file_pair_with_cloexec(
+            FLike::Pipe(replacement_read),
+            FLike::Pipe(replacement_write),
+            false,
+        )
+        .expect("cancelled pipe reservations should be reusable");
+    assert_eq!(replacement_pair, pending_pair);
+    task.close_fd(replacement_pair.0)
+        .expect("replacement read fd should close");
+    task.close_fd(replacement_pair.1)
+        .expect("replacement write fd should close");
+
+    let mut fillers = Vec::new();
+    loop {
+        match task.add_file(FLike::Tty(TtyDevice)) {
+            Ok(fd) => fillers.push(fd),
+            Err("emfile") => break,
+            Err(err) => panic!("unexpected pipe2 fd fill error: {err}"),
+        }
+    }
+    let only_free_fd = fillers.pop().expect("fd table should contain filler fds");
+    task.close_fd(only_free_fd)
+        .expect("one fd slot should be released for pair rollback");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_PIPE, PIPE_USER_BASE, 0, 0, 0, 0, 0,),
+        Err("emfile")
+    );
+    let recovered_fd = task
+        .add_file(FLike::Tty(TtyDevice))
+        .expect("failed pipe2 should return its first fd reservation");
+    assert_eq!(recovered_fd, only_free_fd);
+    task.close_fd(recovered_fd)
+        .expect("recovered fd should close");
+    for fd in fillers {
+        task.close_fd(fd).expect("pipe2 filler fd should close");
     }
 }
 

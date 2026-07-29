@@ -10,6 +10,7 @@ pub const RISCV_SYS_UMOUNT2: usize = 39;
 pub const RISCV_SYS_MOUNT: usize = 40;
 pub const RISCV_SYS_OPENAT: usize = 56;
 pub const RISCV_SYS_CLOSE: usize = 57;
+pub const RISCV_SYS_PIPE2: usize = 59;
 pub const RISCV_SYS_NEWFSTATAT: usize = 79;
 pub const RISCV_SYS_FSTAT: usize = 80;
 pub const RISCV_SYS_READ: usize = 63;
@@ -28,6 +29,7 @@ pub const INTERNAL_SYS_WRITE: usize = 1;
 pub const INTERNAL_SYS_CLOSE: usize = 3;
 pub const INTERNAL_SYS_FSTAT: usize = 5;
 pub const INTERNAL_SYS_BRK: usize = 12;
+pub const INTERNAL_SYS_PIPE: usize = 22;
 pub const INTERNAL_SYS_EXIT: usize = 60;
 pub const INTERNAL_SYS_EXIT_GROUP: usize = 231;
 pub const INTERNAL_SYS_GETPID: usize = 39;
@@ -57,6 +59,7 @@ pub fn map_riscv_nr(nr: usize) -> Option<usize> {
         RISCV_SYS_MOUNT => Some(INTERNAL_SYS_MOUNT),
         RISCV_SYS_OPENAT => Some(INTERNAL_SYS_OPENAT),
         RISCV_SYS_CLOSE => Some(INTERNAL_SYS_CLOSE),
+        RISCV_SYS_PIPE2 => Some(INTERNAL_SYS_PIPE),
         RISCV_SYS_NEWFSTATAT => Some(INTERNAL_SYS_NEWFSTATAT),
         RISCV_SYS_FSTAT => Some(INTERNAL_SYS_FSTAT),
         RISCV_SYS_READ => Some(INTERNAL_SYS_READ),
@@ -212,6 +215,7 @@ pub mod tests {
         mkdirat_maps_to_the_three_argument_internal_entry();
         openat_maps_to_the_four_argument_internal_entry();
         close_maps_to_the_one_argument_internal_entry();
+        pipe2_maps_to_the_two_argument_internal_entry();
         stat_syscalls_map_to_their_distinct_internal_entries();
         signal_syscalls_map_to_migrated_semantics();
     }
@@ -270,6 +274,19 @@ pub mod tests {
         let request = decode_from_trap_frame(&frame);
         assert_eq!(request.internal_nr, Some(INTERNAL_SYS_CLOSE));
         assert_eq!(request.args, [7, 1, 2, 3, 4, 5]);
+    }
+
+    // AGENT: map Linux RV64 pipe2 number 59 onto the migrated pipe semantic id
+    // while preserving the user int[2] pointer and creation flags.
+    #[cfg_attr(test, test)]
+    fn pipe2_maps_to_the_two_argument_internal_entry() {
+        let mut frame = TrapFrame::new();
+        frame.regs[10..16].copy_from_slice(&[0x5000, 0o2004000, 2, 3, 4, 5]);
+        frame.regs[17] = RISCV_SYS_PIPE2;
+
+        let request = decode_from_trap_frame(&frame);
+        assert_eq!(request.internal_nr, Some(INTERNAL_SYS_PIPE));
+        assert_eq!(request.args, [0x5000, 0o2004000, 2, 3, 4, 5]);
     }
 
     // AGENT: preserve newfstatat's four arguments and fstat's two arguments while
