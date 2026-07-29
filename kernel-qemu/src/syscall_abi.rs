@@ -13,6 +13,8 @@ pub const RISCV_SYS_MOUNT: usize = 40;
 pub const RISCV_SYS_OPENAT: usize = 56;
 pub const RISCV_SYS_CLOSE: usize = 57;
 pub const RISCV_SYS_PIPE2: usize = 59;
+// AGENT: Linux asm-generic splice number used by the RV64 userspace ABI.
+pub const RISCV_SYS_SPLICE: usize = 76;
 pub const RISCV_SYS_NEWFSTATAT: usize = 79;
 pub const RISCV_SYS_FSTAT: usize = 80;
 pub const RISCV_SYS_READ: usize = 63;
@@ -32,6 +34,8 @@ pub const INTERNAL_SYS_CLOSE: usize = 3;
 pub const INTERNAL_SYS_FSTAT: usize = 5;
 pub const INTERNAL_SYS_BRK: usize = 12;
 pub const INTERNAL_SYS_PIPE: usize = 22;
+// AGENT: retain the migrated internal syscall namespace while mapping RV64 76.
+pub const INTERNAL_SYS_SPLICE: usize = 275;
 pub const INTERNAL_SYS_DUP: usize = 32;
 pub const INTERNAL_SYS_DUP3: usize = 292;
 pub const INTERNAL_SYS_EXIT: usize = 60;
@@ -66,6 +70,7 @@ pub fn map_riscv_nr(nr: usize) -> Option<usize> {
         RISCV_SYS_OPENAT => Some(INTERNAL_SYS_OPENAT),
         RISCV_SYS_CLOSE => Some(INTERNAL_SYS_CLOSE),
         RISCV_SYS_PIPE2 => Some(INTERNAL_SYS_PIPE),
+        RISCV_SYS_SPLICE => Some(INTERNAL_SYS_SPLICE),
         RISCV_SYS_NEWFSTATAT => Some(INTERNAL_SYS_NEWFSTATAT),
         RISCV_SYS_FSTAT => Some(INTERNAL_SYS_FSTAT),
         RISCV_SYS_READ => Some(INTERNAL_SYS_READ),
@@ -216,7 +221,8 @@ pub fn write_return(frame: &mut TrapFrame, value: usize) {
 pub mod tests {
     use super::*;
 
-    // AGENT: run every focused RISC-V ABI mapping regression, including dup and dup3.
+    // AGENT: run every focused RISC-V ABI mapping regression, including the
+    // six-argument splice adapter.
     pub fn run_all() {
         standard_errno_names_use_linux_riscv_numbers();
         mkdirat_maps_to_the_three_argument_internal_entry();
@@ -225,6 +231,7 @@ pub mod tests {
         dup3_maps_to_the_three_argument_internal_entry();
         close_maps_to_the_one_argument_internal_entry();
         pipe2_maps_to_the_two_argument_internal_entry();
+        splice_maps_all_six_arguments_to_the_internal_entry();
         stat_syscalls_map_to_their_distinct_internal_entries();
         signal_syscalls_map_to_migrated_semantics();
     }
@@ -322,6 +329,19 @@ pub mod tests {
         let request = decode_from_trap_frame(&frame);
         assert_eq!(request.internal_nr, Some(INTERNAL_SYS_PIPE));
         assert_eq!(request.args, [0x5000, 0o2004000, 2, 3, 4, 5]);
+    }
+
+    // AGENT: preserve both off_t pointers, length, and flags while translating
+    // Linux RV64 syscall 76 into the existing internal splice id.
+    #[cfg_attr(test, test)]
+    fn splice_maps_all_six_arguments_to_the_internal_entry() {
+        let mut frame = TrapFrame::new();
+        frame.regs[10..16].copy_from_slice(&[7, 0x5000, 8, 0x6000, 4096, 0x02]);
+        frame.regs[17] = RISCV_SYS_SPLICE;
+
+        let request = decode_from_trap_frame(&frame);
+        assert_eq!(request.internal_nr, Some(INTERNAL_SYS_SPLICE));
+        assert_eq!(request.args, [7, 0x5000, 8, 0x6000, 4096, 0x02]);
     }
 
     // AGENT: preserve newfstatat's four arguments and fstat's two arguments while

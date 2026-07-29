@@ -35,6 +35,22 @@ pub enum PipeWriteOutcome {
     Broken { written: usize },
 }
 
+// AGENT: preserve splice progress separately from broken-pipe notification so
+// syscall glue can apply Linux's partial-return plus SIGPIPE rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpliceOutcome {
+    Moved(usize),
+    BrokenPipe { moved: usize },
+}
+
+// AGENT: represent an atomically prepared pipe-to-pipe wait without retaining
+// either pipe-state guard across the scheduler handoff.
+enum PipeSpliceAction {
+    Complete(SpliceOutcome),
+    WaitInput(WaitToken),
+    WaitOutput(WaitToken),
+}
+
 // AGENT: describe one lock-held write attempt; atomic_request is supplied by
 // the complete write call rather than recomputed from a shrinking remainder.
 enum PipeWriteStep {
@@ -460,6 +476,222 @@ impl PipeNode {
             }
         }
     }
+
+    // AGENT: identify both endpoints of one pipe without exposing PipeShared or
+    // confusing descriptor/OFD identity with pipe-buffer identity.
+    pub fn same_pipe(&self, other: &PipeNode) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
+    // AGENT: wait for one writable pipe window, then atomically commit a
+    // regular-file read and pipe fill so failures never advance only one side.
+    pub fn splice_from_file(
+        &self,
+        task_id: usize,
+        nonblock: bool,
+        file: &FHandle,
+        file_status: FdOpt,
+        file_pos: &mut SpliceFilePos,
+        count: usize,
+    ) -> Result<SpliceOutcome, &'static str> {
+        if self.dir != PipeDir::Wr {
+            return Err("ebadf");
+        }
+        loop {
+            let token = {
+                let mut state = self.shared.state.lock().unwrap();
+                if state.readers == 0 {
+                    return Ok(SpliceOutcome::BrokenPipe { moved: 0 });
+                }
+                let available = state.buf.remaining();
+                if available != 0 {
+                    let bytes = file.splice_read(file_status, file_pos, min(count, available))?;
+                    if bytes.is_empty() {
+                        return Ok(SpliceOutcome::Moved(0));
+                    }
+                    let moved = state.buf.fill_from(&bytes);
+                    debug_assert_eq!(moved, bytes.len());
+                    state.publish_readiness();
+                    drop(state);
+                    self.shared.read_waiters.broadcast();
+                    return Ok(SpliceOutcome::Moved(moved));
+                }
+                if nonblock {
+                    return Err("eagain");
+                }
+                self.shared.write_waiters.enqueue_task_locked(task_id)
+            };
+
+            let outcome = token.wait_interruptible(None);
+            self.shared.write_waiters.remove_waiter(&token);
+            if outcome == WaitOutcome::Signal {
+                return Err("eintr");
+            }
+        }
+    }
+
+    // AGENT: peek one readable pipe prefix and consume it only after the
+    // regular-file write has committed, preserving pipe bytes on write errors.
+    pub fn splice_to_file(
+        &self,
+        task_id: usize,
+        nonblock: bool,
+        file: &FHandle,
+        file_status: FdOpt,
+        file_pos: &mut SpliceFilePos,
+        count: usize,
+    ) -> Result<SpliceOutcome, &'static str> {
+        if self.dir != PipeDir::Rd {
+            return Err("ebadf");
+        }
+        loop {
+            let token = {
+                let mut state = self.shared.state.lock().unwrap();
+                if !state.buf.empty() {
+                    let mut bytes = Vec::new();
+                    state.buf.peek_to(&mut bytes, min(count, state.buf.len()));
+                    let moved = file.splice_write(file_status, file_pos, &bytes)?;
+                    let discarded = state.buf.discard(moved);
+                    debug_assert_eq!(discarded, moved);
+                    state.publish_readiness();
+                    drop(state);
+                    if moved != 0 {
+                        self.shared.write_waiters.broadcast();
+                    }
+                    return Ok(SpliceOutcome::Moved(moved));
+                }
+                if state.writers == 0 {
+                    return Ok(SpliceOutcome::Moved(0));
+                }
+                if nonblock {
+                    return Err("eagain");
+                }
+                self.shared.read_waiters.enqueue_task_locked(task_id)
+            };
+
+            let outcome = token.wait_interruptible(None);
+            self.shared.read_waiters.remove_waiter(&token);
+            if outcome == WaitOutcome::Signal {
+                return Err("eintr");
+            }
+        }
+    }
+
+    // AGENT: classify one lock-held pipe-to-pipe attempt and enqueue any
+    // required waiter before releasing the condition's pipe-state locks.
+    fn prepare_pipe_splice_locked(
+        &self,
+        output: &PipeNode,
+        input: &mut PipeBuf,
+        output_state: &mut PipeBuf,
+        task_id: usize,
+        nonblock: bool,
+        count: usize,
+    ) -> Result<PipeSpliceAction, &'static str> {
+        if output_state.readers == 0 {
+            return Ok(PipeSpliceAction::Complete(SpliceOutcome::BrokenPipe {
+                moved: 0,
+            }));
+        }
+        if input.buf.empty() {
+            if input.writers == 0 {
+                return Ok(PipeSpliceAction::Complete(SpliceOutcome::Moved(0)));
+            }
+            if nonblock {
+                return Err("eagain");
+            }
+            return Ok(PipeSpliceAction::WaitInput(
+                self.shared.read_waiters.enqueue_task_locked(task_id),
+            ));
+        }
+        if output_state.buf.remaining() == 0 {
+            if nonblock {
+                return Err("eagain");
+            }
+            return Ok(PipeSpliceAction::WaitOutput(
+                output.shared.write_waiters.enqueue_task_locked(task_id),
+            ));
+        }
+
+        let moved = min(count, min(input.buf.len(), output_state.buf.remaining()));
+        for _ in 0..moved {
+            let byte = input.buf.pop().expect("checked splice input length");
+            assert!(output_state.buf.push(byte));
+        }
+        input.publish_readiness();
+        output_state.publish_readiness();
+        Ok(PipeSpliceAction::Complete(SpliceOutcome::Moved(moved)))
+    }
+
+    // AGENT: move one currently available FIFO prefix between distinct pipes,
+    // ordering both state locks by allocation identity to prevent ABBA deadlock.
+    pub fn splice_to_pipe(
+        &self,
+        output: &PipeNode,
+        task_id: usize,
+        nonblock: bool,
+        count: usize,
+    ) -> Result<SpliceOutcome, &'static str> {
+        if self.dir != PipeDir::Rd || output.dir != PipeDir::Wr {
+            return Err("ebadf");
+        }
+        if self.same_pipe(output) {
+            return Err("einval");
+        }
+
+        loop {
+            let input_key = Arc::as_ptr(&self.shared) as usize;
+            let output_key = Arc::as_ptr(&output.shared) as usize;
+            let action = if input_key < output_key {
+                let mut input = self.shared.state.lock().unwrap();
+                let mut output_state = output.shared.state.lock().unwrap();
+                self.prepare_pipe_splice_locked(
+                    output,
+                    &mut input,
+                    &mut output_state,
+                    task_id,
+                    nonblock,
+                    count,
+                )?
+            } else {
+                let mut output_state = output.shared.state.lock().unwrap();
+                let mut input = self.shared.state.lock().unwrap();
+                self.prepare_pipe_splice_locked(
+                    output,
+                    &mut input,
+                    &mut output_state,
+                    task_id,
+                    nonblock,
+                    count,
+                )?
+            };
+
+            match action {
+                PipeSpliceAction::Complete(result) => {
+                    if matches!(result, SpliceOutcome::Moved(moved) if moved != 0) {
+                        self.shared.write_waiters.broadcast();
+                        output.shared.read_waiters.broadcast();
+                    }
+                    return Ok(result);
+                }
+                PipeSpliceAction::WaitInput(token) => {
+                    let outcome = token.wait_interruptible(None);
+                    self.shared.read_waiters.remove_waiter(&token);
+                    if outcome == WaitOutcome::Signal {
+                        return Err("eintr");
+                    }
+                }
+                PipeSpliceAction::WaitOutput(token) => {
+                    let outcome = token.wait_interruptible(None);
+                    output.shared.write_waiters.remove_waiter(&token);
+                    if outcome == WaitOutcome::Signal {
+                        return Err("eintr");
+                    }
+                }
+            }
+        }
+    }
+
     // AGENT: poll reuses the same readiness bit calculation as epoll
     // registration, so pipe readiness has one local source of truth.
     pub fn poll(&self) -> PollStatus {

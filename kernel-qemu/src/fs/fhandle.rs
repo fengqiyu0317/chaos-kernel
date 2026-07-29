@@ -8,6 +8,25 @@ pub enum FSeek {
     Cur(i64),
 }
 
+// AGENT: distinguish an OFD-owned file position from one copied in through a
+// non-null splice off_t pointer.
+#[derive(Debug)]
+pub enum SpliceFilePos {
+    Shared,
+    Explicit(u64),
+}
+
+impl SpliceFilePos {
+    // AGENT: expose only caller-owned positions for syscall copy-out; shared
+    // positions remain encapsulated by FHandle.
+    pub fn explicit(&self) -> Option<u64> {
+        match self {
+            Self::Shared => None,
+            Self::Explicit(offset) => Some(*offset),
+        }
+    }
+}
+
 // AGENT: regular-file handle for one open-file description. It owns the
 // per-open offset while FInstance owns only the backing file object.
 pub struct FHandle {
@@ -137,131 +156,105 @@ impl FHandle {
         Ok(next)
     }
 
-    // AGENT: copy regular-file bytes and commit handle offsets only after the
-    // destination write succeeds.
-    pub(super) fn splice_to(
+    // AGENT: read a regular-file chunk for splice and advance exactly the
+    // selected shared or explicit position after the backing read succeeds.
+    pub(super) fn splice_read(
         &self,
-        dst: &FHandle,
-        src_status: FdOpt,
-        dst_status: FdOpt,
+        status: FdOpt,
+        pos: &mut SpliceFilePos,
         count: usize,
-    ) -> Result<usize, &'static str> {
-        if ptr::eq(self, dst) {
-            let mut offset = self.offset.write().unwrap();
-            return Self::splice_same_locked(
-                &self.instance,
-                &dst.instance,
-                &mut offset,
-                src_status,
-                dst_status,
-                count,
-            );
+    ) -> Result<Vec<u8>, &'static str> {
+        if !status.rd {
+            return Err("ebadf");
         }
-
-        let self_key = self as *const FHandle as usize;
-        let dst_key = dst as *const FHandle as usize;
-        if self_key < dst_key {
-            let mut src_offset = self.offset.write().unwrap();
-            let mut dst_offset = dst.offset.write().unwrap();
-            Self::splice_locked(
-                &self.instance,
-                &mut src_offset,
-                &dst.instance,
-                &mut dst_offset,
-                src_status,
-                dst_status,
-                count,
-            )
-        } else {
-            let mut dst_offset = dst.offset.write().unwrap();
-            let mut src_offset = self.offset.write().unwrap();
-            Self::splice_locked(
-                &self.instance,
-                &mut src_offset,
-                &dst.instance,
-                &mut dst_offset,
-                src_status,
-                dst_status,
-                count,
-            )
+        if self.instance.node.kind != FileKind::Regular {
+            return Err("einval");
+        }
+        match pos {
+            SpliceFilePos::Shared => {
+                let mut offset = self.offset.write().unwrap();
+                Self::splice_read_at(&self.instance, &mut offset, count)
+            }
+            SpliceFilePos::Explicit(offset) => Self::splice_read_at(&self.instance, offset, count),
         }
     }
 
-    // AGENT: splice through one shared offset without reintroducing an inode
-    // accessor that duplicates FInstance's public object identity.
-    fn splice_same_locked(
-        src: &FInstance,
-        dst: &FInstance,
+    // AGENT: keep checked regular-file splice reads independent of whether the
+    // selected position is shared by an OFD or owned by the syscall arguments.
+    fn splice_read_at(
+        instance: &FInstance,
         offset: &mut u64,
-        src_status: FdOpt,
-        dst_status: FdOpt,
         count: usize,
-    ) -> Result<usize, &'static str> {
-        if !src_status.rd || !dst_status.wr {
-            return Err("ebadf");
-        }
-        if src.node.kind != FileKind::Regular || dst.node.kind != FileKind::Regular {
-            return Err("enodev");
+    ) -> Result<Vec<u8>, &'static str> {
+        if *offset > i64::MAX as u64 {
+            return Err("einval");
         }
         if count == 0 {
-            return Ok(0);
+            return Ok(Vec::new());
         }
-        let src_off = match usize::try_from(*offset) {
-            Ok(off) => off,
-            Err(_) => return Ok(0),
-        };
-        let chunk = src.copy_chunk_at(src_off, count)?;
-        if chunk.is_empty() {
-            return Ok(0);
+        let start = usize::try_from(*offset).map_err(|_| "einval")?;
+        let chunk = instance.copy_chunk_at(start, count)?;
+        let moved = u64::try_from(chunk.len()).map_err(|_| "efbig")?;
+        let next = offset.checked_add(moved).ok_or("efbig")?;
+        if next > i64::MAX as u64 {
+            return Err("efbig");
         }
-        let write_off = if dst_status.ap {
-            None
-        } else {
-            Some(src_off.checked_add(chunk.len()).ok_or("efbig")?)
-        };
-        let end = dst.node.write_bytes(dst.storage(), write_off, &chunk)?;
-        *offset = u64::try_from(end).map_err(|_| "efbig")?;
-        Ok(chunk.len())
+        *offset = next;
+        Ok(chunk)
     }
 
-    // AGENT: splice between distinct offsets using each FInstance's public node
-    // and mount-derived storage backend.
-    fn splice_locked(
-        src: &FInstance,
-        src_offset: &mut u64,
-        dst: &FInstance,
-        dst_offset: &mut u64,
-        src_status: FdOpt,
-        dst_status: FdOpt,
-        count: usize,
+    // AGENT: write a pipe prefix to a regular file and advance exactly the
+    // selected position only after the complete backing write succeeds.
+    pub(super) fn splice_write(
+        &self,
+        status: FdOpt,
+        pos: &mut SpliceFilePos,
+        bytes: &[u8],
     ) -> Result<usize, &'static str> {
-        if !src_status.rd || !dst_status.wr {
+        if !status.wr {
             return Err("ebadf");
         }
-        if src.node.kind != FileKind::Regular || dst.node.kind != FileKind::Regular {
-            return Err("enodev");
+        if status.ap {
+            return Err("einval");
         }
-        if count == 0 {
+        if self.instance.node.kind != FileKind::Regular {
+            return Err("einval");
+        }
+        match pos {
+            SpliceFilePos::Shared => {
+                let mut offset = self.offset.write().unwrap();
+                Self::splice_write_at(&self.instance, &mut offset, bytes)
+            }
+            SpliceFilePos::Explicit(offset) => Self::splice_write_at(&self.instance, offset, bytes),
+        }
+    }
+
+    // AGENT: keep the pipe unchanged until this checked backing write commits;
+    // callers discard only the returned number of pipe bytes.
+    fn splice_write_at(
+        instance: &FInstance,
+        offset: &mut u64,
+        bytes: &[u8],
+    ) -> Result<usize, &'static str> {
+        if *offset > i64::MAX as u64 {
+            return Err("einval");
+        }
+        if bytes.is_empty() {
             return Ok(0);
         }
-        let src_off = match usize::try_from(*src_offset) {
-            Ok(off) => off,
-            Err(_) => return Ok(0),
-        };
-        let chunk = src.copy_chunk_at(src_off, count)?;
-        if chunk.is_empty() {
-            return Ok(0);
+        let start = usize::try_from(*offset).map_err(|_| "einval")?;
+        let expected_end = start.checked_add(bytes.len()).ok_or("efbig")?;
+        if expected_end > i64::MAX as usize {
+            return Err("efbig");
         }
-        let write_off = if dst_status.ap {
-            None
-        } else {
-            Some(usize::try_from(*dst_offset).map_err(|_| "efbig")?)
-        };
-        let end = dst.node.write_bytes(dst.storage(), write_off, &chunk)?;
-        let moved = u64::try_from(chunk.len()).map_err(|_| "efbig")?;
-        *src_offset = src_offset.checked_add(moved).ok_or("efbig")?;
-        *dst_offset = u64::try_from(end).map_err(|_| "efbig")?;
-        Ok(chunk.len())
+        let end = instance
+            .node
+            .write_bytes(instance.storage(), Some(start), bytes)?;
+        if end != expected_end {
+            return Err("eio");
+        }
+        *offset = u64::try_from(end).map_err(|_| "efbig")?;
+        Ok(bytes.len())
     }
 }
 

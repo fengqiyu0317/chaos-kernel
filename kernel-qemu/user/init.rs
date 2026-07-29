@@ -12,6 +12,7 @@ const SYS_OPENAT: usize = 56;
 const SYS_CLOSE: usize = 57;
 const SYS_PIPE2: usize = 59;
 const SYS_READ: usize = 63;
+const SYS_SPLICE: usize = 76;
 const SYS_NEWFSTATAT: usize = 79;
 const SYS_FSTAT: usize = 80;
 const SYS_EXIT: usize = 93;
@@ -27,6 +28,7 @@ const OPEN_MESSAGE: &[u8] = b"[init] openat round-trip passed\n";
 const DUP_MESSAGE: &[u8] = b"[init] dup round-trip passed\n";
 const DUP3_MESSAGE: &[u8] = b"[init] dup3 round-trip passed\n";
 const PIPE_MESSAGE: &[u8] = b"[init] pipe2 round-trip passed\n";
+const SPLICE_MESSAGE: &[u8] = b"[init] splice round-trip passed\n";
 const STAT_MESSAGE: &[u8] = b"[init] stat round-trip passed\n";
 const CLOSE_MESSAGE: &[u8] = b"[init] close round-trip passed\n";
 const MKDIR_PATH: &[u8] = b"/tmp/init-mkdirat\0";
@@ -49,6 +51,35 @@ unsafe fn syscall4(number: usize, arg0: usize, arg1: usize, arg2: usize, arg3: u
             in("a1") arg1,
             in("a2") arg2,
             in("a3") arg3,
+            in("a7") number,
+            options(nostack)
+        );
+    }
+    result as isize
+}
+
+// AGENT: issue the complete Linux RV64 splice ABI with both off_t pointers,
+// length, and flags in a0 through a5.
+#[inline(always)]
+unsafe fn syscall6(
+    number: usize,
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+    arg4: usize,
+    arg5: usize,
+) -> isize {
+    let mut result = arg0;
+    unsafe {
+        asm!(
+            "ecall",
+            inlateout("a0") result,
+            in("a1") arg1,
+            in("a2") arg2,
+            in("a3") arg3,
+            in("a4") arg4,
+            in("a5") arg5,
             in("a7") number,
             options(nostack)
         );
@@ -130,8 +161,8 @@ fn stat_u64(bytes: &[u8; RISCV64_STAT_SIZE], offset: usize) -> u64 {
     ])
 }
 
-// AGENT: prove user-mode mkdirat/openat/dup/dup3/pipe2/fstat/newfstatat/close,
-// including exact-target descriptor survival, real copyout, and OFD teardown.
+// AGENT: prove user-mode mkdirat/openat/dup/dup3/pipe2/splice/stat/close,
+// including six-argument offset copyout, exact-target survival, and OFD teardown.
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -349,6 +380,82 @@ pub extern "C" fn _start() -> ! {
     } else {
         -1
     };
+    let splice_source_fd = if pipe_round_trip_ok {
+        unsafe { syscall4(SYS_OPENAT, AT_FDCWD, OPEN_PATH.as_ptr() as usize, 0, 0) }
+    } else {
+        -1
+    };
+    let mut splice_fds = [-1i32; 2];
+    let splice_pipe_result = if splice_source_fd >= 0 {
+        unsafe { syscall2(SYS_PIPE2, splice_fds.as_mut_ptr() as usize, 0) }
+    } else {
+        splice_source_fd
+    };
+    let mut splice_offset = 0i64;
+    let splice_moved = if splice_pipe_result == 0 && splice_fds[1] >= 0 {
+        unsafe {
+            syscall6(
+                SYS_SPLICE,
+                splice_source_fd as usize,
+                (&mut splice_offset as *mut i64) as usize,
+                splice_fds[1] as usize,
+                0,
+                OPEN_PAYLOAD.len(),
+                0,
+            )
+        }
+    } else {
+        splice_pipe_result
+    };
+    let mut splice_output = [0u8; OPEN_PAYLOAD.len()];
+    let splice_read = if splice_moved == OPEN_PAYLOAD.len() as isize && splice_fds[0] >= 0 {
+        unsafe {
+            syscall3(
+                SYS_READ,
+                splice_fds[0] as usize,
+                splice_output.as_mut_ptr() as usize,
+                splice_output.len(),
+            )
+        }
+    } else {
+        splice_moved
+    };
+    let splice_read_close = if splice_pipe_result == 0 && splice_fds[0] >= 0 {
+        unsafe { syscall1(SYS_CLOSE, splice_fds[0] as usize) }
+    } else {
+        splice_pipe_result
+    };
+    let splice_write_close = if splice_pipe_result == 0 && splice_fds[1] >= 0 {
+        unsafe { syscall1(SYS_CLOSE, splice_fds[1] as usize) }
+    } else {
+        splice_pipe_result
+    };
+    let splice_source_close = if splice_source_fd >= 0 {
+        unsafe { syscall1(SYS_CLOSE, splice_source_fd as usize) }
+    } else {
+        splice_source_fd
+    };
+    let splice_round_trip_ok = splice_source_fd >= 0
+        && splice_pipe_result == 0
+        && splice_moved == OPEN_PAYLOAD.len() as isize
+        && splice_offset == OPEN_PAYLOAD.len() as i64
+        && splice_read == OPEN_PAYLOAD.len() as isize
+        && splice_output == OPEN_PAYLOAD
+        && splice_read_close == 0
+        && splice_write_close == 0
+        && splice_source_close == 0;
+    let splice_message_written = if splice_round_trip_ok {
+        unsafe {
+            syscall3(
+                SYS_WRITE,
+                STDOUT_FILENO,
+                SPLICE_MESSAGE.as_ptr() as usize,
+                SPLICE_MESSAGE.len(),
+            )
+        }
+    } else {
+        -1
+    };
     let close_fd = if dup3_result == DUP3_TARGET_FD as isize {
         dup3_result
     } else if duplicated >= 0 {
@@ -387,6 +494,8 @@ pub extern "C" fn _start() -> ! {
             || stat_message_written != STAT_MESSAGE.len() as isize
             || !pipe_round_trip_ok
             || pipe_message_written != PIPE_MESSAGE.len() as isize
+            || !splice_round_trip_ok
+            || splice_message_written != SPLICE_MESSAGE.len() as isize
             || close_result != 0
             || close_message_written != CLOSE_MESSAGE.len() as isize,
     );

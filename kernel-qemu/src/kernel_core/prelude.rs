@@ -72,8 +72,8 @@ pub const O_NONBLOCK: usize = 0o4000;
 pub const O_APPEND: usize = 0o2000;
 pub const O_CLOEXEC: usize = 0o2000000;
 
-// AGENT: Linux splice(2) flag bits; the syscall entry is currently a TODO stub
-// until pipe-buffer-backed movement is migrated.
+// AGENT: Linux splice(2) flag bits accepted by the pipe-backed implementation;
+// MOVE, MORE, and GIFT remain permitted hints while NONBLOCK controls waiting.
 pub const SPLICE_F_MOVE: usize = 0x01;
 pub const SPLICE_F_NONBLOCK: usize = 0x02;
 pub const SPLICE_F_MORE: usize = 0x04;

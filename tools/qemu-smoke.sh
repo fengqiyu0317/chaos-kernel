@@ -56,6 +56,9 @@ grep -F "[init] dup3 round-trip passed" "$LOG"
 grep -F "[init] stat round-trip passed" "$LOG"
 # AGENT: require real U-mode pipe2 fd copyout plus write/read/close traversal.
 grep -F "[init] pipe2 round-trip passed" "$LOG"
+# AGENT: require RISC-V syscall 76 to move regular-file bytes into a real pipe
+# and copy the explicit off_t update back to U-mode.
+grep -F "[init] splice round-trip passed" "$LOG"
 # AGENT: require the real U-mode close ecall to release the surviving dup3 fd.
 grep -F "[init] close round-trip passed" "$LOG"
 grep -F "[kernel-qemu] init process exited" "$LOG"

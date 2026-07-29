@@ -36,6 +36,36 @@ pub enum FdWriteOutcome {
     BrokenPipe { written: usize },
 }
 
+// AGENT: retain copied-in signed RV64 off_t values separately for each splice
+// endpoint; None represents a null pointer and therefore an OFD-owned position
+// for a regular file.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SpliceOffsets {
+    pub input: Option<i64>,
+    pub output: Option<i64>,
+}
+
+// AGENT: convert one copied-in non-negative off_t into the position selector
+// consumed by the regular-file layer.
+fn splice_file_pos(offset: Option<i64>) -> Result<SpliceFilePos, &'static str> {
+    match offset {
+        Some(offset) => u64::try_from(offset)
+            .map(SpliceFilePos::Explicit)
+            .map_err(|_| "einval"),
+        None => Ok(SpliceFilePos::Shared),
+    }
+}
+
+// AGENT: copy an updated explicit position back into its syscall-owned slot
+// while leaving null/shared offset arguments untouched.
+fn update_splice_offset(slot: &mut Option<i64>, pos: &SpliceFilePos) -> Result<(), &'static str> {
+    if slot.is_some() {
+        let offset = pos.explicit().ok_or("eio")?;
+        *slot = Some(i64::try_from(offset).map_err(|_| "efbig")?);
+    }
+    Ok(())
+}
+
 // AGENT: shared open-file description; dup/fork clone FdEntry while sharing
 // this object, so status flags, file handles, and pipe endpoint lifetime remain shared.
 pub struct OpenFileDesc {
@@ -257,16 +287,79 @@ impl OpenFileDesc {
         matches!(self.file, FLike::Tty(_))
     }
 
-    // AGENT: keep splice on the shared open-file-description path so mutable
-    // status flags such as O_APPEND are honored for both ends.
-    pub fn splice_to(&self, dst: &OpenFileDesc, count: usize) -> Result<usize, &'static str> {
+    // AGENT: reject non-null offsets on pipe endpoints before syscall usercopy,
+    // matching Linux's ESPIPE precedence over dereferencing such pointers.
+    pub fn validate_splice_offset_args(
+        &self,
+        dst: &OpenFileDesc,
+        input_offset_present: bool,
+        output_offset_present: bool,
+    ) -> Result<(), &'static str> {
+        if matches!(self.file, FLike::Pipe(_)) && input_offset_present {
+            return Err("espipe");
+        }
+        if matches!(dst.file, FLike::Pipe(_)) && output_offset_present {
+            return Err("espipe");
+        }
+        Ok(())
+    }
+
+    // AGENT: dispatch Linux splice semantics at the shared OFD boundary so
+    // access flags, O_NONBLOCK, O_APPEND, and shared file offsets stay coherent.
+    pub fn splice_to(
+        &self,
+        dst: &OpenFileDesc,
+        task_id: usize,
+        offsets: &mut SpliceOffsets,
+        count: usize,
+        flags: usize,
+    ) -> Result<SpliceOutcome, &'static str> {
+        self.validate_splice_offset_args(dst, offsets.input.is_some(), offsets.output.is_some())?;
+
+        let src_status = self.status_flags();
+        let dst_status = dst.status_flags();
+        if !src_status.rd || !dst_status.wr {
+            return Err("ebadf");
+        }
+        let requested_nonblock = flags & SPLICE_F_NONBLOCK != 0;
+
         match (&self.file, &dst.file) {
-            (FLike::File(src), FLike::File(dst_file)) => {
-                let src_status = self.status_flags();
-                let dst_status = dst.status_flags();
-                src.splice_to(dst_file, src_status, dst_status, count)
+            (FLike::File(src), FLike::Pipe(output)) => {
+                let mut pos = splice_file_pos(offsets.input)?;
+                let result = output.splice_from_file(
+                    task_id,
+                    requested_nonblock || dst_status.nb,
+                    src,
+                    src_status,
+                    &mut pos,
+                    count,
+                )?;
+                update_splice_offset(&mut offsets.input, &pos)?;
+                Ok(result)
             }
-            _ => Err("enosys"),
+            (FLike::Pipe(input), FLike::File(dst_file)) => {
+                if dst_status.ap {
+                    return Err("einval");
+                }
+                let mut pos = splice_file_pos(offsets.output)?;
+                let result = input.splice_to_file(
+                    task_id,
+                    requested_nonblock || src_status.nb,
+                    dst_file,
+                    dst_status,
+                    &mut pos,
+                    count,
+                )?;
+                update_splice_offset(&mut offsets.output, &pos)?;
+                Ok(result)
+            }
+            (FLike::Pipe(input), FLike::Pipe(output)) => input.splice_to_pipe(
+                output,
+                task_id,
+                requested_nonblock || src_status.nb || dst_status.nb,
+                count,
+            ),
+            _ => Err("einval"),
         }
     }
 }
@@ -553,10 +646,33 @@ impl FdEntry {
         self.desc.is_tty()
     }
 
-    // AGENT: fd-table callers splice through descriptor entries rather than
-    // raw instances, preserving shared status and offset semantics.
-    pub fn splice_to(&self, dst: &FdEntry, count: usize) -> Result<usize, &'static str> {
-        self.desc.splice_to(dst.desc.as_ref(), count)
+    // AGENT: expose pipe-offset validation without leaking concrete FLike
+    // objects from the shared open-file description.
+    pub fn validate_splice_offset_args(
+        &self,
+        dst: &FdEntry,
+        input_offset_present: bool,
+        output_offset_present: bool,
+    ) -> Result<(), &'static str> {
+        self.desc.validate_splice_offset_args(
+            dst.desc.as_ref(),
+            input_offset_present,
+            output_offset_present,
+        )
+    }
+
+    // AGENT: carry the calling task and copied offset state through the
+    // authoritative shared open-file descriptions for both endpoints.
+    pub fn splice_to(
+        &self,
+        dst: &FdEntry,
+        task_id: usize,
+        offsets: &mut SpliceOffsets,
+        count: usize,
+        flags: usize,
+    ) -> Result<SpliceOutcome, &'static str> {
+        self.desc
+            .splice_to(dst.desc.as_ref(), task_id, offsets, count, flags)
     }
 }
 

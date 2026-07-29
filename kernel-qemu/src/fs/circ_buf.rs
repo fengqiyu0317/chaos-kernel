@@ -73,6 +73,28 @@ impl CircBuf {
         moved
     }
 
+    // AGENT: copy a FIFO prefix without consuming it so splice can commit a
+    // pipe read only after the destination write has succeeded.
+    pub fn peek_to(&self, dst: &mut Vec<u8>, max: usize) -> usize {
+        let moved = min(max, self.n);
+        dst.reserve(moved);
+        for offset in 0..moved {
+            dst.push(self.data[(self.rd + offset) % self.cap]);
+        }
+        moved
+    }
+
+    // AGENT: consume an already-committed FIFO prefix without exposing ring
+    // cursors to pipe splice callers.
+    pub fn discard(&mut self, count: usize) -> usize {
+        let discarded = min(count, self.n);
+        if self.cap != 0 {
+            self.rd = (self.rd + discarded) % self.cap;
+        }
+        self.n -= discarded;
+        discarded
+    }
+
     // AGENT: fill through push so capacity handling stays in one place.
     pub fn fill_from(&mut self, src: &[u8]) -> usize {
         let mut written = 0;

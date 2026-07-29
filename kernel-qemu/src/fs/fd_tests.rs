@@ -10,6 +10,7 @@ fn child_name(name: &str) -> ChildName<'_> {
 
 // AGENT: keep the QEMU boot selftest aggregator in the moved fd test module.
 pub fn run_all() {
+    circ_buf_peek_and_discard_preserve_wrapped_fifo_order();
     set_len_tracks_byte_length_and_block_capacity();
     metadata_blocks_expand_for_large_regular_file();
     metadata_blocks_expand_for_large_directory_entry();
@@ -19,8 +20,26 @@ pub fn run_all() {
     regular_file_poll_and_ioctl_are_explicit();
     terminal_is_a_typed_nonseekable_fd_object();
     typed_regular_file_stays_a_regular_file();
-    splice_checks_permissions_before_moving_offsets();
-    splice_uses_shared_append_status();
+}
+
+// AGENT: pin the non-consuming peek and later discard contract used to keep
+// pipe-to-file splice failure-atomic across a wrapped ring buffer.
+#[cfg_attr(test, test)]
+fn circ_buf_peek_and_discard_preserve_wrapped_fifo_order() {
+    let mut buf = CircBuf::new(4);
+    assert_eq!(buf.fill_from(b"abcd"), 4);
+    assert_eq!(buf.pop(), Some(b'a'));
+    assert_eq!(buf.pop(), Some(b'b'));
+    assert_eq!(buf.fill_from(b"ef"), 2);
+
+    let mut peeked = Vec::new();
+    assert_eq!(buf.peek_to(&mut peeked, 3), 3);
+    assert_eq!(&peeked, b"cde");
+    assert_eq!(buf.len(), 4);
+    assert_eq!(buf.discard(3), 3);
+    let mut remaining = Vec::new();
+    assert_eq!(buf.drain_to(&mut remaining, 4), 1);
+    assert_eq!(&remaining, b"f");
 }
 
 // AGENT: shared writable regular-file option used by moved fd regressions.
@@ -309,49 +328,4 @@ fn typed_regular_file_stays_a_regular_file() {
     assert_eq!(entry.write(0, b"file-data"), Ok(FdWriteOutcome::Written(9)));
     assert_eq!(entry.offset(), 9);
     assert_eq!(file_bytes(&instance, 0, 9), b"file-data");
-}
-
-// AGENT: moved splice permission regression out of fd.rs unchanged.
-#[cfg_attr(test, test)]
-fn splice_checks_permissions_before_moving_offsets() {
-    let src = regular_file(vec![1, 2, 3]);
-    let dst = regular_file(Vec::new());
-    let src_entry = file_entry(&src, FdOpt::default());
-    let dst_entry = file_entry(&dst, FdOpt::default());
-
-    assert_eq!(src_entry.splice_to(&dst_entry, 2), Err("ebadf"));
-    assert_eq!(src_entry.offset(), 0);
-    assert_eq!(dst_entry.offset(), 0);
-    assert_eq!(dst.len(), 0);
-
-    let unreadable = FdOpt {
-        rd: false,
-        wr: true,
-        ap: false,
-        nb: false,
-    };
-    let src = regular_file(vec![1, 2, 3]);
-    let dst = regular_file(Vec::new());
-    let src_entry = file_entry(&src, unreadable);
-    let dst_entry = file_entry(&dst, writable_opt());
-
-    assert_eq!(src_entry.splice_to(&dst_entry, 2), Err("ebadf"));
-    assert_eq!(src_entry.offset(), 0);
-    assert_eq!(dst.len(), 0);
-}
-
-// AGENT: append-status splice appends at the byte-precise FileNode EOF.
-#[cfg_attr(test, test)]
-fn splice_uses_shared_append_status() {
-    let src = regular_file(vec![1, 2, 3]);
-    let dst = regular_file(vec![9, 9]);
-    let src_entry = file_entry(&src, FdOpt::default());
-    let dst_entry = file_entry(&dst, writable_opt());
-    dst_entry.seek(FSeek::Start(1)).unwrap();
-
-    dst_entry.set_status_flags(O_APPEND).unwrap();
-    assert_eq!(src_entry.splice_to(&dst_entry, 2), Ok(2));
-    assert_eq!(src_entry.offset(), 2);
-    assert_eq!(dst_entry.offset(), 4);
-    assert_eq!(file_bytes(&dst, 0, 4).as_slice(), &[9, 9, 1, 2]);
 }

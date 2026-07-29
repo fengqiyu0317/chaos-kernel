@@ -154,6 +154,33 @@ fn write_user_i32(
     )
 }
 
+// AGENT: copy one native RV64 off_t through the live address space without
+// directly dereferencing a userspace pointer.
+fn read_user_i64(task: &Task, addr: usize) -> Result<i64, &'static str> {
+    let mut bytes = [0u8; mem::size_of::<i64>()];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(addr, &mut bytes)?;
+    Ok(i64::from_ne_bytes(bytes))
+}
+
+// AGENT: write one updated native RV64 off_t through AddrSpace so COW and page
+// permissions follow the same usercopy path as other filesystem syscalls.
+fn write_user_i64(
+    kernel: &Kernel,
+    task: &Task,
+    addr: usize,
+    value: i64,
+) -> Result<(), &'static str> {
+    task.process.addr_space.lock().unwrap().write_user_bytes(
+        addr,
+        &value.to_ne_bytes(),
+        &kernel.pool,
+    )
+}
+
 // AGENT: preflight a bounded writable userspace prefix, read through the current
 // task's shared open-file description, then copy the returned bytes to userspace.
 pub(super) fn sys_read(
@@ -481,10 +508,8 @@ pub(super) fn sys_dup3(
     task.dup3_fd(old_fd, new_fd, flags & O_CLOEXEC != 0)
 }
 
-// AGENT: TODO(M9-splice): implement Linux splice(2) through real pipe buffers,
-// user off_t pointer copy-in/copy-out, blocking/nonblocking waits, and pipe/file
-// direction checks. This stub only reserves the syscall surface and rejects
-// unsupported nonzero transfers instead of reusing the old file-to-file helper.
+// AGENT: adapt Linux splice(2) arguments into OFD/pipe semantics while keeping
+// user off_t copy-in/copy-out and SIGPIPE generation at the syscall boundary.
 pub(super) fn sys_splice(
     kernel: &Kernel,
     a0: usize,
@@ -495,27 +520,67 @@ pub(super) fn sys_splice(
     a5: usize,
 ) -> Result<usize, &'static str> {
     let fd_in = a0;
-    let _off_in_addr = a1;
+    let off_in_addr = a1;
     let fd_out = a2;
-    let _off_out_addr = a3;
+    let off_out_addr = a3;
     let size = a4;
     let flags = a5;
 
-    if fd_in >= MAX_FD || fd_out >= MAX_FD {
-        return Err("ebadf");
+    // AGENT: Linux returns success for a zero-length splice before inspecting
+    // flags, descriptors, or user offset pointers.
+    if size == 0 {
+        return Ok(0);
     }
     if flags & !SPLICE_KNOWN_FLAGS != 0 {
         return Err("einval");
     }
 
     let task = kernel.cur_task(0).ok_or("esrch")?;
-    let _in_entry = task.get_fd_entry(fd_in).ok_or("ebadf")?;
-    let _out_entry = task.get_fd_entry(fd_out).ok_or("ebadf")?;
-    if size == 0 {
-        return Ok(0);
+    let in_entry = task.get_fd_entry(fd_in).ok_or("ebadf")?;
+    let out_entry = task.get_fd_entry(fd_out).ok_or("ebadf")?;
+    in_entry.validate_splice_offset_args(&out_entry, off_in_addr != 0, off_out_addr != 0)?;
+
+    let mut offsets = SpliceOffsets {
+        input: if off_in_addr == 0 {
+            None
+        } else {
+            Some(read_user_i64(&task, off_in_addr)?)
+        },
+        output: if off_out_addr == 0 {
+            None
+        } else {
+            Some(read_user_i64(&task, off_out_addr)?)
+        },
+    };
+
+    let outcome = in_entry.splice_to(
+        &out_entry,
+        task.id(),
+        &mut offsets,
+        min(size, MAX_RW_COUNT),
+        flags,
+    )?;
+    let moved = match outcome {
+        SpliceOutcome::Moved(moved) => moved,
+        SpliceOutcome::BrokenPipe { moved } => {
+            kernel.send_signal_to_task(&task, SIGPIPE as i32, 0);
+            if moved == 0 {
+                return Err("epipe");
+            }
+            moved
+        }
+    };
+
+    // AGENT: copy output then input positions after a successful operation,
+    // matching Linux; a late EFAULT does not roll back already-moved data.
+    if let Some(offset) = offsets.output {
+        write_user_i64(kernel, &task, off_out_addr, offset)?;
+    }
+    if let Some(offset) = offsets.input {
+        write_user_i64(kernel, &task, off_in_addr, offset)?;
     }
 
-    Err("enosys")
+    Ok(moved)
 }
 
 // AGENT: fcntl mutates fd entries while keeping access mode fixed in the

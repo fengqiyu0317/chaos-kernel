@@ -4,9 +4,9 @@ use super::*;
 use crate::syscall_abi::{
     map_riscv_nr, INTERNAL_SYS_DUP, INTERNAL_SYS_DUP3, INTERNAL_SYS_FSTAT, INTERNAL_SYS_MKDIRAT,
     INTERNAL_SYS_MOUNT, INTERNAL_SYS_NEWFSTATAT, INTERNAL_SYS_OPENAT, INTERNAL_SYS_PIPE,
-    INTERNAL_SYS_READ, INTERNAL_SYS_UMOUNT2, RISCV_SYS_DUP, RISCV_SYS_DUP3, RISCV_SYS_FSTAT,
-    RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT, RISCV_SYS_NEWFSTATAT, RISCV_SYS_OPENAT, RISCV_SYS_PIPE2,
-    RISCV_SYS_READ, RISCV_SYS_UMOUNT2,
+    INTERNAL_SYS_READ, INTERNAL_SYS_SPLICE, INTERNAL_SYS_UMOUNT2, RISCV_SYS_DUP, RISCV_SYS_DUP3,
+    RISCV_SYS_FSTAT, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT, RISCV_SYS_NEWFSTATAT, RISCV_SYS_OPENAT,
+    RISCV_SYS_PIPE2, RISCV_SYS_READ, RISCV_SYS_SPLICE, RISCV_SYS_UMOUNT2,
 };
 
 const USER_STRINGS_BASE: usize = 0x4000_0000;
@@ -16,6 +16,7 @@ const READ_USER_BASE: usize = 0x4003_0000;
 const UNMOUNT_USER_BASE: usize = 0x4004_0000;
 const STAT_USER_BASE: usize = 0x4005_0000;
 const PIPE_USER_BASE: usize = 0x4006_0000;
+const SPLICE_USER_BASE: usize = 0x4007_0000;
 
 // AGENT: Run filesystem ABI and semantic regressions after QEMU installs the
 // real kernel frame pool, current init task, Sv39 mappings, and fd table.
@@ -36,6 +37,7 @@ pub fn run_all(kernel: &Kernel) {
     read_uses_usercopy_and_shared_open_file_offsets(kernel);
     read_moves_pipe_bytes_and_reports_empty_states(kernel);
     write_to_pipe_without_readers_returns_epipe_and_queues_sigpipe(kernel);
+    splice_moves_between_files_and_pipes_with_linux_offsets(kernel);
 }
 
 // AGENT: Write one NUL-terminated syscall string through the active address
@@ -76,6 +78,30 @@ fn read_user_pipe_fds(task: &Task, addr: usize) -> (usize, usize) {
         usize::try_from(read_fd).expect("pipe2 read fd should be non-negative"),
         usize::try_from(write_fd).expect("pipe2 write fd should be non-negative"),
     )
+}
+
+// AGENT: seed one signed RV64 off_t through the same writable user mapping used
+// by sys_splice copy-in and copy-out.
+fn write_user_off(kernel: &Kernel, task: &Task, addr: usize, value: i64) {
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .write_user_bytes(addr, &value.to_ne_bytes(), &kernel.pool)
+        .expect("splice offset should be writable in userspace");
+}
+
+// AGENT: observe one sys_splice off_t copy-out without directly dereferencing
+// the emulated user virtual address.
+fn read_user_off(task: &Task, addr: usize) -> i64 {
+    let mut bytes = [0u8; mem::size_of::<i64>()];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(addr, &mut bytes)
+        .expect("splice offset should be readable in userspace");
+    i64::from_ne_bytes(bytes)
 }
 
 // AGENT: decode one little-endian u32 from the fixed RV64 stat regression image.
@@ -1945,4 +1971,478 @@ fn write_to_pipe_without_readers_returns_epipe_and_queues_sigpipe(kernel: &Kerne
         .retain(|(signo, _)| *signo != SIGPIPE as i32);
     task.close_fd(write_fd)
         .expect("broken pipe write descriptor should close");
+}
+
+// AGENT: exercise the real splice syscall across file-to-pipe, pipe-to-file,
+// and pipe-to-pipe paths, including RV64 off_t usercopy and failure atomicity.
+#[cfg_attr(test, test)]
+fn splice_moves_between_files_and_pipes_with_linux_offsets(kernel: &Kernel) {
+    assert_eq!(map_riscv_nr(RISCV_SYS_SPLICE), Some(INTERNAL_SYS_SPLICE));
+    let task = kernel.cur_task(0).expect("init task should be current");
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(SPLICE_USER_BASE, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("splice read-write user page should map");
+        addr_space
+            .map_region(
+                VmRegion::new(SPLICE_USER_BASE + PAGE_SZ, PAGE_SZ, VM_READ),
+                &kernel.pool,
+            )
+            .expect("splice read-only user page should map");
+    }
+
+    let src_path_addr = SPLICE_USER_BASE;
+    let dst_path_addr = SPLICE_USER_BASE + 64;
+    let input_offset_addr = SPLICE_USER_BASE + 256;
+    let output_offset_addr = SPLICE_USER_BASE + 264;
+    let readonly_offset_addr = SPLICE_USER_BASE + PAGE_SZ;
+    let unmapped_offset_addr = SPLICE_USER_BASE + 2 * PAGE_SZ;
+    write_user_string(kernel, &task, src_path_addr, "/tmp/qemu-splice-src");
+    write_user_string(kernel, &task, dst_path_addr, "/tmp/qemu-splice-dst");
+    kernel
+        .install_file("/tmp/qemu-splice-src", b"abcdef".to_vec(), false)
+        .expect("splice source fixture should install");
+    kernel
+        .install_file("/tmp/qemu-splice-dst", b".....".to_vec(), false)
+        .expect("splice destination fixture should install");
+    let src_fd = kernel
+        .dispatch_syscall_without_signal_delivery(SYS_OPENAT, 0, src_path_addr, 0, 0, 0, 0)
+        .expect("splice source should open read-only");
+    let dst_fd = kernel
+        .dispatch_syscall_without_signal_delivery(SYS_OPENAT, 0, dst_path_addr, 1, 0, 0, 0)
+        .expect("splice destination should open write-only");
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            MAX_FD,
+            unmapped_offset_addr,
+            MAX_FD,
+            unmapped_offset_addr,
+            0,
+            usize::MAX,
+        ),
+        Ok(0)
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            MAX_FD,
+            0,
+            MAX_FD,
+            0,
+            1,
+            SPLICE_KNOWN_FLAGS | 0x10,
+        ),
+        Err("einval")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_SPLICE, MAX_FD, 0, dst_fd, 0, 1, 0,),
+        Err("ebadf")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_SPLICE, src_fd, 0, dst_fd, 0, 1, 0,),
+        Err("einval")
+    );
+
+    let (first_read, first_write) = PipeNode::pair();
+    let (first_read_fd, first_write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(first_read), FLike::Pipe(first_write), false)
+        .expect("file-to-pipe splice fixture should allocate descriptors");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            src_fd,
+            0,
+            first_write_fd,
+            output_offset_addr,
+            1,
+            0,
+        ),
+        Err("espipe")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            src_fd,
+            unmapped_offset_addr,
+            first_write_fd,
+            0,
+            1,
+            0,
+        ),
+        Err("efault")
+    );
+    write_user_off(kernel, &task, input_offset_addr, -1);
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            src_fd,
+            input_offset_addr,
+            first_write_fd,
+            0,
+            1,
+            0,
+        ),
+        Err("einval")
+    );
+
+    write_user_off(kernel, &task, input_offset_addr, 1);
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            src_fd,
+            input_offset_addr,
+            first_write_fd,
+            0,
+            3,
+            SPLICE_F_MOVE | SPLICE_F_MORE | SPLICE_F_GIFT,
+        ),
+        Ok(3)
+    );
+    assert_eq!(read_user_off(&task, input_offset_addr), 4);
+    assert_eq!(
+        task.get_fd_entry(src_fd)
+            .expect("splice source descriptor should exist")
+            .offset(),
+        0
+    );
+    let mut moved = [0u8; 3];
+    assert_eq!(
+        task.get_fd_entry(first_read_fd)
+            .expect("file-to-pipe read endpoint should exist")
+            .read(task.id(), &mut moved),
+        Ok(3)
+    );
+    assert_eq!(&moved, b"bcd");
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            src_fd,
+            0,
+            first_write_fd,
+            0,
+            2,
+            0,
+        ),
+        Ok(2)
+    );
+    assert_eq!(
+        task.get_fd_entry(src_fd)
+            .expect("splice source descriptor should remain installed")
+            .offset(),
+        2
+    );
+    let mut shared_bytes = [0u8; 2];
+    assert_eq!(
+        task.get_fd_entry(first_read_fd)
+            .expect("shared-offset pipe bytes should remain readable")
+            .read(task.id(), &mut shared_bytes),
+        Ok(2)
+    );
+    assert_eq!(&shared_bytes, b"ab");
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            src_fd,
+            readonly_offset_addr,
+            first_write_fd,
+            0,
+            1,
+            0,
+        ),
+        Err("efault")
+    );
+    let mut late_fault_byte = [0u8; 1];
+    assert_eq!(
+        task.get_fd_entry(first_read_fd)
+            .expect("late-fault splice byte should remain committed")
+            .read(task.id(), &mut late_fault_byte),
+        Ok(1)
+    );
+    assert_eq!(&late_fault_byte, b"a");
+    assert_eq!(
+        task.get_fd_entry(src_fd)
+            .expect("explicit late-fault offset should not move OFD state")
+            .offset(),
+        2
+    );
+    task.close_fd(first_read_fd)
+        .expect("first splice pipe read fd should close");
+    task.close_fd(first_write_fd)
+        .expect("first splice pipe write fd should close");
+
+    let (to_file_read, to_file_write) = PipeNode::pair();
+    let (to_file_read_fd, to_file_write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(to_file_read), FLike::Pipe(to_file_write), false)
+        .expect("pipe-to-file splice fixture should allocate descriptors");
+    assert_eq!(
+        task.get_fd_entry(to_file_write_fd)
+            .expect("pipe-to-file writer should exist")
+            .write(task.id(), b"XYZ"),
+        Ok(FdWriteOutcome::Written(3))
+    );
+    write_user_off(kernel, &task, output_offset_addr, 1);
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            to_file_read_fd,
+            0,
+            dst_fd,
+            output_offset_addr,
+            3,
+            0,
+        ),
+        Ok(3)
+    );
+    assert_eq!(read_user_off(&task, output_offset_addr), 4);
+    assert_eq!(
+        task.get_fd_entry(dst_fd)
+            .expect("splice destination descriptor should exist")
+            .offset(),
+        0
+    );
+    let dst_instance = kernel
+        .vfs
+        .resolve("/tmp/qemu-splice-dst")
+        .expect("splice destination should resolve")
+        .path_ref;
+    let mut dst_bytes = [0u8; 5];
+    assert_eq!(dst_instance.read_at(0, &mut dst_bytes), Ok(5));
+    assert_eq!(&dst_bytes, b".XYZ.");
+    task.close_fd(to_file_read_fd)
+        .expect("pipe-to-file read fd should close");
+    task.close_fd(to_file_write_fd)
+        .expect("pipe-to-file write fd should close");
+
+    let append_fd = kernel
+        .dispatch_syscall_without_signal_delivery(
+            SYS_OPENAT,
+            0,
+            dst_path_addr,
+            O_APPEND | 1,
+            0,
+            0,
+            0,
+        )
+        .expect("append splice destination should open");
+    let (append_read, append_write) = PipeNode::pair();
+    let (append_read_fd, append_write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(append_read), FLike::Pipe(append_write), false)
+        .expect("append rejection pipe should allocate descriptors");
+    assert_eq!(
+        task.get_fd_entry(append_write_fd)
+            .expect("append rejection writer should exist")
+            .write(task.id(), b"Q"),
+        Ok(FdWriteOutcome::Written(1))
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            append_read_fd,
+            0,
+            append_fd,
+            0,
+            1,
+            0,
+        ),
+        Err("einval")
+    );
+    assert_eq!(
+        task.get_fd_entry(append_read_fd)
+            .expect("append rejection should preserve pipe bytes")
+            .io_ctl(FIONREAD),
+        Ok(1)
+    );
+    task.close_fd(append_read_fd)
+        .expect("append pipe read fd should close");
+    task.close_fd(append_write_fd)
+        .expect("append pipe write fd should close");
+    task.close_fd(append_fd)
+        .expect("append destination fd should close");
+
+    let (input_read, input_write) = PipeNode::pair();
+    let (input_read_fd, input_write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(input_read), FLike::Pipe(input_write), false)
+        .expect("pipe-to-pipe input should allocate descriptors");
+    let (output_read, output_write) = PipeNode::pair();
+    let (output_read_fd, output_write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(output_read), FLike::Pipe(output_write), false)
+        .expect("pipe-to-pipe output should allocate descriptors");
+    assert_eq!(
+        task.get_fd_entry(input_write_fd)
+            .expect("pipe-to-pipe writer should exist")
+            .write(task.id(), b"pq"),
+        Ok(FdWriteOutcome::Written(2))
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            input_read_fd,
+            0,
+            output_write_fd,
+            0,
+            2,
+            0,
+        ),
+        Ok(2)
+    );
+    let mut pipe_bytes = [0u8; 2];
+    assert_eq!(
+        task.get_fd_entry(output_read_fd)
+            .expect("pipe-to-pipe output should be readable")
+            .read(task.id(), &mut pipe_bytes),
+        Ok(2)
+    );
+    assert_eq!(&pipe_bytes, b"pq");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            input_read_fd,
+            0,
+            input_write_fd,
+            0,
+            1,
+            SPLICE_F_NONBLOCK,
+        ),
+        Err("einval")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            input_read_fd,
+            0,
+            dst_fd,
+            0,
+            1,
+            SPLICE_F_NONBLOCK,
+        ),
+        Err("eagain")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            input_read_fd,
+            input_offset_addr,
+            dst_fd,
+            0,
+            1,
+            0,
+        ),
+        Err("espipe")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            input_write_fd,
+            0,
+            dst_fd,
+            0,
+            1,
+            SPLICE_F_NONBLOCK,
+        ),
+        Err("ebadf")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            src_fd,
+            0,
+            input_read_fd,
+            0,
+            1,
+            SPLICE_F_NONBLOCK,
+        ),
+        Err("ebadf")
+    );
+    task.close_fd(input_read_fd)
+        .expect("pipe-to-pipe input read fd should close");
+    task.close_fd(input_write_fd)
+        .expect("pipe-to-pipe input write fd should close");
+    task.close_fd(output_read_fd)
+        .expect("pipe-to-pipe output read fd should close");
+    task.close_fd(output_write_fd)
+        .expect("pipe-to-pipe output write fd should close");
+
+    task.process
+        .sig_queue
+        .lock()
+        .unwrap()
+        .retain(|(signo, _)| *signo != SIGPIPE as i32);
+    let source_offset_before_broken = task
+        .get_fd_entry(src_fd)
+        .expect("broken splice source should exist")
+        .offset();
+    let (broken_read, broken_write) = PipeNode::pair();
+    let (broken_read_fd, broken_write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(broken_read), FLike::Pipe(broken_write), false)
+        .expect("broken splice pipe should allocate descriptors");
+    task.close_fd(broken_read_fd)
+        .expect("broken splice should close its last reader");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            src_fd,
+            0,
+            broken_write_fd,
+            0,
+            1,
+            0,
+        ),
+        Err("epipe")
+    );
+    assert_eq!(
+        task.get_fd_entry(src_fd)
+            .expect("broken splice source should remain installed")
+            .offset(),
+        source_offset_before_broken
+    );
+    assert!(
+        task.process
+            .sig_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(signo, _)| *signo == SIGPIPE as i32),
+        "broken file-to-pipe splice should queue SIGPIPE"
+    );
+    task.process
+        .sig_queue
+        .lock()
+        .unwrap()
+        .retain(|(signo, _)| *signo != SIGPIPE as i32);
+    task.close_fd(broken_write_fd)
+        .expect("broken splice write fd should close");
+
+    let (eof_read, eof_write) = PipeNode::pair();
+    let (eof_read_fd, eof_write_fd) = task
+        .add_file_pair_with_cloexec(FLike::Pipe(eof_read), FLike::Pipe(eof_write), false)
+        .expect("EOF splice pipe should allocate descriptors");
+    task.close_fd(eof_write_fd)
+        .expect("EOF splice should close its last writer");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_SPLICE,
+            eof_read_fd,
+            0,
+            dst_fd,
+            0,
+            1,
+            0,
+        ),
+        Ok(0)
+    );
+    task.close_fd(eof_read_fd)
+        .expect("EOF splice read fd should close");
+
+    task.close_fd(src_fd)
+        .expect("splice source fd should close");
+    task.close_fd(dst_fd)
+        .expect("splice destination fd should close");
 }
