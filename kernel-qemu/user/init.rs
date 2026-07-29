@@ -7,6 +7,7 @@ use core::panic::PanicInfo;
 const SYS_WRITE: usize = 64;
 const SYS_MKDIRAT: usize = 34;
 const SYS_OPENAT: usize = 56;
+const SYS_CLOSE: usize = 57;
 const SYS_EXIT: usize = 93;
 const AT_FDCWD: usize = (-100isize) as usize;
 const O_WRONLY: usize = 1;
@@ -15,6 +16,7 @@ const STDOUT_FILENO: usize = 1;
 const INIT_MESSAGE: &[u8] = b"[init] userspace /bin/init reached\n";
 const MKDIR_MESSAGE: &[u8] = b"[init] mkdirat round-trip passed\n";
 const OPEN_MESSAGE: &[u8] = b"[init] openat round-trip passed\n";
+const CLOSE_MESSAGE: &[u8] = b"[init] close round-trip passed\n";
 const MKDIR_PATH: &[u8] = b"/tmp/init-mkdirat\0";
 const OPEN_PATH: &[u8] = b"/tmp/init-mkdirat/file\0";
 const OPEN_PAYLOAD: &[u8] = b"openat-ok";
@@ -71,8 +73,8 @@ unsafe fn syscall1(number: usize, arg0: usize) -> isize {
     result as isize
 }
 
-// AGENT: prove the user-mode mkdirat and openat paths, including strict parent
-// creation and regular-file OFD dispatch, then report failures via exit status.
+// AGENT: prove the user-mode mkdirat, openat, and close paths, including strict
+// parent creation and regular-file OFD teardown, then report failures via status.
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -135,12 +137,31 @@ pub extern "C" fn _start() -> ! {
     } else {
         file_written
     };
+    let close_result = if file_written == OPEN_PAYLOAD.len() as isize {
+        unsafe { syscall1(SYS_CLOSE, opened as usize) }
+    } else {
+        file_written
+    };
+    let close_message_written = if close_result == 0 {
+        unsafe {
+            syscall3(
+                SYS_WRITE,
+                STDOUT_FILENO,
+                CLOSE_MESSAGE.as_ptr() as usize,
+                CLOSE_MESSAGE.len(),
+            )
+        }
+    } else {
+        close_result
+    };
     let status = usize::from(
         console_written != INIT_MESSAGE.len() as isize
             || mkdir_result != 0
             || mkdir_message_written != MKDIR_MESSAGE.len() as isize
             || file_written != OPEN_PAYLOAD.len() as isize
-            || open_message_written != OPEN_MESSAGE.len() as isize,
+            || open_message_written != OPEN_MESSAGE.len() as isize
+            || close_result != 0
+            || close_message_written != CLOSE_MESSAGE.len() as isize,
     );
     let _ = unsafe { syscall1(SYS_EXIT, status) };
 

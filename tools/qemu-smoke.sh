@@ -48,4 +48,6 @@ grep -F "[init] userspace /bin/init reached" "$LOG"
 grep -F "[init] mkdirat round-trip passed" "$LOG"
 # AGENT: require the real U-mode openat -> regular-file write round trip.
 grep -F "[init] openat round-trip passed" "$LOG"
+# AGENT: require the real U-mode close ecall to release the opened descriptor.
+grep -F "[init] close round-trip passed" "$LOG"
 grep -F "[kernel-qemu] init process exited" "$LOG"

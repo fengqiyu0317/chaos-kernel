@@ -9,6 +9,7 @@ pub const RISCV_SYS_MKDIRAT: usize = 34;
 pub const RISCV_SYS_UMOUNT2: usize = 39;
 pub const RISCV_SYS_MOUNT: usize = 40;
 pub const RISCV_SYS_OPENAT: usize = 56;
+pub const RISCV_SYS_CLOSE: usize = 57;
 pub const RISCV_SYS_READ: usize = 63;
 pub const RISCV_SYS_WRITE: usize = 64;
 pub const RISCV_SYS_KILL: usize = 129;
@@ -22,6 +23,7 @@ pub const RISCV_SYS_GETPID: usize = 172;
 
 pub const INTERNAL_SYS_READ: usize = 0;
 pub const INTERNAL_SYS_WRITE: usize = 1;
+pub const INTERNAL_SYS_CLOSE: usize = 3;
 pub const INTERNAL_SYS_BRK: usize = 12;
 pub const INTERNAL_SYS_EXIT: usize = 60;
 pub const INTERNAL_SYS_EXIT_GROUP: usize = 231;
@@ -50,6 +52,7 @@ pub fn map_riscv_nr(nr: usize) -> Option<usize> {
         RISCV_SYS_UMOUNT2 => Some(INTERNAL_SYS_UMOUNT2),
         RISCV_SYS_MOUNT => Some(INTERNAL_SYS_MOUNT),
         RISCV_SYS_OPENAT => Some(INTERNAL_SYS_OPENAT),
+        RISCV_SYS_CLOSE => Some(INTERNAL_SYS_CLOSE),
         RISCV_SYS_READ => Some(INTERNAL_SYS_READ),
         RISCV_SYS_WRITE => Some(INTERNAL_SYS_WRITE),
         RISCV_SYS_KILL => Some(INTERNAL_SYS_KILL),
@@ -202,6 +205,7 @@ pub mod tests {
         standard_errno_names_use_linux_riscv_numbers();
         mkdirat_maps_to_the_three_argument_internal_entry();
         openat_maps_to_the_four_argument_internal_entry();
+        close_maps_to_the_one_argument_internal_entry();
         signal_syscalls_map_to_migrated_semantics();
     }
 
@@ -246,6 +250,19 @@ pub mod tests {
         let request = decode_from_trap_frame(&frame);
         assert_eq!(request.internal_nr, Some(INTERNAL_SYS_OPENAT));
         assert_eq!(request.args, [usize::MAX - 99, 0x4000, 0x81, 0o640, 5, 6]);
+    }
+
+    // AGENT: preserve close's single fd argument while translating Linux RISC-V
+    // syscall 57 into the internal close syscall id.
+    #[cfg_attr(test, test)]
+    fn close_maps_to_the_one_argument_internal_entry() {
+        let mut frame = TrapFrame::new();
+        frame.regs[10..16].copy_from_slice(&[7, 1, 2, 3, 4, 5]);
+        frame.regs[17] = RISCV_SYS_CLOSE;
+
+        let request = decode_from_trap_frame(&frame);
+        assert_eq!(request.internal_nr, Some(INTERNAL_SYS_CLOSE));
+        assert_eq!(request.args, [7, 1, 2, 3, 4, 5]);
     }
 
     // AGENT: pin the four asm-generic RISC-V signal syscall numbers to the
