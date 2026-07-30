@@ -1,6 +1,6 @@
 # Chaos 项目交接状态
 
-更新日期：2026-07-23
+更新日期：2026-07-30
 
 ## 目标
 
@@ -519,6 +519,15 @@ cargo test --test pressure
 - `[M8][重要] TODO`: `kernel-sim` 的 `KernLock` 目前仍只是可重入自旋式模拟锁，缺少公平性、阻塞等待、抢占/中断控制等真实内核大锁语义；当前 guard 只解决 owner-checked 释放和 guard 路径的自动释放，若后续要把它作为真实大内核锁模型，应继续补齐这些语义或在接口文档中明确它只是 simulator 简化实现。
 
 ### M9 `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
+
+#### 2026-07-30：真实 RV64 `execve` 第一阶段闭环
+
+- 目标与边界：只接通“真实 RV64 可达、成功不返回、失败可回滚”的最小 exec 闭环；不引入 cwd、相对路径、动态链接、PIE 或完整多线程 exec。
+- ABI 与提交路径：`syscall_abi.rs` 将 Linux RV64 `execve(221)` 映射到迁移语义 `SYS_EXEC(59)`，继续由既有 `sys_exec -> do_exec_for_trap -> prepare_exec_image -> commit_exec -> ReplaceUserContext` 路径完成准备、提交和 trap-frame 替换。
+- 用户态闭环：`build.rs` 统一构建 `/bin/init` 与新的固定地址 `ET_EXEC` `/bin/exec-smoke`；启动时通过对象 VFS 安装两者后统一 flush。init 完成既有 fd/stat/splice smoke 后创建 fd 101 的 `O_CLOEXEC` stdout 别名，并发起真实 `ecall(221)`；成功路径不返回旧映像。
+- 新映像验证：`exec_smoke.rs` 以汇编入口在 Rust 序言前捕获原始 `sp`，检查 `argc=1`、`argv[0]=exec-smoke`、`envp[0]=EXEC_TEST=1`，确认 `fstat(101)` 返回 `EBADF`，再通过继承的 stdout 输出 `[init] execve round-trip passed` 并 `exit(0)`。
+- 回滚与 smoke：QEMU proc selftest 新增非法 ELF 回归，确认失败后旧 Sv39 token/映射内容、TrapFrame、信号 disposition、exec_path、did_exec 和 `FD_CLOEXEC` fd 均不变；标准 smoke 要求成功标记并拒绝 `[init] execve unexpectedly returned`。
+- 验证：RISC-V target `cargo check`、`cargo build --release --features qemu-selftest`、RAM 后端完整 `qemu-selftest` 和 VirtIO `bash tools/qemu-smoke.sh` 均通过；真实 QEMU 日志包含 exec 成功标记和 `init process exited`。未运行或修改 `kernel-sim`。
 
 #### 2026-07-25：轮询式 virtio-blk 与真实 raw sector 持久化
 

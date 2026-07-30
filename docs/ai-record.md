@@ -1,6 +1,6 @@
 # Chaos AI 工作日志
 
-更新时间：2026-07-28
+更新时间：2026-07-30
 
 ## 维护约定
 
@@ -11,6 +11,44 @@
   - `/home/huawei/.codex/sessions/2026/06/18/rollout-2026-06-18T23-57-15-019edb73-6ad9-7b23-8162-c76a589a57a9.jsonl`
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
+
+## 2026-07-30：kernel-qemu 真实 RV64 `execve` 第一阶段
+
+目标：实现“真实 RV64 可达、成功不返回、失败可回滚”的最小 exec 闭环；本阶段不合并 cwd、相对路径、动态链接、PIE 或完整多线程 exec。
+
+已完成修改：
+
+- 在 `syscall_abi.rs` 增加 Linux RV64 `execve(221)` 到内部 `SYS_EXEC(59)` 的显式映射和 ABI 回归，保留用户 ABI 与迁移语义两套编号。
+- `build.rs` 抽出统一用户 ELF 构建函数，在原 `/bin/init` 外新增固定地址 RISC-V `ET_EXEC` `/bin/exec-smoke`；启动时通过现有对象 VFS 安装两个 ELF 后统一 flush。
+- init 在既有 fd/stat/splice smoke 全部通过后，以 `dup3(stdout, 101, O_CLOEXEC)` 留下验证描述符，构造 `argv=["exec-smoke"]`、`envp=["EXEC_TEST=1"]` 并发起真实 `ecall(221)`；旧映像仅在失败返回时输出明确失败标记并退出 1。
+- 新 ELF 用汇编入口在 Rust 函数序言前保存原始用户 `sp`，检查初始栈的 argc/argv/envp，确认 fd 101 的 `fstat` 返回 `-EBADF`，并通过继承 stdout 输出 `[init] execve round-trip passed` 后退出 0。
+- QEMU proc selftest 增加非法 ELF 失败回滚：旧 Sv39 token/用户字节、TrapFrame、信号 disposition、exec_path、did_exec 与 close-on-exec fd 全部保持不变。
+- `tools/qemu-smoke.sh` 要求 exec 成功标记，并显式拒绝旧映像的 `execve unexpectedly returned` 标记。
+
+关键文件：
+
+- `kernel-qemu/src/syscall_abi.rs`
+- `kernel-qemu/build.rs`
+- `kernel-qemu/src/main.rs`
+- `kernel-qemu/user/init.rs`
+- `kernel-qemu/user/exec_smoke.rs`
+- `kernel-qemu/src/proc/process_tests.rs`
+- `tools/qemu-smoke.sh`
+
+验收结果：
+
+```bash
+cargo check --manifest-path kernel-qemu/Cargo.toml --target riscv64gc-unknown-none-elf
+
+cd kernel-qemu
+cargo build --release --features qemu-selftest
+cargo run --release --features qemu-selftest,ram-block-device
+
+cd ..
+bash tools/qemu-smoke.sh
+```
+
+全部通过。RAM 完整 selftest 包含新增失败回滚回归，真实 U-mode 日志输出 `[init] execve round-trip passed`；VirtIO 标准 smoke 同样通过并正常输出 `[kernel-qemu] init process exited`。本轮未检查、修改或运行 `kernel-sim`，也未修改禁止路径 `kernel/src/kernel.rs`。
 
 ## 2026-07-28：kernel-qemu 普通卸载与 lazy detach
 

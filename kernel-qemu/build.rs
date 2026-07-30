@@ -1,13 +1,15 @@
 use std::env;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const USER_TARGET: &str = "riscv64gc-unknown-none-elf";
 
-// AGENT: build the first-stage userspace init as a separate fixed-address
-// RISC-V ELF before rustc embeds it into the no_std kernel image.
+// AGENT: build every first-stage userspace source as a separate fixed-address
+// RISC-V ELF before rustc embeds the images into the no_std kernel.
 fn main() {
     println!("cargo:rerun-if-changed=user/init.rs");
+    println!("cargo:rerun-if-changed=user/exec_smoke.rs");
     println!("cargo:rerun-if-changed=user/linker.ld");
     println!("cargo:rerun-if-env-changed=RUSTC");
 
@@ -20,14 +22,37 @@ fn main() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("missing OUT_DIR"));
-    let source = manifest_dir.join("user/init.rs");
     let linker_script = manifest_dir.join("user/linker.ld");
-    let output = out_dir.join("root-init");
     let rustc = env::var_os("RUSTC").expect("Cargo should provide RUSTC");
 
+    build_user_binary(
+        &rustc,
+        &manifest_dir.join("user/init.rs"),
+        &linker_script,
+        &out_dir.join("root-init"),
+        "kernel_qemu_init",
+    );
+    build_user_binary(
+        &rustc,
+        &manifest_dir.join("user/exec_smoke.rs"),
+        &linker_script,
+        &out_dir.join("exec-smoke"),
+        "kernel_qemu_exec_smoke",
+    );
+}
+
+// AGENT: keep the rustc/linker contract identical for init and its exec target
+// while giving Cargo independently named ELF outputs to embed.
+fn build_user_binary(
+    rustc: &OsStr,
+    source: &Path,
+    linker_script: &Path,
+    output: &Path,
+    crate_name: &str,
+) {
     let status = Command::new(rustc)
         .arg("--crate-name")
-        .arg("kernel_qemu_init")
+        .arg(crate_name)
         .arg("--crate-type")
         .arg("bin")
         .arg("--edition=2021")
@@ -50,6 +75,6 @@ fn main() {
         .arg(&output)
         .arg(&source)
         .status()
-        .expect("failed to invoke rustc for the embedded init");
-    assert!(status.success(), "failed to build the embedded init ELF");
+        .expect("failed to invoke rustc for an embedded userspace ELF");
+    assert!(status.success(), "failed to build embedded userspace ELF");
 }

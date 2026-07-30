@@ -61,6 +61,9 @@ static BOOT_RESERVED_FRAMES: IrqOnceCell<Vec<kernel::PgFrame>> = IrqOnceCell::ne
 // AGENT: embed the separately linked fixed-address RISC-V init ELF produced by
 // build.rs and install it through the ordinary path-backed exec file store.
 const ROOT_INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/root-init"));
+// AGENT: embed a distinct exec target so /bin/init can prove that a successful
+// execve replaces its image instead of recursively executing itself.
+const EXEC_SMOKE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/exec-smoke"));
 
 // AGENT: Enter the M9 QEMU carrier with cleared global state, then install the
 // kernel trap vector before heap, frame, page-table, or Kernel initialization.
@@ -189,9 +192,10 @@ fn init_qemu_kernel_backend(frame_pool: kernel::FramePool) -> (&'static kernel::
     let kernel = Box::leak(Box::new(kernel::Kernel::new_with_block_device(
         frame_pool, root_block,
     )));
-    let init_installed = match install_embedded_root_init(kernel, ROOT_INIT_ELF) {
+    let init_installed = match install_embedded_user_images(kernel, ROOT_INIT_ELF, EXEC_SMOKE_ELF) {
         Ok(true) => {
             println!("[kernel-qemu] installed embedded /bin/init");
+            println!("[kernel-qemu] installed embedded /bin/exec-smoke");
             true
         }
         Ok(false) => {
@@ -417,13 +421,14 @@ fn prepare_root_init_task(kernel: &kernel::Kernel, init_installed: bool) -> bool
     }
 }
 
-// AGENT: install the linked init payload through the same path-backed file store
-// used by exec and file handles, instead of treating it as raw block data.
-fn install_embedded_root_init(
+// AGENT: install both linked user payloads through the same path-backed file
+// store, then publish one complete namespace before either image can execute.
+fn install_embedded_user_images(
     kernel: &kernel::Kernel,
     init_elf: &[u8],
+    exec_smoke_elf: &[u8],
 ) -> Result<bool, &'static str> {
-    if init_elf.is_empty() {
+    if init_elf.is_empty() || exec_smoke_elf.is_empty() {
         return Ok(false);
     }
     // AGENT: establish the embedded root image's directory skeleton before the
@@ -431,6 +436,7 @@ fn install_embedded_root_init(
     kernel.install_directory("/bin")?;
     kernel.install_directory("/tmp")?;
     kernel.install_exec_file("/bin/init", Vec::from(init_elf))?;
+    kernel.install_exec_file("/bin/exec-smoke", Vec::from(exec_smoke_elf))?;
     // AGENT: publish the complete boot namespace through the ChaosFs inode table
     // and bitmap before init begins, so a later boot can mount rather than rebuild it.
     kernel.vfs.root_fs().flush()?;

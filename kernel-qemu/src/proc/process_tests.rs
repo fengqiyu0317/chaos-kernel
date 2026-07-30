@@ -42,6 +42,7 @@ pub fn run_all(pool: &FramePool) {
     parse_elf_validates_program_header_layouts();
     elf_load_regions_coalesce_contiguous_permissions();
     prepared_user_image_normalizes_invalid_elf_to_enoexec(pool);
+    failed_exec_preserves_old_process_image(pool);
     prepared_user_image_loads_elf_segment_and_stack(pool);
     prepared_user_image_preserves_no_access_segment(pool);
     prepared_user_image_loads_segments_sharing_a_page(pool);
@@ -76,6 +77,100 @@ fn prepared_user_image_normalizes_invalid_elf_to_enoexec(pool: &FramePool) {
         prepare_user_image(b"not an ELF", Vec::new(), Vec::new(), pool).err(),
         Some("enoexec")
     );
+}
+
+// AGENT: lock the prepare-before-commit boundary: a malformed replacement ELF
+// must not alter the old address space, trap frame, signal disposition, process
+// identity, or descriptor-local FD_CLOEXEC state.
+fn failed_exec_preserves_old_process_image(pool: &FramePool) {
+    const OLD_MAPPING: usize = 0x6000_0000;
+    const OLD_BYTES: &[u8] = b"old-image";
+
+    let kernel = Kernel::new(pool.clone());
+    kernel.proc_init();
+    kernel
+        .install_directory("/bin")
+        .expect("exec rollback fixture should install /bin");
+    kernel
+        .install_exec_file("/bin/bad-elf", b"not an ELF".to_vec())
+        .expect("exec rollback fixture should install malformed executable");
+    let task = kernel.cur_task(0).expect("init should be current");
+    let old_token = {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(OLD_MAPPING, PAGE_SZ, VM_READ | VM_WRITE),
+                pool,
+            )
+            .expect("old image mapping should succeed");
+        addr_space
+            .write_user_bytes(OLD_MAPPING, OLD_BYTES, pool)
+            .expect("old image bytes should be writable");
+        addr_space
+            .vm_token()
+            .expect("old image should own an Sv39 root")
+    };
+
+    let mut old_frame = TrapFrame::new();
+    old_frame.regs[2] = 0x7000_0000;
+    old_frame.regs[10] = 0x55;
+    old_frame.sepc = 0x401000;
+    task.install_user_trap_frame(old_frame.clone())
+        .expect("old trap frame should install");
+    let cloexec_fd = task
+        .add_file(FLike::Tty(TtyDevice))
+        .expect("rollback fixture should allocate an fd");
+    task.set_cloexec(cloexec_fd, true)
+        .expect("rollback fixture fd should become close-on-exec");
+    assert!(task.process.sig_state.lock().unwrap().set_action(
+        SIGUSR1,
+        SigAction {
+            handler: 0x402000,
+            mask: 0x1234,
+        },
+    ));
+    *task.process.exec_path.lock().unwrap() = "/bin/old-image".to_string();
+
+    assert_eq!(
+        kernel.do_exec(
+            task.id(),
+            "/bin/bad-elf",
+            vec!["bad-elf".to_string()],
+            Vec::new(),
+        ),
+        Err("enoexec")
+    );
+
+    let mut old_bytes = [0u8; OLD_BYTES.len()];
+    {
+        let addr_space = task.process.addr_space.lock().unwrap();
+        assert_eq!(addr_space.vm_token(), Ok(old_token));
+        addr_space
+            .read_user_bytes(OLD_MAPPING, &mut old_bytes)
+            .expect("failed exec should preserve old user bytes");
+    }
+    assert_eq!(&old_bytes, OLD_BYTES);
+    assert_eq!(task.snapshot_user_trap_frame(), Ok(old_frame));
+    let preserved_fd = task
+        .get_fd_entry(cloexec_fd)
+        .expect("failed exec should preserve close-on-exec fd");
+    assert!(preserved_fd.is_cloexec());
+    let sig_state = task.process.sig_state.lock().unwrap();
+    let action = sig_state
+        .get_action(SIGUSR1)
+        .expect("failed exec should preserve signal disposition");
+    assert_eq!(action.handler, 0x402000);
+    assert_eq!(action.mask, 0x1234);
+    drop(sig_state);
+    assert_eq!(
+        task.process.exec_path.lock().unwrap().as_str(),
+        "/bin/old-image"
+    );
+    assert!(!task.process.did_exec.load(Ordering::SeqCst));
+
+    task.close_fd(cloexec_fd)
+        .expect("rollback fixture fd should close");
+    task.process.addr_space.lock().unwrap().release_all_pages();
 }
 
 // AGENT: prove KStk owns its zeroed direct-map pages through ordinary PgFrame

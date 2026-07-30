@@ -17,6 +17,7 @@ const SYS_SPLICE: usize = 76;
 const SYS_NEWFSTATAT: usize = 79;
 const SYS_FSTAT: usize = 80;
 const SYS_EXIT: usize = 93;
+const SYS_EXECVE: usize = 221;
 const AT_FDCWD: usize = (-100isize) as usize;
 const O_WRONLY: usize = 1;
 const O_CREAT: usize = 0o100;
@@ -37,6 +38,7 @@ const SEEK_SET: i16 = 0;
 const FD_CLOEXEC: usize = 1;
 const STDOUT_FILENO: usize = 1;
 const DUP3_TARGET_FD: usize = 100;
+const EXEC_CLOEXEC_FD: usize = 101;
 const INIT_MESSAGE: &[u8] = b"[init] userspace /bin/init reached\n";
 const MKDIR_MESSAGE: &[u8] = b"[init] mkdirat round-trip passed\n";
 const OPEN_MESSAGE: &[u8] = b"[init] openat round-trip passed\n";
@@ -47,9 +49,13 @@ const SPLICE_MESSAGE: &[u8] = b"[init] splice round-trip passed\n";
 const STAT_MESSAGE: &[u8] = b"[init] stat round-trip passed\n";
 const FCNTL_MESSAGE: &[u8] = b"[init] fcntl nine-command round-trip passed\n";
 const CLOSE_MESSAGE: &[u8] = b"[init] close round-trip passed\n";
+const EXEC_FAILURE_MESSAGE: &[u8] = b"[init] execve unexpectedly returned\n";
 const MKDIR_PATH: &[u8] = b"/tmp/init-mkdirat\0";
 const OPEN_PATH: &[u8] = b"/tmp/init-mkdirat/file\0";
 const OPEN_PAYLOAD: &[u8] = b"openat-ok";
+const EXEC_PATH: &[u8] = b"/bin/exec-smoke\0";
+const EXEC_ARG0: &[u8] = b"exec-smoke\0";
+const EXEC_ENV0: &[u8] = b"EXEC_TEST=1\0";
 const PIPE_PAYLOAD: &[u8] = b"pipe2-ok";
 const RISCV64_STAT_SIZE: usize = 128;
 const S_IFMT: u32 = 0o170000;
@@ -661,7 +667,45 @@ pub extern "C" fn _start() -> ! {
             || close_result != 0
             || close_message_written != CLOSE_MESSAGE.len() as isize,
     );
-    let _ = unsafe { syscall1(SYS_EXIT, status) };
+    if status != 0 {
+        let _ = unsafe { syscall1(SYS_EXIT, status) };
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    // AGENT: leave one fixed close-on-exec alias live across execve so the new
+    // image can distinguish descriptor cleanup from inherited stdout.
+    let exec_cloexec = unsafe { syscall3(SYS_DUP3, STDOUT_FILENO, EXEC_CLOEXEC_FD, O_CLOEXEC) };
+    if exec_cloexec != EXEC_CLOEXEC_FD as isize {
+        let _ = unsafe { syscall1(SYS_EXIT, 1) };
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    let argv = [EXEC_ARG0.as_ptr() as usize, 0];
+    let envp = [EXEC_ENV0.as_ptr() as usize, 0];
+    let result = unsafe {
+        syscall3(
+            SYS_EXECVE,
+            EXEC_PATH.as_ptr() as usize,
+            argv.as_ptr() as usize,
+            envp.as_ptr() as usize,
+        )
+    };
+
+    // AGENT: reaching this point means execve failed and returned to the old image.
+    let _ = result;
+    let _ = unsafe {
+        syscall3(
+            SYS_WRITE,
+            STDOUT_FILENO,
+            EXEC_FAILURE_MESSAGE.as_ptr() as usize,
+            EXEC_FAILURE_MESSAGE.len(),
+        )
+    };
+    let _ = unsafe { syscall1(SYS_EXIT, 1) };
 
     loop {
         core::hint::spin_loop();

@@ -29,6 +29,8 @@ pub const RISCV_SYS_RT_SIGPROCMASK: usize = 135;
 pub const RISCV_SYS_RT_SIGRETURN: usize = 139;
 pub const RISCV_SYS_BRK: usize = 214;
 pub const RISCV_SYS_CLONE: usize = 220;
+// AGENT: map Linux RV64 execve into the migrated internal exec namespace.
+pub const RISCV_SYS_EXECVE: usize = 221;
 pub const RISCV_SYS_WAIT4: usize = 260;
 pub const RISCV_SYS_EXIT: usize = 93;
 pub const RISCV_SYS_EXIT_GROUP: usize = 94;
@@ -48,6 +50,7 @@ pub const INTERNAL_SYS_DUP: usize = 32;
 pub const INTERNAL_SYS_DUP3: usize = 292;
 pub const INTERNAL_SYS_FCNTL: usize = 72;
 pub const INTERNAL_SYS_CLONE: usize = 56;
+pub const INTERNAL_SYS_EXEC: usize = 59;
 pub const INTERNAL_SYS_EXIT: usize = 60;
 pub const INTERNAL_SYS_EXIT_GROUP: usize = 231;
 pub const INTERNAL_SYS_WAIT4: usize = 61;
@@ -94,6 +97,7 @@ pub fn map_riscv_nr(nr: usize) -> Option<usize> {
         RISCV_SYS_RT_SIGRETURN => Some(INTERNAL_SYS_RT_SIGRETURN),
         RISCV_SYS_BRK => Some(INTERNAL_SYS_BRK),
         RISCV_SYS_CLONE => Some(INTERNAL_SYS_CLONE),
+        RISCV_SYS_EXECVE => Some(INTERNAL_SYS_EXEC),
         RISCV_SYS_WAIT4 => Some(INTERNAL_SYS_WAIT4),
         RISCV_SYS_EXIT => Some(INTERNAL_SYS_EXIT),
         RISCV_SYS_EXIT_GROUP => Some(INTERNAL_SYS_EXIT_GROUP),
@@ -252,6 +256,7 @@ pub mod tests {
         splice_maps_all_six_arguments_to_the_internal_entry();
         stat_syscalls_map_to_their_distinct_internal_entries();
         signal_syscalls_map_to_migrated_semantics();
+        execve_maps_to_migrated_exec_semantics();
     }
 
     // AGENT: keep every audited file/exec errno distinguishable from EINVAL at
@@ -410,5 +415,13 @@ pub mod tests {
             map_riscv_nr(RISCV_SYS_RT_SIGRETURN),
             Some(INTERNAL_SYS_RT_SIGRETURN)
         );
+    }
+
+    // AGENT: pin Linux RV64 execve(221) to the pre-existing migrated exec id;
+    // these namespaces intentionally use different syscall numbers.
+    #[cfg_attr(test, test)]
+    fn execve_maps_to_migrated_exec_semantics() {
+        assert_eq!(map_riscv_nr(RISCV_SYS_EXECVE), Some(INTERNAL_SYS_EXEC));
+        assert_eq!(INTERNAL_SYS_EXEC, crate::kernel::SYS_EXEC);
     }
 }

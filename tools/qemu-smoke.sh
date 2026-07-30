@@ -64,4 +64,10 @@ grep -F "[init] pipe2 round-trip passed" "$LOG"
 grep -F "[init] splice round-trip passed" "$LOG"
 # AGENT: require the real U-mode close ecall to release the surviving dup3 fd.
 grep -F "[init] close round-trip passed" "$LOG"
+# AGENT: require execve to replace init with a second ELF, preserve stdout, and
+# close the fixed FD_CLOEXEC descriptor checked by that new image.
+grep -F "[init] execve round-trip passed" "$LOG"
+if grep -F "[init] execve unexpectedly returned" "$LOG"; then
+    exit 1
+fi
 grep -F "[kernel-qemu] init process exited" "$LOG"
