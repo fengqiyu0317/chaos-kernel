@@ -211,7 +211,9 @@ pub const SYS_IOCTL: usize = 16;
 pub const SYS_PIPE: usize = 22;
 pub const SYS_DUP: usize = 32;
 pub const SYS_DUP3: usize = 292;
-pub const SYS_FORK: usize = 57;
+// AGENT: keep clone in the migrated internal namespace; RV64 syscall 220 maps
+// here before the semantic layer classifies process and thread clone requests.
+pub const SYS_CLONE: usize = 56;
 pub const SYS_EXEC: usize = 59;
 pub const SYS_EXIT: usize = 60;
 pub const SYS_EXIT_GROUP: usize = 231;

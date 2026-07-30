@@ -3,6 +3,7 @@ use super::*;
 use crate::trap::TrapFrame;
 
 const WAIT4_WNOHANG: usize = 1;
+const CLONE_EXIT_SIGNAL_MASK: usize = 0xff;
 
 impl Kernel {
     // AGENT: keep the thread-local exit helper beside sys_exit; only the shared
@@ -158,12 +159,26 @@ impl Kernel {
     }
 }
 
-// AGENT: pass the live trap frame into the single Kernel fork path; direct
-// semantic selftests fall back to the task-owned snapshot at this ABI boundary.
-pub(super) fn sys_fork(
+// AGENT: accept only the RV64 clone form that is semantically equivalent to
+// fork, then enter the shared TrapFrame/COW creation path directly; later clone
+// milestones must explicitly add stack, TLS, and TID effects.
+pub(super) fn sys_clone(
     kernel: &Kernel,
+    flags: usize,
+    child_stack: usize,
+    parent_tid: usize,
+    tls: usize,
+    child_tid: usize,
     caller_frame: Option<&TrapFrame>,
 ) -> Result<usize, &'static str> {
+    let exit_signal = flags & CLONE_EXIT_SIGNAL_MASK;
+    let feature_flags = flags & !CLONE_EXIT_SIGNAL_MASK;
+    if exit_signal != SIGCHLD as usize {
+        return Err("einval");
+    }
+    if feature_flags != 0 || child_stack != 0 || parent_tid != 0 || tls != 0 || child_tid != 0 {
+        return Err("enotsup");
+    }
     let parent = kernel.cur_task(0).ok_or("esrch")?;
     let stored_frame;
     let caller_frame = match caller_frame {

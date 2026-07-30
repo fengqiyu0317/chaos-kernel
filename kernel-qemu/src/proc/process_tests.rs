@@ -23,6 +23,7 @@ pub fn run_all(pool: &FramePool) {
     job_control_stays_authoritative_across_process_transitions(pool);
     reap_rejects_live_process(pool);
     reap_rejects_zombie_with_unreparented_children(pool);
+    riscv_clone_accepts_only_the_fork_equivalent_subset(pool);
     fork_copies_complete_user_frame(pool);
     fork_splits_process_and_caller_task_inheritance(pool);
     fork_from_nonleader_attaches_process_parent(pool);
@@ -610,6 +611,96 @@ fn reap_rejects_zombie_with_unreparented_children(pool: &FramePool) {
         .process
         .parent()
         .is_some_and(|linked| Arc::ptr_eq(&linked, &parent.process)));
+}
+
+// AGENT: connect RV64 clone/wait4 numbers to the migrated namespace while
+// preserving syscall 57 as close and rejecting unsupported clone side effects
+// before any child identity, table entry, family link, or run-queue slot exists.
+fn riscv_clone_accepts_only_the_fork_equivalent_subset(pool: &FramePool) {
+    use crate::syscall_abi::{
+        decode_from_trap_frame, map_riscv_nr, INTERNAL_SYS_CLONE, INTERNAL_SYS_CLOSE,
+        INTERNAL_SYS_WAIT4, RISCV_SYS_CLONE, RISCV_SYS_CLOSE, RISCV_SYS_WAIT4,
+    };
+
+    assert_eq!(map_riscv_nr(RISCV_SYS_CLONE), Some(INTERNAL_SYS_CLONE));
+    assert_eq!(map_riscv_nr(RISCV_SYS_WAIT4), Some(INTERNAL_SYS_WAIT4));
+    assert_eq!(map_riscv_nr(RISCV_SYS_CLOSE), Some(INTERNAL_SYS_CLOSE));
+    assert_eq!(INTERNAL_SYS_CLONE, SYS_CLONE);
+    assert_eq!(INTERNAL_SYS_WAIT4, SYS_WAIT4);
+
+    let mut request_frame = TrapFrame::new();
+    request_frame.regs[10..16].copy_from_slice(&[SIGCHLD as usize, 0, 0, 0, 0, 0x55]);
+    request_frame.regs[17] = RISCV_SYS_CLONE;
+    let request = decode_from_trap_frame(&request_frame);
+    assert_eq!(request.internal_nr, Some(INTERNAL_SYS_CLONE));
+    assert_eq!(request.args, [SIGCHLD as usize, 0, 0, 0, 0, 0x55]);
+
+    let kernel = Kernel::new(pool.clone());
+    kernel.proc_init();
+    let parent = kernel.cur_task(0).expect("init should be current");
+    let initial_seq = kernel.tasks.seq.load(Ordering::SeqCst);
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_CLONE, 0, 0, 0, 0, 0, 0),
+        Err("einval")
+    );
+    for [child_stack, parent_tid, tls, child_tid] in
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+    {
+        assert_eq!(
+            kernel.dispatch_syscall_without_signal_delivery(
+                SYS_CLONE,
+                SIGCHLD as usize,
+                child_stack,
+                parent_tid,
+                tls,
+                child_tid,
+                0,
+            ),
+            Err("enotsup")
+        );
+    }
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_CLONE,
+            SIGCHLD as usize | 0x100,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ),
+        Err("enotsup")
+    );
+    assert_eq!(kernel.tasks.task_count(), 1);
+    assert_eq!(kernel.tasks.process_count(), 1);
+    assert_eq!(kernel.tasks.seq.load(Ordering::SeqCst), initial_seq);
+    assert!(parent.process.children_snapshot().is_empty());
+    assert!(kernel.run_queue.pick_next().is_none());
+
+    let child_id = kernel
+        .dispatch_syscall_without_signal_delivery(SYS_CLONE, SIGCHLD as usize, 0, 0, 0, 0, 0)
+        .expect("fork-equivalent clone should succeed");
+    let child = kernel
+        .tasks
+        .find_task(child_id)
+        .expect("clone child should be registered");
+    assert_eq!(kernel.tasks.task_count(), 2);
+    assert_eq!(kernel.tasks.process_count(), 2);
+    assert_eq!(child.sched_state(), TaskRunState::Runnable);
+    assert_eq!(kernel.run_queue.pick_next(), Some(child_id));
+    assert_eq!(
+        child
+            .snapshot_user_trap_frame()
+            .expect("clone child should retain a user frame")
+            .regs[10],
+        0
+    );
+    assert!(parent
+        .process
+        .children_snapshot()
+        .iter()
+        .any(|process| Arc::ptr_eq(process, &child.process)));
 }
 
 // AGENT: the Kernel fork path copies every architectural user register and
