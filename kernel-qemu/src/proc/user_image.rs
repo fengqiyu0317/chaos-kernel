@@ -38,8 +38,8 @@ struct ElfLoadBoundary {
 // complete user image shared by initial task creation and exec.
 pub(crate) fn prepare_user_image(
     elf_data: &[u8],
-    args: Vec<String>,
-    envs: Vec<String>,
+    args: Vec<UserCString>,
+    envs: Vec<UserCString>,
     pool: &FramePool,
 ) -> Result<PreparedUserImage, &'static str> {
     let elf = parse_elf(elf_data).map_err(normalize_user_image_error)?;
@@ -199,8 +199,8 @@ fn populate_user_image(
     addr_space: &mut AddrSpace,
     elf_data: &[u8],
     elf: ParsedElf,
-    args: Vec<String>,
-    envs: Vec<String>,
+    args: Vec<UserCString>,
+    envs: Vec<UserCString>,
     pool: &FramePool,
 ) -> Result<UserEntry, &'static str> {
     let ParsedElf {

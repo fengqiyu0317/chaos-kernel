@@ -31,8 +31,8 @@ impl Kernel {
         &self,
         task: &Arc<Task>,
         path: &str,
-        args: Vec<String>,
-        envs: Vec<String>,
+        args: Vec<UserCString>,
+        envs: Vec<UserCString>,
     ) -> Result<PreparedExec, &'static str> {
         let (exec_path, elf_data) = self.read_file_for_exec(path)?;
         // AGENT: delegate ELF mapping and stack construction to the common
@@ -51,17 +51,25 @@ impl Kernel {
     // and mark successful exec so parent setpgid calls can reject children
     // after the exec boundary.
     fn commit_exec(&self, task: &Arc<Task>, prepared: PreparedExec) -> UserEntry {
-        self.close_cloexec_task_fds(task, &prepared.close_fds);
+        let PreparedExec {
+            exec_path,
+            addr_space,
+            user_entry,
+            close_fds,
+        } = prepared;
+        self.close_cloexec_task_fds(task, &close_fds);
         task.process.sig_state.lock().unwrap().reset_for_exec();
-        {
+        // AGENT: publish the fully prepared address space in one lock-held swap,
+        // then reclaim old mappings after unlock; commit performs no fallible work.
+        let mut old_addr_space = {
             let mut current_addr_space = task.process.addr_space.lock().unwrap();
-            current_addr_space.release_all_pages();
-            *current_addr_space = prepared.addr_space;
-        }
-        *task.process.exec_path.lock().unwrap() = prepared.exec_path;
+            mem::replace(&mut *current_addr_space, addr_space)
+        };
+        *task.process.exec_path.lock().unwrap() = exec_path;
         task.process.did_exec.store(true, Ordering::SeqCst);
         task.sig_frames.lock().unwrap().clear();
-        prepared.user_entry
+        old_addr_space.release_all_pages();
+        user_entry
     }
 
     // AGENT: perform the address-space and process-state exec transaction while
@@ -70,11 +78,16 @@ impl Kernel {
         &self,
         task_id: usize,
         path: &str,
-        args: Vec<String>,
-        envs: Vec<String>,
+        args: Vec<UserCString>,
+        envs: Vec<UserCString>,
     ) -> Result<UserEntry, &'static str> {
         let task = self.tasks.find_task(task_id).ok_or("esrch")?;
         task.kernel_stack_top().ok_or("ekstk")?;
+        // AGENT: reject an already multithreaded process until the dedicated
+        // begin_exec/finish_exec gate can retire siblings atomically in M9.
+        if task.process.thread_count() != 1 {
+            return Err("enotsup");
+        }
         let prepared = self.prepare_exec_image(&task, path, args, envs)?;
         Ok(self.commit_exec(&task, prepared))
     }
@@ -85,8 +98,8 @@ impl Kernel {
         &self,
         task_id: usize,
         path: &str,
-        args: Vec<String>,
-        envs: Vec<String>,
+        args: Vec<UserCString>,
+        envs: Vec<UserCString>,
     ) -> Result<(), &'static str> {
         let user_entry = self.do_exec_for_trap(task_id, path, args, envs)?;
         let task = self.tasks.find_task(task_id).ok_or("esrch")?;

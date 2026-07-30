@@ -12,7 +12,9 @@ const EXEC_CLOEXEC_FD: usize = 101;
 const EBADF_RET: isize = -9;
 const RISCV64_STAT_SIZE: usize = 128;
 const EXPECTED_ARG0: &[u8] = b"exec-smoke";
+const EXPECTED_ARG1: &[u8] = b"\x80raw-arg";
 const EXPECTED_ENV0: &[u8] = b"EXEC_TEST=1";
+const EXPECTED_ENV1: &[u8] = b"RAW=\xff";
 const SUCCESS_MESSAGE: &[u8] = b"[init] execve round-trip passed\n";
 
 // AGENT: capture the kernel-provided initial stack pointer before any Rust
@@ -82,14 +84,18 @@ pub extern "C" fn exec_smoke_main(initial_sp: usize) -> ! {
     let words = initial_sp as *const usize;
     let argc = unsafe { words.read() };
     let argv0 = unsafe { words.add(1).read() };
-    let argv_end = unsafe { words.add(2).read() };
-    let env0 = unsafe { words.add(3).read() };
-    let env_end = unsafe { words.add(4).read() };
-    let stack_ok = argc == 1
+    let argv1 = unsafe { words.add(2).read() };
+    let argv_end = unsafe { words.add(3).read() };
+    let env0 = unsafe { words.add(4).read() };
+    let env1 = unsafe { words.add(5).read() };
+    let env_end = unsafe { words.add(6).read() };
+    let stack_ok = argc == 2
         && argv_end == 0
         && env_end == 0
         && unsafe { user_c_string_eq(argv0, EXPECTED_ARG0) }
-        && unsafe { user_c_string_eq(env0, EXPECTED_ENV0) };
+        && unsafe { user_c_string_eq(argv1, EXPECTED_ARG1) }
+        && unsafe { user_c_string_eq(env0, EXPECTED_ENV0) }
+        && unsafe { user_c_string_eq(env1, EXPECTED_ENV1) };
 
     let mut stat = [0u8; RISCV64_STAT_SIZE];
     let cloexec_closed =

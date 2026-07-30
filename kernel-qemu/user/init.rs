@@ -55,7 +55,9 @@ const OPEN_PATH: &[u8] = b"/tmp/init-mkdirat/file\0";
 const OPEN_PAYLOAD: &[u8] = b"openat-ok";
 const EXEC_PATH: &[u8] = b"/bin/exec-smoke\0";
 const EXEC_ARG0: &[u8] = b"exec-smoke\0";
+const EXEC_ARG1: &[u8] = b"\x80raw-arg\0";
 const EXEC_ENV0: &[u8] = b"EXEC_TEST=1\0";
+const EXEC_ENV1: &[u8] = b"RAW=\xff\0";
 const PIPE_PAYLOAD: &[u8] = b"pipe2-ok";
 const RISCV64_STAT_SIZE: usize = 128;
 const S_IFMT: u32 = 0o170000;
@@ -684,8 +686,18 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    let argv = [EXEC_ARG0.as_ptr() as usize, 0];
-    let envp = [EXEC_ENV0.as_ptr() as usize, 0];
+    // AGENT: carry deliberately non-UTF-8 argv/envp entries through the real
+    // RV64 ecall so the replacement image validates byte-preserving copy-in.
+    let argv = [
+        EXEC_ARG0.as_ptr() as usize,
+        EXEC_ARG1.as_ptr() as usize,
+        0,
+    ];
+    let envp = [
+        EXEC_ENV0.as_ptr() as usize,
+        EXEC_ENV1.as_ptr() as usize,
+        0,
+    ];
     let result = unsafe {
         syscall3(
             SYS_EXECVE,

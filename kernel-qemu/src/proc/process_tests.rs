@@ -42,7 +42,10 @@ pub fn run_all(pool: &FramePool) {
     parse_elf_validates_program_header_layouts();
     elf_load_regions_coalesce_contiguous_permissions();
     prepared_user_image_normalizes_invalid_elf_to_enoexec(pool);
+    failed_prepared_user_image_releases_partial_pages(pool);
     failed_exec_preserves_old_process_image(pool);
+    successful_exec_commits_raw_bytes_and_process_state(pool);
+    multithreaded_exec_is_rejected_before_prepare(pool);
     prepared_user_image_loads_elf_segment_and_stack(pool);
     prepared_user_image_preserves_no_access_segment(pool);
     prepared_user_image_loads_segments_sharing_a_page(pool);
@@ -77,6 +80,19 @@ fn prepared_user_image_normalizes_invalid_elf_to_enoexec(pool: &FramePool) {
         prepare_user_image(b"not an ELF", Vec::new(), Vec::new(), pool).err(),
         Some("enoexec")
     );
+}
+
+// AGENT: force a post-parse mapping conflict after the signal trampoline has
+// allocated real pages, then prove prepare_user_image reclaims the whole
+// temporary address space before returning the loader error.
+fn failed_prepared_user_image_releases_partial_pages(pool: &FramePool) {
+    let elf = test_elf_with_load_segment(PAGE_SZ, USER_SIGTRAMP, b"conflict", 16);
+    let free_before = pool.free_count();
+    assert_eq!(
+        prepare_user_image(&elf, Vec::new(), Vec::new(), pool).err(),
+        Some("overlap")
+    );
+    assert_eq!(pool.free_count(), free_before);
 }
 
 // AGENT: lock the prepare-before-commit boundary: a malformed replacement ELF
@@ -130,16 +146,18 @@ fn failed_exec_preserves_old_process_image(pool: &FramePool) {
         },
     ));
     *task.process.exec_path.lock().unwrap() = "/bin/old-image".to_string();
+    let free_before_attempt = pool.free_count();
 
     assert_eq!(
         kernel.do_exec(
             task.id(),
             "/bin/bad-elf",
-            vec!["bad-elf".to_string()],
+            vec![Vec::from(&b"bad-elf"[..])],
             Vec::new(),
         ),
         Err("enoexec")
     );
+    assert_eq!(pool.free_count(), free_before_attempt);
 
     let mut old_bytes = [0u8; OLD_BYTES.len()];
     {
@@ -171,6 +189,144 @@ fn failed_exec_preserves_old_process_image(pool: &FramePool) {
     task.close_fd(cloexec_fd)
         .expect("rollback fixture fd should close");
     task.process.addr_space.lock().unwrap().release_all_pages();
+}
+
+// AGENT: prove the infallible commit closes only FD_CLOEXEC descriptors,
+// resets caught dispositions, replaces old mappings/frame state, and preserves
+// arbitrary argv/envp bytes on the newly constructed initial user stack.
+fn successful_exec_commits_raw_bytes_and_process_state(pool: &FramePool) {
+    const OLD_MAPPING: usize = 0x6000_0000;
+    const ENTRY: usize = 0x0040_1000;
+    const RAW_ARG: &[u8] = b"\x80raw-arg";
+    const RAW_ENV: &[u8] = b"RAW=\xff";
+
+    let kernel = Kernel::new(pool.clone());
+    kernel.proc_init();
+    kernel
+        .install_directory("/bin")
+        .expect("successful exec fixture should install /bin");
+    let elf = test_elf_with_load_segment(PAGE_SZ, ENTRY, b"exec", 16);
+    kernel
+        .install_exec_file("/bin/raw-exec", elf)
+        .expect("successful exec fixture should install its ELF");
+    let task = kernel.cur_task(0).expect("init should be current");
+    let old_token = {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(OLD_MAPPING, PAGE_SZ, VM_READ | VM_WRITE),
+                pool,
+            )
+            .expect("old success-fixture mapping should succeed");
+        addr_space
+            .write_user_bytes(OLD_MAPPING, b"old", pool)
+            .expect("old success-fixture bytes should be writable");
+        addr_space
+            .vm_token()
+            .expect("old success-fixture address space should own a root")
+    };
+
+    let inherited_fd = task
+        .add_file(FLike::Tty(TtyDevice))
+        .expect("ordinary exec fd should allocate");
+    let cloexec_fd = task
+        .add_file(FLike::Tty(TtyDevice))
+        .expect("close-on-exec fd should allocate");
+    task.set_cloexec(cloexec_fd, true)
+        .expect("exec fixture should set FD_CLOEXEC");
+    assert!(task.process.sig_state.lock().unwrap().set_action(
+        SIGUSR1,
+        SigAction {
+            handler: 0x402000,
+            mask: 0x1234,
+        },
+    ));
+    *task.process.exec_path.lock().unwrap() = "/bin/old-image".to_string();
+
+    kernel
+        .do_exec(
+            task.id(),
+            "/bin/raw-exec",
+            vec![Vec::from(&b"raw-exec"[..]), Vec::from(RAW_ARG)],
+            vec![Vec::from(RAW_ENV)],
+        )
+        .expect("valid raw-byte exec should commit");
+
+    let frame = task
+        .snapshot_user_trap_frame()
+        .expect("successful exec should install a fresh frame");
+    assert_eq!(frame.sepc, ENTRY);
+    let sp = frame.regs[2];
+    let addr_space = task.process.addr_space.lock().unwrap();
+    assert_ne!(addr_space.vm_token(), Ok(old_token));
+    let mut old_byte = [0u8; 1];
+    assert_eq!(
+        addr_space.read_user_bytes(OLD_MAPPING, &mut old_byte),
+        Err("efault")
+    );
+
+    let word = mem::size_of::<usize>();
+    assert_eq!(addr_space.read_user_usize(sp).unwrap(), 2);
+    let argv0 = addr_space.read_user_usize(sp + word).unwrap();
+    let argv1 = addr_space.read_user_usize(sp + word * 2).unwrap();
+    assert_eq!(addr_space.read_user_usize(sp + word * 3).unwrap(), 0);
+    let env0 = addr_space.read_user_usize(sp + word * 4).unwrap();
+    assert_eq!(addr_space.read_user_usize(sp + word * 5).unwrap(), 0);
+    assert_user_cbytes(&addr_space, argv0, b"raw-exec");
+    assert_user_cbytes(&addr_space, argv1, RAW_ARG);
+    assert_user_cbytes(&addr_space, env0, RAW_ENV);
+    drop(addr_space);
+
+    assert!(task.get_fd_entry(inherited_fd).is_some());
+    assert!(task.get_fd_entry(cloexec_fd).is_none());
+    let action = task
+        .process
+        .sig_state
+        .lock()
+        .unwrap()
+        .get_action(SIGUSR1)
+        .expect("successful exec should retain a default action slot")
+        .clone();
+    assert_eq!(action.handler, SIG_DFL);
+    assert_eq!(action.mask, 0);
+    assert_eq!(
+        task.process.exec_path.lock().unwrap().as_str(),
+        "/bin/raw-exec"
+    );
+    assert!(task.process.did_exec.load(Ordering::SeqCst));
+
+    task.close_fd(inherited_fd)
+        .expect("inherited success-fixture fd should close");
+    task.process.addr_space.lock().unwrap().release_all_pages();
+}
+
+// AGENT: keep the pre-M9-thread-exec behavior explicit: a process with a
+// sibling must fail before pathname lookup or any process-image mutation.
+fn multithreaded_exec_is_rejected_before_prepare(pool: &FramePool) {
+    let kernel = Kernel::new(pool.clone());
+    kernel.proc_init();
+    let leader = kernel.cur_task(0).expect("init should be current");
+    let old_frame = leader
+        .snapshot_user_trap_frame()
+        .expect("multithreaded exec fixture should have a frame");
+    let sibling = kernel
+        .tasks
+        .clone_thread(&leader, 0x8000_0000, 0)
+        .expect("multithreaded exec fixture should clone");
+
+    assert_eq!(
+        kernel.do_exec(
+            leader.id(),
+            "/bin/not-looked-up",
+            vec![Vec::from(&b"ignored"[..])],
+            Vec::new(),
+        ),
+        Err("enotsup")
+    );
+    assert_eq!(leader.process.thread_count(), 2);
+    assert_eq!(leader.snapshot_user_trap_frame(), Ok(old_frame));
+    assert!(kernel.tasks.find_task(sibling.id()).is_some());
+    assert!(!leader.process.did_exec.load(Ordering::SeqCst));
 }
 
 // AGENT: prove KStk owns its zeroed direct-map pages through ordinary PgFrame
@@ -1402,8 +1558,8 @@ fn proc_init_push_at_writes_user_stack(pool: &FramePool) {
         .expect("user stack should map");
 
     let init = ProcInit {
-        args: vec!["init".to_string()],
-        envs: vec!["A=B".to_string()],
+        args: vec![Vec::from(&b"init"[..])],
+        envs: vec![Vec::from(&b"A=B"[..])],
         auxv: BTreeMap::from([(AT_PAGESZ, PAGE_SZ), (AT_ENTRY, entry)]),
     };
 
@@ -1450,8 +1606,8 @@ fn prepared_user_image_loads_elf_segment_and_stack(pool: &FramePool) {
     let elf = test_elf_with_load_segment(segment_offset, segment_vaddr, payload, 16);
     let mut image = prepare_user_image(
         &elf,
-        vec!["init".to_string()],
-        vec!["A=B".to_string()],
+        vec![Vec::from(&b"init"[..])],
+        vec![Vec::from(&b"A=B"[..])],
         pool,
     )
     .expect("shared ELF image builder should succeed");
@@ -1855,10 +2011,16 @@ fn release_all_pages_drops_same_space_aliases(pool: &FramePool) {
 // AGENT: read a known-length C string from user memory and verify its trailing
 // NUL byte without relying on host-side string helpers.
 fn assert_user_cstr(addr_space: &AddrSpace, addr: usize, expected: &str) {
+    assert_user_cbytes(addr_space, addr, expected.as_bytes());
+}
+
+// AGENT: verify one initial-stack C string as raw bytes so exec tests can cover
+// values that intentionally cannot be represented as Rust UTF-8 strings.
+fn assert_user_cbytes(addr_space: &AddrSpace, addr: usize, expected: &[u8]) {
     let mut bytes = vec![0u8; expected.len() + 1];
     addr_space
         .read_user_bytes(addr, &mut bytes)
         .expect("user string should be readable");
-    assert_eq!(&bytes[..expected.len()], expected.as_bytes());
+    assert_eq!(&bytes[..expected.len()], expected);
     assert_eq!(bytes[expected.len()], 0);
 }

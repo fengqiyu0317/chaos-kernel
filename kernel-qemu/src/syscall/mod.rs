@@ -7,6 +7,10 @@ mod epoll;
 mod fs;
 mod mm;
 mod proc;
+// AGENT: expose exec copy-in/rollback regressions through the existing process
+// QEMU selftest feature without coupling them to filesystem syscall tests.
+#[cfg(any(test, feature = "qemu-proc-selftest"))]
+pub mod proc_tests;
 mod signal;
 mod stat;
 mod sync;

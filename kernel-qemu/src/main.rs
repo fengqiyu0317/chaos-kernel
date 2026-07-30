@@ -125,6 +125,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     {
         println!("[kernel-qemu] proc selftest start");
         kernel::proc::process_tests::run_all(frame_pool.as_ref());
+        kernel::syscall::proc_tests::run_all(frame_pool.as_ref());
         println!("[kernel-qemu] proc selftest passed");
     }
     // AGENT: isolate selftests that intentionally mutate current-task, restored
@@ -408,7 +409,7 @@ fn prepare_root_init_task(kernel: &kernel::Kernel, init_installed: bool) -> bool
             kernel.do_exec(
                 kernel::INIT_PID,
                 "/bin/init",
-                alloc::vec![alloc::string::String::from("/bin/init")],
+                alloc::vec![Vec::from(&b"/bin/init"[..])],
                 Vec::new(),
             )
         });

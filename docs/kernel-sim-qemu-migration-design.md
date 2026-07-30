@@ -492,6 +492,15 @@ cargo test
 - 内核能识别 syscall number 和参数。
 - init 的建立过程能映射回 `kernel-sim` 中 `proc_init` / `exec` / 用户栈相关语义。
 
+#### 2026-07-30：QEMU `execve` 第二阶段边界
+
+- `argv` / `envp` 已从 syscall copy-in 到 `ProcInit` 全链路改为不含尾随 NUL 的原始 `Vec<u8>`，允许非 UTF-8 参数和环境变量；pathname 仍在现有 UTF-8 VFS 边界转换为 `&str`，完整字节路径模型继续后置。
+- pathname 上限为 4096 字节（含 NUL）；`argv` 与 `envp` 共享 `USR_STK_SZ` 字节预算和 128 个非空指针上限，并在读取 ELF 前复用 `ProcInit` 计算完整字符串、指针、auxv 与对齐后的初始栈大小。
+- exec 准备阶段完成路径/权限、ELF 快照与解析、新地址空间和初始栈构造；提交阶段只执行不可失败的 CLOEXEC 关闭、signal disposition 重置、地址空间交换与进程标识更新。旧地址空间在新空间一次交换发布后释放。
+- QEMU proc selftest 覆盖 pathname `EFAULT`、跨未映射页 argv `EFAULT`、pathname `ENAMETOOLONG`、非 UTF-8 pathname `EINVAL`、共享指针/字节预算 `E2BIG`、非法 ELF `ENOEXEC`，并验证失败时旧 Sv39 token/映射、TrapFrame、信号、exec_path、did_exec、FD_CLOEXEC 与 frame 数量不变。
+- 成功回归验证旧映射消失、新 entry/sp 和原始非 UTF-8 初始栈生效、普通 fd 保留、FD_CLOEXEC 关闭、caught signal handler 重置；真实 U-mode `/bin/init -> execve(221) -> /bin/exec-smoke` 同时携带非 UTF-8 argv/envp 并通过。
+- 完整多线程 exec 仍属于第三阶段。在引入 lifecycle `begin_exec` / `finish_exec` gate、停止 sibling task 和不可失败去线程化提交前，已经存在 sibling 的进程明确返回 `ENOTSUP`，不能错误地替换共享地址空间后留下旧线程运行。
+
 ### Milestone 5：迁移最小 syscall 语义
 
 产物：

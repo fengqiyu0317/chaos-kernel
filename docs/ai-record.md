@@ -12,6 +12,47 @@
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
 
+## 2026-07-30：kernel-qemu 真实 RV64 `execve` 第二阶段
+
+目标：在第一阶段真实 exec 闭环上完成原始字节参数复制、统一大小限制和失败回滚验证；本阶段继续排除 cwd、动态链接和完整多线程 exec。
+
+已完成修改：
+
+- `ProcInit.args/envs` 及 exec 准备接口统一改为不含尾随 NUL 的 `Vec<u8>`，不再要求 `argv/envp` 是 UTF-8；pathname 仍按当前 VFS 能力转换为 `&str`。
+- `sys_exec` 增加 4096 字节 pathname、64 KiB 共享参数字节和 128 个共享非空指针限制；`ProcInit::checked_total_size_for()` 在 ELF lookup 前精确预检完整初始栈布局。
+- `commit_exec()` 改为解构完整 `PreparedExec` 后执行不可失败提交，以一次地址空间交换发布新映像，再在锁外释放旧页；完整多线程 exec 完成前，已有 sibling 的进程返回 `ENOTSUP`。
+- 新增 `syscall/proc_tests.rs`，通过真实 Sv39 usercopy 覆盖 pathname/跨页 argv 的 `EFAULT`、`ENAMETOOLONG`、非 UTF-8 pathname `EINVAL`、共享预算 `E2BIG` 和非法 ELF `ENOEXEC`，并在每次失败后检查旧映像、TrapFrame、信号、fd 和 frame 计数。
+- process selftest 新增成功提交与多线程拒绝回归；真实用户 init/exec-smoke 增加非 UTF-8 `argv[1]` 和 `envp[1]` 的逐字节往返验证。
+
+关键文件：
+
+- `kernel-qemu/src/syscall/proc.rs`
+- `kernel-qemu/src/syscall/proc_tests.rs`
+- `kernel-qemu/src/proc/process/init_stack.rs`
+- `kernel-qemu/src/proc/user_image.rs`
+- `kernel-qemu/src/kernel_core/kernel_ops/exec.rs`
+- `kernel-qemu/src/proc/process_tests.rs`
+- `kernel-qemu/user/init.rs`
+- `kernel-qemu/user/exec_smoke.rs`
+- `TASK.md`
+- `docs/kernel-sim-qemu-migration-design.md`
+
+验收结果：
+
+```bash
+cargo check --manifest-path kernel-qemu/Cargo.toml \
+  --target riscv64gc-unknown-none-elf
+
+cd kernel-qemu
+cargo check --features qemu-proc-selftest
+cargo build --release --features qemu-selftest
+
+cd ..
+bash tools/qemu-smoke.sh
+```
+
+上述检查全部通过；另以带 4 MiB VirtIO raw disk 的 QEMU 实际启动完整 `qemu-selftest` 镜像，日志包含 `[kernel-qemu] proc selftest passed`、`[init] execve round-trip passed` 和 `[kernel-qemu] init process exited`。本轮未修改或运行 `kernel-sim`，未修改禁止路径 `kernel/src/kernel.rs`。
+
 ## 2026-07-30：kernel-qemu 真实 RV64 `execve` 第一阶段
 
 目标：实现“真实 RV64 可达、成功不返回、失败可回滚”的最小 exec 闭环；本阶段不合并 cwd、相对路径、动态链接、PIE 或完整多线程 exec。

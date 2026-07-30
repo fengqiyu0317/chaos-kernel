@@ -520,6 +520,17 @@ cargo test --test pressure
 
 ### M9 `kernel-sim` 语义迁移到 QEMU / `no_std` 承载层
 
+#### 2026-07-30：真实 RV64 `execve` 第二阶段参数复制与回滚
+
+- 目标与边界：在第一阶段真实 `ecall(221)` 闭环上修正 `argv/envp` 参数复制和失败原子性；仍不引入 cwd、相对路径、ET_DYN/PIE、PT_INTERP 或完整多线程 exec，也未修改/运行 `kernel-sim`。
+- 原始参数：新增 `UserCString = Vec<u8>`（不含尾随 NUL），`sys_exec -> do_exec_for_trap -> prepare_exec_image -> prepare_user_image -> ProcInit` 全链路不再把 `argv/envp` 转成 UTF-8 `String`。pathname 继续在现有 UTF-8 VFS 边界转换为 `&str`。
+- 有界 copy-in：pathname 限制为 4096 字节（含 NUL）；`argv`/`envp` 共享 64 KiB 字符串预算和 128 个非空指针上限。`ProcInit::checked_total_size_for()` 在读取 ELF 前统一计算字符串、指针表、两个 auxv 项与对齐后的完整栈大小，避免大分配后才返回 `E2BIG`。
+- 提交边界：`PreparedExec` 完成所有路径、ELF、页面和初始栈可失败工作；`commit_exec()` 解构准备结果后执行不可失败提交，并以 `mem::replace` 一次发布新地址空间、锁外释放旧页。第三阶段 gate 完成前，多线程进程 exec 明确返回 `ENOTSUP`。
+- 回归：新增 syscall proc selftest，覆盖无效 pathname `EFAULT`、argv 指针数组跨未映射页 `EFAULT`、pathname 无 NUL `ENAMETOOLONG`、非 UTF-8 pathname `EINVAL`、共享指针/字节预算 `E2BIG` 和非法 ELF `ENOEXEC`；每次失败均检查旧 Sv39 token/字节、TrapFrame、signal disposition、exec_path、did_exec、FD_CLOEXEC fd 与 FramePool 计数不变。
+- 成功验证：process selftest 检查旧映射消失、新 entry/sp、普通 fd 保留、FD_CLOEXEC 关闭、caught signal handler 重置和非 UTF-8 初始栈字节；真实 `/bin/init` 传入 `argv[1]=b"\x80raw-arg"`、`envp[1]=b"RAW=\xff"`，新 ELF 逐字节验证后继续输出 `[init] execve round-trip passed`。
+- 验证：`cargo check --manifest-path kernel-qemu/Cargo.toml --target riscv64gc-unknown-none-elf`、`cargo check --features qemu-proc-selftest`、在 `kernel-qemu/` 下 `cargo build --release --features qemu-selftest`、带 VirtIO raw disk 的完整 QEMU selftest 和 `bash tools/qemu-smoke.sh` 均通过；selftest 日志包含 `proc selftest passed`、exec 成功标记与 `init process exited`。
+- 下一阶段：为 `ProcessLifecycle` 增加 exec owner/gate，在同一锁内阻止 clone 并摘除 siblings；所有准备工作继续放在 gate 前，去线程化与提交路径必须不可失败。
+
 #### 2026-07-30：真实 RV64 `execve` 第一阶段闭环
 
 - 目标与边界：只接通“真实 RV64 可达、成功不返回、失败可回滚”的最小 exec 闭环；不引入 cwd、相对路径、动态链接、PIE 或完整多线程 exec。

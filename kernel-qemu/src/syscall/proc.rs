@@ -4,6 +4,43 @@ use crate::trap::TrapFrame;
 
 const WAIT4_WNOHANG: usize = 1;
 const CLONE_EXIT_SIGNAL_MASK: usize = 0xff;
+// AGENT: bound exec pathname and combined argv/envp copy-in before allocating
+// a replacement image; the full stack footprint remains capped by USR_STK_SZ.
+const EXEC_PATH_MAX: usize = 4096;
+const EXEC_ARG_MAX: usize = USR_STK_SZ;
+const EXEC_MAX_POINTERS: usize = 128;
+
+// AGENT: make argv and envp share both byte and pointer budgets instead of
+// allowing each userspace array to consume an independent maximum.
+#[derive(Default)]
+struct ExecCopyBudget {
+    string_bytes: usize,
+    pointers: usize,
+}
+
+// AGENT: centralize checked accounting for every copied exec argument.
+impl ExecCopyBudget {
+    fn remaining_bytes(&self) -> usize {
+        EXEC_ARG_MAX.saturating_sub(self.string_bytes)
+    }
+
+    fn charge_pointer(&mut self) -> Result<(), &'static str> {
+        self.pointers = self.pointers.checked_add(1).ok_or("e2big")?;
+        if self.pointers > EXEC_MAX_POINTERS {
+            return Err("e2big");
+        }
+        Ok(())
+    }
+
+    fn charge_string(&mut self, len: usize) -> Result<(), &'static str> {
+        let len_with_nul = len.checked_add(1).ok_or("e2big")?;
+        self.string_bytes = self.string_bytes.checked_add(len_with_nul).ok_or("e2big")?;
+        if self.string_bytes > EXEC_ARG_MAX {
+            return Err("e2big");
+        }
+        Ok(())
+    }
+}
 
 impl Kernel {
     // AGENT: keep the thread-local exit helper beside sys_exit; only the shared
@@ -202,26 +239,39 @@ pub(super) fn sys_exec(
     let envp_addr = a2;
     let task = kernel.cur_task(0).ok_or("esrch")?;
     let task_id = task.id();
-    let (path, args, envs) = {
-        let addr_space = task.process.addr_space.lock().unwrap();
-        let path = read_user_c_string(&addr_space, path_addr, 4096, "enametoolong")?;
-        let args = read_user_string_array(&addr_space, argv_addr, 64, 4096)?;
-        let envs = read_user_string_array(&addr_space, envp_addr, 64, 4096)?;
-        (path, args, envs)
-    };
-    let user_entry = kernel.do_exec_for_trap(task_id, &path, args, envs)?;
+    // AGENT: expose the temporary pre-thread-exec boundary at the syscall edge
+    // before even usercopy can obscure it with an unrelated pointer error.
+    if task.process.thread_count() != 1 {
+        return Err("enotsup");
+    }
+    let addr_space = task.process.addr_space.lock().unwrap();
+    let path_bytes = read_user_c_bytes(&addr_space, path_addr, EXEC_PATH_MAX, "enametoolong")?;
+    // AGENT: keep raw bytes for argv/envp, but retain the current UTF-8 VFS
+    // pathname boundary until directory entries gain byte-string names.
+    let path = core::str::from_utf8(&path_bytes).map_err(|_| "einval")?;
+    let mut budget = ExecCopyBudget::default();
+    let args = read_user_byte_array(&addr_space, argv_addr, &mut budget)?;
+    let envs = read_user_byte_array(&addr_space, envp_addr, &mut budget)?;
+    if ProcInit::checked_total_size_for(&args, &envs, 2)? > EXEC_ARG_MAX {
+        return Err("e2big");
+    }
+    drop(addr_space);
+
+    let user_entry = kernel.do_exec_for_trap(task_id, path, args, envs)?;
     Ok(SyscallOutcome::ReplaceUserContext {
         entry: user_entry.entry,
         stack_pointer: user_entry.stack_pointer,
     })
 }
 
-fn read_user_c_string(
+// AGENT: copy one NUL-terminated userspace string without imposing UTF-8 on
+// argv/envp; the returned byte vector deliberately excludes the terminator.
+fn read_user_c_bytes(
     addr_space: &AddrSpace,
     addr: usize,
     max_len: usize,
     too_long: &'static str,
-) -> Result<String, &'static str> {
+) -> Result<UserCString, &'static str> {
     if addr == 0 {
         return Err("efault");
     }
@@ -231,25 +281,27 @@ fn read_user_c_string(
         let mut byte = [0u8; 1];
         addr_space.read_user_bytes(cur, &mut byte)?;
         if byte[0] == 0 {
-            return String::from_utf8(bytes).map_err(|_| "einval");
+            return Ok(bytes);
         }
         bytes.push(byte[0]);
     }
     Err(too_long)
 }
 
-fn read_user_string_array(
+// AGENT: walk one native-pointer array while charging the caller-provided
+// budget shared by argv and envp, including each copied trailing NUL.
+fn read_user_byte_array(
     addr_space: &AddrSpace,
     array_addr: usize,
-    max_items: usize,
-    max_string_len: usize,
-) -> Result<Vec<String>, &'static str> {
+    budget: &mut ExecCopyBudget,
+) -> Result<Vec<UserCString>, &'static str> {
     if array_addr == 0 {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
     let word = mem::size_of::<usize>();
-    for idx in 0..max_items {
+    let mut idx = 0usize;
+    loop {
         let ptr_addr = array_addr
             .checked_add(idx.checked_mul(word).ok_or("efault")?)
             .ok_or("efault")?;
@@ -257,14 +309,12 @@ fn read_user_string_array(
         if ptr == 0 {
             return Ok(out);
         }
-        out.push(read_user_c_string(
-            addr_space,
-            ptr,
-            max_string_len,
-            "e2big",
-        )?);
+        budget.charge_pointer()?;
+        let value = read_user_c_bytes(addr_space, ptr, budget.remaining_bytes(), "e2big")?;
+        budget.charge_string(value.len())?;
+        out.push(value);
+        idx = idx.checked_add(1).ok_or("e2big")?;
     }
-    Err("e2big")
 }
 
 // AGENT: terminate only the calling Task, allowing the final-thread lifecycle
