@@ -7,6 +7,8 @@ pub const ENOSYS_RET: usize = (-38isize) as usize;
 // AGENT: Linux asm-generic syscall numbers used by the RISC-V ABI.
 pub const RISCV_SYS_DUP: usize = 23;
 pub const RISCV_SYS_DUP3: usize = 24;
+// AGENT: Linux asm-generic fcntl number used by the RV64 userspace ABI.
+pub const RISCV_SYS_FCNTL: usize = 25;
 // AGENT: Linux asm-generic ioctl number used by the RV64 userspace ABI.
 pub const RISCV_SYS_IOCTL: usize = 29;
 pub const RISCV_SYS_MKDIRAT: usize = 34;
@@ -44,6 +46,7 @@ pub const INTERNAL_SYS_PIPE: usize = 22;
 pub const INTERNAL_SYS_SPLICE: usize = 275;
 pub const INTERNAL_SYS_DUP: usize = 32;
 pub const INTERNAL_SYS_DUP3: usize = 292;
+pub const INTERNAL_SYS_FCNTL: usize = 72;
 pub const INTERNAL_SYS_CLONE: usize = 56;
 pub const INTERNAL_SYS_EXIT: usize = 60;
 pub const INTERNAL_SYS_EXIT_GROUP: usize = 231;
@@ -72,6 +75,7 @@ pub fn map_riscv_nr(nr: usize) -> Option<usize> {
     match nr {
         RISCV_SYS_DUP => Some(INTERNAL_SYS_DUP),
         RISCV_SYS_DUP3 => Some(INTERNAL_SYS_DUP3),
+        RISCV_SYS_FCNTL => Some(INTERNAL_SYS_FCNTL),
         RISCV_SYS_IOCTL => Some(INTERNAL_SYS_IOCTL),
         RISCV_SYS_MKDIRAT => Some(INTERNAL_SYS_MKDIRAT),
         RISCV_SYS_UMOUNT2 => Some(INTERNAL_SYS_UMOUNT2),
@@ -210,7 +214,9 @@ fn errno_ret(err: &'static str) -> usize {
         "enospc" => 28,
         "espipe" => 29,
         "epipe" => 32,
+        "edeadlk" => 35,
         "enametoolong" => 36,
+        "enolck" => 37,
         "enosys" => 38,
         "removed" => 43,
         "eoverflow" => 75,

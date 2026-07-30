@@ -27,6 +27,9 @@ mod le_codec;
 // AGENT: Isolate mount-table path resolution from I/O scheduling and devices.
 pub mod mount;
 pub mod pipe;
+// AGENT: keep process-associated POSIX byte-range locks separate from fd/OFD
+// state while keying conflicts by stable filesystem and inode identity.
+pub mod record_lock;
 pub mod tty;
 // AGENT: connect filesystem instances and mounts to resolved path identity.
 pub mod vfs;
@@ -47,5 +50,6 @@ pub use self::fs_instance::*;
 pub use self::io_queue::*;
 pub use self::mount::*;
 pub use self::pipe::*;
+pub use self::record_lock::*;
 pub use self::tty::*;
 pub use self::vfs::*;

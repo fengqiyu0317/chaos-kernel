@@ -159,6 +159,32 @@ struct FdCloseCleanup {
     last_fd_slot: bool,
 }
 
+// AGENT: carry the stable identity of an implicitly or explicitly closed file
+// out of the fd-table lock, then run ordinary OFD/epoll teardown separately.
+pub(crate) struct CloseEffect {
+    file_identity: Option<FileIdentity>,
+    cleanup: FdCloseCleanup,
+}
+
+// AGENT: let Kernel apply process-lock cleanup after fd-table unlock without
+// exposing the closed descriptor entry or global kernel state to FdTable.
+impl CloseEffect {
+    fn new(cleanup: FdCloseCleanup) -> Self {
+        Self {
+            file_identity: cleanup.closed_entry.file_identity(),
+            cleanup,
+        }
+    }
+
+    pub(crate) fn file_identity(&self) -> Option<FileIdentity> {
+        self.file_identity
+    }
+
+    pub(crate) fn run(self) {
+        self.cleanup.run();
+    }
+}
+
 // AGENT: detach all epoll source callbacks before dropping a closed entry.
 impl FdCloseCleanup {
     // AGENT: decrement the explicit fd-slot count while retaining the OFD Arc
@@ -257,14 +283,6 @@ pub(crate) fn install_initial_stdio(task: &Arc<Task>) -> Result<(), &'static str
         return Err("ebadf");
     }
     Ok(())
-}
-
-// AGENT: distinguish dup2 same-fd success from dup3 same-fd rejection while
-// keeping exact-target replacement in one fd-table implementation.
-#[derive(Clone, Copy)]
-enum SameFdBehavior {
-    ReturnTarget,
-    Reject,
 }
 
 // AGENT: implement the complete Task fd-table surface in the descriptor module.
@@ -453,6 +471,13 @@ impl Task {
 
     // AGENT: close an fd, detach epoll registrations, and drop it after unlock.
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
+        self.prepare_close_fd(fd)?.run();
+        Ok(())
+    }
+
+    // AGENT: remove one fd under the table lock but return all externally owned
+    // close effects for Kernel to apply only after the table is unlocked.
+    pub(crate) fn prepare_close_fd(&self, fd: usize) -> Result<CloseEffect, &'static str> {
         if fd >= MAX_FD {
             return Err("ebadf");
         }
@@ -465,8 +490,7 @@ impl Task {
             cleanup
         };
 
-        cleanup.run();
-        Ok(())
+        Ok(CloseEffect::new(cleanup))
     }
 
     // AGENT: duplicate an entry onto the lowest available descriptor.
@@ -489,32 +513,25 @@ impl Task {
         Ok(new_fd)
     }
 
-    // AGENT: implement dup2 same-fd success and clear close-on-exec on a new
-    // descriptor while sharing the source open-file description.
-    pub fn dup2_fd(&self, old_fd: usize, new_fd: usize) -> Result<usize, &'static str> {
-        self.dup_to_fd(old_fd, new_fd, false, SameFdBehavior::ReturnTarget)
-    }
-
-    // AGENT: implement dup3 exact-target duplication with caller-selected
-    // close-on-exec state and Linux same-fd rejection.
-    pub fn dup3_fd(
+    // AGENT: expose dup3 replacement close effects through the same deferred
+    // lifecycle boundary used by explicit close and exec FD_CLOEXEC handling.
+    pub(crate) fn dup3_fd_with_close_effect(
         &self,
         old_fd: usize,
         new_fd: usize,
         cloexec: bool,
-    ) -> Result<usize, &'static str> {
-        self.dup_to_fd(old_fd, new_fd, cloexec, SameFdBehavior::Reject)
+    ) -> Result<(usize, Option<CloseEffect>), &'static str> {
+        self.dup_to_fd_with_close_effect(old_fd, new_fd, cloexec)
     }
 
-    // AGENT: atomically replace one exact fd target, report pending open/pipe
-    // reservations as EBUSY, and defer replaced-OFD cleanup until after unlock.
-    fn dup_to_fd(
+    // AGENT: atomically install an exact target while returning any replaced
+    // file cleanup to the caller instead of running global effects under locks.
+    fn dup_to_fd_with_close_effect(
         &self,
         old_fd: usize,
         new_fd: usize,
         cloexec: bool,
-        same_fd: SameFdBehavior,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<(usize, Option<CloseEffect>), &'static str> {
         if old_fd >= MAX_FD || new_fd >= MAX_FD {
             return Err("ebadf");
         }
@@ -522,10 +539,7 @@ impl Task {
             let mut table = self.process.fd_table.lock().unwrap();
             let entry = table.entries.get(&old_fd).cloned().ok_or("ebadf")?;
             if old_fd == new_fd {
-                return match same_fd {
-                    SameFdBehavior::ReturnTarget => Ok(new_fd),
-                    SameFdBehavior::Reject => Err("einval"),
-                };
+                return Err("einval");
             }
             let cleanup = if table.entries.contains_key(&new_fd) {
                 Some(table.remove_fd_locked(new_fd)?)
@@ -541,10 +555,7 @@ impl Task {
             table.install_entry(new_fd, entry.dup(cloexec));
             cleanup
         };
-        if let Some(cleanup) = cleanup {
-            cleanup.run();
-        }
-        Ok(new_fd)
+        Ok((new_fd, cleanup.map(CloseEffect::new)))
     }
 
     // AGENT: update per-descriptor close-on-exec state without changing the OFD.

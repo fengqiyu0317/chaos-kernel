@@ -253,6 +253,38 @@ impl OpenFileDesc {
         }
     }
 
+    // AGENT: derive one validated process-lock request from the regular-file
+    // identity and shared OFD offset/access state without keying locks by OFD.
+    pub fn record_lock_request(
+        &self,
+        flock: FlockArg,
+        allow_unlock: bool,
+    ) -> Result<RecordLockRequest, &'static str> {
+        let FLike::File(file) = &self.file else {
+            return Err("einval");
+        };
+        if !file.instance().is_regular() {
+            return Err("einval");
+        }
+        RecordLockRequest::from_flock(
+            file.instance().file_identity(),
+            self.status_flags(),
+            file.offset(),
+            file.len(),
+            flock,
+            allow_unlock,
+        )
+    }
+
+    // AGENT: expose stable file identity to close/dup replacement lifecycle
+    // cleanup while returning None for pipes, epoll objects, and terminals.
+    pub fn file_identity(&self) -> Option<FileIdentity> {
+        match &self.file {
+            FLike::File(file) => Some(file.instance().file_identity()),
+            FLike::Pipe(_) | FLike::Ep(_) | FLike::Tty(_) => None,
+        }
+    }
+
     // AGENT: lseek mutates the shared regular-file handle offset.
     pub fn seek(&self, pos: FSeek) -> Result<u64, &'static str> {
         let FLike::File(file) = &self.file else {
@@ -594,6 +626,22 @@ impl FdEntry {
     // treating descriptor flags or the current file offset as inode metadata.
     pub fn file_attr(&self) -> Result<FileAttr, &'static str> {
         self.desc.file_attr()
+    }
+
+    // AGENT: keep flock validation at the shared open-file-description boundary
+    // while the global table remains independent from descriptors and paths.
+    pub fn record_lock_request(
+        &self,
+        flock: FlockArg,
+        allow_unlock: bool,
+    ) -> Result<RecordLockRequest, &'static str> {
+        self.desc.record_lock_request(flock, allow_unlock)
+    }
+
+    // AGENT: snapshot only stable regular-file identity for deferred close
+    // effects; per-fd and per-open state do not enter the conflict key.
+    pub fn file_identity(&self) -> Option<FileIdentity> {
+        self.desc.file_identity()
     }
 
     // AGENT: forward explicit poll status through the descriptor entry layer.

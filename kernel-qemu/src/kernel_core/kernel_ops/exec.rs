@@ -51,9 +51,7 @@ impl Kernel {
     // and mark successful exec so parent setpgid calls can reject children
     // after the exec boundary.
     fn commit_exec(&self, task: &Arc<Task>, prepared: PreparedExec) -> UserEntry {
-        for fd in prepared.close_fds {
-            let _ = task.close_fd(fd);
-        }
+        self.close_cloexec_task_fds(task, &prepared.close_fds);
         task.process.sig_state.lock().unwrap().reset_for_exec();
         {
             let mut current_addr_space = task.process.addr_space.lock().unwrap();

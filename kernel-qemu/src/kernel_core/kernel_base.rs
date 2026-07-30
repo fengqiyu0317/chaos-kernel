@@ -47,6 +47,9 @@ pub struct Kernel {
     // AGENT: make the object VFS the sole owner of root storage, mounts, and
     // filesystem-local node namespaces.
     pub vfs: Vfs,
+    // AGENT: own process-associated POSIX locks globally so independent opens
+    // and repeated mounts of the same filesystem inode share one conflict domain.
+    pub record_locks: RecordLockTable,
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
     pub shm_store: RwLock<BTreeMap<usize, Weak<ShmSegment>>>,
     pub tty_buf: Mutex<VecDeque<u8>>,
@@ -134,6 +137,7 @@ impl Kernel {
             pool,
             processors: core::array::from_fn(|_| Mutex::new(Processor::new())),
             vfs,
+            record_locks: RecordLockTable::new(),
             sem_store: RwLock::new(BTreeMap::new()),
             shm_store: RwLock::new(BTreeMap::new()),
             tty_buf: Mutex::new(VecDeque::new()),

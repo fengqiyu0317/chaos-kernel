@@ -54,6 +54,9 @@ grep -F "[init] dup round-trip passed" "$LOG"
 grep -F "[init] dup3 round-trip passed" "$LOG"
 # AGENT: require real U-mode fstat/newfstatat copyout before descriptor teardown.
 grep -F "[init] stat round-trip passed" "$LOG"
+# AGENT: require RV64 fcntl(25) to exercise all nine currently declared commands,
+# including fixed-layout flock copyin/copyout, from real U-mode.
+grep -F "[init] fcntl nine-command round-trip passed" "$LOG"
 # AGENT: require real U-mode pipe2 fd copyout plus write/read/close traversal.
 grep -F "[init] pipe2 round-trip passed" "$LOG"
 # AGENT: require RISC-V syscall 76 to move regular-file bytes into a real pipe

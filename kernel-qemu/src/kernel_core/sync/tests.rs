@@ -8,8 +8,9 @@ use crate::kernel::kernel_core::{
 };
 use crate::kernel::{
     clear_global_kernel_for_test, epoll_ready_events, install_kernel, signal_bit, EpCtlOp, EpData,
-    EpEvent, EpInst, EpKey, FLike, FdEntry, FdWriteOutcome, FramePool, Kernel, PipeNode,
-    PipeWriteOutcome, TaskRunState, VmRegion, CLK, PIPE_BUF, SIGUSR1,
+    EpEvent, EpInst, EpKey, FLike, FdEntry, FdWriteOutcome, FileIdentity, FramePool, Kernel,
+    LockKind, LockRange, PipeNode, PipeWriteOutcome, RecordLockRequest, TaskRunState, VmRegion,
+    CLK, PIPE_BUF, SIGUSR1,
 };
 
 // AGENT: share one token/result slot with the real task-stack wait regressions;
@@ -27,6 +28,20 @@ static PIPE_ROUND_TRIP_PAIR: Mutex<Option<(PipeNode, PipeNode)>> = Mutex::new(No
 static PIPE_READ_ROUND_TRIP_RESULT: Mutex<Option<Result<usize, &'static str>>> = Mutex::new(None);
 static PIPE_WRITE_ROUND_TRIP_RESULT: Mutex<Option<Result<PipeWriteOutcome, &'static str>>> =
     Mutex::new(None);
+// AGENT: carry one F_SETLKW request/result through real task-stack scheduling so
+// blocking record locks reuse the same wake and signal paths as pipes/futexes.
+static RECORD_LOCK_ROUND_TRIP_REQUEST: Mutex<Option<RecordLockRequest>> = Mutex::new(None);
+static RECORD_LOCK_ROUND_TRIP_RESULT: Mutex<Option<Result<(), &'static str>>> = Mutex::new(None);
+const RECORD_LOCK_WAITER_PID: usize = 41;
+const RECORD_LOCK_BLOCKER_PID: usize = 42;
+const RECORD_LOCK_FILE_A: FileIdentity = FileIdentity {
+    fs_id: 17,
+    inode: 23,
+};
+const RECORD_LOCK_FILE_B: FileIdentity = FileIdentity {
+    fs_id: 17,
+    inode: 24,
+};
 
 // AGENT: include futex requeue/user-mapping and storage/fd regressions, using
 // the boot-discovered physical pool whenever tests allocate mapped task pages.
@@ -52,6 +67,8 @@ pub fn run_all(pool: &FramePool) {
     wait_token_interruptible_wait_reports_signal_not_event(pool);
     wait_token_stays_blocked_after_masked_signal(pool);
     wait_token_sleeping_wait_reports_later_signal(pool);
+    record_lock_blocking_wait_wakes_and_detects_deadlock(pool);
+    record_lock_blocking_wait_returns_eintr(pool);
     futex_wait_returns_changed_without_queueing();
     futex_wait_propagates_word_read_fault();
     futex_wait_timeout_removes_published_waiter();
@@ -523,6 +540,140 @@ extern "C" fn futex_wait_round_trip_test_task() -> ! {
     }
 }
 
+// AGENT: run F_SETLKW on a real task stack, prove it sleeps behind another PID,
+// reject the reverse dependency as EDEADLK, then resume after unlock broadcast.
+fn record_lock_blocking_wait_wakes_and_detects_deadlock(pool: &FramePool) {
+    reset_wait_token_state();
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
+    kernel.proc_init();
+    let task = kernel
+        .cur_task(0)
+        .expect("record-lock test task should exist");
+    let owned_a = RecordLockRequest {
+        identity: RECORD_LOCK_FILE_A,
+        kind: Some(LockKind::Write),
+        range: LockRange {
+            start: 0,
+            end: Some(10),
+        },
+    };
+    let owned_b = RecordLockRequest {
+        identity: RECORD_LOCK_FILE_B,
+        kind: Some(LockKind::Write),
+        range: LockRange {
+            start: 0,
+            end: Some(10),
+        },
+    };
+    kernel
+        .record_locks
+        .set_nonblocking(RECORD_LOCK_WAITER_PID, owned_a)
+        .expect("waiter setup lock should install");
+    kernel
+        .record_locks
+        .set_nonblocking(RECORD_LOCK_BLOCKER_PID, owned_b)
+        .expect("blocker setup lock should install");
+    *RECORD_LOCK_ROUND_TRIP_REQUEST.lock().unwrap() = Some(owned_b);
+    *RECORD_LOCK_ROUND_TRIP_RESULT.lock().unwrap() = None;
+    task.install_test_kernel_entry(record_lock_round_trip_test_task)
+        .expect("record-lock wait task should receive kernel entry");
+    install_kernel(kernel);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    assert_eq!(*RECORD_LOCK_ROUND_TRIP_RESULT.lock().unwrap(), None);
+    assert_eq!(
+        kernel
+            .record_locks
+            .set_blocking(RECORD_LOCK_BLOCKER_PID, task.id(), owned_a),
+        Err("edeadlk")
+    );
+
+    kernel
+        .record_locks
+        .release_file(RECORD_LOCK_BLOCKER_PID, RECORD_LOCK_FILE_B);
+    assert_eq!(task.sched_state(), TaskRunState::Runnable);
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(*RECORD_LOCK_ROUND_TRIP_RESULT.lock().unwrap(), Some(Ok(())));
+    assert!(task.done());
+
+    kernel.record_locks.release_process(RECORD_LOCK_WAITER_PID);
+    *RECORD_LOCK_ROUND_TRIP_REQUEST.lock().unwrap() = None;
+    *RECORD_LOCK_ROUND_TRIP_RESULT.lock().unwrap() = None;
+    clear_wait_token_state();
+}
+
+// AGENT: prove a pending signal wins an interruptible F_SETLKW wait and removes
+// the process wait edge instead of granting the lock or leaving a stale token.
+fn record_lock_blocking_wait_returns_eintr(pool: &FramePool) {
+    reset_wait_token_state();
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
+    kernel.proc_init();
+    let task = kernel
+        .cur_task(0)
+        .expect("record-lock signal task should exist");
+    let request = RecordLockRequest {
+        identity: RECORD_LOCK_FILE_A,
+        kind: Some(LockKind::Write),
+        range: LockRange {
+            start: 5,
+            end: Some(15),
+        },
+    };
+    kernel
+        .record_locks
+        .set_nonblocking(RECORD_LOCK_BLOCKER_PID, request)
+        .expect("record-lock signal blocker should install");
+    *RECORD_LOCK_ROUND_TRIP_REQUEST.lock().unwrap() = Some(request);
+    *RECORD_LOCK_ROUND_TRIP_RESULT.lock().unwrap() = None;
+    task.install_test_kernel_entry(record_lock_round_trip_test_task)
+        .expect("record-lock signal task should receive kernel entry");
+    install_kernel(kernel);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+    kernel.send_signal_to_task(&task, SIGUSR1 as i32, -1);
+    assert_eq!(task.sched_state(), TaskRunState::Runnable);
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(
+        *RECORD_LOCK_ROUND_TRIP_RESULT.lock().unwrap(),
+        Some(Err("eintr"))
+    );
+    assert!(task.done());
+    assert!(!kernel
+        .record_locks
+        .process_has_locks(RECORD_LOCK_WAITER_PID));
+
+    kernel.record_locks.release_process(RECORD_LOCK_BLOCKER_PID);
+    *RECORD_LOCK_ROUND_TRIP_REQUEST.lock().unwrap() = None;
+    *RECORD_LOCK_ROUND_TRIP_RESULT.lock().unwrap() = None;
+    clear_wait_token_state();
+}
+
+// AGENT: execute the shared record-lock blocking API from a schedulable kernel
+// context and return to the test driver's idle stack after publishing the result.
+extern "C" fn record_lock_round_trip_test_task() -> ! {
+    let request = RECORD_LOCK_ROUND_TRIP_REQUEST
+        .lock()
+        .unwrap()
+        .expect("record-lock round-trip request should be installed");
+    let kernel = crate::kernel::global_kernel().expect("record-lock test kernel should exist");
+    let task = kernel
+        .cur_task(0)
+        .expect("record-lock test task should be current");
+    let result = kernel
+        .record_locks
+        .set_blocking(RECORD_LOCK_WAITER_PID, task.id(), request);
+    *RECORD_LOCK_ROUND_TRIP_RESULT.lock().unwrap() = Some(result);
+
+    task.mark_thread_exited();
+    drop(task);
+    kernel.switch_current_to_idle(0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 // AGENT: cmp_requeue now reads the source futex word through a caller-supplied
 // copy-in closure; read errors should be returned instead of panicking.
 #[cfg_attr(test, test)]
@@ -680,7 +831,7 @@ fn futex_requeue_syscalls_reject_unmapped_destination(pool: &FramePool) {
 }
 
 // AGENT: exercise the generic id allocator through fd lower-bound allocation,
-// dup2 exact placement/replacement, and close-driven reuse under one FdTable.
+// dup3 exact placement/replacement, and close-driven reuse under one FdTable.
 fn fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool: &FramePool) {
     let kernel = Kernel::new(pool.clone());
     let task = kernel.tasks.spawn_root().expect("spawn fd allocator task");
@@ -702,24 +853,23 @@ fn fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool: &FramePool) 
         .expect("next lower-bound fd allocation should succeed");
     assert_eq!(next_high_fd, 6);
 
-    let exact_fd = task
-        .dup2_fd(source_fd, 2)
-        .expect("dup2 exact fd allocation should succeed");
+    let exact_fd = kernel
+        .dup3_task_fd(&task, source_fd, 2, false)
+        .expect("dup3 exact fd allocation should succeed");
     assert_eq!(exact_fd, 2);
     task.set_cloexec(source_fd, true)
         .expect("source cloexec update should succeed");
-    assert_eq!(task.dup2_fd(source_fd, source_fd), Ok(source_fd));
     assert!(task
         .get_fd_entry(source_fd)
-        .expect("same-fd dup2 source should remain open")
+        .expect("source should remain open after cloexec update")
         .is_cloexec());
     let next_exact_fd = task
         .dup_fd_from(source_fd, 2, false)
         .expect("next exact-range fd allocation should succeed");
     assert_eq!(next_exact_fd, 3);
 
-    let dup3_fd = task
-        .dup3_fd(source_fd, 4, true)
+    let dup3_fd = kernel
+        .dup3_task_fd(&task, source_fd, 4, true)
         .expect("dup3 exact fd allocation should succeed");
     assert_eq!(dup3_fd, 4);
     let dup3_entry = task
@@ -731,15 +881,24 @@ fn fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool: &FramePool) 
             .expect("dup3 source should remain open")
     ));
     assert!(dup3_entry.is_cloexec());
-    assert_eq!(task.dup3_fd(source_fd, source_fd, false), Err("einval"));
+    assert_eq!(
+        kernel.dup3_task_fd(&task, source_fd, source_fd, false),
+        Err("einval")
+    );
 
     let pending_pair = task
         .add_file_pair_transaction(
             FdEntry::new(FLike::Ep(EpInst::new())),
             FdEntry::new(FLike::Ep(EpInst::new())),
             |first_fd, second_fd| {
-                assert_eq!(task.dup2_fd(source_fd, first_fd), Err("ebusy"));
-                assert_eq!(task.dup3_fd(source_fd, second_fd, true), Err("ebusy"));
+                assert_eq!(
+                    kernel.dup3_task_fd(&task, source_fd, first_fd, false),
+                    Err("ebusy")
+                );
+                assert_eq!(
+                    kernel.dup3_task_fd(&task, source_fd, second_fd, true),
+                    Err("ebusy")
+                );
                 Ok(())
             },
         )
@@ -749,21 +908,27 @@ fn fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool: &FramePool) 
         .expect("target cloexec update should succeed");
     let previous_target = task
         .get_fd_entry(high_fd)
-        .expect("dup2 target should be open");
-    assert_eq!(task.dup2_fd(MAX_FD - 1, high_fd), Err("ebadf"));
+        .expect("dup3 target should be open");
+    assert_eq!(
+        kernel.dup3_task_fd(&task, MAX_FD - 1, high_fd, false),
+        Err("ebadf")
+    );
     assert!(task
         .get_fd_entry(high_fd)
-        .expect("invalid source must not close dup2 target")
+        .expect("invalid source must not close dup3 target")
         .same_open_description(&previous_target));
 
-    assert_eq!(task.dup2_fd(source_fd, high_fd), Ok(high_fd));
+    assert_eq!(
+        kernel.dup3_task_fd(&task, source_fd, high_fd, false),
+        Ok(high_fd)
+    );
     let replaced = task
         .get_fd_entry(high_fd)
-        .expect("dup2 target should hold the source OFD");
+        .expect("dup3 target should hold the source OFD");
     assert!(replaced.same_open_description(
         &task
             .get_fd_entry(source_fd)
-            .expect("dup2 source should remain open")
+            .expect("dup3 source should remain open")
     ));
     assert!(!replaced.is_cloexec());
     task.close_fd(high_fd)

@@ -68,6 +68,21 @@ impl FInstance {
         self.node.len()
     }
 
+    // AGENT: expose mount-independent file identity for process-associated
+    // record locks; repeated mounts of one FsInstance retain the same fs id.
+    pub fn file_identity(&self) -> FileIdentity {
+        FileIdentity {
+            fs_id: self.mount.fs().id(),
+            inode: self.node.id(),
+        }
+    }
+
+    // AGENT: admit record locking only for regular files, not directories or
+    // non-file FLike objects that happen to occupy a descriptor slot.
+    pub fn is_regular(&self) -> bool {
+        self.node.kind == FileKind::Regular
+    }
+
     // AGENT: bind stat device identity to the shared filesystem rather than one
     // mount attachment, then delegate inode-owned fields to FileNode.
     pub fn file_attr(&self) -> Result<FileAttr, &'static str> {

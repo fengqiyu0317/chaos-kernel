@@ -7,6 +7,7 @@ use core::panic::PanicInfo;
 const SYS_WRITE: usize = 64;
 const SYS_DUP: usize = 23;
 const SYS_DUP3: usize = 24;
+const SYS_FCNTL: usize = 25;
 const SYS_MKDIRAT: usize = 34;
 const SYS_OPENAT: usize = 56;
 const SYS_CLOSE: usize = 57;
@@ -20,6 +21,20 @@ const AT_FDCWD: usize = (-100isize) as usize;
 const O_WRONLY: usize = 1;
 const O_CREAT: usize = 0o100;
 const O_CLOEXEC: usize = 0o2000000;
+const O_APPEND: usize = 0o2000;
+const F_DUPFD: usize = 0;
+const F_GETFD: usize = 1;
+const F_SETFD: usize = 2;
+const F_GETFL: usize = 3;
+const F_SETFL: usize = 4;
+const F_GETLK: usize = 5;
+const F_SETLK: usize = 6;
+const F_SETLKW: usize = 7;
+const F_DUPFD_CLOEXEC: usize = 1030;
+const F_WRLCK: i16 = 1;
+const F_UNLCK: i16 = 2;
+const SEEK_SET: i16 = 0;
+const FD_CLOEXEC: usize = 1;
 const STDOUT_FILENO: usize = 1;
 const DUP3_TARGET_FD: usize = 100;
 const INIT_MESSAGE: &[u8] = b"[init] userspace /bin/init reached\n";
@@ -30,6 +45,7 @@ const DUP3_MESSAGE: &[u8] = b"[init] dup3 round-trip passed\n";
 const PIPE_MESSAGE: &[u8] = b"[init] pipe2 round-trip passed\n";
 const SPLICE_MESSAGE: &[u8] = b"[init] splice round-trip passed\n";
 const STAT_MESSAGE: &[u8] = b"[init] stat round-trip passed\n";
+const FCNTL_MESSAGE: &[u8] = b"[init] fcntl nine-command round-trip passed\n";
 const CLOSE_MESSAGE: &[u8] = b"[init] close round-trip passed\n";
 const MKDIR_PATH: &[u8] = b"/tmp/init-mkdirat\0";
 const OPEN_PATH: &[u8] = b"/tmp/init-mkdirat/file\0";
@@ -161,6 +177,23 @@ fn stat_u64(bytes: &[u8; RISCV64_STAT_SIZE], offset: usize) -> u64 {
     ])
 }
 
+// AGENT: build the exact 32-byte asm-generic RV64 flock image without relying
+// on a Rust repr(C) layout or leaving user-stack padding uninitialized.
+fn flock_image(lock_type: i16, start: i64, len: i64) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[0..2].copy_from_slice(&lock_type.to_le_bytes());
+    bytes[2..4].copy_from_slice(&SEEK_SET.to_le_bytes());
+    bytes[8..16].copy_from_slice(&start.to_le_bytes());
+    bytes[16..24].copy_from_slice(&len.to_le_bytes());
+    bytes
+}
+
+// AGENT: inspect only the returned l_type field needed by the same-process
+// F_GETLK smoke assertion.
+fn flock_type(bytes: &[u8; 32]) -> i16 {
+    i16::from_le_bytes([bytes[0], bytes[1]])
+}
+
 // AGENT: prove user-mode mkdirat/openat/dup/dup3/pipe2/splice/stat/close,
 // including six-argument offset copyout, exact-target survival, and OFD teardown.
 #[no_mangle]
@@ -236,14 +269,7 @@ pub extern "C" fn _start() -> ! {
         duplicated
     };
     let dup3_result = if source_close_result == 0 {
-        unsafe {
-            syscall3(
-                SYS_DUP3,
-                duplicated as usize,
-                DUP3_TARGET_FD,
-                O_CLOEXEC,
-            )
-        }
+        unsafe { syscall3(SYS_DUP3, duplicated as usize, DUP3_TARGET_FD, O_CLOEXEC) }
     } else {
         source_close_result
     };
@@ -321,8 +347,142 @@ pub extern "C" fn _start() -> ! {
     } else {
         -1
     };
+    let fcntl_getfd_before = if stat_round_trip_ok {
+        unsafe { syscall3(SYS_FCNTL, DUP3_TARGET_FD, F_GETFD, 0) }
+    } else {
+        -1
+    };
+    let fcntl_setfd = if fcntl_getfd_before == FD_CLOEXEC as isize {
+        unsafe { syscall3(SYS_FCNTL, DUP3_TARGET_FD, F_SETFD, 0) }
+    } else {
+        fcntl_getfd_before
+    };
+    let fcntl_getfd_after = if fcntl_setfd == 0 {
+        unsafe { syscall3(SYS_FCNTL, DUP3_TARGET_FD, F_GETFD, 0) }
+    } else {
+        fcntl_setfd
+    };
+    let fcntl_getfl_before = if fcntl_getfd_after == 0 {
+        unsafe { syscall3(SYS_FCNTL, DUP3_TARGET_FD, F_GETFL, 0) }
+    } else {
+        fcntl_getfd_after
+    };
+    let fcntl_setfl = if fcntl_getfl_before == O_WRONLY as isize {
+        unsafe { syscall3(SYS_FCNTL, DUP3_TARGET_FD, F_SETFL, O_APPEND) }
+    } else {
+        fcntl_getfl_before
+    };
+    let fcntl_getfl_after = if fcntl_setfl == 0 {
+        unsafe { syscall3(SYS_FCNTL, DUP3_TARGET_FD, F_GETFL, 0) }
+    } else {
+        fcntl_setfl
+    };
+    let fcntl_dup = if fcntl_getfl_after == (O_WRONLY | O_APPEND) as isize {
+        unsafe { syscall3(SYS_FCNTL, DUP3_TARGET_FD, F_DUPFD, 10) }
+    } else {
+        fcntl_getfl_after
+    };
+    let fcntl_cloexec_dup = if fcntl_dup >= 10 {
+        unsafe { syscall3(SYS_FCNTL, DUP3_TARGET_FD, F_DUPFD_CLOEXEC, 11) }
+    } else {
+        fcntl_dup
+    };
+    let fcntl_cloexec_dup_flags = if fcntl_cloexec_dup >= 11 {
+        unsafe { syscall3(SYS_FCNTL, fcntl_cloexec_dup as usize, F_GETFD, 0) }
+    } else {
+        fcntl_cloexec_dup
+    };
+    let mut record_lock = flock_image(F_WRLCK, 0, 0);
+    let fcntl_setlk = if fcntl_cloexec_dup_flags == FD_CLOEXEC as isize {
+        unsafe {
+            syscall3(
+                SYS_FCNTL,
+                DUP3_TARGET_FD,
+                F_SETLK,
+                record_lock.as_mut_ptr() as usize,
+            )
+        }
+    } else {
+        fcntl_cloexec_dup_flags
+    };
+    let fcntl_getlk = if fcntl_setlk == 0 {
+        unsafe {
+            syscall3(
+                SYS_FCNTL,
+                fcntl_dup as usize,
+                F_GETLK,
+                record_lock.as_mut_ptr() as usize,
+            )
+        }
+    } else {
+        fcntl_setlk
+    };
+    let fcntl_getlk_type = flock_type(&record_lock);
+    record_lock = flock_image(F_WRLCK, 0, 0);
+    let fcntl_setlkw = if fcntl_getlk == 0 && fcntl_getlk_type == F_UNLCK {
+        // F_GETLK wrote F_UNLCK into the previous image; rebuild the write-lock
+        // request before exercising the blocking command on our own lock.
+        unsafe {
+            syscall3(
+                SYS_FCNTL,
+                DUP3_TARGET_FD,
+                F_SETLKW,
+                record_lock.as_mut_ptr() as usize,
+            )
+        }
+    } else {
+        -1
+    };
+    let mut record_unlock = flock_image(F_UNLCK, 0, 0);
+    let fcntl_unlock = if fcntl_setlkw == 0 {
+        unsafe {
+            syscall3(
+                SYS_FCNTL,
+                DUP3_TARGET_FD,
+                F_SETLK,
+                record_unlock.as_mut_ptr() as usize,
+            )
+        }
+    } else {
+        fcntl_setlkw
+    };
+    let fcntl_dup_close = if fcntl_dup >= 0 {
+        unsafe { syscall1(SYS_CLOSE, fcntl_dup as usize) }
+    } else {
+        fcntl_dup
+    };
+    let fcntl_cloexec_dup_close = if fcntl_cloexec_dup >= 0 {
+        unsafe { syscall1(SYS_CLOSE, fcntl_cloexec_dup as usize) }
+    } else {
+        fcntl_cloexec_dup
+    };
+    let fcntl_round_trip_ok = fcntl_getfd_before == FD_CLOEXEC as isize
+        && fcntl_getfd_after == 0
+        && fcntl_getfl_before == O_WRONLY as isize
+        && fcntl_getfl_after == (O_WRONLY | O_APPEND) as isize
+        && fcntl_dup >= 10
+        && fcntl_cloexec_dup > fcntl_dup
+        && fcntl_cloexec_dup_flags == FD_CLOEXEC as isize
+        && fcntl_setlk == 0
+        && fcntl_getlk == 0
+        && fcntl_setlkw == 0
+        && fcntl_unlock == 0
+        && fcntl_dup_close == 0
+        && fcntl_cloexec_dup_close == 0;
+    let fcntl_message_written = if fcntl_round_trip_ok {
+        unsafe {
+            syscall3(
+                SYS_WRITE,
+                STDOUT_FILENO,
+                FCNTL_MESSAGE.as_ptr() as usize,
+                FCNTL_MESSAGE.len(),
+            )
+        }
+    } else {
+        -1
+    };
     let mut pipe_fds = [-1i32; 2];
-    let pipe_result = if stat_round_trip_ok {
+    let pipe_result = if fcntl_round_trip_ok {
         unsafe { syscall2(SYS_PIPE2, pipe_fds.as_mut_ptr() as usize, 0) }
     } else {
         -1
@@ -492,6 +652,8 @@ pub extern "C" fn _start() -> ! {
             || dup3_message_written != DUP3_MESSAGE.len() as isize
             || !stat_round_trip_ok
             || stat_message_written != STAT_MESSAGE.len() as isize
+            || !fcntl_round_trip_ok
+            || fcntl_message_written != FCNTL_MESSAGE.len() as isize
             || !pipe_round_trip_ok
             || pipe_message_written != PIPE_MESSAGE.len() as isize
             || !splice_round_trip_ok

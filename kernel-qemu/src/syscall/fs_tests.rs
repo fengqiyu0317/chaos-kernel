@@ -2,12 +2,12 @@
 // pool, current init task, Sv39 mappings, and authoritative AddrSpace usercopy.
 use super::*;
 use crate::syscall_abi::{
-    map_riscv_nr, INTERNAL_SYS_DUP, INTERNAL_SYS_DUP3, INTERNAL_SYS_FSTAT, INTERNAL_SYS_IOCTL,
-    INTERNAL_SYS_MKDIRAT, INTERNAL_SYS_MOUNT, INTERNAL_SYS_NEWFSTATAT, INTERNAL_SYS_OPENAT,
-    INTERNAL_SYS_PIPE, INTERNAL_SYS_READ, INTERNAL_SYS_SPLICE, INTERNAL_SYS_UMOUNT2, RISCV_SYS_DUP,
-    RISCV_SYS_DUP3, RISCV_SYS_FSTAT, RISCV_SYS_IOCTL, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT,
-    RISCV_SYS_NEWFSTATAT, RISCV_SYS_OPENAT, RISCV_SYS_PIPE2, RISCV_SYS_READ, RISCV_SYS_SPLICE,
-    RISCV_SYS_UMOUNT2,
+    decode_from_trap_frame, map_riscv_nr, INTERNAL_SYS_DUP, INTERNAL_SYS_DUP3, INTERNAL_SYS_FCNTL,
+    INTERNAL_SYS_FSTAT, INTERNAL_SYS_IOCTL, INTERNAL_SYS_MKDIRAT, INTERNAL_SYS_MOUNT,
+    INTERNAL_SYS_NEWFSTATAT, INTERNAL_SYS_OPENAT, INTERNAL_SYS_PIPE, INTERNAL_SYS_READ,
+    INTERNAL_SYS_SPLICE, INTERNAL_SYS_UMOUNT2, RISCV_SYS_DUP, RISCV_SYS_DUP3, RISCV_SYS_FCNTL,
+    RISCV_SYS_FSTAT, RISCV_SYS_IOCTL, RISCV_SYS_MKDIRAT, RISCV_SYS_MOUNT, RISCV_SYS_NEWFSTATAT,
+    RISCV_SYS_OPENAT, RISCV_SYS_PIPE2, RISCV_SYS_READ, RISCV_SYS_SPLICE, RISCV_SYS_UMOUNT2,
 };
 
 const USER_STRINGS_BASE: usize = 0x4000_0000;
@@ -19,6 +19,7 @@ const STAT_USER_BASE: usize = 0x4005_0000;
 const PIPE_USER_BASE: usize = 0x4006_0000;
 const SPLICE_USER_BASE: usize = 0x4007_0000;
 const IOCTL_USER_BASE: usize = 0x4008_0000;
+const FCNTL_USER_BASE: usize = 0x4009_0000;
 
 // AGENT: Run filesystem ABI and semantic regressions after QEMU installs the
 // real kernel frame pool, current init task, Sv39 mappings, and fd table.
@@ -41,6 +42,8 @@ pub fn run_all(kernel: &Kernel) {
     read_moves_pipe_bytes_and_reports_empty_states(kernel);
     write_to_pipe_without_readers_returns_epipe_and_queues_sigpipe(kernel);
     splice_moves_between_files_and_pipes_with_linux_offsets(kernel);
+    crate::kernel::fs::record_lock::tests::run_all();
+    fcntl_implements_fd_ofd_record_lock_and_lifecycle_semantics(kernel);
 }
 
 // AGENT: Write one NUL-terminated syscall string through the active address
@@ -128,6 +131,53 @@ fn read_user_ioctl_int(task: &Task, addr: usize) -> i32 {
         .read_user_bytes(addr, &mut bytes)
         .expect("ioctl integer result should be readable");
     i32::from_ne_bytes(bytes)
+}
+
+// AGENT: encode one complete RV64 flock fixture with explicit ABI offsets and
+// zero padding, then publish it through the live user address space.
+fn write_user_flock_fixture(kernel: &Kernel, task: &Task, addr: usize, flock: FlockArg) {
+    let mut bytes = [0u8; RISCV64_FLOCK_SIZE];
+    bytes[0..2].copy_from_slice(&flock.lock_type.to_le_bytes());
+    bytes[2..4].copy_from_slice(&flock.whence.to_le_bytes());
+    bytes[8..16].copy_from_slice(&flock.start.to_le_bytes());
+    bytes[16..24].copy_from_slice(&flock.len.to_le_bytes());
+    bytes[24..28].copy_from_slice(&flock.pid.to_le_bytes());
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .write_user_bytes(addr, &bytes, &kernel.pool)
+        .expect("fcntl flock fixture should be writable");
+}
+
+// AGENT: decode a returned RV64 flock through AddrSpace rather than directly
+// dereferencing its user virtual address in the kernel selftest.
+fn read_user_flock_fixture(task: &Task, addr: usize) -> FlockArg {
+    let mut bytes = [0u8; RISCV64_FLOCK_SIZE];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(addr, &mut bytes)
+        .expect("fcntl flock result should be readable");
+    FlockArg {
+        lock_type: i16::from_le_bytes(bytes[0..2].try_into().unwrap()),
+        whence: i16::from_le_bytes(bytes[2..4].try_into().unwrap()),
+        start: i64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        len: i64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+        pid: i32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+    }
+}
+
+// AGENT: construct one concise flock request for syscall and lifecycle tests.
+fn flock_fixture(lock_type: i16, whence: i16, start: i64, len: i64) -> FlockArg {
+    FlockArg {
+        lock_type,
+        whence,
+        start,
+        len,
+        pid: 0,
+    }
 }
 
 // AGENT: decode one little-endian u32 from the fixed RV64 stat regression image.
@@ -1809,6 +1859,419 @@ fn dup3_uses_the_shared_exact_target_implementation(kernel: &Kernel) {
         .expect("dup3 occupied target should close");
     task.close_fd(exact_fd)
         .expect("dup3 exact target should close");
+}
+
+// AGENT: exercise all nine declared fcntl commands through the internal syscall
+// dispatcher, fixed RV64 flock usercopy, process lock table, and close lifecycle.
+#[cfg_attr(test, test)]
+fn fcntl_implements_fd_ofd_record_lock_and_lifecycle_semantics(kernel: &Kernel) {
+    assert_eq!(map_riscv_nr(RISCV_SYS_FCNTL), Some(INTERNAL_SYS_FCNTL));
+    assert_eq!(INTERNAL_SYS_FCNTL, SYS_FCNTL);
+    let mut frame = TrapFrame::new();
+    frame.regs[10..16].copy_from_slice(&[17, F_SETLK, FCNTL_USER_BASE, 4, 5, 6]);
+    frame.regs[17] = RISCV_SYS_FCNTL;
+    let decoded = decode_from_trap_frame(&frame);
+    assert_eq!(decoded.internal_nr, Some(SYS_FCNTL));
+    assert_eq!(decoded.args, [17, F_SETLK, FCNTL_USER_BASE, 4, 5, 6]);
+
+    let task = kernel.cur_task(0).expect("init task should be current");
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(FCNTL_USER_BASE, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("fcntl read-write user page should map");
+        addr_space
+            .map_region(
+                VmRegion::new(FCNTL_USER_BASE + 2 * PAGE_SZ, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("fcntl protection-transition page should map");
+    }
+
+    kernel
+        .install_file("/tmp/qemu-fcntl-a", vec![0u8; 128], false)
+        .expect("fcntl primary fixture should install");
+    kernel
+        .install_file("/tmp/qemu-fcntl-b", vec![0u8; 64], false)
+        .expect("fcntl replacement fixture should install");
+    let fd = do_open(kernel, &task, "/tmp/qemu-fcntl-a", 2, 0)
+        .expect("fcntl primary fixture should open read-write");
+    let flock_addr = FCNTL_USER_BASE + 256;
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_FCNTL, fd, F_GETFD, 0, 0, 0, 0),
+        Ok(0)
+    );
+    assert_eq!(
+        kernel
+            .dispatch_syscall_without_signal_delivery(SYS_FCNTL, fd, F_SETFD, FD_CLOEXEC, 0, 0, 0,),
+        Ok(0)
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_FCNTL, fd, F_GETFD, 0, 0, 0, 0),
+        Ok(FD_CLOEXEC)
+    );
+
+    let dup_fd = kernel
+        .dispatch_syscall_without_signal_delivery(SYS_FCNTL, fd, F_DUPFD, 40, 0, 0, 0)
+        .expect("F_DUPFD should allocate from its lower bound");
+    assert!(dup_fd >= 40);
+    assert!(!task.get_fd_entry(dup_fd).unwrap().is_cloexec());
+    let cloexec_dup_fd = kernel
+        .dispatch_syscall_without_signal_delivery(
+            SYS_FCNTL,
+            fd,
+            F_DUPFD_CLOEXEC,
+            dup_fd + 1,
+            0,
+            0,
+            0,
+        )
+        .expect("F_DUPFD_CLOEXEC should allocate from its lower bound");
+    assert!(cloexec_dup_fd > dup_fd);
+    assert!(task.get_fd_entry(cloexec_dup_fd).unwrap().is_cloexec());
+    assert!(task
+        .get_fd_entry(fd)
+        .unwrap()
+        .same_open_description(&task.get_fd_entry(dup_fd).unwrap()));
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_FCNTL, fd, F_GETFL, 0, 0, 0, 0),
+        Ok(2)
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_FCNTL,
+            dup_fd,
+            F_SETFL,
+            O_APPEND | O_NONBLOCK,
+            0,
+            0,
+            0,
+        ),
+        Ok(0)
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_FCNTL, fd, F_GETFL, 0, 0, 0, 0),
+        Ok(2 | O_APPEND | O_NONBLOCK)
+    );
+
+    let missing_fd = task
+        .add_file(FLike::Tty(TtyDevice))
+        .expect("fcntl missing-fd probe should allocate");
+    kernel
+        .close_task_fd(&task, missing_fd)
+        .expect("fcntl missing-fd probe should close");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_FCNTL, missing_fd, F_DUPFD, MAX_FD, 0, 0, 0,
+        ),
+        Err("ebadf")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_FCNTL,
+            missing_fd,
+            F_SETFL,
+            usize::MAX,
+            0,
+            0,
+            0,
+        ),
+        Err("ebadf")
+    );
+
+    let write_lock = flock_fixture(F_WRLCK, SEEK_SET, 10, 20);
+    write_user_flock_fixture(kernel, &task, flock_addr, write_lock);
+    assert_eq!(
+        kernel
+            .dispatch_syscall_without_signal_delivery(SYS_FCNTL, fd, F_SETLK, flock_addr, 0, 0, 0,),
+        Ok(0)
+    );
+    assert!(kernel.record_locks.process_has_locks(task.process.pid()));
+
+    write_user_flock_fixture(kernel, &task, flock_addr, write_lock);
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_FCNTL, dup_fd, F_GETLK, flock_addr, 0, 0, 0,
+        ),
+        Ok(0)
+    );
+    assert_eq!(
+        read_user_flock_fixture(&task, flock_addr).lock_type,
+        F_UNLCK
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_FCNTL,
+            fd,
+            F_SETLKW,
+            flock_addr,
+            0,
+            0,
+            0,
+        ),
+        Ok(0)
+    );
+
+    let unlock = flock_fixture(F_UNLCK, SEEK_SET, 10, 20);
+    write_user_flock_fixture(kernel, &task, flock_addr, unlock);
+    assert_eq!(
+        kernel
+            .dispatch_syscall_without_signal_delivery(SYS_FCNTL, fd, F_SETLK, flock_addr, 0, 0, 0,),
+        Ok(0)
+    );
+    assert!(!kernel.record_locks.process_has_locks(task.process.pid()));
+
+    let entry = task
+        .get_fd_entry(fd)
+        .expect("fcntl primary fd should remain");
+    let request = entry
+        .record_lock_request(write_lock, true)
+        .expect("fcntl direct conflict request should normalize");
+    let other_pid = task.process.pid() + 100;
+    kernel
+        .record_locks
+        .set_nonblocking(other_pid, request)
+        .expect("other process lock should install");
+    write_user_flock_fixture(kernel, &task, flock_addr, write_lock);
+    assert_eq!(
+        kernel
+            .dispatch_syscall_without_signal_delivery(SYS_FCNTL, fd, F_GETLK, flock_addr, 0, 0, 0,),
+        Ok(0)
+    );
+    let conflict = read_user_flock_fixture(&task, flock_addr);
+    assert_eq!(conflict.lock_type, F_WRLCK);
+    assert_eq!(conflict.whence, SEEK_SET);
+    assert_eq!(conflict.start, 10);
+    assert_eq!(conflict.len, 20);
+    assert_eq!(conflict.pid, other_pid as i32);
+    write_user_flock_fixture(kernel, &task, flock_addr, write_lock);
+    assert_eq!(
+        kernel
+            .dispatch_syscall_without_signal_delivery(SYS_FCNTL, fd, F_SETLK, flock_addr, 0, 0, 0,),
+        Err("eagain")
+    );
+    kernel.record_locks.release_process(other_pid);
+
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_FCNTL, fd, F_SETLK, 0, 0, 0, 0),
+        Err("efault")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_FCNTL,
+            fd,
+            F_SETLK,
+            FCNTL_USER_BASE + 4 * PAGE_SZ,
+            0,
+            0,
+            0,
+        ),
+        Err("efault")
+    );
+    let partial_addr = FCNTL_USER_BASE + PAGE_SZ - 16;
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .write_user_bytes(partial_addr, &[0u8; 16], &kernel.pool)
+        .expect("partial flock prefix should be writable");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_FCNTL,
+            fd,
+            F_SETLK,
+            partial_addr,
+            0,
+            0,
+            0,
+        ),
+        Err("efault")
+    );
+
+    let readonly_addr = FCNTL_USER_BASE + 2 * PAGE_SZ;
+    write_user_flock_fixture(kernel, &task, readonly_addr, write_lock);
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .protect(readonly_addr, PAGE_SZ, VM_READ)
+        .expect("fcntl result page should become read-only");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_FCNTL,
+            fd,
+            F_GETLK,
+            readonly_addr,
+            0,
+            0,
+            0,
+        ),
+        Err("efault")
+    );
+
+    write_user_flock_fixture(kernel, &task, flock_addr, write_lock);
+    assert_eq!(
+        kernel
+            .dispatch_syscall_without_signal_delivery(SYS_FCNTL, fd, F_SETLK, flock_addr, 0, 0, 0,),
+        Ok(0)
+    );
+    let close_alias = task
+        .dup_fd(fd, false)
+        .expect("close lifecycle alias should duplicate");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(SYS_CLOSE, close_alias, 0, 0, 0, 0, 0,),
+        Ok(0)
+    );
+    assert!(!kernel.record_locks.process_has_locks(task.process.pid()));
+
+    write_user_flock_fixture(kernel, &task, flock_addr, write_lock);
+    assert_eq!(
+        kernel
+            .dispatch_syscall_without_signal_delivery(SYS_FCNTL, fd, F_SETLK, flock_addr, 0, 0, 0,),
+        Ok(0)
+    );
+    let replacement_source = do_open(kernel, &task, "/tmp/qemu-fcntl-b", 2, 0)
+        .expect("fcntl replacement source should open");
+    assert_eq!(
+        kernel.dispatch_syscall_without_signal_delivery(
+            SYS_DUP3,
+            replacement_source,
+            fd,
+            0,
+            0,
+            0,
+            0,
+        ),
+        Ok(fd)
+    );
+    assert!(!kernel.record_locks.process_has_locks(task.process.pid()));
+
+    let replacement_entry = task
+        .get_fd_entry(fd)
+        .expect("dup3 replacement should remain installed");
+    let replacement_request = replacement_entry
+        .record_lock_request(write_lock, true)
+        .expect("replacement record-lock request should normalize");
+    kernel
+        .record_locks
+        .set_nonblocking(task.process.pid(), replacement_request)
+        .expect("checkpoint rejection lock should install");
+    let saved_frame = task
+        .snapshot_user_trap_frame()
+        .expect("fcntl checkpoint fixture should retain a frame")
+        .to_saved_checkpoint_frame();
+    assert_eq!(
+        kernel.checkpoint_current_image(0, saved_frame),
+        Err("enotsup")
+    );
+    kernel.record_locks.release_process(task.process.pid());
+
+    for cleanup_fd in [dup_fd, cloexec_dup_fd, replacement_source, fd] {
+        kernel
+            .close_task_fd(&task, cleanup_fd)
+            .expect("fcntl fixture descriptor should close");
+    }
+
+    // AGENT: a forked process shares fd/OFD state but starts with no parent-owned
+    // POSIX record locks because the global table is keyed by process PID.
+    let fork_kernel = Kernel::new(kernel.pool.clone());
+    fork_kernel.proc_init();
+    fork_kernel
+        .install_directory("/tmp")
+        .expect("fork lock fixture requires /tmp");
+    fork_kernel
+        .install_file("/tmp/fork-lock", vec![0u8; 8], false)
+        .expect("fork lock fixture should install");
+    let fork_parent = fork_kernel
+        .cur_task(0)
+        .expect("fork lock parent should exist");
+    let fork_fd = do_open(&fork_kernel, &fork_parent, "/tmp/fork-lock", 2, 0)
+        .expect("fork lock fixture should open");
+    let fork_request = fork_parent
+        .get_fd_entry(fork_fd)
+        .unwrap()
+        .record_lock_request(write_lock, true)
+        .unwrap();
+    fork_kernel
+        .record_locks
+        .set_nonblocking(fork_parent.process.pid(), fork_request)
+        .unwrap();
+    let fork_child = fork_kernel
+        .tasks
+        .fork_process(&fork_parent)
+        .expect("record-lock fork child should be created");
+    assert!(fork_kernel
+        .record_locks
+        .process_has_locks(fork_parent.process.pid()));
+    assert!(!fork_kernel
+        .record_locks
+        .process_has_locks(fork_child.process.pid()));
+    fork_kernel
+        .record_locks
+        .release_process(fork_parent.process.pid());
+
+    // AGENT: exec preserves locks when no descriptor for the file closes, but
+    // its captured FD_CLOEXEC close list releases all locks for that file.
+    let exec_kernel = Kernel::new(kernel.pool.clone());
+    exec_kernel.proc_init();
+    exec_kernel
+        .install_directory("/tmp")
+        .expect("exec lock fixture requires /tmp");
+    exec_kernel
+        .install_file("/tmp/exec-lock", vec![0u8; 8], false)
+        .expect("exec lock fixture should install");
+    let exec_task = exec_kernel
+        .cur_task(0)
+        .expect("exec lock task should exist");
+    let exec_fd = do_open(&exec_kernel, &exec_task, "/tmp/exec-lock", 2, 0)
+        .expect("exec lock fixture should open");
+    let exec_alias = exec_task
+        .dup_fd(exec_fd, false)
+        .expect("exec lock alias should duplicate");
+    exec_task
+        .set_cloexec(exec_fd, true)
+        .expect("exec lock source should become close-on-exec");
+    let exec_request = exec_task
+        .get_fd_entry(exec_fd)
+        .unwrap()
+        .record_lock_request(write_lock, true)
+        .unwrap();
+    exec_kernel
+        .record_locks
+        .set_nonblocking(exec_task.process.pid(), exec_request)
+        .unwrap();
+    let close_fds = exec_task.cloexec_fds();
+    exec_kernel.close_cloexec_task_fds(&exec_task, &close_fds);
+    assert!(exec_task.get_fd_entry(exec_fd).is_none());
+    assert!(exec_task.get_fd_entry(exec_alias).is_some());
+    assert!(!exec_kernel
+        .record_locks
+        .process_has_locks(exec_task.process.pid()));
+
+    let exec_alias_request = exec_task
+        .get_fd_entry(exec_alias)
+        .unwrap()
+        .record_lock_request(write_lock, true)
+        .unwrap();
+    exec_kernel
+        .record_locks
+        .set_nonblocking(exec_task.process.pid(), exec_alias_request)
+        .unwrap();
+    exec_kernel.close_cloexec_task_fds(&exec_task, &[]);
+    assert!(exec_kernel
+        .record_locks
+        .process_has_locks(exec_task.process.pid()));
+    exec_kernel
+        .record_locks
+        .release_process(exec_task.process.pid());
+    exec_kernel
+        .close_task_fd(&exec_task, exec_alias)
+        .expect("exec lock alias should close");
 }
 
 // AGENT: verify the live read/dup ABI, lowest-fd allocation, per-fd cloexec,

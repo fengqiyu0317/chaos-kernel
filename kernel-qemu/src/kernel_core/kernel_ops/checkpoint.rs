@@ -14,6 +14,11 @@ impl Kernel {
         if thread_count != 1 {
             return Err("enotsup");
         }
+        // AGENT: the first checkpoint image has no record-lock or blocked-wait
+        // section, so reject owned locks rather than silently losing semantics.
+        if self.record_locks.process_has_locks(task.process.pid()) {
+            return Err("enotsup");
+        }
 
         let (brk, vmas, pages) = {
             let addr_space = task.process.addr_space.lock().unwrap();

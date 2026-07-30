@@ -8,6 +8,7 @@ const SUPPORTED_OPEN_FLAGS: usize =
 // AGENT: support the two ordinary Linux pipe2 creation flags while rejecting
 // packet-mode and notification-pipe behavior that this pipe layer lacks.
 const SUPPORTED_PIPE_FLAGS: usize = O_NONBLOCK | O_CLOEXEC;
+pub(crate) const RISCV64_FLOCK_SIZE: usize = 32;
 
 // AGENT: keep the first-stage supported open flags explicit instead of
 // accepting unimplemented path, durability, or directory semantics silently.
@@ -181,6 +182,51 @@ fn write_user_i64(
     )
 }
 
+// AGENT: decode the fixed 32-byte Linux asm-generic RV64 flock image without
+// exposing Rust struct padding or trusting a raw user pointer.
+fn read_user_flock(task: &Task, addr: usize) -> Result<FlockArg, &'static str> {
+    if addr == 0 {
+        return Err("efault");
+    }
+    let mut bytes = [0u8; RISCV64_FLOCK_SIZE];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(addr, &mut bytes)?;
+    Ok(FlockArg {
+        lock_type: i16::from_le_bytes(bytes[0..2].try_into().map_err(|_| "efault")?),
+        whence: i16::from_le_bytes(bytes[2..4].try_into().map_err(|_| "efault")?),
+        start: i64::from_le_bytes(bytes[8..16].try_into().map_err(|_| "efault")?),
+        len: i64::from_le_bytes(bytes[16..24].try_into().map_err(|_| "efault")?),
+        pid: i32::from_le_bytes(bytes[24..28].try_into().map_err(|_| "efault")?),
+    })
+}
+
+// AGENT: preflight the complete output mapping and encode every explicit RV64
+// flock field while deterministically clearing ABI padding bytes.
+fn write_user_flock(
+    kernel: &Kernel,
+    task: &Task,
+    addr: usize,
+    flock: FlockArg,
+) -> Result<(), &'static str> {
+    if addr == 0 {
+        return Err("efault");
+    }
+    let mut bytes = [0u8; RISCV64_FLOCK_SIZE];
+    bytes[0..2].copy_from_slice(&flock.lock_type.to_le_bytes());
+    bytes[2..4].copy_from_slice(&flock.whence.to_le_bytes());
+    bytes[8..16].copy_from_slice(&flock.start.to_le_bytes());
+    bytes[16..24].copy_from_slice(&flock.len.to_le_bytes());
+    bytes[24..28].copy_from_slice(&flock.pid.to_le_bytes());
+    let mut addr_space = task.process.addr_space.lock().unwrap();
+    if addr_space.writable_user_prefix_len(addr, bytes.len())? != bytes.len() {
+        return Err("efault");
+    }
+    addr_space.write_user_bytes(addr, &bytes, &kernel.pool)
+}
+
 // AGENT: preflight a bounded writable userspace prefix, read through the current
 // task's shared open-file description, then copy the returned bytes to userspace.
 pub(super) fn sys_read(
@@ -267,7 +313,7 @@ pub(super) fn sys_write(
 
 // AGENT: install one absolute path through a descriptor reservation so EMFILE
 // is reported before path creation or truncation can change global state.
-fn do_open(
+pub(crate) fn do_open(
     kernel: &Kernel,
     task: &Task,
     path: &str,
@@ -333,7 +379,7 @@ pub(super) fn sys_close(kernel: &Kernel, a0: usize) -> Result<usize, &'static st
     let t = kernel.cur_task(0).ok_or("esrch")?;
     // AGENT: close only releases the process fd; block-cache keys are device
     // blocks, not process-local descriptor numbers.
-    t.close_fd(fd)?;
+    kernel.close_task_fd(&t, fd)?;
     Ok(0)
 }
 
@@ -470,7 +516,7 @@ pub(super) fn sys_dup3(
         return Err("ebadf");
     }
     let task = kernel.cur_task(0).ok_or("esrch")?;
-    task.dup3_fd(old_fd, new_fd, flags & O_CLOEXEC != 0)
+    kernel.dup3_task_fd(&task, old_fd, new_fd, flags & O_CLOEXEC != 0)
 }
 
 // AGENT: adapt Linux splice(2) arguments into OFD/pipe semantics while keeping
@@ -566,12 +612,16 @@ pub(super) fn sys_fcntl(
     let task = kernel.cur_task(0).ok_or("esrch")?;
     match cmd {
         F_DUPFD => {
+            // AGENT: Linux reports EBADF for a missing source before validating
+            // the requested allocation lower bound.
+            let _ = task.get_fd_entry(fd).ok_or("ebadf")?;
             if arg >= MAX_FD {
                 return Err("einval");
             }
             task.dup_fd_from(fd, arg, false)
         }
         F_DUPFD_CLOEXEC => {
+            let _ = task.get_fd_entry(fd).ok_or("ebadf")?;
             if arg >= MAX_FD {
                 return Err("einval");
             }
@@ -591,25 +641,34 @@ pub(super) fn sys_fcntl(
             Ok(fdopt_to_open_flags(entry.status_flags()))
         }
         F_SETFL => {
+            // AGENT: validate the descriptor before unsupported mutable bits so
+            // an invalid fd retains Linux EBADF precedence.
+            let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
             let valid_mask = O_NONBLOCK | O_APPEND | 0x3;
             if arg & !valid_mask != 0 {
                 return Err("einval");
             }
-            let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
             entry.set_status_flags(arg)?;
             Ok(0)
         }
-        F_GETLK => {
-            if !check_access(arg, 32) {
-                return Err("efault");
+        F_GETLK | F_SETLK | F_SETLKW => {
+            let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
+            let mut flock = read_user_flock(&task, arg)?;
+            let request = entry.record_lock_request(flock, cmd != F_GETLK)?;
+            let owner_pid = task.process.pid();
+            match cmd {
+                F_GETLK => {
+                    kernel.record_locks.query(owner_pid, request, &mut flock)?;
+                    write_user_flock(kernel, &task, arg, flock)?;
+                }
+                F_SETLK => kernel.record_locks.set_nonblocking(owner_pid, request)?,
+                F_SETLKW => {
+                    kernel
+                        .record_locks
+                        .set_blocking(owner_pid, task.id(), request)?;
+                }
+                _ => unreachable!(),
             }
-            Ok(0)
-        }
-        F_SETLK | F_SETLKW => {
-            if !check_access(arg, 32) {
-                return Err("efault");
-            }
-            let _lock_type = arg & 0xF;
             Ok(0)
         }
         _ => Err("einval"),

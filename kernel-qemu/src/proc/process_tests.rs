@@ -1032,6 +1032,26 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     let fd = leader
         .add_file(FLike::File(FHandle::new(standalone_regular_file())))
         .expect("shared child fd should install");
+    // AGENT: process-associated locks survive one non-last thread exit and are
+    // released only when the final thread enters process-wide teardown.
+    let exit_lock = leader
+        .get_fd_entry(fd)
+        .expect("exit lock fd should remain installed")
+        .record_lock_request(
+            FlockArg {
+                lock_type: F_RDLCK,
+                whence: SEEK_SET,
+                start: 0,
+                len: 0,
+                pid: 0,
+            },
+            true,
+        )
+        .expect("exit lock should normalize");
+    kernel
+        .record_locks
+        .set_nonblocking(child_pid, exit_lock)
+        .expect("exit lock should install");
 
     leader.set_sched_state(TaskRunState::Runnable);
     kernel.run_queue.enqueue(&leader);
@@ -1049,6 +1069,7 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     assert!(kernel.tasks.find_process(child_pid).is_some());
     assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(parent.id()));
     assert!(leader.get_fd_entry(fd).is_some());
+    assert!(kernel.record_locks.process_has_locks(child_pid));
     assert_eq!(
         leader.process.exec_path.lock().unwrap().as_str(),
         "/thread-exit"
@@ -1076,6 +1097,7 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
 
     assert!(leader.done());
     assert!(leader.process.is_zombie());
+    assert!(!kernel.record_locks.process_has_locks(child_pid));
     assert!(leader.get_fd_entry(fd).is_none());
     assert!(leader.process.exec_path.lock().unwrap().is_empty());
     assert_eq!(leader.process.ev.lock().unwrap().cb_len(), 0);

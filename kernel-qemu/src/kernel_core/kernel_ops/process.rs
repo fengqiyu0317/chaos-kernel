@@ -48,6 +48,9 @@ impl Kernel {
         let child_pid = process.pid();
 
         self.release_exit_thread_resources(cpu, task, process, thread_ids);
+        // AGENT: release every process-associated lock before dropping the fd
+        // table; waiters are awakened after the record-lock state lock is gone.
+        self.record_locks.release_process(process.pid());
         process.release_exit_resources();
         let adopted_zombie_pids = self.tasks.reparent_children_to_init(&process);
         process.finish_process_exit();

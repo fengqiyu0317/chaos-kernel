@@ -3,6 +3,8 @@ use super::*;
 
 mod checkpoint;
 mod exec;
+// AGENT: centralize fd close effects that must also update Kernel-owned record locks.
+mod fd;
 mod fs_store;
 mod ipc;
 mod memory;
