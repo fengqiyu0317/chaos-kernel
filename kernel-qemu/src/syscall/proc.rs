@@ -53,7 +53,7 @@ impl Kernel {
     ) -> Result<(), &'static str> {
         let process = task.process.clone();
         self.prepare_current_thread_retirement(cpu, task)?;
-        let decision = process.begin_thread_exit(task.id(), reason)?;
+        let decision = process.complete_thread_exit(task.id(), Some(reason))?;
         self.publish_current_thread_retirement(task, &process);
         if decision == ThreadExitDecision::Last {
             self.commit_process_exit(&process);

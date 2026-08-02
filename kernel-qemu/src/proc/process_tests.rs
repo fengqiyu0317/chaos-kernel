@@ -89,7 +89,7 @@ fn finish_process_for_test(table: &TaskTable, initiator: &Arc<Task>, reason: Exi
             .find_task(tid)
             .expect("acknowledged test thread should remain registered");
         process
-            .acknowledge_thread_exit(tid)
+            .complete_thread_exit(tid, None)
             .expect("test thread acknowledgement should succeed");
         task.mark_thread_exited();
         assert!(table.remove_exited_thread(tid, &process));
@@ -1247,7 +1247,7 @@ fn exiting_phase_blocks_clone_wait_and_reap(pool: &FramePool) {
     );
 
     assert_eq!(
-        task.process.acknowledge_thread_exit(task.id()),
+        task.process.complete_thread_exit(task.id(), None),
         Ok(ThreadExitDecision::Last)
     );
     task.mark_thread_exited();

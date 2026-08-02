@@ -4,20 +4,30 @@ use super::*;
 
 // AGENT: implement process-wide lifecycle transitions on the shared Process.
 impl Process {
-    // AGENT: ordinary exit leaves a multi-threaded process Running, but the
-    // final live member fixes the process exit reason before it acknowledges.
-    pub fn begin_thread_exit(
+    // AGENT: complete one thread's process-lifecycle departure in both ordinary
+    // and group exit; Running consumes the caller's reason, while Exiting keeps
+    // the process-wide reason already fixed by begin_group_exit.
+    pub fn complete_thread_exit(
         &self,
         tid: Tid,
-        reason: ExitReason,
+        reason_if_running: Option<ExitReason>,
     ) -> Result<ThreadExitDecision, &'static str> {
         let mut lifecycle = self.lifecycle.lock().unwrap();
-        if lifecycle.phase != ProcessPhase::Running || !lifecycle.threads.contains(&tid) {
+        if !lifecycle.threads.contains(&tid) {
             return Err("esrch");
         }
-        if lifecycle.threads.len() == 1 {
-            lifecycle.phase = ProcessPhase::Exiting(reason);
+
+        match lifecycle.phase {
+            ProcessPhase::Running => {
+                let reason = reason_if_running.ok_or("einval")?;
+                if lifecycle.threads.len() == 1 {
+                    lifecycle.phase = ProcessPhase::Exiting(reason);
+                }
+            }
+            ProcessPhase::Exiting(_) => {}
+            ProcessPhase::Zombie(_) => return Err("esrch"),
         }
+
         lifecycle.threads.remove(&tid);
         if lifecycle.threads.is_empty() {
             Ok(ThreadExitDecision::Last)
@@ -46,32 +56,6 @@ impl Process {
             }
             ProcessPhase::Exiting(_) => Ok(GroupExitStart::InProgress),
             ProcessPhase::Zombie(_) => Err("esrch"),
-        }
-    }
-
-    // AGENT: remove only the thread that reached its own exit safe point; the
-    // last Exiting member alone receives authority to commit process teardown.
-    pub fn acknowledge_thread_exit(&self, tid: Tid) -> Result<ThreadExitDecision, &'static str> {
-        let mut lifecycle = self.lifecycle.lock().unwrap();
-        if !lifecycle.threads.remove(&tid) {
-            return Err("esrch");
-        }
-        match lifecycle.phase {
-            ProcessPhase::Running if !lifecycle.threads.is_empty() => {
-                Ok(ThreadExitDecision::Remaining)
-            }
-            ProcessPhase::Exiting(_) if lifecycle.threads.is_empty() => {
-                Ok(ThreadExitDecision::Last)
-            }
-            ProcessPhase::Running => {
-                lifecycle.threads.insert(tid);
-                Err("einval")
-            }
-            ProcessPhase::Exiting(_) => Ok(ThreadExitDecision::Remaining),
-            ProcessPhase::Zombie(_) => {
-                lifecycle.threads.insert(tid);
-                Err("esrch")
-            }
         }
     }
 

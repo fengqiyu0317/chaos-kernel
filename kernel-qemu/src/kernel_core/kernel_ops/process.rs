@@ -72,7 +72,7 @@ impl Kernel {
     ) -> Result<ThreadExitDecision, &'static str> {
         let process = current.process.clone();
         self.prepare_current_thread_retirement(cpu, current)?;
-        let decision = process.acknowledge_thread_exit(current.id())?;
+        let decision = process.complete_thread_exit(current.id(), None)?;
         self.publish_current_thread_retirement(current, &process);
         Ok(decision)
     }
