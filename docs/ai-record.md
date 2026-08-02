@@ -1,6 +1,6 @@
 # Chaos AI 工作日志
 
-更新时间：2026-07-30
+更新时间：2026-08-02
 
 ## 维护约定
 
@@ -11,6 +11,33 @@
   - `/home/huawei/.codex/sessions/2026/06/18/rollout-2026-06-18T23-57-15-019edb73-6ad9-7b23-8162-c76a589a57a9.jsonl`
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
+
+## 2026-08-02：kernel-qemu 收敛线程退出清理边界
+
+目标：在已统一的 `retire_current_thread()` 路径中收敛 Task 退出资源清理和终态发布，删除仅有单一调用点的转发 helper。
+
+已完成修改：
+
+- `Task::release_exit_resources()` 专门清空退出线程的 signal mask 并释放保存的 signal frame，与 clear-child-tid、robust futex 和 Task timer 注销一起在 `prepare_current_thread_retirement()` 中执行。
+- 删除 `Task::mark_thread_exited()` 及中间的 `publish_current_thread_retirement()`；`retire_current_thread()` 在进程生命周期确认成功后直接发布 `Zombie`、移除 run-queue 项并删除 TaskTable 项。
+- 低层 scheduler/sync/process 测试改为直接构造所需的 `Zombie` 状态，避免为测试保留生产 helper。
+- 进程回归新增非最后线程退出时 signal mask 和 signal-frame 容量已清空的断言，同时确认存活线程的 signal frame 保持不变。
+
+验收结果：
+
+```bash
+cargo check --manifest-path kernel-qemu/Cargo.toml \
+  --target riscv64gc-unknown-none-elf --features qemu-proc-selftest
+
+cd kernel-qemu
+cargo run --release --features qemu-selftest,ram-block-device
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check
+```
+
+上述检查全部通过。组合 selftest 输出 MM、sync、context、sched、proc、fs syscall、checkpoint 和 U-mode signal 全部 passed，最终完成 `execve` 并正常关机；标准 VirtIO smoke 同样通过。本轮未修改或运行 `kernel-sim`，未修改禁止路径 `kernel/src/kernel.rs`。
 
 ## 2026-07-30：kernel-qemu 两阶段协作式线程组退出
 

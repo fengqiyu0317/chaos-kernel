@@ -592,7 +592,7 @@ fn signal_stop_and_sigcont_cover_thread_group(pool: &FramePool) {
     assert_eq!(kernel.run_queue.pick_next(), Some(thread.id()));
 
     kernel.run_queue.remove(thread.id());
-    thread.mark_thread_exited();
+    thread.set_sched_state(TaskRunState::Zombie);
     thread.release_kernel_stack();
 }
 
@@ -610,7 +610,7 @@ extern "C" fn processor_stop_test_task() -> ! {
     assert_eq!(kernel.deliver_pending_signals(0), 1);
 
     PROCESSOR_STOP_TEST_RESUMED.store(true, Ordering::Relaxed);
-    task.mark_thread_exited();
+    task.set_sched_state(TaskRunState::Zombie);
     drop(task);
     kernel.switch_current_to_idle(0);
     loop {

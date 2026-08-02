@@ -723,7 +723,7 @@ extern "C" fn wait_round_trip_test_task() -> ! {
     let task = kernel
         .cur_task(0)
         .expect("wait test task should still be current");
-    task.mark_thread_exited();
+    task.set_sched_state(TaskRunState::Zombie);
     drop(task);
     kernel.switch_current_to_idle(0);
     loop {
@@ -884,7 +884,7 @@ extern "C" fn futex_wait_round_trip_test_task() -> ! {
     let task = kernel
         .cur_task(0)
         .expect("futex test task should still be current");
-    task.mark_thread_exited();
+    task.set_sched_state(TaskRunState::Zombie);
     drop(task);
     kernel.switch_current_to_idle(0);
     loop {
@@ -1018,7 +1018,7 @@ extern "C" fn record_lock_round_trip_test_task() -> ! {
         .set_blocking(RECORD_LOCK_WAITER_PID, task.id(), request);
     *RECORD_LOCK_ROUND_TRIP_RESULT.lock().unwrap() = Some(result);
 
-    task.mark_thread_exited();
+    task.set_sched_state(TaskRunState::Zombie);
     drop(task);
     kernel.switch_current_to_idle(0);
     loop {
@@ -1827,7 +1827,7 @@ extern "C" fn pipe_read_round_trip_test_task() -> ! {
     *PIPE_READ_ROUND_TRIP_RESULT.lock().unwrap() =
         Some(read_end.read_at(task.id(), false, &mut byte));
 
-    task.mark_thread_exited();
+    task.set_sched_state(TaskRunState::Zombie);
     drop(task);
     kernel.switch_current_to_idle(0);
     loop {
@@ -1852,7 +1852,7 @@ extern "C" fn pipe_write_round_trip_test_task() -> ! {
     *PIPE_WRITE_ROUND_TRIP_RESULT.lock().unwrap() =
         Some(write_end.write_at(task.id(), false, &payload));
 
-    task.mark_thread_exited();
+    task.set_sched_state(TaskRunState::Zombie);
     drop(task);
     kernel.switch_current_to_idle(0);
     loop {

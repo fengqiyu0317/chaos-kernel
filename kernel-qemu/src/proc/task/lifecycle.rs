@@ -106,20 +106,15 @@ impl Task {
         sched.slice_left == 0
     }
 
-    // AGENT: publish exit state, release saved signal-frame backing storage, and
-    // retain a live kernel stack only until CPU0 switches back to idle.
-    pub(crate) fn mark_thread_exited(&self) {
-        debug_assert!(
-            !self.has_active_wait(),
-            "thread exited before its active wait stack cleaned up"
-        );
+    // AGENT: discard thread-owned signal delivery state during the common
+    // retirement preparation phase, independently of scheduler publication.
+    pub(crate) fn release_exit_resources(&self) {
         *self.sig_mask.lock().unwrap() = 0;
         let old_sig_frames = {
             let mut sig_frames = self.sig_frames.lock().unwrap();
             mem::take(&mut *sig_frames)
         };
         drop(old_sig_frames);
-        self.set_sched_state(TaskRunState::Zombie);
     }
 
     // AGENT: release an exited task's stack only after __switch has returned to

@@ -59,15 +59,22 @@ impl Kernel {
         let process = current.process.clone();
         self.prepare_current_thread_retirement(cpu, current)?;
         let decision = process.complete_thread_exit(current.id(), reason_if_running)?;
-        self.publish_current_thread_retirement(current, &process);
+        debug_assert!(
+            !current.has_active_wait(),
+            "thread exited before its active wait stack cleaned up"
+        );
+        current.set_sched_state(TaskRunState::Zombie);
+        self.run_queue.remove(current.id());
+        let removed = self.tasks.remove_exited_thread(current.id(), &process);
+        assert!(removed, "retired current thread was absent from task table");
         if decision == ThreadExitDecision::Last {
             self.commit_process_exit(&process);
         }
         Ok(())
     }
 
-    // AGENT: validate stack ownership and complete implemented Task-owned ABI
-    // cleanup before either ordinary or group lifecycle acknowledgement.
+    // AGENT: validate stack ownership, complete Task-owned ABI cleanup, and
+    // discard thread-local resources before lifecycle acknowledgement.
     pub(crate) fn prepare_current_thread_retirement(
         &self,
         cpu: usize,
@@ -99,6 +106,7 @@ impl Kernel {
         if let Some(timer_wheel) = TIMER_WHEEL.get() {
             timer_wheel.lock().cancel_task_targets(current.id());
         }
+        current.release_exit_resources();
         Ok(())
     }
 
@@ -162,19 +170,6 @@ impl Kernel {
         for futex_addr in wake_addrs {
             current.process.futex.wake(futex_addr, 1);
         }
-    }
-
-    // AGENT: remove one already-acknowledged current Task from scheduler and
-    // task-table ownership without touching any sibling's stack.
-    pub(crate) fn publish_current_thread_retirement(
-        &self,
-        current: &Arc<Task>,
-        process: &Arc<Process>,
-    ) {
-        current.mark_thread_exited();
-        self.run_queue.remove(current.id());
-        let removed = self.tasks.remove_exited_thread(current.id(), &process);
-        assert!(removed, "retired current thread was absent from task table");
     }
 
     // AGENT: commit process-owned teardown only after its lifecycle set proves

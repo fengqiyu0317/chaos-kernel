@@ -91,7 +91,7 @@ fn finish_process_for_test(table: &TaskTable, initiator: &Arc<Task>, reason: Exi
         process
             .complete_thread_exit(tid, None)
             .expect("test thread acknowledgement should succeed");
-        task.mark_thread_exited();
+        task.set_sched_state(TaskRunState::Zombie);
         assert!(table.remove_exited_thread(tid, &process));
     }
     process.finish_process_exit();
@@ -1250,7 +1250,7 @@ fn exiting_phase_blocks_clone_wait_and_reap(pool: &FramePool) {
         task.process.complete_thread_exit(task.id(), None),
         Ok(ThreadExitDecision::Last)
     );
-    task.mark_thread_exited();
+    task.set_sched_state(TaskRunState::Zombie);
     assert!(table.remove_exited_thread(task.id(), &task.process));
     task.process.finish_process_exit();
     assert!(!task.process.is_terminating());
@@ -1293,6 +1293,11 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     leader.sig_frames.lock().unwrap().push(SigFrame {
         saved_frame: TrapFrame::new(),
         saved_mask: 1,
+    });
+    *thread.sig_mask.lock().unwrap() = 0x24;
+    thread.sig_frames.lock().unwrap().push(SigFrame {
+        saved_frame: TrapFrame::new(),
+        saved_mask: 2,
     });
     leader
         .process
@@ -1394,6 +1399,8 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     );
     assert_eq!(leader.process.ev.lock().unwrap().cb_len(), 1);
     assert_eq!(leader.sig_frames.lock().unwrap().len(), 1);
+    assert_eq!(*thread.sig_mask.lock().unwrap(), 0);
+    assert_eq!(thread.sig_frames.lock().unwrap().capacity(), 0);
     let mut cleared_tid = [0xffu8; 4];
     leader
         .process
