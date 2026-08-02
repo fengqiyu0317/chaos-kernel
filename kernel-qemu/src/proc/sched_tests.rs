@@ -84,7 +84,7 @@ extern "C" fn processor_exit_test_task() -> ! {
         .cur_task(0)
         .expect("scheduler test task should be current");
     assert_eq!(
-        kernel.exit_current_thread(0, &task, ExitReason::Code(0)),
+        kernel.retire_current_thread(0, &task, Some(ExitReason::Code(0))),
         Ok(())
     );
     assert!(task.done());

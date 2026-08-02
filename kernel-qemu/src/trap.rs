@@ -205,7 +205,7 @@ pub(crate) fn retire_current_if_group_exiting(
     if !task.process.is_terminating() {
         return;
     }
-    if let Err(err) = kernel.retire_current_group_member(0, task) {
+    if let Err(err) = kernel.retire_current_thread(0, task, None) {
         println!(
             "[kernel-qemu] cannot retire terminating task {}: {}",
             task.id(),

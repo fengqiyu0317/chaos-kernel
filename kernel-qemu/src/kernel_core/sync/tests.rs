@@ -330,7 +330,7 @@ extern "C" fn group_exit_pipe_waiter_task() -> ! {
     let result = reader.read_at(task.id(), false, &mut byte);
     drop(reader);
     *GROUP_EXIT_PIPE_RESULT.lock().unwrap() = Some(result);
-    assert_eq!(kernel.retire_current_group_member(0, &task), Ok(()));
+    assert_eq!(kernel.retire_current_thread(0, &task, None), Ok(()));
     drop(task);
     kernel.switch_current_to_idle(0);
     loop {
@@ -349,7 +349,7 @@ extern "C" fn group_exit_timer_waiter_task() -> ! {
     let deadline = CLK.load(Ordering::Relaxed).saturating_add(100);
     let outcome = token.wait_interruptible(Some(deadline));
     *GROUP_EXIT_TIMER_RESULT.lock().unwrap() = Some(outcome);
-    assert_eq!(kernel.retire_current_group_member(0, &task), Ok(()));
+    assert_eq!(kernel.retire_current_thread(0, &task, None), Ok(()));
     drop(task);
     kernel.switch_current_to_idle(0);
     loop {
@@ -368,7 +368,7 @@ extern "C" fn group_exit_futex_waiter_task() -> ! {
         .futex
         .wait(task.id(), FUTEX_ROUND_TRIP_ADDR, 1, None, || Ok(1));
     *GROUP_EXIT_FUTEX_RESULT.lock().unwrap() = Some(result);
-    assert_eq!(kernel.retire_current_group_member(0, &task), Ok(()));
+    assert_eq!(kernel.retire_current_thread(0, &task, None), Ok(()));
     drop(task);
     kernel.switch_current_to_idle(0);
     loop {
@@ -395,7 +395,7 @@ extern "C" fn group_exit_epoll_waiter_task() -> ! {
     let outcome = token.wait_interruptible(None);
     epoll.remove_waiter(&token);
     *GROUP_EXIT_EPOLL_RESULT.lock().unwrap() = Some(outcome);
-    assert_eq!(kernel.retire_current_group_member(0, &task), Ok(()));
+    assert_eq!(kernel.retire_current_thread(0, &task, None), Ok(()));
     drop(task);
     kernel.switch_current_to_idle(0);
     loop {
@@ -418,7 +418,7 @@ extern "C" fn group_exit_record_waiter_task() -> ! {
         .record_locks
         .set_blocking(task.process.pid(), task.id(), request);
     *GROUP_EXIT_RECORD_RESULT.lock().unwrap() = Some(result);
-    assert_eq!(kernel.retire_current_group_member(0, &task), Ok(()));
+    assert_eq!(kernel.retire_current_thread(0, &task, None), Ok(()));
     drop(task);
     kernel.switch_current_to_idle(0);
     loop {

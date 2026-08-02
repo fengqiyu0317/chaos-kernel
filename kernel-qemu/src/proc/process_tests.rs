@@ -1374,7 +1374,7 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     thread.set_sched_state(TaskRunState::Running);
     kernel.set_cur(0, Some(thread.clone()));
     assert_eq!(
-        kernel.exit_current_thread(0, &thread, ExitReason::Code(5)),
+        kernel.retire_current_thread(0, &thread, Some(ExitReason::Code(5))),
         Ok(())
     );
 
@@ -1430,7 +1430,7 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     leader.set_sched_state(TaskRunState::Running);
     kernel.set_cur(0, Some(leader.clone()));
     assert_eq!(
-        kernel.exit_current_thread(0, &leader, ExitReason::Code(9)),
+        kernel.retire_current_thread(0, &leader, Some(ExitReason::Code(9))),
         Ok(())
     );
 
@@ -1487,7 +1487,7 @@ fn leader_exit_keeps_remaining_thread_and_process(pool: &FramePool) {
     kernel.set_cur(0, Some(leader.clone()));
 
     assert_eq!(
-        kernel.exit_current_thread(0, &leader, ExitReason::Code(4)),
+        kernel.retire_current_thread(0, &leader, Some(ExitReason::Code(4))),
         Ok(())
     );
 
@@ -1559,7 +1559,7 @@ fn exit_group_terminates_every_thread(pool: &FramePool) {
 
     first.set_sched_state(TaskRunState::Running);
     kernel.set_cur(0, Some(first.clone()));
-    assert_eq!(kernel.retire_current_group_member(0, &first), Ok(()));
+    assert_eq!(kernel.retire_current_thread(0, &first, None), Ok(()));
     assert!(leader.process.is_terminating());
     assert_eq!(
         kernel.do_wait(init.id(), leader.process.pid() as isize, 1),
@@ -1568,7 +1568,7 @@ fn exit_group_terminates_every_thread(pool: &FramePool) {
 
     second.set_sched_state(TaskRunState::Running);
     kernel.set_cur(0, Some(second.clone()));
-    assert_eq!(kernel.retire_current_group_member(0, &second), Ok(()));
+    assert_eq!(kernel.retire_current_thread(0, &second, None), Ok(()));
     assert!(leader.process.is_zombie());
     assert_eq!(leader.process.zombie_wait_status(), Some(11 << 8));
     assert_eq!(leader.process.thread_count(), 0);
@@ -1623,7 +1623,7 @@ fn fatal_signal_terminates_every_thread(pool: &FramePool) {
     assert!(leader.process.is_terminating());
     thread.set_sched_state(TaskRunState::Running);
     kernel.set_cur(0, Some(thread.clone()));
-    assert_eq!(kernel.retire_current_group_member(0, &thread), Ok(()));
+    assert_eq!(kernel.retire_current_thread(0, &thread, None), Ok(()));
     assert!(leader.process.is_zombie());
     assert_eq!(leader.process.zombie_wait_status(), Some(SIGUSR1 as usize));
     assert!(kernel.run_queue.pick_next().is_none());

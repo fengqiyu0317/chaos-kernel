@@ -45,36 +45,25 @@ impl Kernel {
             }
         }
 
-        self.retire_current_group_member(cpu, current)
+        self.retire_current_thread(cpu, current, None)
     }
 
-    // AGENT: let a group member at a trap/bootstrap safe point confirm itself;
-    // the last confirmer alone runs process-level exit commit.
-    pub(crate) fn retire_current_group_member(
-        &self,
-        cpu: usize,
-        current: &Arc<Task>,
-    ) -> Result<(), &'static str> {
-        let process = current.process.clone();
-        let decision = self.retire_current_thread(cpu, current)?;
-        if decision == ThreadExitDecision::Last {
-            self.commit_process_exit(&process);
-        }
-        Ok(())
-    }
-
-    // AGENT: publish only the currently executing thread's terminal state and
-    // delete its task-table entry; its live stack remains owned by scheduler.
+    // AGENT: retire the currently executing thread for both ordinary and group
+    // exit, then let only the last member commit process-owned teardown.
     pub(crate) fn retire_current_thread(
         &self,
         cpu: usize,
         current: &Arc<Task>,
-    ) -> Result<ThreadExitDecision, &'static str> {
+        reason_if_running: Option<ExitReason>,
+    ) -> Result<(), &'static str> {
         let process = current.process.clone();
         self.prepare_current_thread_retirement(cpu, current)?;
-        let decision = process.complete_thread_exit(current.id(), None)?;
+        let decision = process.complete_thread_exit(current.id(), reason_if_running)?;
         self.publish_current_thread_retirement(current, &process);
-        Ok(decision)
+        if decision == ThreadExitDecision::Last {
+            self.commit_process_exit(&process);
+        }
+        Ok(())
     }
 
     // AGENT: validate stack ownership and complete implemented Task-owned ABI

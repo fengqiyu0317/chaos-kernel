@@ -43,24 +43,6 @@ impl ExecCopyBudget {
 }
 
 impl Kernel {
-    // AGENT: keep the thread-local exit helper beside sys_exit; only the shared
-    // process teardown primitives remain in kernel_ops/process.rs.
-    pub(crate) fn exit_current_thread(
-        &self,
-        cpu: usize,
-        task: &Arc<Task>,
-        reason: ExitReason,
-    ) -> Result<(), &'static str> {
-        let process = task.process.clone();
-        self.prepare_current_thread_retirement(cpu, task)?;
-        let decision = process.complete_thread_exit(task.id(), Some(reason))?;
-        self.publish_current_thread_retirement(task, &process);
-        if decision == ThreadExitDecision::Last {
-            self.commit_process_exit(&process);
-        }
-        Ok(())
-    }
-
     // AGENT: fork from the complete frame captured by the active syscall trap
     // so the child resumes after ecall with the caller's full register state.
     pub(crate) fn do_fork_from_frame(
@@ -320,7 +302,7 @@ fn read_user_byte_array(
 // current-task lookup and syscall exit-code decoding at the syscall boundary.
 pub(super) fn sys_exit(kernel: &Kernel, a0: usize) -> Result<SyscallOutcome, &'static str> {
     let task = kernel.cur_task(0).ok_or("esrch")?;
-    kernel.exit_current_thread(0, &task, ExitReason::Code((a0 & 0xFF) as u8))?;
+    kernel.retire_current_thread(0, &task, Some(ExitReason::Code((a0 & 0xFF) as u8)))?;
     Ok(SyscallOutcome::NoReturn)
 }
 
