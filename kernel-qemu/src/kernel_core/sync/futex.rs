@@ -165,6 +165,7 @@ impl FutexBucket {
             WaitOutcome::Event => Ok(()),
             WaitOutcome::Timeout => Err("timeout"),
             WaitOutcome::Signal => Err("eintr"),
+            WaitOutcome::GroupExit => Err("group_exit"),
         }
     }
 

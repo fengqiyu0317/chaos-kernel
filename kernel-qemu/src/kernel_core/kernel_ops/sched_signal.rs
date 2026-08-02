@@ -23,8 +23,23 @@ impl Kernel {
     // AGENT: record that a wait/event completed; job-stopped tasks become
     // runnable in scheduler state but stay off the run queue until SIGCONT.
     fn make_task_runnable(&self, task: &Arc<Task>) {
-        task.set_sched_state(TaskRunState::Runnable);
-        self.enqueue_task_if_ready(task);
+        if task.wake_active_wait() {
+            self.enqueue_task_if_ready(task);
+        }
+    }
+
+    // AGENT: group exit overrides job-control placement and queues every live
+    // member after its concrete wait has been canceled, without retiring it.
+    pub(crate) fn make_task_runnable_for_group_exit(&self, task: &Arc<Task>) {
+        if task.done() {
+            return;
+        }
+        if task.sched_state() == TaskRunState::Sleeping {
+            let _ = task.wake_active_wait();
+        }
+        if task.sched_state() == TaskRunState::Runnable {
+            self.run_queue.enqueue(task);
+        }
     }
 
     // AGENT: apply one job-control transition to the whole thread group while
@@ -80,6 +95,13 @@ impl Kernel {
             }
             return false;
         };
+        if task.process.is_terminating() {
+            token.cancel_for_group_exit();
+            if restore_interrupts {
+                crate::csr::enable_interrupts();
+            }
+            return false;
+        }
         if task.done()
             || task.process.is_job_stopped()
             || !self.is_current_task_on_cpu0(task_id)
@@ -92,9 +114,15 @@ impl Kernel {
             }
             return false;
         }
-        task.set_sched_state(TaskRunState::Sleeping);
+        if !task.install_active_wait(token.clone()) {
+            if restore_interrupts {
+                crate::csr::enable_interrupts();
+            }
+            return false;
+        }
         self.run_queue.remove(task_id);
         self.switch_current_to_idle(0);
+        let _ = task.clear_active_wait(token);
         if restore_interrupts {
             crate::csr::enable_interrupts();
         }
@@ -247,7 +275,8 @@ impl Kernel {
                     break;
                 }
                 SignalDeliveryAction::Terminate => {
-                    self.exit_thread_group(cpu, &task, ExitReason::Signal(sig.signo as u8));
+                    self.exit_thread_group(cpu, &task, ExitReason::Signal(sig.signo as u8))
+                        .expect("fatal signal target must be a live current group member");
                     break;
                 }
                 SignalDeliveryAction::Handler(handler) => {

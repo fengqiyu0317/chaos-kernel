@@ -4,8 +4,8 @@ use super::*;
 
 // AGENT: implement process-wide lifecycle transitions on the shared Process.
 impl Process {
-    // AGENT: atomically remove a non-last exiting thread, or reserve the final
-    // thread while moving the whole process from Running to Exiting.
+    // AGENT: ordinary exit leaves a multi-threaded process Running, but the
+    // final live member fixes the process exit reason before it acknowledges.
     pub fn begin_thread_exit(
         &self,
         tid: Tid,
@@ -17,38 +17,79 @@ impl Process {
         }
         if lifecycle.threads.len() == 1 {
             lifecycle.phase = ProcessPhase::Exiting(reason);
-            return Ok(ThreadExitDecision::Last);
         }
         lifecycle.threads.remove(&tid);
-        Ok(ThreadExitDecision::NonLast)
+        if lifecycle.threads.is_empty() {
+            Ok(ThreadExitDecision::Last)
+        } else {
+            Ok(ThreadExitDecision::Remaining)
+        }
     }
 
-    // AGENT: start one process-wide exit exactly once and snapshot every retained
-    // TID while the same lock prevents any later thread clone from joining.
-    pub fn begin_group_exit(&self, reason: ExitReason) -> Option<Vec<Tid>> {
+    // AGENT: fix the first process-wide exit reason and snapshot retained TIDs;
+    // later group-exit callers keep that reason and only confirm themselves.
+    pub fn begin_group_exit(
+        &self,
+        tid: Tid,
+        reason: ExitReason,
+    ) -> Result<GroupExitStart, &'static str> {
         let mut lifecycle = self.lifecycle.lock().unwrap();
-        if lifecycle.phase != ProcessPhase::Running {
-            return None;
+        if !lifecycle.threads.contains(&tid) {
+            return Err("esrch");
         }
-        lifecycle.phase = ProcessPhase::Exiting(reason);
-        Some(lifecycle.threads.iter().copied().collect())
+        match lifecycle.phase {
+            ProcessPhase::Running => {
+                lifecycle.phase = ProcessPhase::Exiting(reason);
+                Ok(GroupExitStart::Started(
+                    lifecycle.threads.iter().copied().collect(),
+                ))
+            }
+            ProcessPhase::Exiting(_) => Ok(GroupExitStart::InProgress),
+            ProcessPhase::Zombie(_) => Err("esrch"),
+        }
+    }
+
+    // AGENT: remove only the thread that reached its own exit safe point; the
+    // last Exiting member alone receives authority to commit process teardown.
+    pub fn acknowledge_thread_exit(&self, tid: Tid) -> Result<ThreadExitDecision, &'static str> {
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        if !lifecycle.threads.remove(&tid) {
+            return Err("esrch");
+        }
+        match lifecycle.phase {
+            ProcessPhase::Running if !lifecycle.threads.is_empty() => {
+                Ok(ThreadExitDecision::Remaining)
+            }
+            ProcessPhase::Exiting(_) if lifecycle.threads.is_empty() => {
+                Ok(ThreadExitDecision::Last)
+            }
+            ProcessPhase::Running => {
+                lifecycle.threads.insert(tid);
+                Err("einval")
+            }
+            ProcessPhase::Exiting(_) => Ok(ThreadExitDecision::Remaining),
+            ProcessPhase::Zombie(_) => {
+                lifecycle.threads.insert(tid);
+                Err("esrch")
+            }
+        }
     }
 
     // AGENT: publish Zombie only after process-level teardown, dispatch the final
     // process event once, and discard subscriptions that no zombie can service.
-    pub fn finish_process_exit(&self) {
+    pub fn finish_process_exit(&self) -> bool {
         let became_zombie = {
             let mut lifecycle = self.lifecycle.lock().unwrap();
             match lifecycle.phase {
-                ProcessPhase::Exiting(reason) => {
+                ProcessPhase::Exiting(reason) if lifecycle.threads.is_empty() => {
                     lifecycle.phase = ProcessPhase::Zombie(reason);
                     true
                 }
-                ProcessPhase::Running | ProcessPhase::Zombie(_) => false,
+                ProcessPhase::Running | ProcessPhase::Exiting(_) | ProcessPhase::Zombie(_) => false,
             }
         };
         if !became_zombie {
-            return;
+            return false;
         }
 
         let old_event_subscriptions = {
@@ -60,6 +101,7 @@ impl Process {
         if let Some(parent) = self.parent() {
             parent.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
         }
+        true
     }
 
     // AGENT: expose only the in-progress teardown phase; Zombie remains a

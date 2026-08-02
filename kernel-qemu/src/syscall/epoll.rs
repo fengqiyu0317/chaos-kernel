@@ -217,16 +217,16 @@ pub(super) fn sys_epoll_wait(
             return Ok(0);
         }
         let outcome = token.wait_interruptible(deadline);
+        inst.remove_waiter(&token);
         match outcome {
             WaitOutcome::Event => {}
             WaitOutcome::Timeout => {
-                inst.remove_waiter(&token);
                 return Ok(0);
             }
             WaitOutcome::Signal => {
-                inst.remove_waiter(&token);
                 return Err("eintr");
             }
+            WaitOutcome::GroupExit => return Err("group_exit"),
         }
     }
 }

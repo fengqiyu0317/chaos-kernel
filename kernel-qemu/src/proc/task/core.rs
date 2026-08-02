@@ -11,6 +11,12 @@ pub struct Task {
     pub process: Arc<Process>,
     pub sig_mask: Mutex<u64>,
     pub sig_frames: Mutex<Vec<SigFrame>>,
+    // AGENT: retain the userspace clear-on-exit word independently per thread;
+    // zero means no CLONE_CHILD_CLEARTID/set_tid_address registration.
+    clear_child_tid: AtomicUsize,
+    // AGENT: store the RV64 robust_list_head pointer per thread; zero means no
+    // robust futex list was registered through set_robust_list.
+    robust_list_head: AtomicUsize,
     pub kstk: Mutex<Option<KStk>>,
     // AGENT: keep the switch context at a stable address outside every lock so
     // the single-hart scheduler never carries a MutexGuard across __switch.
@@ -44,6 +50,8 @@ impl Task {
             process,
             sig_mask: Mutex::new(0),
             sig_frames: Mutex::new(Vec::new()),
+            clear_child_tid: AtomicUsize::new(0),
+            robust_list_head: AtomicUsize::new(0),
             kstk: Mutex::new(Some(kstk)),
             kernel_context: KernelContextCell::new(kernel_context),
             sched: Mutex::new(SchedEntity::new()),
@@ -80,6 +88,30 @@ impl Task {
     // AGENT: expose the schedulable thread id.
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    // AGENT: install one thread-owned clear_child_tid address and return the
+    // caller's TID as required by set_tid_address(2).
+    pub(crate) fn set_clear_child_tid(&self, addr: usize) -> usize {
+        self.clear_child_tid.store(addr, Ordering::Release);
+        self.id
+    }
+
+    // AGENT: consume the registration exactly once before process address-space
+    // teardown, so repeated retirement cannot write or wake the futex twice.
+    pub(crate) fn take_clear_child_tid(&self) -> usize {
+        self.clear_child_tid.swap(0, Ordering::AcqRel)
+    }
+
+    // AGENT: replace one thread's robust list registration after the syscall
+    // layer validates the fixed RV64 robust_list_head size.
+    pub(crate) fn set_robust_list_head(&self, addr: usize) {
+        self.robust_list_head.store(addr, Ordering::Release);
+    }
+
+    // AGENT: consume the robust list exactly once during thread retirement.
+    pub(crate) fn take_robust_list_head(&self) -> usize {
+        self.robust_list_head.swap(0, Ordering::AcqRel)
     }
 
     // AGENT: expose only the kernel stack top needed by trap setup.
@@ -158,6 +190,61 @@ impl Task {
         self.sched.lock().unwrap().state = state;
     }
 
+    // AGENT: publish the token and Sleeping state atomically at the scheduler's
+    // final lost-wakeup check; only the currently Running owner may install it.
+    pub(crate) fn install_active_wait(&self, token: WaitToken) -> bool {
+        let mut sched = self.sched.lock().unwrap();
+        if sched.state != TaskRunState::Running || sched.active_wait.is_some() {
+            return false;
+        }
+        sched.active_wait = Some(token);
+        sched.state = TaskRunState::Sleeping;
+        true
+    }
+
+    // AGENT: clear one matching active wait after its kernel stack resumes; a
+    // wake path may already have cleared it while making the task runnable.
+    pub(crate) fn clear_active_wait(&self, token: &WaitToken) -> bool {
+        let mut sched = self.sched.lock().unwrap();
+        if sched
+            .active_wait
+            .as_ref()
+            .is_none_or(|active| !active.same(token))
+        {
+            return false;
+        }
+        sched.active_wait = None;
+        if sched.state == TaskRunState::Sleeping {
+            sched.state = TaskRunState::Runnable;
+        }
+        true
+    }
+
+    // AGENT: atomically detach the wait that justified Sleeping and publish the
+    // runnable state before the kernel enqueues this task.
+    pub(crate) fn wake_active_wait(&self) -> bool {
+        let mut sched = self.sched.lock().unwrap();
+        if sched.state != TaskRunState::Sleeping || sched.active_wait.is_none() {
+            return false;
+        }
+        sched.active_wait = None;
+        sched.state = TaskRunState::Runnable;
+        true
+    }
+
+    // AGENT: snapshot and cancel the concrete blocking point without retaining
+    // the sched lock while WaitToken wakes through the global kernel backend.
+    pub(crate) fn cancel_active_wait_for_group_exit(&self) -> bool {
+        let active = self.sched.lock().unwrap().active_wait.clone();
+        active.is_some_and(|token| token.cancel_for_group_exit())
+    }
+
+    // AGENT: expose whether a focused lifecycle test or exit path still has a
+    // registered blocking point without leaking the token itself.
+    pub(crate) fn has_active_wait(&self) -> bool {
+        self.sched.lock().unwrap().active_wait.is_some()
+    }
+
     // AGENT: report only this thread's terminal scheduler state; one sibling's
     // SYS_EXIT must never make every Task in the Process appear dead.
     pub fn done(&self) -> bool {
@@ -197,6 +284,10 @@ impl Task {
     // AGENT: publish exit state, release saved signal-frame backing storage, and
     // retain a live kernel stack only until CPU0 switches back to idle.
     pub(crate) fn mark_thread_exited(&self) {
+        debug_assert!(
+            !self.has_active_wait(),
+            "thread exited before its active wait stack cleaned up"
+        );
         *self.sig_mask.lock().unwrap() = 0;
         let old_sig_frames = {
             let mut sig_frames = self.sig_frames.lock().unwrap();

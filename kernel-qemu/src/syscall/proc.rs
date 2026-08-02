@@ -52,15 +52,11 @@ impl Kernel {
         reason: ExitReason,
     ) -> Result<(), &'static str> {
         let process = task.process.clone();
-        match process.begin_thread_exit(task.id(), reason)? {
-            ThreadExitDecision::NonLast => {
-                self.release_exited_thread(cpu, task);
-                let removed = self.tasks.remove_exited_thread(task.id(), &process);
-                debug_assert!(removed);
-            }
-            ThreadExitDecision::Last => {
-                self.finish_process_exit(cpu, task, &process, vec![task.id()]);
-            }
+        self.prepare_current_thread_retirement(cpu, task)?;
+        let decision = process.begin_thread_exit(task.id(), reason)?;
+        self.publish_current_thread_retirement(task, &process);
+        if decision == ThreadExitDecision::Last {
+            self.commit_process_exit(&process);
         }
         Ok(())
     }
@@ -112,8 +108,10 @@ impl Kernel {
 
             let outcome = wait.0.wait_interruptible(None);
             Self::cancel_child_wait(&parent, wait);
-            if outcome == WaitOutcome::Signal {
-                return Err("eintr");
+            match outcome {
+                WaitOutcome::Signal => return Err("eintr"),
+                WaitOutcome::GroupExit => return Err("group_exit"),
+                WaitOutcome::Event | WaitOutcome::Timeout => {}
             }
         }
     }
@@ -331,8 +329,30 @@ pub(super) fn sys_exit(kernel: &Kernel, a0: usize) -> Result<SyscallOutcome, &'s
 // lookup and syscall exit-code decoding belong to this syscall adapter.
 pub(super) fn sys_exit_group(kernel: &Kernel, a0: usize) -> Result<SyscallOutcome, &'static str> {
     let task = kernel.cur_task(0).ok_or("esrch")?;
-    kernel.exit_thread_group(0, &task, ExitReason::Code((a0 & 0xFF) as u8));
+    kernel.exit_thread_group(0, &task, ExitReason::Code((a0 & 0xFF) as u8))?;
     Ok(SyscallOutcome::NoReturn)
+}
+
+// AGENT: register the current thread's clear-on-exit futex word; address-space
+// validation is intentionally deferred to exit-time put-user semantics.
+pub(super) fn sys_set_tid_address(kernel: &Kernel, tidptr: usize) -> Result<usize, &'static str> {
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    Ok(task.set_clear_child_tid(tidptr))
+}
+
+// AGENT: register the fixed RV64 robust-list head for exit-time best-effort
+// owner-death cleanup; list contents remain userspace-owned until retirement.
+pub(super) fn sys_set_robust_list(
+    kernel: &Kernel,
+    head: usize,
+    len: usize,
+) -> Result<usize, &'static str> {
+    if len != ROBUST_LIST_HEAD_SIZE {
+        return Err("einval");
+    }
+    let task = kernel.cur_task(0).ok_or("esrch")?;
+    task.set_robust_list_head(head);
+    Ok(0)
 }
 
 // AGENT: copy wait status before committing the zombie reap so a failed user

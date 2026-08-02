@@ -73,6 +73,31 @@ fn standalone_regular_file() -> FInstance {
     FInstance::new(mount, node)
 }
 
+// AGENT: drive low-level lifecycle tests through the same per-thread
+// acknowledgement ordering while no CPU scheduler is installed in TaskTable.
+fn finish_process_for_test(table: &TaskTable, initiator: &Arc<Task>, reason: ExitReason) {
+    let process = initiator.process.clone();
+    let thread_ids = match process
+        .begin_group_exit(initiator.id(), reason)
+        .expect("test initiator should be a live process member")
+    {
+        GroupExitStart::Started(thread_ids) => thread_ids,
+        GroupExitStart::InProgress => process.thread_ids(),
+    };
+    for tid in thread_ids {
+        let task = table
+            .find_task(tid)
+            .expect("acknowledged test thread should remain registered");
+        process
+            .acknowledge_thread_exit(tid)
+            .expect("test thread acknowledgement should succeed");
+        task.mark_thread_exited();
+        assert!(table.remove_exited_thread(tid, &process));
+    }
+    process.finish_process_exit();
+    assert!(process.is_zombie());
+}
+
 // AGENT: preserve detailed parser diagnostics for focused parser tests while
 // exposing malformed executable images to callers as Linux ENOEXEC.
 fn prepared_user_image_normalizes_invalid_elf_to_enoexec(pool: &FramePool) {
@@ -385,11 +410,7 @@ fn task_slot_limit_reopens_only_after_reap(pool: &FramePool) {
 
     let reaped = tasks.pop().expect("full task table should have a victim");
     let reaped_pid = reaped.process.pid();
-    assert!(reaped
-        .process
-        .begin_group_exit(ExitReason::Code(0))
-        .is_some());
-    reaped.process.finish_process_exit();
+    finish_process_for_test(&table, &reaped, ExitReason::Code(0));
     assert_eq!(table.reap(reaped_pid), Ok(()));
     assert_eq!(table.task_count(), N_PROC - 1);
 
@@ -631,8 +652,7 @@ fn init_process_resolves_through_process_index(pool: &FramePool) {
     let init = table.spawn_root().expect("root spawn should work");
     let init_process = Arc::downgrade(&init.process);
 
-    assert!(init.process.begin_group_exit(ExitReason::Code(0)).is_some());
-    init.process.finish_process_exit();
+    finish_process_for_test(&table, &init, ExitReason::Code(0));
     assert_eq!(table.reap(INIT_PID), Ok(()));
     assert!(table.init_process().is_none());
 
@@ -669,8 +689,7 @@ fn pgid_group_keeps_zombie_members_until_reap(pool: &FramePool) {
         .process_pgid(task.process.pid())
         .expect("spawned task should have job-control membership");
 
-    assert!(task.process.begin_group_exit(ExitReason::Code(0)).is_some());
-    task.process.finish_process_exit();
+    finish_process_for_test(&table, &task, ExitReason::Code(0));
 
     let group = table.pgid_group(pgid);
     assert_eq!(group.len(), 1);
@@ -810,11 +829,7 @@ fn job_control_stays_authoritative_across_process_transitions(pool: &FramePool) 
     assert_eq!(table.process_pgid(session_pid), Some(session_pid as i32));
     assert_eq!(table.process_sid(session_pid), Some(session_pid));
 
-    assert!(moved_child
-        .process
-        .begin_group_exit(ExitReason::Code(0))
-        .is_some());
-    moved_child.process.finish_process_exit();
+    finish_process_for_test(&table, &moved_child, ExitReason::Code(0));
     assert_eq!(table.reap(moved_pid), Ok(()));
     assert_eq!(table.process_pgid(moved_pid), None);
     assert!(table.pgid_group(moved_pid as i32).is_empty());
@@ -845,11 +860,7 @@ fn reap_rejects_zombie_with_unreparented_children(pool: &FramePool) {
         .expect("child process should fork");
     let parent_pid = parent.process.pid();
 
-    assert!(parent
-        .process
-        .begin_group_exit(ExitReason::Code(3))
-        .is_some());
-    parent.process.finish_process_exit();
+    finish_process_for_test(&table, &parent, ExitReason::Code(3));
 
     assert_eq!(table.reap(parent_pid), Err("ebusy"));
     assert!(table.find_process(parent_pid).is_some());
@@ -1133,8 +1144,13 @@ fn reparented_zombie_notifies_init(pool: &FramePool) {
         .expect("future zombie should fork");
     let zombie_pid = zombie.process.pid();
 
-    kernel.exit_thread_group(0, &zombie, ExitReason::Code(7));
+    zombie.set_sched_state(TaskRunState::Running);
+    kernel.set_cur(0, Some(zombie.clone()));
+    kernel
+        .exit_thread_group(0, &zombie, ExitReason::Code(7))
+        .expect("single-thread child group exit should commit");
     assert!(zombie.process.is_zombie());
+    kernel.set_cur(0, Some(init.clone()));
 
     init.process.ev.lock().unwrap().clear(EvFlag::CHILD_QUIT);
     init.process.sig_queue.lock().unwrap().clear();
@@ -1148,7 +1164,12 @@ fn reparented_zombie_notifies_init(pool: &FramePool) {
         }),
     );
 
-    kernel.exit_thread_group(0, &exiting_parent, ExitReason::Code(8));
+    exiting_parent.set_sched_state(TaskRunState::Running);
+    kernel.set_cur(0, Some(exiting_parent.clone()));
+    kernel
+        .exit_thread_group(0, &exiting_parent, ExitReason::Code(8))
+        .expect("single-thread parent group exit should commit");
+    kernel.set_cur(0, Some(init.clone()));
 
     let adopted_parent = zombie
         .process
@@ -1183,11 +1204,7 @@ fn reap_zombie_process_removes_thread_group_once(pool: &FramePool) {
 
     let child_pid = child.process.pid();
     let child_process = Arc::downgrade(&child.process);
-    assert!(child
-        .process
-        .begin_group_exit(ExitReason::Code(7))
-        .is_some());
-    child.process.finish_process_exit();
+    finish_process_for_test(&table, &child, ExitReason::Code(7));
     assert_eq!(
         table
             .zombie_processes()
@@ -1216,8 +1233,9 @@ fn exiting_phase_blocks_clone_wait_and_reap(pool: &FramePool) {
     let pid = task.process.pid();
 
     assert_eq!(
-        task.process.begin_group_exit(ExitReason::Code(3)),
-        Some(vec![task.id()])
+        task.process
+            .begin_group_exit(task.id(), ExitReason::Code(3)),
+        Ok(GroupExitStart::Started(vec![task.id()]))
     );
     assert!(task.process.is_terminating());
     assert!(!task.process.is_zombie());
@@ -1228,6 +1246,12 @@ fn exiting_phase_blocks_clone_wait_and_reap(pool: &FramePool) {
         Some("eexist")
     );
 
+    assert_eq!(
+        task.process.acknowledge_thread_exit(task.id()),
+        Ok(ThreadExitDecision::Last)
+    );
+    task.mark_thread_exited();
+    assert!(table.remove_exited_thread(task.id(), &task.process));
     task.process.finish_process_exit();
     assert!(!task.process.is_terminating());
     assert!(task.process.is_zombie());
@@ -1280,6 +1304,47 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
             pool,
         )
         .expect("shared child page should map");
+    leader
+        .process
+        .addr_space
+        .lock()
+        .unwrap()
+        .write_user_bytes(mapped_addr, &0xfeed_beefu32.to_ne_bytes(), pool)
+        .expect("clear_child_tid test word should initialize");
+    assert_eq!(thread.set_clear_child_tid(mapped_addr), thread.id());
+    let robust_head = mapped_addr + 0x100;
+    let robust_node = mapped_addr + 0x200;
+    let robust_futex = robust_node + mem::size_of::<usize>();
+    let mut robust_head_bytes = [0u8; ROBUST_LIST_HEAD_SIZE];
+    robust_head_bytes[0..8].copy_from_slice(&robust_node.to_ne_bytes());
+    robust_head_bytes[8..16].copy_from_slice(&(mem::size_of::<usize>() as isize).to_ne_bytes());
+    robust_head_bytes[16..24].copy_from_slice(&0usize.to_ne_bytes());
+    {
+        let mut addr_space = leader.process.addr_space.lock().unwrap();
+        addr_space
+            .write_user_bytes(robust_head, &robust_head_bytes, pool)
+            .expect("robust-list head should initialize");
+        addr_space
+            .write_user_bytes(robust_node, &robust_head.to_ne_bytes(), pool)
+            .expect("robust-list node should link to its head sentinel");
+        addr_space
+            .write_user_bytes(
+                robust_futex,
+                &(0x8000_0000u32 | thread.id() as u32).to_ne_bytes(),
+                pool,
+            )
+            .expect("robust futex owner word should initialize");
+    }
+    thread.set_robust_list_head(robust_head);
+    let owned_timer = global_timer_wheel().lock().register_timer(
+        CLK.load(Ordering::Relaxed).saturating_add(100),
+        0,
+        TimerTarget::SignalTask {
+            task_id: thread.id(),
+            signo: SIGUSR1 as i32,
+            sender_tid: -1,
+        },
+    );
     let fd = leader
         .add_file(FLike::File(FHandle::new(standalone_regular_file())))
         .expect("shared child fd should install");
@@ -1306,6 +1371,8 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
 
     leader.set_sched_state(TaskRunState::Runnable);
     kernel.run_queue.enqueue(&leader);
+    thread.set_sched_state(TaskRunState::Running);
+    kernel.set_cur(0, Some(thread.clone()));
     assert_eq!(
         kernel.exit_current_thread(0, &thread, ExitReason::Code(5)),
         Ok(())
@@ -1318,7 +1385,7 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     assert!(kernel.tasks.find_task(thread.id()).is_none());
     assert!(kernel.tasks.find_task(leader.id()).is_some());
     assert!(kernel.tasks.find_process(child_pid).is_some());
-    assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(parent.id()));
+    kernel.set_cur(0, Some(parent.clone()));
     assert!(leader.get_fd_entry(fd).is_some());
     assert!(kernel.record_locks.process_has_locks(child_pid));
     assert_eq!(
@@ -1327,6 +1394,25 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
     );
     assert_eq!(leader.process.ev.lock().unwrap().cb_len(), 1);
     assert_eq!(leader.sig_frames.lock().unwrap().len(), 1);
+    let mut cleared_tid = [0xffu8; 4];
+    leader
+        .process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(mapped_addr, &mut cleared_tid)
+        .expect("surviving process should retain clear_child_tid page");
+    assert_eq!(u32::from_ne_bytes(cleared_tid), 0);
+    let mut robust_owner = [0u8; 4];
+    leader
+        .process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(robust_futex, &mut robust_owner)
+        .expect("surviving process should retain robust futex page");
+    assert_eq!(u32::from_ne_bytes(robust_owner), 0xc000_0000);
+    assert!(!global_timer_wheel().lock().cancel(owned_timer));
     assert!(leader
         .process
         .addr_space
@@ -1341,6 +1427,8 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
         Ok((0, 0))
     );
 
+    leader.set_sched_state(TaskRunState::Running);
+    kernel.set_cur(0, Some(leader.clone()));
     assert_eq!(
         kernel.exit_current_thread(0, &leader, ExitReason::Code(9)),
         Ok(())
@@ -1373,6 +1461,7 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
         .unwrap()
         .iter()
         .any(|(signo, sender)| *signo == SIGCHLD as i32 && *sender == child_pid as isize));
+    kernel.set_cur(0, Some(parent.clone()));
     assert_eq!(
         kernel.do_wait(parent.id(), child_pid as isize, 1),
         Ok((child_pid, 9 << 8))
@@ -1394,6 +1483,8 @@ fn leader_exit_keeps_remaining_thread_and_process(pool: &FramePool) {
         .expect("thread clone should succeed");
     thread.set_sched_state(TaskRunState::Runnable);
     kernel.run_queue.enqueue(&thread);
+    leader.set_sched_state(TaskRunState::Running);
+    kernel.set_cur(0, Some(leader.clone()));
 
     assert_eq!(
         kernel.exit_current_thread(0, &leader, ExitReason::Code(4)),
@@ -1407,11 +1498,11 @@ fn leader_exit_keeps_remaining_thread_and_process(pool: &FramePool) {
     assert!(kernel.tasks.find_task(leader.id()).is_none());
     assert!(kernel.tasks.find_task(thread.id()).is_some());
     assert!(kernel.tasks.find_process(leader.process.pid()).is_some());
-    assert!(kernel.cur_task(0).is_none());
+    kernel.set_cur(0, None);
 }
 
-// AGENT: ensure exit_group marks and detaches every runnable sibling while
-// retaining their zombie task records for the later process-level reap.
+// AGENT: ensure exit_group retires only its caller, preserves the first reason,
+// keeps wait4 blind during Exiting, and commits after every sibling confirms.
 fn exit_group_terminates_every_thread(pool: &FramePool) {
     let kernel = Kernel::new(pool.clone());
     kernel.proc_init();
@@ -1428,21 +1519,73 @@ fn exit_group_terminates_every_thread(pool: &FramePool) {
         .tasks
         .clone_thread(&leader, 0x8100_0000, 0)
         .expect("second thread should clone");
+    assert!(init.process.set_signal_action(
+        SIGCHLD,
+        SigAction {
+            handler: 0x5000,
+            mask: 0,
+        },
+    ));
     for thread in [&first, &second] {
         thread.set_sched_state(TaskRunState::Runnable);
         kernel.run_queue.enqueue(thread);
     }
-    kernel.exit_thread_group(0, &leader, ExitReason::Code(11));
+    leader.process.set_job_stopped(true);
+    kernel.run_queue.remove(first.id());
+    kernel.run_queue.remove(second.id());
+    leader.set_sched_state(TaskRunState::Running);
+    kernel.set_cur(0, Some(leader.clone()));
+    kernel
+        .exit_thread_group(0, &leader, ExitReason::Code(11))
+        .expect("group leader should begin cooperative exit");
 
     assert!(leader.done());
-    assert!(first.done());
-    assert!(second.done());
+    assert!(!first.done());
+    assert!(!second.done());
+    assert!(leader.process.is_terminating());
+    assert!(!leader.process.is_job_stopped());
+    assert_eq!(leader.process.thread_count(), 2);
+    assert_eq!(kernel.tasks.task_count(), 3);
+    assert_eq!(
+        kernel.do_wait(init.id(), leader.process.pid() as isize, 1),
+        Ok((0, 0))
+    );
+    assert_eq!(
+        leader
+            .process
+            .begin_group_exit(first.id(), ExitReason::Code(99)),
+        Ok(GroupExitStart::InProgress)
+    );
+
+    first.set_sched_state(TaskRunState::Running);
+    kernel.set_cur(0, Some(first.clone()));
+    assert_eq!(kernel.retire_current_group_member(0, &first), Ok(()));
+    assert!(leader.process.is_terminating());
+    assert_eq!(
+        kernel.do_wait(init.id(), leader.process.pid() as isize, 1),
+        Ok((0, 0))
+    );
+
+    second.set_sched_state(TaskRunState::Running);
+    kernel.set_cur(0, Some(second.clone()));
+    assert_eq!(kernel.retire_current_group_member(0, &second), Ok(()));
     assert!(leader.process.is_zombie());
     assert_eq!(leader.process.zombie_wait_status(), Some(11 << 8));
-    assert_eq!(leader.process.thread_count(), 3);
-    assert_eq!(kernel.tasks.task_count(), 4);
-    assert!(kernel.run_queue.pick_next().is_none());
-    assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(init.id()));
+    assert_eq!(leader.process.thread_count(), 0);
+    assert_eq!(kernel.tasks.task_count(), 1);
+    assert_eq!(
+        init.process
+            .sig_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(signo, sender)| {
+                *signo == SIGCHLD as i32 && *sender == leader.process.pid() as isize
+            })
+            .count(),
+        1
+    );
+    kernel.set_cur(0, Some(init));
 }
 
 // AGENT: default-fatal signal delivery must use group exit so every sibling is
@@ -1469,28 +1612,45 @@ fn fatal_signal_terminates_every_thread(pool: &FramePool) {
         pending.action.resolve(pending.signo),
         SignalDeliveryAction::Terminate
     );
-    kernel.exit_thread_group(0, &leader, ExitReason::Signal(pending.signo as u8));
+    leader.set_sched_state(TaskRunState::Running);
+    kernel.set_cur(0, Some(leader.clone()));
+    kernel
+        .exit_thread_group(0, &leader, ExitReason::Signal(pending.signo as u8))
+        .expect("fatal signal should begin group exit");
 
     assert!(leader.done());
-    assert!(thread.done());
+    assert!(!thread.done());
+    assert!(leader.process.is_terminating());
+    thread.set_sched_state(TaskRunState::Running);
+    kernel.set_cur(0, Some(thread.clone()));
+    assert_eq!(kernel.retire_current_group_member(0, &thread), Ok(()));
     assert!(leader.process.is_zombie());
     assert_eq!(leader.process.zombie_wait_status(), Some(SIGUSR1 as usize));
     assert!(kernel.run_queue.pick_next().is_none());
-    assert_eq!(kernel.cur_task(0).map(|task| task.id()), Some(init.id()));
+    kernel.set_cur(0, Some(init));
 }
 
 // AGENT: pin Linux/RISC-V exit 93 and exit_group 94 to separate x86_64-style
 // internal syscall ids so dispatch cannot collapse their lifecycle semantics.
 fn riscv_exit_numbers_map_to_distinct_internal_calls() {
     use crate::syscall_abi::{
-        map_riscv_nr, INTERNAL_SYS_EXIT, INTERNAL_SYS_EXIT_GROUP, RISCV_SYS_EXIT,
-        RISCV_SYS_EXIT_GROUP,
+        map_riscv_nr, INTERNAL_SYS_EXIT, INTERNAL_SYS_EXIT_GROUP, INTERNAL_SYS_SET_ROBUST_LIST,
+        INTERNAL_SYS_SET_TID_ADDRESS, RISCV_SYS_EXIT, RISCV_SYS_EXIT_GROUP,
+        RISCV_SYS_SET_ROBUST_LIST, RISCV_SYS_SET_TID_ADDRESS,
     };
 
     assert_eq!(map_riscv_nr(RISCV_SYS_EXIT), Some(INTERNAL_SYS_EXIT));
     assert_eq!(
         map_riscv_nr(RISCV_SYS_EXIT_GROUP),
         Some(INTERNAL_SYS_EXIT_GROUP)
+    );
+    assert_eq!(
+        map_riscv_nr(RISCV_SYS_SET_TID_ADDRESS),
+        Some(INTERNAL_SYS_SET_TID_ADDRESS)
+    );
+    assert_eq!(
+        map_riscv_nr(RISCV_SYS_SET_ROBUST_LIST),
+        Some(INTERNAL_SYS_SET_ROBUST_LIST)
     );
     assert_ne!(INTERNAL_SYS_EXIT, INTERNAL_SYS_EXIT_GROUP);
 }

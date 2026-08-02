@@ -12,6 +12,43 @@
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
 
+## 2026-07-30：kernel-qemu 两阶段协作式线程组退出
+
+目标：把 `exit_group` 从“调用者直接回收全部 sibling Task/内核栈”改为两阶段协作退出；每个线程必须恢复自己的内核栈并清理活动等待，最后一个确认者才释放进程资源、发布 Zombie 和发送 SIGCHLD。
+
+已完成修改：
+
+- `ProcessLifecycle` 新增首次 group-exit 与逐线程确认结果，第一次 `ExitReason` 固定；普通非最后 `exit` 保持 Running，`Exiting` 对 wait4 不可见，线程集合清空后才允许 Zombie。
+- `Task::sched` 在同一把锁下记录 `TaskRunState` 与 `active_wait`；`WaitToken` 新增 `GroupExit`，退出请求只取消具体等待并唤醒 sibling，不替 sibling 释放栈。
+- pipe、epoll、futex、record-lock、wait4 和通用 condition wait 在收到 GroupExit 后先删除 waiter/subscription/dependency；带 deadline 的统一 wait 路径同时取消 timer。
+- `exit_thread_group()` 只退休调用者并压过 job-control stop；`rust_user_trap()` 返回用户态前和 `task_bootstrap()` 首次进入 U-mode 前增加统一终止安全点。
+- 每个已确认 Task 立即从 task table/run queue 删除并归还 `N_PROC` 配额；scheduler 回到 idle 栈后才释放当前内核栈。Zombie reap 只再删除 Process、父子关系和 job-control 元数据。
+- 最后确认线程依次释放 record locks、进程资源和地址空间，重定向子进程，发布一次 Zombie/SIGCHLD；接入 RV64 `set_tid_address(96)` 与 `set_robust_list(99)`，在线程确认前执行 `clear_child_tid` 写零/futex wake、robust futex owner-death/wake，并取消所有指向该 Task 的 wait/wake/signal timer target。
+- 迁移设计文档同步固定上述协议。`CLONE_CHILD_CLEARTID`、`CLONE_CHILD_SETTID` 等 flags 仍随当前明确拒绝的完整线程 clone ABI 保留为后续工作。
+
+关键测试：
+
+- 新增真实 task-stack 协作退出回归：同一线程组分别阻塞于 pipe read、futex、epoll、record lock 和带 timeout 的 WaitToken；group exit 后逐个恢复清理，所有等待注册和 timer 最终归零。
+- 验证最后确认前进程保持 Exiting、wait4/WNOHANG 返回 0、job-control stop 被覆盖、第一次 reason 保留、最终只产生一次 SIGCHLD、Task 配额立即回收。
+- 进程资源释放后，外部 pipe writer/reader 分别观察 Broken/EPIPE 语义和 EOF。
+- 真实 U-mode trap selftest 改为执行 RV64 `SYS_EXIT_GROUP(94)` 并完成 task → idle 往返；另验证 `clear_child_tid` 写零、robust futex OWNER_DIED 转换和 Task timer 删除。
+
+验收结果：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo check --target riscv64gc-unknown-none-elf
+cargo build --release --features qemu-selftest
+
+cd ..
+KERNEL_QEMU_SKIP_BUILD=1 bash tools/qemu-smoke.sh
+bash tools/qemu-smoke.sh
+git diff --check -- kernel-qemu docs/kernel-sim-qemu-migration-design.md docs/ai-record.md
+```
+
+上述检查全部通过。带 4 MiB VirtIO raw disk 的 `qemu-selftest` 镜像输出 sync、sched、proc、fs、checkpoint 和 U-mode selftest 全部 passed，并最终输出 `[init] execve round-trip passed`、`[kernel-qemu] init process exited`；普通 smoke 同样通过。本轮未修改或运行 `kernel-sim`，未修改禁止路径 `kernel/src/kernel.rs`。
+
 ## 2026-07-30：kernel-qemu 真实 RV64 `execve` 第二阶段
 
 目标：在第一阶段真实 exec 闭环上完成原始字节参数复制、统一大小限制和失败回滚验证；本阶段继续排除 cwd、动态链接和完整多线程 exec。

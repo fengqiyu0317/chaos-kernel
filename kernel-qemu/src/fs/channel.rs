@@ -20,7 +20,7 @@ impl Channel {
     }
     // AGENT: wait_until() checks buffer/shutdown state and registers the waiter
     // under the same buffer lock, then sleeps after that lock is released.
-    pub fn recv(&self, task_id: usize) -> Option<u8> {
+    pub fn recv(&self, task_id: usize) -> Result<Option<u8>, &'static str> {
         self.wq.wait_until(task_id, &self.buf, |ring| {
             if let Some(v) = ring.pop() {
                 Some(Some(v))

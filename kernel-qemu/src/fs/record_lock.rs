@@ -242,8 +242,10 @@ impl RecordLockTable {
             let outcome = token.wait_interruptible(None);
             self.waiters.remove_waiter(&token);
             self.state.lock().unwrap().waiting.remove(&owner_pid);
-            if outcome == WaitOutcome::Signal {
-                return Err("eintr");
+            match outcome {
+                WaitOutcome::Signal => return Err("eintr"),
+                WaitOutcome::GroupExit => return Err("group_exit"),
+                WaitOutcome::Event | WaitOutcome::Timeout => {}
             }
         }
     }
@@ -303,6 +305,13 @@ impl RecordLockTable {
             .locks
             .values()
             .any(|locks| locks.iter().any(|lock| lock.owner_pid == owner_pid))
+    }
+
+    // AGENT: expose one process's wait-edge presence only to focused QEMU
+    // cleanup tests; production callers continue through set/release APIs.
+    #[cfg(any(test, feature = "qemu-sync-selftest"))]
+    pub(crate) fn process_is_waiting(&self, owner_pid: usize) -> bool {
+        self.state.lock().unwrap().waiting.contains_key(&owner_pid)
     }
 }
 

@@ -106,6 +106,9 @@ pub extern "C" fn task_bootstrap() -> ! {
         println!("[kernel-qemu] task bootstrap has no CPU0 task");
         sbi::shutdown();
     };
+    // AGENT: a never-run sibling selected after exit_group must acknowledge on
+    // its own stack instead of entering U-mode for the first time.
+    trap::retire_current_if_group_exiting(kernel, &task);
     unsafe { trap::enter_task_user_mode(&task) }
 }
 

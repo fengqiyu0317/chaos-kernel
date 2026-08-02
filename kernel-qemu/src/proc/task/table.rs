@@ -408,8 +408,8 @@ impl TaskTable {
         removed
     }
 
-    // AGENT: reap only a zombie whose exit path already detached every child,
-    // then remove it from family, group, process, and thread indexes.
+    // AGENT: reap only a zombie whose exit path already detached every child
+    // and Task, then remove its family, group, and process metadata.
     // AGENT TODO: reject the designated init process explicitly; its process-level
     // exit must shut down the machine rather than become an ordinary reapable zombie.
     // AGENT TODO: before enabling SMP or concurrent wait4 callers, make zombie
@@ -426,21 +426,6 @@ impl TaskTable {
         }
         process.set_parent(None);
         self.job_control.lock().unwrap().remove_process(pid);
-
-        let thread_ids = process.take_threads();
-        let mut tasks = self.tasks.write().unwrap();
-        let mut removed_tasks = 0;
-        for tid in thread_ids {
-            if tasks
-                .get(&tid)
-                .is_some_and(|thread| Arc::ptr_eq(&thread.process, &process))
-            {
-                tasks.remove(&tid);
-                removed_tasks += 1;
-            }
-        }
-        drop(tasks);
-        self.release_task_slots(removed_tasks);
 
         let mut processes = self.processes.write().unwrap();
         if processes

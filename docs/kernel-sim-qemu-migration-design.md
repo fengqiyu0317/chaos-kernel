@@ -282,7 +282,7 @@ QEMU 侧的上下文所有权按下列边界固定，不再保留从 simulator
 复制而来的 16 槽寄存器镜像：
 
 - 每个 task 的完整用户态 `TrapFrame` 固定位于 `kernel_stack_top - size_of::<TrapFrame>()`，由 `trap.S` 原地保存和恢复，并作为用户寄存器的唯一事实来源。
-- 第一阶段的 signal-frame stack 直接由 `Task::sig_frames` 持有，信号屏蔽字只由 `Task::sig_mask` 持有，不再为单一字段保留 `ThdCtx` 包装。单线程退出核心路径已经接入；尚未接入 syscall 的 `clear_child_tid` 不提前保留，待 `clone` / `set_tid_address` ABI 接入后在线程资源和地址空间释放前补写零与 futex wake。
+- 第一阶段的 signal-frame stack 直接由 `Task::sig_frames` 持有，信号屏蔽字只由 `Task::sig_mask` 持有，不再为单一字段保留 `ThdCtx` 包装。`set_tid_address`、`set_robust_list`、线程退出时的 `clear_child_tid` 写零/futex wake、robust futex owner-death/wake 和 Task timer 取消已接入，并在线程确认和地址空间释放前执行；`CLONE_CHILD_CLEARTID`、`CLONE_CHILD_SETTID` 等 clone flags 仍需随完整线程 clone ABI 单独迁移。
 - `fork` / `clone` 从调用者的完整 live `TrapFrame` 派生子任务现场；`exec` / `sigreturn` 通过 syscall outcome 由持有 live frame 的 trap 边界原子替换现场，避免从 `Task` 再创建第二个可变引用。
 - checkpoint 中的 `SavedTrapFrame` 只是序列化 DTO，restore 时转成运行时 `TrapFrame` 并直接安装到新 task 的内核栈顶。
 - task 切换使用仅保存内核态 `ra` / `sp` / `s0..s11` 的 `KernelContext` 和 `__switch`；不将内核切换现场混入用户 `TrapFrame`。
@@ -298,10 +298,13 @@ QEMU 侧的上下文所有权按下列边界固定，不再保留从 simulator
 - `exec`、`sigreturn` 或重新调度后必须在每次用户返回边界刷新 user satp、kernel satp、内核 TrapFrame 指针和 trampoline 地址，不能复用旧地址空间的运行时元数据。
 - 固定单个 `TRAP_CONTEXT` 别名依赖“只有 CPU0 执行真实用户任务”的现阶段约束；引入多 hart 前必须改为 per-hart trap context 槽位或其他不会并发重绑定同一用户根的协议。
 - CPU0 scheduler 在 boot stack 上关中断选取 runnable task，先发布 `Running` 和 `current`，再从 `idle_context` 切换到 task context；task 阻塞、时间片用尽或退出时先发布状态，然后切回 idle context。无 runnable task 时必须清空 `current`，打开中断并在 idle stack 上执行 `wfi`。运行路径不保留“scheduler 尚未初始化时只修改 `current` / run queue”的兼容分支；任何需要换出当前 task 的操作都必须发生在已初始化的 idle-context 调度器中，否则属于内核生命周期错误。
-- 正在运行的退出 task 只先标记 zombie 并保留内核栈；只有 `__switch` 已经回到 idle stack 后，scheduler 才能释放该栈。
-- `Task::done()` 只读取线程局部的 `TaskRunState::Zombie`。`Process` 用同一生命周期锁维护 `ProcessPhase::{Running, Exiting, Zombie}` 和线程 TID 集合，使最后线程判断与禁止退出期 clone 成为一个原子状态转换。
-- RISC-V `exit(93)` 进入单线程退出；`exit_group(94)` 和默认终止信号进入线程组退出。非最后线程不得释放 fd、地址空间或 futex waiters，也不得重定向子进程、发布 `CHILD_QUIT` 或发送 `SIGCHLD`。
-- `wait4` / reap 只能观察 `ProcessPhase::Zombie`；`Exiting` 表示资源清理尚未完成，不能提前暴露给父进程。
+- 线程退出采用两阶段协作协议。普通 `exit(93)` 在仍有兄弟线程时只从进程成员集合确认并移除调用者，进程保持 `Running`；最后一个普通退出线程或第一次 `exit_group(94)` / 默认终止信号把阶段原子地改为 `Exiting(reason)`。第一次 group-exit reason 固定后不得被后续请求覆盖。
+- `Exiting` 阶段保留尚未确认退出的 TID。每个线程必须恢复到自己的内核调用栈，清理所在 pipe/epoll/futex/record-lock 等等待注册和 timer，再从统一的 trap/user-return 安全点确认退出。尚未第一次进入 U-mode 的线程在 `task_bootstrap()` 执行同一检查。退出请求只取消兄弟线程的活动等待、压过 job-control stop 并使它可调度，不得替兄弟线程释放内核栈或直接发布其线程退出状态。
+- `Task` 的调度状态与当前活动 `WaitToken` 由同一把锁保护。`WaitToken` 明确区分 `Event`、`Timeout`、`Signal` 和 `GroupExit`；group-exit 取消只决定等待结果并唤醒 owner，具体 wait queue、timer 和栈上临时所有权的清理由被唤醒线程完成。
+- 每个确认退出的 Task 立即从 task table 和 run queue 删除并归还一个 `N_PROC` 配额，但当前内核栈必须保留到 `__switch` 已回到 idle stack，再由 scheduler 持有的 `Arc<Task>` 安全释放。不得遍历其他线程调用 `release_kernel_stack()`。
+- 最后一个确认线程是唯一的进程级提交者：依次释放 record locks、fd/信号/地址空间等进程资源，重定向子进程，发布 `Zombie(reason)`，再发送一次 `SIGCHLD`。每个线程在确认和地址空间释放前完成 `clear_child_tid` 写零与对应 futex wake、robust futex owner-death 清理，并取消 WaitToken、wake 和 signal 等 Task-owned timer target。
+- `Task::done()` 只读取线程局部的 `TaskRunState::Zombie`。`Process` 用同一生命周期锁维护 `ProcessPhase::{Running, Exiting, Zombie}` 和尚未确认的线程 TID 集合，使最后确认、禁止退出期 clone 和 Zombie 发布前置条件成为原子状态转换。
+- `wait4` / reap 只能观察 `ProcessPhase::Zombie`；只要仍有一个线程未确认，进程就保持 `Exiting`，资源仍存在且父进程不可见。Zombie 不再保留 Task，reap 只删除 Process、父子关系和 job-control 项。
 
 #### Signal 第二阶段待办：把现场迁移到用户栈
 

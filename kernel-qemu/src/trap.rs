@@ -185,6 +185,7 @@ pub extern "C" fn rust_user_trap(frame: &mut TrapFrame) {
         println!("[kernel-qemu] user trap return has no CPU0 task");
         sbi::shutdown();
     };
+    retire_current_if_group_exiting(kernel, &task);
     if let Err(err) = prepare_user_return(&task, frame) {
         println!(
             "[kernel-qemu] cannot prepare task {} user return: {}",
@@ -193,6 +194,27 @@ pub extern "C" fn rust_user_trap(frame: &mut TrapFrame) {
         );
         sbi::shutdown();
     }
+}
+
+// AGENT: make every completed user trap a cooperative group-exit safe point;
+// retiring here happens only after the interrupted kernel stack has unwound.
+pub(crate) fn retire_current_if_group_exiting(
+    kernel: &crate::kernel::Kernel,
+    task: &alloc::sync::Arc<crate::kernel::Task>,
+) {
+    if !task.process.is_terminating() {
+        return;
+    }
+    if let Err(err) = kernel.retire_current_group_member(0, task) {
+        println!(
+            "[kernel-qemu] cannot retire terminating task {}: {}",
+            task.id(),
+            err
+        );
+        sbi::shutdown();
+    }
+    kernel.switch_current_to_idle(0);
+    unreachable!("a group-exited task was scheduled again");
 }
 
 // AGENT: Dispatch raw RISC-V trap causes to narrow handlers without defining syscall semantics.
@@ -550,9 +572,9 @@ pub mod tests {
     }
 
     // AGENT: execute real RISC-V user instructions under a process satp, return
-    // to U-mode after getpid, then prove SYS_EXIT reaches idle on kernel satp
-    // before the idle side releases the task's kernel stack.
-    pub fn user_satp_exit_round_trip(pool: &FramePool) {
+    // to U-mode after getpid, then prove SYS_EXIT_GROUP reaches idle on kernel
+    // satp before the idle side releases the task's kernel stack.
+    pub fn user_satp_exit_group_round_trip(pool: &FramePool) {
         let kernel_satp = csr::read_satp();
         let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
         let task = prepare_user_test_task(kernel);
@@ -561,7 +583,7 @@ pub mod tests {
             0x0ac0_0893u32, // addi a7, zero, 172 (getpid)
             0x0000_0073u32, // ecall and return to the following user PC
             0x0000_0513u32, // addi a0, zero, 0
-            0x05d0_0893u32, // addi a7, zero, 93 (exit)
+            0x05e0_0893u32, // addi a7, zero, 94 (exit_group)
             0x0000_0073u32, // ecall
             0x0000_006fu32, // jal zero, 0 (must never be reached)
         ];

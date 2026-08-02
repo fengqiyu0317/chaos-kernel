@@ -34,6 +34,8 @@ pub const RISCV_SYS_EXECVE: usize = 221;
 pub const RISCV_SYS_WAIT4: usize = 260;
 pub const RISCV_SYS_EXIT: usize = 93;
 pub const RISCV_SYS_EXIT_GROUP: usize = 94;
+pub const RISCV_SYS_SET_TID_ADDRESS: usize = 96;
+pub const RISCV_SYS_SET_ROBUST_LIST: usize = 99;
 pub const RISCV_SYS_GETPID: usize = 172;
 
 pub const INTERNAL_SYS_READ: usize = 0;
@@ -55,6 +57,8 @@ pub const INTERNAL_SYS_EXIT: usize = 60;
 pub const INTERNAL_SYS_EXIT_GROUP: usize = 231;
 pub const INTERNAL_SYS_WAIT4: usize = 61;
 pub const INTERNAL_SYS_GETPID: usize = 39;
+pub const INTERNAL_SYS_SET_TID_ADDRESS: usize = 218;
+pub const INTERNAL_SYS_SET_ROBUST_LIST: usize = 273;
 pub const INTERNAL_SYS_KILL: usize = 62;
 pub const INTERNAL_SYS_MKDIRAT: usize = 258;
 pub const INTERNAL_SYS_MOUNT: usize = 165;
@@ -101,6 +105,8 @@ pub fn map_riscv_nr(nr: usize) -> Option<usize> {
         RISCV_SYS_WAIT4 => Some(INTERNAL_SYS_WAIT4),
         RISCV_SYS_EXIT => Some(INTERNAL_SYS_EXIT),
         RISCV_SYS_EXIT_GROUP => Some(INTERNAL_SYS_EXIT_GROUP),
+        RISCV_SYS_SET_TID_ADDRESS => Some(INTERNAL_SYS_SET_TID_ADDRESS),
+        RISCV_SYS_SET_ROBUST_LIST => Some(INTERNAL_SYS_SET_ROBUST_LIST),
         RISCV_SYS_GETPID => Some(INTERNAL_SYS_GETPID),
         _ => None,
     }

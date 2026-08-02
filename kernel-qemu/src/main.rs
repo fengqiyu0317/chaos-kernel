@@ -154,7 +154,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     #[cfg(feature = "qemu-sched-selftest")]
     {
         println!("[kernel-qemu] user satp selftest start");
-        trap::tests::user_satp_exit_round_trip(frame_pool.as_ref());
+        trap::tests::user_satp_exit_group_round_trip(frame_pool.as_ref());
         println!("[kernel-qemu] user signal round-trip selftest start");
         trap::tests::user_signal_round_trip(frame_pool.as_ref());
         println!("[kernel-qemu] user signal round-trip selftest passed");

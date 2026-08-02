@@ -35,10 +35,11 @@ pub enum TaskRunState {
     Zombie,
 }
 
-// AGENT: group the mutable per-task scheduler placement, policy, and remaining
-// slice alongside the policy and run queue that consume this state.
+// AGENT: group scheduler placement and the exact wait currently responsible
+// for Sleeping under one lock so group exit can cancel without guessing.
 pub struct SchedEntity {
     pub state: TaskRunState,
+    pub active_wait: Option<WaitToken>,
     pub policy: SchedulePolicy,
     pub slice_left: usize,
 }
@@ -51,6 +52,7 @@ impl SchedEntity {
         let slice_left = policy.time_slice();
         Self {
             state: TaskRunState::Runnable,
+            active_wait: None,
             policy,
             slice_left,
         }

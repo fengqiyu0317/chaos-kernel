@@ -17,12 +17,14 @@ pub enum WaitOutcome {
     Event,
     Timeout,
     Signal,
+    GroupExit,
 }
 
 const WAIT_PENDING: u8 = 0;
 const WAIT_EVENT: u8 = 1;
 const WAIT_TIMEOUT: u8 = 2;
 const WAIT_SIGNAL: u8 = 3;
+const WAIT_GROUP_EXIT: u8 = 4;
 
 // AGENT: clones share one wait identity through the Arc-backed state; distinct
 // waits are distinguished with Arc::ptr_eq rather than a redundant numeric id.
@@ -108,6 +110,27 @@ impl WaitToken {
             .compare_exchange(
                 WAIT_PENDING,
                 WAIT_SIGNAL,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.wake_waiter_task();
+            true
+        } else {
+            false
+        }
+    }
+
+    // AGENT: let exit_group win only a still-pending wait and wake its owning
+    // task; the resumed kernel stack remains responsible for queue/timer cleanup.
+    pub fn cancel_for_group_exit(&self) -> bool {
+        if self
+            .state
+            .outcome
+            .compare_exchange(
+                WAIT_PENDING,
+                WAIT_GROUP_EXIT,
                 Ordering::Release,
                 Ordering::Relaxed,
             )
@@ -217,6 +240,7 @@ impl WaitToken {
         match self.state.outcome.load(Ordering::Acquire) {
             WAIT_TIMEOUT => WaitOutcome::Timeout,
             WAIT_SIGNAL => WaitOutcome::Signal,
+            WAIT_GROUP_EXIT => WaitOutcome::GroupExit,
             _ => WaitOutcome::Event,
         }
     }
@@ -333,7 +357,12 @@ impl ConditionWait {
 
     // AGENT: require the scheduler-aware caller to identify the task that may
     // be parked instead of resolving current task state inside the wait helper.
-    pub fn park_on<T>(&self, task_id: usize, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
+    pub fn park_on<T>(
+        &self,
+        task_id: usize,
+        g: &Mutex<T>,
+        pred: impl Fn(&T) -> bool,
+    ) -> Result<bool, &'static str> {
         self.wait_until(task_id, g, |d| if pred(d) { Some(true) } else { None })
     }
 
@@ -343,7 +372,7 @@ impl ConditionWait {
         task_id: usize,
         g: &Mutex<T>,
         mut cond: impl FnMut(&T) -> Option<bool>,
-    ) -> bool {
+    ) -> Result<bool, &'static str> {
         self.wait_until(task_id, g, |d| cond(d))
     }
 
@@ -354,16 +383,20 @@ impl ConditionWait {
         task_id: usize,
         g: &Mutex<T>,
         mut cond: impl FnMut(&mut T) -> Option<R>,
-    ) -> R {
+    ) -> Result<R, &'static str> {
         loop {
             let token = {
                 let mut d = g.lock().unwrap();
                 if let Some(r) = cond(&mut d) {
-                    return r;
+                    return Ok(r);
                 }
                 self.waiters.enqueue_task_locked(task_id)
             };
-            token.wait(None);
+            let outcome = token.wait(None);
+            self.waiters.remove_waiter(&token);
+            if outcome == WaitOutcome::GroupExit {
+                return Err("group_exit");
+            }
         }
     }
 

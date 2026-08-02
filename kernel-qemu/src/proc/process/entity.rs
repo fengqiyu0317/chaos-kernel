@@ -19,12 +19,20 @@ pub(super) struct ProcessLifecycle {
     pub(super) threads: BTreeSet<Tid>,
 }
 
-// AGENT: tell the kernel whether one SYS_EXIT retires only its caller or must
-// complete the shared process-exit path for the final thread.
+// AGENT: tell the kernel whether one acknowledged thread leaves live members
+// or is the final confirmer responsible for process-level exit commit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThreadExitDecision {
-    NonLast,
+    Remaining,
     Last,
+}
+
+// AGENT: distinguish the first caller that fixed a group-exit reason and must
+// notify every sibling from later members merely reaching their own safe point.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GroupExitStart {
+    Started(Vec<Tid>),
+    InProgress,
 }
 
 // AGENT: represent one process independently from any schedulable thread;
@@ -177,14 +185,6 @@ impl Process {
     // AGENT: expose thread count to checkpoint validation without leaking the set.
     pub fn thread_count(&self) -> usize {
         self.lifecycle.lock().unwrap().threads.len()
-    }
-
-    // AGENT: drain every retained thread id exactly once after Zombie has made
-    // the process reapable; non-last exited threads were removed immediately.
-    pub(in crate::kernel::proc) fn take_threads(&self) -> Vec<Tid> {
-        let mut lifecycle = self.lifecycle.lock().unwrap();
-        debug_assert!(matches!(lifecycle.phase, ProcessPhase::Zombie(_)));
-        mem::take(&mut lifecycle.threads).into_iter().collect()
     }
 
     // AGENT: expose process-wide job-control stop independently of Task state.

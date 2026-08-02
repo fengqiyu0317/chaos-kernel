@@ -412,8 +412,10 @@ impl PipeNode {
 
             let outcome = token.wait_interruptible(None);
             self.shared.read_waiters.remove_waiter(&token);
-            if outcome == WaitOutcome::Signal {
-                return Err("eintr");
+            match outcome {
+                WaitOutcome::Signal => return Err("eintr"),
+                WaitOutcome::GroupExit => return Err("group_exit"),
+                WaitOutcome::Event | WaitOutcome::Timeout => {}
             }
         }
     }
@@ -467,12 +469,16 @@ impl PipeNode {
 
             let outcome = token.wait_interruptible(None);
             self.shared.write_waiters.remove_waiter(&token);
-            if outcome == WaitOutcome::Signal {
-                return if written == 0 {
-                    Err("eintr")
-                } else {
-                    Ok(PipeWriteOutcome::Written(written))
-                };
+            match outcome {
+                WaitOutcome::Signal => {
+                    return if written == 0 {
+                        Err("eintr")
+                    } else {
+                        Ok(PipeWriteOutcome::Written(written))
+                    };
+                }
+                WaitOutcome::GroupExit => return Err("group_exit"),
+                WaitOutcome::Event | WaitOutcome::Timeout => {}
             }
         }
     }
@@ -524,8 +530,10 @@ impl PipeNode {
 
             let outcome = token.wait_interruptible(None);
             self.shared.write_waiters.remove_waiter(&token);
-            if outcome == WaitOutcome::Signal {
-                return Err("eintr");
+            match outcome {
+                WaitOutcome::Signal => return Err("eintr"),
+                WaitOutcome::GroupExit => return Err("group_exit"),
+                WaitOutcome::Event | WaitOutcome::Timeout => {}
             }
         }
     }
@@ -571,8 +579,10 @@ impl PipeNode {
 
             let outcome = token.wait_interruptible(None);
             self.shared.read_waiters.remove_waiter(&token);
-            if outcome == WaitOutcome::Signal {
-                return Err("eintr");
+            match outcome {
+                WaitOutcome::Signal => return Err("eintr"),
+                WaitOutcome::GroupExit => return Err("group_exit"),
+                WaitOutcome::Event | WaitOutcome::Timeout => {}
             }
         }
     }
@@ -677,15 +687,19 @@ impl PipeNode {
                 PipeSpliceAction::WaitInput(token) => {
                     let outcome = token.wait_interruptible(None);
                     self.shared.read_waiters.remove_waiter(&token);
-                    if outcome == WaitOutcome::Signal {
-                        return Err("eintr");
+                    match outcome {
+                        WaitOutcome::Signal => return Err("eintr"),
+                        WaitOutcome::GroupExit => return Err("group_exit"),
+                        WaitOutcome::Event | WaitOutcome::Timeout => {}
                     }
                 }
                 PipeSpliceAction::WaitOutput(token) => {
                     let outcome = token.wait_interruptible(None);
                     output.shared.write_waiters.remove_waiter(&token);
-                    if outcome == WaitOutcome::Signal {
-                        return Err("eintr");
+                    match outcome {
+                        WaitOutcome::Signal => return Err("eintr"),
+                        WaitOutcome::GroupExit => return Err("group_exit"),
+                        WaitOutcome::Event | WaitOutcome::Timeout => {}
                     }
                 }
             }
@@ -710,5 +724,12 @@ impl PipeNode {
     // AGENT: FIONREAD/TIOCINQ reports the bytes currently buffered for the pipe.
     pub fn readable_len(&self) -> usize {
         self.shared.state.lock().unwrap().readable_len()
+    }
+
+    // AGENT: expose queue cardinality only to focused scheduler selftests so
+    // cooperative group-exit cleanup can prove no canceled waiter remains.
+    #[cfg(any(test, feature = "qemu-sync-selftest"))]
+    pub(crate) fn pending_read_waiters(&self) -> usize {
+        self.shared.read_waiters.pending()
     }
 }

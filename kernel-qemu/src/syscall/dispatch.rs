@@ -47,6 +47,8 @@ impl Kernel {
             SYS_KILL => returning(sys_kill(self, a0, a1)),
             SYS_FCNTL => returning(sys_fcntl(self, a0, a1, a2)),
             SYS_GETPID => returning(sys_getpid(self)),
+            SYS_SET_TID_ADDRESS => returning(sys_set_tid_address(self, a0)),
+            SYS_SET_ROBUST_LIST => returning(sys_set_robust_list(self, a0, a1)),
             SYS_GETPPID => returning(sys_getppid(self)),
             SYS_SETPGID => returning(sys_setpgid(self, a0, a1)),
             SYS_GETPGID => returning(sys_getpgid(self, a0)),

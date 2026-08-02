@@ -4,9 +4,9 @@ use super::*;
 use crate::kernel::kernel_core::{init_timer_wheel, TIMER_WHEEL};
 use crate::kernel::{
     global_kernel, install_kernel, signal_bit, ExitReason, FramePool, Kernel, SigAction, SigSet,
-    SignalDeliveryAction, SignalEnqueueResult, TaskRunState, NSIG, PRIO_MIN, SIGCHLD, SIGCONT,
-    SIGKILL, SIGRTMIN, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGWINCH,
-    SIG_DFL, SIG_IGN, SYS_SIGRETURN, UNMASKABLE_SIGNAL_MASK, USER_SIGTRAMP,
+    SignalDeliveryAction, SignalEnqueueResult, Task, TaskRunState, WaitToken, NSIG, PRIO_MIN,
+    SIGCHLD, SIGCONT, SIGKILL, SIGRTMIN, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGUSR1,
+    SIGUSR2, SIGWINCH, SIG_DFL, SIG_IGN, SYS_SIGRETURN, UNMASKABLE_SIGNAL_MASK, USER_SIGTRAMP,
 };
 use crate::trap::TrapFrame;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +14,15 @@ use core::sync::atomic::{AtomicBool, Ordering};
 static PROCESSOR_EXIT_TEST_RAN: AtomicBool = AtomicBool::new(false);
 static PROCESSOR_STOP_TEST_ENTERED: AtomicBool = AtomicBool::new(false);
 static PROCESSOR_STOP_TEST_RESUMED: AtomicBool = AtomicBool::new(false);
+
+// AGENT: focused scheduler tests that need a synthetic sleeping task install
+// the same active token/state pair as production block_task_for_wait().
+fn install_test_wait(task: &Arc<Task>) -> WaitToken {
+    task.set_sched_state(TaskRunState::Running);
+    let token = WaitToken::for_task(task.id());
+    assert!(task.install_active_wait(token.clone()));
+    token
+}
 
 // AGENT: expose focused scheduler queue checks to the optional QEMU boot
 // selftest path and use its discovered RAM pool for real task kernel stacks.
@@ -316,7 +325,7 @@ fn ignored_signal_is_neither_queued_nor_woken(pool: &FramePool) {
 
     let kernel = Kernel::new(pool.clone());
     let task = kernel.tasks.spawn().expect("spawn worker");
-    task.set_sched_state(TaskRunState::Sleeping);
+    let _wait = install_test_wait(&task);
 
     kernel.send_signal_to_task(&task, SIGURG as i32, -1);
 
@@ -431,8 +440,8 @@ fn process_signal_wakes_an_unblocked_thread(pool: &FramePool) {
         .expect("clone signal receiver");
     let signal_mask = signal_bit(SIGUSR1).expect("SIGUSR1 has a mask bit");
     *leader.sig_mask.lock().unwrap() = signal_mask;
-    leader.set_sched_state(TaskRunState::Sleeping);
-    thread.set_sched_state(TaskRunState::Sleeping);
+    let _leader_wait = install_test_wait(&leader);
+    let _thread_wait = install_test_wait(&thread);
 
     kernel.send_signal_to_process(&leader.process, SIGUSR1 as i32, -1);
 
@@ -446,7 +455,7 @@ fn process_signal_wakes_an_unblocked_thread(pool: &FramePool) {
 
     kernel.run_queue.remove(thread.id());
     *thread.sig_mask.lock().unwrap() = signal_mask;
-    thread.set_sched_state(TaskRunState::Sleeping);
+    let _second_thread_wait = install_test_wait(&thread);
     kernel.send_signal_to_process(&leader.process, SIGUSR1 as i32, -1);
 
     assert_eq!(leader.sched_state(), TaskRunState::Sleeping);
@@ -637,7 +646,7 @@ fn sigcont_keeps_sleeping_task_asleep_until_wait_wakeup(pool: &FramePool) {
 
     let kernel = Kernel::new(pool.clone());
     let task = kernel.tasks.spawn().expect("spawn worker");
-    task.set_sched_state(TaskRunState::Sleeping);
+    let _wait = install_test_wait(&task);
     task.process.set_job_stopped(true);
 
     kernel.send_signal_to_task(&task, SIGCONT as i32, -1);

@@ -211,6 +211,25 @@ impl TimerWheel {
         false
     }
 
+    // AGENT: remove every wait, wake, or signal timer owned by one retiring
+    // Task; global Noop timers and other tasks' targets remain untouched.
+    pub fn cancel_task_targets(&mut self, task_id: usize) -> usize {
+        let mut canceled = 0;
+        for slot in self.slots.iter_mut() {
+            let before = slot.len();
+            slot.retain(|entry| match &entry.target {
+                TimerTarget::Noop => true,
+                TimerTarget::WakeToken { token } => token.task_id() != task_id,
+                TimerTarget::WakeTask { task_id: target }
+                | TimerTarget::SignalTask {
+                    task_id: target, ..
+                } => *target != task_id,
+            });
+            canceled += before - slot.len();
+        }
+        canceled
+    }
+
     // AGENT: snapshot only timers whose observable target belongs to the saved
     // single task; unrelated global timers remain owned by their live tasks.
     pub fn snapshot_checkpoint_timers(

@@ -9,8 +9,8 @@ use crate::kernel::kernel_core::{
 use crate::kernel::{
     clear_global_kernel_for_test, epoll_ready_events, install_kernel, signal_bit, EpCtlOp, EpData,
     EpEvent, EpInst, EpKey, FLike, FdEntry, FdWriteOutcome, FileIdentity, FramePool, Kernel,
-    LockKind, LockRange, PipeNode, PipeWriteOutcome, RecordLockRequest, TaskRunState, VmRegion,
-    CLK, PIPE_BUF, SIGUSR1,
+    LockKind, LockRange, PipeNode, PipeWriteOutcome, RecordLockRequest, SigAction, TaskRunState,
+    VmRegion, CLK, PIPE_BUF, SIGCHLD, SIGUSR1,
 };
 
 // AGENT: share one token/result slot with the real task-stack wait regressions;
@@ -28,6 +28,17 @@ static PIPE_ROUND_TRIP_PAIR: Mutex<Option<(PipeNode, PipeNode)>> = Mutex::new(No
 static PIPE_READ_ROUND_TRIP_RESULT: Mutex<Option<Result<usize, &'static str>>> = Mutex::new(None);
 static PIPE_WRITE_ROUND_TRIP_RESULT: Mutex<Option<Result<PipeWriteOutcome, &'static str>>> =
     Mutex::new(None);
+// AGENT: hold only the blocking reader across the task-stack group-exit test;
+// peer endpoints stay with the idle-side driver for post-exit EOF/EPIPE checks.
+static GROUP_EXIT_PIPE_READER: Mutex<Option<PipeNode>> = Mutex::new(None);
+static GROUP_EXIT_PIPE_RESULT: Mutex<Option<Result<usize, &'static str>>> = Mutex::new(None);
+static GROUP_EXIT_TIMER_RESULT: Mutex<Option<WaitOutcome>> = Mutex::new(None);
+static GROUP_EXIT_FUTEX_RESULT: Mutex<Option<Result<(), &'static str>>> = Mutex::new(None);
+static GROUP_EXIT_EPOLL: Mutex<Option<EpInst>> = Mutex::new(None);
+static GROUP_EXIT_EPOLL_RESULT: Mutex<Option<WaitOutcome>> = Mutex::new(None);
+static GROUP_EXIT_RECORD_REQUEST: Mutex<Option<RecordLockRequest>> = Mutex::new(None);
+static GROUP_EXIT_RECORD_RESULT: Mutex<Option<Result<(), &'static str>>> = Mutex::new(None);
+static GROUP_EXIT_CALLER_RAN: AtomicBool = AtomicBool::new(false);
 // AGENT: carry one F_SETLKW request/result through real task-stack scheduling so
 // blocking record locks reuse the same wake and signal paths as pipes/futexes.
 static RECORD_LOCK_ROUND_TRIP_REQUEST: Mutex<Option<RecordLockRequest>> = Mutex::new(None);
@@ -87,6 +98,7 @@ pub fn run_all(pool: &FramePool) {
     pipe_blocking_read_wakes_for_eof(pool);
     pipe_blocking_large_write_resumes_until_complete(pool);
     pipe_blocking_write_wakes_for_broken_peer(pool);
+    group_exit_unwinds_blocked_pipe_reader(pool);
     pipe_rejects_wrong_direction_direct_io();
     pipe_epoll_closed_status_reports_hup_and_err();
     fd_allocator_supports_lower_bounds_fixed_targets_and_reuse(pool);
@@ -94,6 +106,345 @@ pub fn run_all(pool: &FramePool) {
     fd_alias_keeps_epoll_source_across_number_reuse(pool);
     forked_fd_slot_keeps_epoll_source_until_child_close(pool);
     epoll_ready_list_deduplicates_and_requeues();
+}
+
+// AGENT: run exit_group and a canceled pipe read on their real kernel stacks;
+// only the last cooperative acknowledgement may publish Zombie and SIGCHLD.
+fn group_exit_unwinds_blocked_pipe_reader(pool: &FramePool) {
+    reset_wait_token_state();
+    GROUP_EXIT_CALLER_RAN.store(false, Ordering::Relaxed);
+    *GROUP_EXIT_PIPE_RESULT.lock().unwrap() = None;
+    *GROUP_EXIT_TIMER_RESULT.lock().unwrap() = None;
+    *GROUP_EXIT_FUTEX_RESULT.lock().unwrap() = None;
+    *GROUP_EXIT_EPOLL_RESULT.lock().unwrap() = None;
+    *GROUP_EXIT_RECORD_RESULT.lock().unwrap() = None;
+
+    let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
+    kernel.proc_init();
+    let init = kernel
+        .cur_task(0)
+        .expect("group-exit init should be current");
+    assert!(init.process.set_signal_action(
+        SIGCHLD,
+        SigAction {
+            handler: 0x5000,
+            mask: 0,
+        },
+    ));
+    let leader = kernel
+        .tasks
+        .fork_process(&init)
+        .expect("group-exit child should fork");
+    let waiter = kernel
+        .tasks
+        .clone_thread(&leader, 0x8000_0000, 0)
+        .expect("group-exit pipe waiter should clone");
+    let timer_waiter = kernel
+        .tasks
+        .clone_thread(&leader, 0x8100_0000, 0)
+        .expect("group-exit timer waiter should clone");
+    let futex_waiter = kernel
+        .tasks
+        .clone_thread(&leader, 0x8200_0000, 0)
+        .expect("group-exit futex waiter should clone");
+    let epoll_waiter = kernel
+        .tasks
+        .clone_thread(&leader, 0x8300_0000, 0)
+        .expect("group-exit epoll waiter should clone");
+    let record_waiter = kernel
+        .tasks
+        .clone_thread(&leader, 0x8400_0000, 0)
+        .expect("group-exit record-lock waiter should clone");
+
+    let (blocked_reader, external_writer) = PipeNode::pair();
+    let (external_reader, owned_writer) = PipeNode::pair();
+    leader
+        .add_file(FLike::Pipe(blocked_reader.clone()))
+        .expect("process should own its blocked pipe reader");
+    leader
+        .add_file(FLike::Pipe(owned_writer))
+        .expect("process should own a writer for EOF observation");
+    *GROUP_EXIT_PIPE_READER.lock().unwrap() = Some(blocked_reader.clone());
+    let epoll = EpInst::new();
+    *GROUP_EXIT_EPOLL.lock().unwrap() = Some(epoll.clone());
+    let record_request = RecordLockRequest {
+        identity: RECORD_LOCK_FILE_A,
+        kind: Some(LockKind::Write),
+        range: LockRange {
+            start: 0,
+            end: Some(10),
+        },
+    };
+    kernel
+        .record_locks
+        .set_nonblocking(RECORD_LOCK_BLOCKER_PID, record_request)
+        .expect("record-lock blocker should install");
+    *GROUP_EXIT_RECORD_REQUEST.lock().unwrap() = Some(record_request);
+
+    waiter
+        .install_test_kernel_entry(group_exit_pipe_waiter_task)
+        .expect("pipe waiter should receive its kernel entry");
+    waiter.set_sched_state(TaskRunState::Runnable);
+    kernel.run_queue.enqueue(&waiter);
+    timer_waiter
+        .install_test_kernel_entry(group_exit_timer_waiter_task)
+        .expect("timer waiter should receive its kernel entry");
+    futex_waiter
+        .install_test_kernel_entry(group_exit_futex_waiter_task)
+        .expect("futex waiter should receive its kernel entry");
+    epoll_waiter
+        .install_test_kernel_entry(group_exit_epoll_waiter_task)
+        .expect("epoll waiter should receive its kernel entry");
+    record_waiter
+        .install_test_kernel_entry(group_exit_record_waiter_task)
+        .expect("record-lock waiter should receive its kernel entry");
+    for task in [&timer_waiter, &futex_waiter, &epoll_waiter, &record_waiter] {
+        task.set_sched_state(TaskRunState::Runnable);
+        kernel.run_queue.enqueue(task);
+    }
+    leader
+        .install_test_kernel_entry(group_exit_caller_task)
+        .expect("group-exit caller should receive its kernel entry");
+    kernel.set_cur(0, None);
+    install_kernel(kernel);
+
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert_eq!(waiter.sched_state(), TaskRunState::Sleeping);
+    assert!(waiter.has_active_wait());
+    assert_eq!(blocked_reader.pending_read_waiters(), 1);
+    for task in [&timer_waiter, &futex_waiter, &epoll_waiter, &record_waiter] {
+        assert!(kernel.run_one_cpu0_task_for_test());
+        assert_eq!(task.sched_state(), TaskRunState::Sleeping);
+        assert!(task.has_active_wait());
+    }
+    assert_eq!(global_timer_wheel().lock().active_count(), 1);
+    assert_eq!(leader.process.futex.pending_at(FUTEX_ROUND_TRIP_ADDR), 1);
+    assert_eq!(epoll.pending_waiters(), 1);
+    assert!(kernel.record_locks.process_is_waiting(leader.process.pid()));
+
+    leader.set_sched_state(TaskRunState::Runnable);
+    kernel.run_queue.enqueue(&leader);
+    assert!(kernel.run_one_cpu0_task_for_test());
+    assert!(GROUP_EXIT_CALLER_RAN.load(Ordering::Relaxed));
+    assert!(leader.done());
+    assert!(leader.process.is_terminating());
+    assert!(!leader.process.is_zombie());
+    assert_eq!(
+        kernel.do_wait(init.id(), leader.process.pid() as isize, 1),
+        Ok((0, 0))
+    );
+    for task in [
+        &waiter,
+        &timer_waiter,
+        &futex_waiter,
+        &epoll_waiter,
+        &record_waiter,
+    ] {
+        assert_eq!(task.sched_state(), TaskRunState::Runnable);
+    }
+
+    for _ in 0..5 {
+        assert!(kernel.run_one_cpu0_task_for_test());
+    }
+    assert_eq!(
+        *GROUP_EXIT_PIPE_RESULT.lock().unwrap(),
+        Some(Err("group_exit"))
+    );
+    assert_eq!(
+        *GROUP_EXIT_TIMER_RESULT.lock().unwrap(),
+        Some(WaitOutcome::GroupExit)
+    );
+    assert_eq!(
+        *GROUP_EXIT_FUTEX_RESULT.lock().unwrap(),
+        Some(Err("group_exit"))
+    );
+    assert_eq!(
+        *GROUP_EXIT_EPOLL_RESULT.lock().unwrap(),
+        Some(WaitOutcome::GroupExit)
+    );
+    assert_eq!(
+        *GROUP_EXIT_RECORD_RESULT.lock().unwrap(),
+        Some(Err("group_exit"))
+    );
+    assert_eq!(blocked_reader.pending_read_waiters(), 0);
+    assert_eq!(global_timer_wheel().lock().active_count(), 0);
+    assert_eq!(leader.process.futex.pending_at(FUTEX_ROUND_TRIP_ADDR), 0);
+    assert_eq!(epoll.pending_waiters(), 0);
+    assert!(!kernel.record_locks.process_is_waiting(leader.process.pid()));
+    assert!(leader.process.is_zombie());
+    assert_eq!(leader.process.zombie_wait_status(), Some(37 << 8));
+    assert_eq!(leader.process.thread_count(), 0);
+    assert!(kernel.tasks.find_task(leader.id()).is_none());
+    assert!(kernel.tasks.find_task(waiter.id()).is_none());
+    assert!(kernel.tasks.find_task(timer_waiter.id()).is_none());
+    assert!(kernel.tasks.find_task(futex_waiter.id()).is_none());
+    assert!(kernel.tasks.find_task(epoll_waiter.id()).is_none());
+    assert!(kernel.tasks.find_task(record_waiter.id()).is_none());
+    assert_eq!(kernel.tasks.task_count(), 1);
+    assert_eq!(
+        init.process
+            .sig_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(signo, sender)| {
+                *signo == SIGCHLD as i32 && *sender == leader.process.pid() as isize
+            })
+            .count(),
+        1
+    );
+
+    drop(blocked_reader);
+    assert_eq!(
+        external_writer.write_at(0, true, b"x"),
+        Ok(PipeWriteOutcome::Broken { written: 0 })
+    );
+    let mut byte = [0u8; 1];
+    assert_eq!(external_reader.read_at(0, true, &mut byte), Ok(0));
+
+    *GROUP_EXIT_PIPE_READER.lock().unwrap() = None;
+    *GROUP_EXIT_PIPE_RESULT.lock().unwrap() = None;
+    *GROUP_EXIT_TIMER_RESULT.lock().unwrap() = None;
+    *GROUP_EXIT_FUTEX_RESULT.lock().unwrap() = None;
+    *GROUP_EXIT_EPOLL.lock().unwrap() = None;
+    *GROUP_EXIT_EPOLL_RESULT.lock().unwrap() = None;
+    *GROUP_EXIT_RECORD_REQUEST.lock().unwrap() = None;
+    *GROUP_EXIT_RECORD_RESULT.lock().unwrap() = None;
+    kernel.record_locks.release_process(RECORD_LOCK_BLOCKER_PID);
+    clear_wait_token_state();
+}
+
+// AGENT: block one sibling inside PipeNode::read_at, then unwind its queue and
+// local endpoint ownership before acknowledging group exit on that same stack.
+extern "C" fn group_exit_pipe_waiter_task() -> ! {
+    let reader = GROUP_EXIT_PIPE_READER
+        .lock()
+        .unwrap()
+        .take()
+        .expect("group-exit pipe reader should be installed");
+    let kernel = crate::kernel::global_kernel().expect("group-exit kernel should be installed");
+    let task = kernel
+        .cur_task(0)
+        .expect("group-exit pipe waiter should be current");
+    let mut byte = [0u8; 1];
+    let result = reader.read_at(task.id(), false, &mut byte);
+    drop(reader);
+    *GROUP_EXIT_PIPE_RESULT.lock().unwrap() = Some(result);
+    assert_eq!(kernel.retire_current_group_member(0, &task), Ok(()));
+    drop(task);
+    kernel.switch_current_to_idle(0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+// AGENT: prove a group-exit wake cancels a registered deadline when the owner
+// resumes and unwinds WaitToken::wait_inner on its own stack.
+extern "C" fn group_exit_timer_waiter_task() -> ! {
+    let kernel = crate::kernel::global_kernel().expect("group-exit kernel should be installed");
+    let task = kernel
+        .cur_task(0)
+        .expect("group-exit timer waiter should be current");
+    let token = WaitToken::for_task(task.id());
+    let deadline = CLK.load(Ordering::Relaxed).saturating_add(100);
+    let outcome = token.wait_interruptible(Some(deadline));
+    *GROUP_EXIT_TIMER_RESULT.lock().unwrap() = Some(outcome);
+    assert_eq!(kernel.retire_current_group_member(0, &task), Ok(()));
+    drop(task);
+    kernel.switch_current_to_idle(0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+// AGENT: exercise FutexBucket's normal finish_wait unlink path after GroupExit.
+extern "C" fn group_exit_futex_waiter_task() -> ! {
+    let kernel = crate::kernel::global_kernel().expect("group-exit kernel should be installed");
+    let task = kernel
+        .cur_task(0)
+        .expect("group-exit futex waiter should be current");
+    let result = task
+        .process
+        .futex
+        .wait(task.id(), FUTEX_ROUND_TRIP_ADDR, 1, None, || Ok(1));
+    *GROUP_EXIT_FUTEX_RESULT.lock().unwrap() = Some(result);
+    assert_eq!(kernel.retire_current_group_member(0, &task), Ok(()));
+    drop(task);
+    kernel.switch_current_to_idle(0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+// AGENT: mirror sys_epoll_wait's unconditional token removal before reaching
+// the common group-exit safe point.
+extern "C" fn group_exit_epoll_waiter_task() -> ! {
+    let epoll = GROUP_EXIT_EPOLL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("group-exit epoll should be installed")
+        .clone();
+    let kernel = crate::kernel::global_kernel().expect("group-exit kernel should be installed");
+    let task = kernel
+        .cur_task(0)
+        .expect("group-exit epoll waiter should be current");
+    let token = epoll
+        .prepare_wait(task.id())
+        .expect("empty epoll should publish a waiter");
+    let outcome = token.wait_interruptible(None);
+    epoll.remove_waiter(&token);
+    *GROUP_EXIT_EPOLL_RESULT.lock().unwrap() = Some(outcome);
+    assert_eq!(kernel.retire_current_group_member(0, &task), Ok(()));
+    drop(task);
+    kernel.switch_current_to_idle(0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+// AGENT: run the ordinary blocking record-lock cleanup so its wait dependency
+// is deleted before this member acknowledges group exit.
+extern "C" fn group_exit_record_waiter_task() -> ! {
+    let request = GROUP_EXIT_RECORD_REQUEST
+        .lock()
+        .unwrap()
+        .expect("group-exit record request should be installed");
+    let kernel = crate::kernel::global_kernel().expect("group-exit kernel should be installed");
+    let task = kernel
+        .cur_task(0)
+        .expect("group-exit record waiter should be current");
+    let result = kernel
+        .record_locks
+        .set_blocking(task.process.pid(), task.id(), request);
+    *GROUP_EXIT_RECORD_RESULT.lock().unwrap() = Some(result);
+    assert_eq!(kernel.retire_current_group_member(0, &task), Ok(()));
+    drop(task);
+    kernel.switch_current_to_idle(0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+// AGENT: issue exit_group from the leader's own live stack and return to idle;
+// the blocked sibling remains the only process member after this handoff.
+extern "C" fn group_exit_caller_task() -> ! {
+    GROUP_EXIT_CALLER_RAN.store(true, Ordering::Relaxed);
+    let kernel = crate::kernel::global_kernel().expect("group-exit kernel should be installed");
+    let task = kernel
+        .cur_task(0)
+        .expect("group-exit leader should be current");
+    task.process.set_job_stopped(true);
+    assert_eq!(
+        kernel.exit_thread_group(0, &task, crate::kernel::ExitReason::Code(37)),
+        Ok(())
+    );
+    assert!(!task.process.is_job_stopped());
+    drop(task);
+    kernel.switch_current_to_idle(0);
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 // AGENT: cover zero, sub-tick, exact-tick, just-over-tick, and whole-second
@@ -254,9 +605,10 @@ fn wait_token_event_wake_uses_installed_scheduler_backend(pool: &FramePool) {
 
     let kernel = Box::leak(Box::new(Kernel::new(pool.clone())));
     let task = kernel.tasks.spawn_root().expect("spawn test init task");
-    task.set_sched_state(TaskRunState::Sleeping);
     install_kernel(kernel);
     let token = WaitToken::for_task(task.id());
+    task.set_sched_state(TaskRunState::Running);
+    assert!(task.install_active_wait(token.clone()));
 
     assert!(token.wake_event());
     assert_eq!(task.sched_state(), TaskRunState::Runnable);

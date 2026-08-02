@@ -292,6 +292,12 @@ impl EpInst {
     pub fn remove_waiter(&self, token: &WaitToken) {
         self.waiters.remove_waiter(token);
     }
+
+    // AGENT: expose only waiter cardinality to cooperative-exit selftests.
+    #[cfg(any(test, feature = "qemu-sync-selftest"))]
+    pub(crate) fn pending_waiters(&self) -> usize {
+        self.waiters.pending()
+    }
     // AGENT: remember which EvBus callback backs a watched fd.
     pub(crate) fn set_source_sub(&self, key: &EpKey, sub_id: usize) {
         if let Some(item) = self.inner.lock().unwrap().interests.get_mut(key) {
