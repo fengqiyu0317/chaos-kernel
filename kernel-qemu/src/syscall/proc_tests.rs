@@ -16,6 +16,108 @@ const OLD_BYTES: &[u8] = b"old-exec-image";
 // QEMU frame pool/direct map have been installed.
 pub fn run_all(pool: &FramePool) {
     exec_copyin_failures_preserve_old_image(pool);
+    process_identity_syscalls_require_current(pool);
+    getpid_and_gettid_distinguish_process_from_thread(pool);
+    process_group_and_session_syscalls_enforce_transitions(pool);
+}
+
+// AGENT: reject every process identity/session query or mutation when CPU0 has
+// no syscall caller, even if a registered process remains queryable by pid.
+fn process_identity_syscalls_require_current(pool: &FramePool) {
+    let kernel = Kernel::new(pool.clone());
+    kernel.proc_init();
+    kernel.set_cur(0, None);
+
+    assert_eq!(sys_getpid(&kernel), Err("esrch"));
+    assert_eq!(sys_gettid(&kernel), Err("esrch"));
+    assert_eq!(sys_getppid(&kernel), Err("esrch"));
+    assert_eq!(sys_getpgid(&kernel, 0), Err("esrch"));
+    assert_eq!(sys_getpgid(&kernel, INIT_PID), Err("esrch"));
+    assert_eq!(sys_getsid(&kernel, 0), Err("esrch"));
+    assert_eq!(sys_getsid(&kernel, INIT_PID), Err("esrch"));
+    assert_eq!(sys_setpgid(&kernel, 0, 0), Err("esrch"));
+    assert_eq!(sys_setsid(&kernel), Err("esrch"));
+}
+
+// AGENT: prove getpid is process-wide while gettid follows the selected Task,
+// including a second thread that shares init's Process and parent identity.
+fn getpid_and_gettid_distinguish_process_from_thread(pool: &FramePool) {
+    let kernel = Kernel::new(pool.clone());
+    kernel.proc_init();
+    let init = kernel.cur_task(0).expect("init should be current");
+
+    assert_eq!(sys_getpid(&kernel), Ok(INIT_PID));
+    assert_eq!(sys_gettid(&kernel), Ok(init.id()));
+    assert_eq!(sys_getppid(&kernel), Ok(0));
+
+    let sibling = kernel
+        .tasks
+        .clone_thread(&init, 0x7000_0000, 0x7100_0000)
+        .expect("shared-process thread should clone");
+    assert_ne!(sibling.id(), init.process.pid());
+    kernel.set_cur(0, Some(sibling.clone()));
+
+    assert_eq!(sys_getpid(&kernel), Ok(init.process.pid()));
+    assert_eq!(sys_gettid(&kernel), Ok(sibling.id()));
+    assert_eq!(sys_getppid(&kernel), Ok(0));
+}
+
+// AGENT: exercise the syscall-level parent, exec, process-group, and session
+// rules around the authoritative JobControl state rather than only its helper.
+fn process_group_and_session_syscalls_enforce_transitions(pool: &FramePool) {
+    let kernel = Kernel::new(pool.clone());
+    kernel.proc_init();
+    let parent = kernel.cur_task(0).expect("init should be current");
+    let parent_pid = parent.process.pid();
+    let child = kernel
+        .tasks
+        .fork_process(&parent)
+        .expect("job-control child should fork");
+    let child_pid = child.process.pid();
+
+    assert_eq!(sys_getpgid(&kernel, 0), Ok(parent_pid));
+    assert_eq!(sys_getsid(&kernel, 0), Ok(parent_pid));
+    assert_eq!(sys_getpgid(&kernel, child_pid), Ok(parent_pid));
+    assert_eq!(sys_getsid(&kernel, child_pid), Ok(parent_pid));
+    assert_eq!(sys_getpgid(&kernel, usize::MAX), Err("esrch"));
+    assert_eq!(sys_getsid(&kernel, usize::MAX), Err("esrch"));
+
+    assert_eq!(sys_setpgid(&kernel, 0, 0), Err("eperm"));
+    assert_eq!(sys_setpgid(&kernel, child_pid, usize::MAX), Err("einval"));
+    assert_eq!(sys_setpgid(&kernel, usize::MAX, 0), Err("esrch"));
+    assert_eq!(sys_setpgid(&kernel, child_pid, child_pid + 1), Err("eperm"));
+
+    assert_eq!(sys_setpgid(&kernel, child_pid, 0), Ok(0));
+    assert_eq!(sys_getpgid(&kernel, child_pid), Ok(child_pid));
+    assert_eq!(sys_getsid(&kernel, child_pid), Ok(parent_pid));
+    assert_eq!(sys_setpgid(&kernel, child_pid, parent_pid), Ok(0));
+
+    child.process.did_exec.store(true, Ordering::SeqCst);
+    assert_eq!(sys_setpgid(&kernel, child_pid, child_pid), Err("eacces"));
+    child.process.did_exec.store(false, Ordering::SeqCst);
+
+    let unrelated = kernel
+        .tasks
+        .spawn()
+        .expect("unrelated process should spawn in another session");
+    assert_eq!(
+        sys_setpgid(&kernel, unrelated.process.pid(), 0),
+        Err("esrch")
+    );
+
+    kernel.set_cur(0, Some(child.clone()));
+    assert_eq!(sys_getpid(&kernel), Ok(child_pid));
+    assert_eq!(sys_gettid(&kernel), Ok(child.id()));
+    assert_eq!(sys_getppid(&kernel), Ok(parent_pid));
+    assert_eq!(sys_setsid(&kernel), Ok(child_pid));
+    assert_eq!(sys_getpgid(&kernel, 0), Ok(child_pid));
+    assert_eq!(sys_getsid(&kernel, 0), Ok(child_pid));
+    assert_eq!(sys_setsid(&kernel), Err("eperm"));
+
+    kernel.set_cur(0, Some(parent));
+    assert_eq!(sys_getpgid(&kernel, child_pid), Ok(child_pid));
+    assert_eq!(sys_getsid(&kernel, child_pid), Ok(child_pid));
+    assert_eq!(sys_setpgid(&kernel, child_pid, parent_pid), Err("eperm"));
 }
 
 // AGENT: retain one complete old-image snapshot across pathname, pointer-array,

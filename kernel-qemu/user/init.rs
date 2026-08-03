@@ -17,6 +17,13 @@ const SYS_SPLICE: usize = 76;
 const SYS_NEWFSTATAT: usize = 79;
 const SYS_FSTAT: usize = 80;
 const SYS_EXIT: usize = 93;
+const SYS_SETPGID: usize = 154;
+const SYS_GETPGID: usize = 155;
+const SYS_GETSID: usize = 156;
+const SYS_SETSID: usize = 157;
+const SYS_GETPID: usize = 172;
+const SYS_GETPPID: usize = 173;
+const SYS_GETTID: usize = 178;
 const SYS_EXECVE: usize = 221;
 const AT_FDCWD: usize = (-100isize) as usize;
 const O_WRONLY: usize = 1;
@@ -40,6 +47,7 @@ const STDOUT_FILENO: usize = 1;
 const DUP3_TARGET_FD: usize = 100;
 const EXEC_CLOEXEC_FD: usize = 101;
 const INIT_MESSAGE: &[u8] = b"[init] userspace /bin/init reached\n";
+const PROCESS_IDENTITY_MESSAGE: &[u8] = b"[init] process identity round-trip passed\n";
 const MKDIR_MESSAGE: &[u8] = b"[init] mkdirat round-trip passed\n";
 const OPEN_MESSAGE: &[u8] = b"[init] openat round-trip passed\n";
 const DUP_MESSAGE: &[u8] = b"[init] dup round-trip passed\n";
@@ -62,6 +70,22 @@ const PIPE_PAYLOAD: &[u8] = b"pipe2-ok";
 const RISCV64_STAT_SIZE: usize = 128;
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
+
+// AGENT: issue a zero-argument Linux RISC-V syscall while receiving its native
+// return value from a0 for process identity and session smoke coverage.
+#[inline(always)]
+unsafe fn syscall0(number: usize) -> isize {
+    let result: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            lateout("a0") result,
+            in("a7") number,
+            options(nostack)
+        );
+    }
+    result as isize
+}
 
 // AGENT: issue one Linux RISC-V four-argument syscall so embedded init can
 // validate both openat and newfstatat through the live trap ABI.
@@ -202,8 +226,8 @@ fn flock_type(bytes: &[u8; 32]) -> i16 {
     i16::from_le_bytes([bytes[0], bytes[1]])
 }
 
-// AGENT: prove user-mode mkdirat/openat/dup/dup3/pipe2/splice/stat/close,
-// including six-argument offset copyout, exact-target survival, and OFD teardown.
+// AGENT: prove user-mode process identity, mkdirat/openat/dup/dup3/pipe2/splice,
+// stat/close, six-argument offset copyout, exact-target survival, and OFD teardown.
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -214,6 +238,32 @@ pub extern "C" fn _start() -> ! {
             INIT_MESSAGE.as_ptr() as usize,
             INIT_MESSAGE.len(),
         )
+    };
+    let getpid_result = unsafe { syscall0(SYS_GETPID) };
+    let getppid_result = unsafe { syscall0(SYS_GETPPID) };
+    let gettid_result = unsafe { syscall0(SYS_GETTID) };
+    let getpgid_result = unsafe { syscall1(SYS_GETPGID, 0) };
+    let getsid_result = unsafe { syscall1(SYS_GETSID, 0) };
+    let setpgid_result = unsafe { syscall2(SYS_SETPGID, 0, 0) };
+    let setsid_result = unsafe { syscall0(SYS_SETSID) };
+    let process_identity_round_trip_ok = getpid_result == 1
+        && getppid_result == 0
+        && gettid_result == 1
+        && getpgid_result == 1
+        && getsid_result == 1
+        && setpgid_result == -1
+        && setsid_result == -1;
+    let process_identity_message_written = if process_identity_round_trip_ok {
+        unsafe {
+            syscall3(
+                SYS_WRITE,
+                STDOUT_FILENO,
+                PROCESS_IDENTITY_MESSAGE.as_ptr() as usize,
+                PROCESS_IDENTITY_MESSAGE.len(),
+            )
+        }
+    } else {
+        0
     };
     let mkdir_result =
         unsafe { syscall3(SYS_MKDIRAT, AT_FDCWD, MKDIR_PATH.as_ptr() as usize, 0o700) };
@@ -650,6 +700,8 @@ pub extern "C" fn _start() -> ! {
     };
     let status = usize::from(
         console_written != INIT_MESSAGE.len() as isize
+            || !process_identity_round_trip_ok
+            || process_identity_message_written != PROCESS_IDENTITY_MESSAGE.len() as isize
             || mkdir_result != 0
             || mkdir_message_written != MKDIR_MESSAGE.len() as isize
             || file_written != OPEN_PAYLOAD.len() as isize

@@ -233,7 +233,9 @@ pub const ROBUST_LIST_HEAD_SIZE: usize = 3 * mem::size_of::<usize>();
 pub const SYS_GETPPID: usize = 110;
 pub const SYS_SETPGID: usize = 109;
 pub const SYS_GETPGID: usize = 121;
+pub const SYS_GETSID: usize = 124;
 pub const SYS_SETSID: usize = 112;
+pub const SYS_GETTID: usize = 186;
 // AGENT: Keep migrated semantic syscall ids in the existing x86_64-style
 // internal namespace; syscall_abi maps RISC-V numbers onto these values.
 pub const SYS_MOUNT: usize = 165;

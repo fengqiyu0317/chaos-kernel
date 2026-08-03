@@ -36,7 +36,13 @@ pub const RISCV_SYS_EXIT: usize = 93;
 pub const RISCV_SYS_EXIT_GROUP: usize = 94;
 pub const RISCV_SYS_SET_TID_ADDRESS: usize = 96;
 pub const RISCV_SYS_SET_ROBUST_LIST: usize = 99;
+pub const RISCV_SYS_SETPGID: usize = 154;
+pub const RISCV_SYS_GETPGID: usize = 155;
+pub const RISCV_SYS_GETSID: usize = 156;
+pub const RISCV_SYS_SETSID: usize = 157;
 pub const RISCV_SYS_GETPID: usize = 172;
+pub const RISCV_SYS_GETPPID: usize = 173;
+pub const RISCV_SYS_GETTID: usize = 178;
 
 pub const INTERNAL_SYS_READ: usize = 0;
 pub const INTERNAL_SYS_WRITE: usize = 1;
@@ -57,9 +63,15 @@ pub const INTERNAL_SYS_EXIT: usize = 60;
 pub const INTERNAL_SYS_EXIT_GROUP: usize = 231;
 pub const INTERNAL_SYS_WAIT4: usize = 61;
 pub const INTERNAL_SYS_GETPID: usize = 39;
+pub const INTERNAL_SYS_GETTID: usize = 186;
 pub const INTERNAL_SYS_SET_TID_ADDRESS: usize = 218;
 pub const INTERNAL_SYS_SET_ROBUST_LIST: usize = 273;
 pub const INTERNAL_SYS_KILL: usize = 62;
+pub const INTERNAL_SYS_GETPPID: usize = 110;
+pub const INTERNAL_SYS_SETPGID: usize = 109;
+pub const INTERNAL_SYS_GETPGID: usize = 121;
+pub const INTERNAL_SYS_GETSID: usize = 124;
+pub const INTERNAL_SYS_SETSID: usize = 112;
 pub const INTERNAL_SYS_MKDIRAT: usize = 258;
 pub const INTERNAL_SYS_MOUNT: usize = 165;
 pub const INTERNAL_SYS_RT_SIGACTION: usize = 13;
@@ -107,7 +119,13 @@ pub fn map_riscv_nr(nr: usize) -> Option<usize> {
         RISCV_SYS_EXIT_GROUP => Some(INTERNAL_SYS_EXIT_GROUP),
         RISCV_SYS_SET_TID_ADDRESS => Some(INTERNAL_SYS_SET_TID_ADDRESS),
         RISCV_SYS_SET_ROBUST_LIST => Some(INTERNAL_SYS_SET_ROBUST_LIST),
+        RISCV_SYS_SETPGID => Some(INTERNAL_SYS_SETPGID),
+        RISCV_SYS_GETPGID => Some(INTERNAL_SYS_GETPGID),
+        RISCV_SYS_GETSID => Some(INTERNAL_SYS_GETSID),
+        RISCV_SYS_SETSID => Some(INTERNAL_SYS_SETSID),
         RISCV_SYS_GETPID => Some(INTERNAL_SYS_GETPID),
+        RISCV_SYS_GETPPID => Some(INTERNAL_SYS_GETPPID),
+        RISCV_SYS_GETTID => Some(INTERNAL_SYS_GETTID),
         _ => None,
     }
 }
@@ -263,6 +281,7 @@ pub mod tests {
         stat_syscalls_map_to_their_distinct_internal_entries();
         signal_syscalls_map_to_migrated_semantics();
         execve_maps_to_migrated_exec_semantics();
+        process_identity_syscalls_map_to_migrated_semantics();
     }
 
     // AGENT: keep every audited file/exec errno distinguishable from EINVAL at
@@ -429,5 +448,28 @@ pub mod tests {
     fn execve_maps_to_migrated_exec_semantics() {
         assert_eq!(map_riscv_nr(RISCV_SYS_EXECVE), Some(INTERNAL_SYS_EXEC));
         assert_eq!(INTERNAL_SYS_EXEC, crate::kernel::SYS_EXEC);
+    }
+
+    // AGENT: pin every supported process identity and job-control syscall to
+    // its asm-generic RV64 number while preserving the complete argument bank.
+    #[cfg_attr(test, test)]
+    fn process_identity_syscalls_map_to_migrated_semantics() {
+        for (riscv_nr, internal_nr) in [
+            (RISCV_SYS_SETPGID, INTERNAL_SYS_SETPGID),
+            (RISCV_SYS_GETPGID, INTERNAL_SYS_GETPGID),
+            (RISCV_SYS_GETSID, INTERNAL_SYS_GETSID),
+            (RISCV_SYS_SETSID, INTERNAL_SYS_SETSID),
+            (RISCV_SYS_GETPID, INTERNAL_SYS_GETPID),
+            (RISCV_SYS_GETPPID, INTERNAL_SYS_GETPPID),
+            (RISCV_SYS_GETTID, INTERNAL_SYS_GETTID),
+        ] {
+            let mut frame = TrapFrame::new();
+            frame.regs[10..16].copy_from_slice(&[7, 11, 13, 17, 19, 23]);
+            frame.regs[17] = riscv_nr;
+
+            let request = decode_from_trap_frame(&frame);
+            assert_eq!(request.internal_nr, Some(internal_nr));
+            assert_eq!(request.args, [7, 11, 13, 17, 19, 23]);
+        }
     }
 }

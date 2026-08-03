@@ -375,20 +375,21 @@ pub(super) fn sys_wait4(
 
 // AGENT: return immutable Process identity rather than a leader-task id.
 pub(super) fn sys_getpid(kernel: &Kernel) -> Result<usize, &'static str> {
-    let cur = kernel.cur_task(0);
-    match cur {
-        Some(t) => Ok(t.process.pid()),
-        None => Ok(1),
-    }
+    let cur = kernel.cur_task(0).ok_or("esrch")?;
+    Ok(cur.process.pid())
+}
+
+// AGENT: expose the current schedulable thread identity independently from
+// the process-wide pid returned by getpid.
+pub(super) fn sys_gettid(kernel: &Kernel) -> Result<usize, &'static str> {
+    let cur = kernel.cur_task(0).ok_or("esrch")?;
+    Ok(cur.id())
 }
 
 // AGENT: follow the weak process-family link without depending on a parent Task.
 pub(super) fn sys_getppid(kernel: &Kernel) -> Result<usize, &'static str> {
-    let cur = kernel.cur_task(0);
-    match cur {
-        Some(t) => Ok(t.process.parent().map(|parent| parent.pid()).unwrap_or(0)),
-        None => Ok(0),
-    }
+    let cur = kernel.cur_task(0).ok_or("esrch")?;
+    Ok(cur.process.parent().map(|parent| parent.pid()).unwrap_or(0))
 }
 
 // AGENT: validate POSIX-style process-group changes before asking TaskTable to
@@ -399,11 +400,12 @@ pub(super) fn sys_setpgid(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize
     let cur = kernel.cur_task(0).ok_or("esrch")?;
     let caller_pid = cur.process.pid();
     let target_pid = if pid == 0 { caller_pid } else { pid };
-    let new_pgid = if pgid == 0 { target_pid } else { pgid };
-    if new_pgid > i32::MAX as usize {
+    if pgid > i32::MAX as usize {
         return Err("einval");
     }
     let target = kernel.tasks.find_process(target_pid).ok_or("esrch")?;
+    let new_pgid = if pgid == 0 { target_pid } else { pgid };
+    let new_pgid = i32::try_from(new_pgid).map_err(|_| "einval")?;
     if target_pid != caller_pid {
         let is_child = target
             .parent()
@@ -424,23 +426,15 @@ pub(super) fn sys_setpgid(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize
     if target_sid == target_pid {
         return Err("eperm");
     }
-    kernel
-        .tasks
-        .move_process_to_group(&target, new_pgid as i32)?;
+    kernel.tasks.move_process_to_group(&target, new_pgid)?;
     Ok(0)
 }
 
+// AGENT: resolve pid zero through the syscall caller while keeping process-group
+// membership authoritative in TaskTable for both self and remote queries.
 pub(super) fn sys_getpgid(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
-    let pid = a0;
-    let cur = kernel.cur_task(0);
-    let target = if pid == 0 {
-        cur.as_ref().map(|t| t.process.pid()).unwrap_or(0)
-    } else {
-        pid
-    };
-    if target == 0 {
-        return Err("esrch");
-    }
+    let cur = kernel.cur_task(0).ok_or("esrch")?;
+    let target = if a0 == 0 { cur.process.pid() } else { a0 };
     kernel
         .tasks
         .process_pgid(target)
@@ -448,13 +442,17 @@ pub(super) fn sys_getpgid(kernel: &Kernel, a0: usize) -> Result<usize, &'static 
         .ok_or("esrch")
 }
 
+// AGENT: expose the session id derived from the target process's authoritative
+// process-group membership, with pid zero naming the syscall caller.
+pub(super) fn sys_getsid(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
+    let cur = kernel.cur_task(0).ok_or("esrch")?;
+    let target = if a0 == 0 { cur.process.pid() } else { a0 };
+    kernel.tasks.process_sid(target).ok_or("esrch")
+}
+
 // AGENT: create a new session through TaskTable so sid, pgid, and group
 // membership are updated atomically from the syscall boundary.
 pub(super) fn sys_setsid(kernel: &Kernel) -> Result<usize, &'static str> {
-    let cur = kernel.cur_task(0);
-    if let Some(t) = cur {
-        kernel.tasks.start_new_session(&t.process)
-    } else {
-        Err("esrch")
-    }
+    let cur = kernel.cur_task(0).ok_or("esrch")?;
+    kernel.tasks.start_new_session(&cur.process)
 }

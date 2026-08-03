@@ -1,6 +1,6 @@
 # Chaos AI 工作日志
 
-更新时间：2026-08-02
+更新时间：2026-08-03
 
 ## 维护约定
 
@@ -11,6 +11,36 @@
   - `/home/huawei/.codex/sessions/2026/06/18/rollout-2026-06-18T23-57-15-019edb73-6ad9-7b23-8162-c76a589a57a9.jsonl`
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
+
+## 2026-08-03：kernel-qemu 进程身份与 session/job-control syscall 闭环
+
+目标：修复现有进程身份 syscall 的无 current-task fallback，补齐 RV64 进程组/session ABI，并在现有 Task/Process/JobControl 数据模型上新增 `gettid` 与 `getsid`，不伪造尚未实现的 credentials。
+
+已完成修改：
+
+- `getpid`、`getppid` 和 `getpgid` 统一要求 CPU0 存在 syscall caller；新增进程级 `getsid(pid)` 与线程级 `gettid()`，分别从权威 JobControl membership 和当前 Task identity 返回结果。
+- `setpgid` 保留父子关系、child-exec、session leader、同 session 与合法进程组约束，并修正 `setpgid(不存在的 pid, 0)` 被派生 PGID 范围检查抢先错误返回 `EINVAL` 的问题，使其返回 `ESRCH`。
+- RISC-V ABI 接入 `setpgid(154)`、`getpgid(155)`、`getsid(156)`、`setsid(157)`、`getpid(172)`、`getppid(173)` 和 `gettid(178)`；ABI 层只转换到既有内部 syscall namespace 并透传参数。
+- proc selftest 覆盖无 current task、PID/TID 区分、父子关系、指定 PID 查询、process-group 创建/加入、exec 后拒绝、跨 session 拒绝及 `setsid` 成功/重复失败；ABI selftest 固定全部七个 RV64 映射。
+- embedded init 从真实 U-mode 验证 init 的 PID/PPID/TID/PGID/SID，并确认 session leader 的 `setpgid(0,0)` 与 `setsid()` 返回 `EPERM`；普通 smoke 新增强制日志 `[init] process identity round-trip passed`。
+
+验收结果：
+
+```bash
+cargo fmt --manifest-path kernel-qemu/Cargo.toml -- --check
+cargo check --manifest-path kernel-qemu/Cargo.toml \
+  --target riscv64gc-unknown-none-elf
+
+cd kernel-qemu
+cargo build --release --features qemu-selftest
+
+cd ..
+KERNEL_QEMU_SKIP_BUILD=1 bash tools/qemu-smoke.sh
+bash tools/qemu-smoke.sh
+git diff --check -- kernel-qemu tools/qemu-smoke.sh docs/ai-record.md
+```
+
+上述检查全部通过。完整 selftest 镜像实际启动并输出 proc、fs syscall、checkpoint、U-mode signal selftest 全部 passed，随后真实 init 输出 `[init] process identity round-trip passed` 和 `[init] execve round-trip passed`；普通 VirtIO smoke 同样通过并正常退出。本轮未修改或运行 `kernel-sim`，未修改禁止路径 `kernel/src/kernel.rs`；未实现 credentials、controlling TTY 或多 hart `setpgid` 事务。
 
 ## 2026-08-02：kernel-qemu 收敛线程退出清理边界
 
