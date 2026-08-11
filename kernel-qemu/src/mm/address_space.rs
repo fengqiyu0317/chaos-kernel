@@ -177,6 +177,12 @@ impl AddrSpace {
         self.vm_map.find_free(len, align)
     }
 
+    // AGENT: preserve one non-fixed mmap hint through the address-space API
+    // while keeping the sorted VMA collection private to this owner.
+    pub fn find_free_region_from(&self, start: usize, len: usize, align: usize) -> Option<usize> {
+        self.vm_map.find_free_from(start, len, align)
+    }
+
     // AGENT: expose the current page-aligned program break owned by AddrSpace.
     pub fn brk(&self) -> usize {
         self.brk
@@ -646,6 +652,57 @@ impl AddrSpace {
             let _dropped = self.resident_pages.entries.remove(&addr);
         }
         Ok(pages_to_unmap.len())
+    }
+
+    // AGENT: replace a fixed anonymous range transactionally by retaining the
+    // old VMA list, resident owners, and exact Sv39 leaf flags until the new
+    // mapping commits; restore that snapshot if eager allocation fails.
+    pub fn replace_region(
+        &mut self,
+        region: VmRegion,
+        pool: &FramePool,
+    ) -> Result<(), &'static str> {
+        if region.len == 0 || region.base % PAGE_SZ != 0 || region.len % PAGE_SZ != 0 {
+            return Err("einval");
+        }
+        let start = region.base;
+        let len = region.len;
+        let end = region.checked_end().ok_or("einval")?;
+        if end > USER_TOP {
+            return Err("einval");
+        }
+        self.debug_check_page_table_consistency()?;
+
+        let old_regions = self.vm_map.clone_regions();
+        let mut old_pages = Vec::new();
+        for (&vaddr, page) in self.resident_pages.entries.range(start..end) {
+            let leaf = self.sv39.leaf_mapping(vaddr)?;
+            if leaf.paddr != page.frame.paddr() {
+                return Err("resident and Sv39 physical pages disagree");
+            }
+            old_pages.push((vaddr, page.clone(), leaf.flags));
+        }
+
+        self.unmap_range(start, len, pool)?;
+        match self.map_region(region, pool) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.vm_map.regions = old_regions;
+                for (vaddr, page, leaf_flags) in old_pages {
+                    self.sv39
+                        .map_leaf(vaddr, page.frame.paddr(), leaf_flags, pool)
+                        .expect("preflighted fixed-mmap rollback leaf should restore");
+                    let replaced = self.resident_pages.entries.insert(vaddr, page);
+                    assert!(
+                        replaced.is_none(),
+                        "fixed-mmap rollback must restore into an empty resident slot"
+                    );
+                }
+                crate::csr::sfence_vma();
+                self.debug_check_page_table_consistency()?;
+                Err(err)
+            }
+        }
     }
 
     // AGENT: process teardown removes hardware leaves before resident frames

@@ -1,6 +1,6 @@
 # Chaos AI 工作日志
 
-更新时间：2026-08-03
+更新时间：2026-08-11
 
 ## 维护约定
 
@@ -11,6 +11,42 @@
   - `/home/huawei/.codex/sessions/2026/06/18/rollout-2026-06-18T23-57-15-019edb73-6ad9-7b23-8162-c76a589a57a9.jsonl`
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
+
+## 2026-08-11：kernel-qemu 匿名 mmap/munmap 第一阶段闭环
+
+目标：在不引入文件 backing 和 lazy allocation 的前提下，让已有 eager 匿名 mmap 语义能从 RV64 ABI 到 Sv39 映射生命周期端到端运行，并保证 `MAP_FIXED` 失败不破坏旧映射。
+
+已完成修改：
+
+- `syscall_abi.rs` 新增 RV64 `munmap(215)` / `mmap(222)` 到内部 11/9 号 syscall 的映射，保留 `a0..a5` 六参数透传。
+- `sys_mmap()` 现在要求 `MAP_SHARED` / `MAP_PRIVATE` 恰好选择一种，在同一次地址空间加锁中完成 hint 选址和映射，高位 hint 无空间时回退到 `MMAP_BASE`，并删除无法计入 Sv39 中间页表页的 `free_count()` 预检查。
+- mmap/munmap syscall 的普通用户可变范围截止于 `USER_SIGTRAMP`，防止覆盖或拆除内核依赖的 `rt_sigreturn` 页。
+- `VmMap::find_free_from()` 实现页对齐的向上空洞搜索；`AddrSpace::replace_region()` 在 fixed replacement 期间保留原 VMA、resident page 和 leaf flags，新匿名映射失败时恢复原内容与 COW 状态。
+- `qemu-mm-selftest` 新增 syscall 层回归，同时在隔离的四页物理 sandbox 中稳定触发 `ENOMEM` 并验证 fixed rollback；额外回归确认匿名 shared fork 共享和 private COW 隔离未回退。
+
+验收结果：
+
+```bash
+cargo fmt --check --manifest-path kernel-qemu/Cargo.toml
+cargo check --manifest-path kernel-qemu/Cargo.toml --target riscv64gc-unknown-none-elf
+
+cd kernel-qemu
+cargo build --release --features qemu-mm-selftest
+cargo build --release --features qemu-selftest
+
+cd ..
+# 两个 selftest image 均用 QEMU virt + 128 MiB + 4 MiB 临时 virtio-blk 镜像运行至 init exit
+bash tools/qemu-smoke.sh
+git diff --check -- kernel-qemu TASK.md docs/ai-record.md
+```
+
+结果：RISC-V target check 通过；聚焦 MM image 输出 `[kernel-qemu] mmap syscall selftest passed`；全量 image 中 MM、sync、sched、proc、mmap syscall、fs、checkpoint 和 user-satp selftest 全部通过；普通 smoke 运行至 `[kernel-qemu] init process exited`。
+
+剩余限制：
+
+- 非匿名 mmap 仍返回 `ENOSYS`；文件页装入、`MAP_SHARED` 脏页写回、fd 权限和 backing 生命周期仍待后续迁移。
+- 当前仍是 eager allocation；事务快照会保留旧 frame，因此极端内存压力下 fixed replacement 可能保守地返回 `ENOMEM`，但旧映射不会丢失。
+- `MAP_FIXED_NOREPLACE`、更多 Linux mmap flags 和按需缺页分配未在本阶段实现。
 
 ## 2026-08-03：kernel-qemu 进程身份与 session/job-control syscall 闭环
 

@@ -9,13 +9,14 @@ pub(super) fn sys_mmap(
     a1: usize,
     a2: usize,
     a3: usize,
-    _a4: usize,
+    a4: usize,
     a5: usize,
 ) -> Result<usize, &'static str> {
     let addr = a0;
     let len = a1;
     let prot = a2;
     let flags = a3;
+    let _fd = a4;
     let offset = a5;
     if len == 0 {
         return Err("einval");
@@ -33,7 +34,7 @@ pub(super) fn sys_mmap(
     let map_fixed = (flags & MAP_FIXED) != 0;
     let map_shared = (flags & MAP_SHARED) != 0;
     let map_private = (flags & MAP_PRIVATE) != 0;
-    if map_shared && map_private {
+    if map_shared == map_private {
         return Err("einval");
     }
     if !map_anon {
@@ -42,7 +43,6 @@ pub(super) fn sys_mmap(
     if offset != 0 {
         return Err("einval");
     }
-    let effective_shared = map_shared;
     let mut vm_flags: u32 = 0;
     if prot & PROT_READ != 0 {
         vm_flags |= VM_READ;
@@ -53,39 +53,35 @@ pub(super) fn sys_mmap(
     if prot & PROT_EXEC != 0 {
         vm_flags |= VM_EXEC;
     }
-    if effective_shared {
+    if map_shared {
         vm_flags |= VM_SHARED;
     }
     let task = kernel.cur_task(0).ok_or("esrch")?;
+    let mut addr_space = task.process.addr_space.lock().unwrap();
     let result_addr = if map_fixed {
         if addr == 0 || addr % PAGE_SZ != 0 {
             return Err("einval");
         }
         addr.checked_add(aligned_len).ok_or("enomem")?;
         addr
-    } else {
-        task.process
-            .addr_space
-            .lock()
-            .unwrap()
+    } else if addr == 0 {
+        addr_space
             .find_free_region(aligned_len, PAGE_SZ)
+            .ok_or("enomem")?
+    } else {
+        addr_space
+            .find_free_region_from(addr, aligned_len, PAGE_SZ)
+            .or_else(|| addr_space.find_free_region(aligned_len, PAGE_SZ))
             .ok_or("enomem")?
     };
     let result_end = result_addr.checked_add(aligned_len).ok_or("enomem")?;
-    if result_end > USER_TOP {
+    if result_end > USER_SIGTRAMP {
         return Err("enomem");
     }
-    let pages_needed = aligned_len / PAGE_SZ;
-    let _avail = kernel.pool.free_count();
-    if _avail < pages_needed {
-        return Err("enomem");
-    }
-    {
-        let mut addr_space = task.process.addr_space.lock().unwrap();
-        if map_fixed {
-            addr_space.unmap_range(result_addr, aligned_len, &kernel.pool)?;
-        }
-        let region = VmRegion::new(result_addr, aligned_len, vm_flags);
+    let region = VmRegion::new(result_addr, aligned_len, vm_flags);
+    if map_fixed {
+        addr_space.replace_region(region, &kernel.pool)?;
+    } else {
         addr_space.map_region(region, &kernel.pool)?;
     }
     Ok(result_addr)
@@ -101,7 +97,7 @@ pub(super) fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize,
     }
     let aligned_len = checked_align_up(len, PAGE_SZ).ok_or("enomem")?;
     let end = addr.checked_add(aligned_len).ok_or("enomem")?;
-    if end > USER_TOP {
+    if end > USER_SIGTRAMP {
         return Err("enomem");
     }
     let task = kernel.cur_task(0).ok_or("esrch")?;

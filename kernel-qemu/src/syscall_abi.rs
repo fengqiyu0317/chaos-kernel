@@ -27,10 +27,13 @@ pub const RISCV_SYS_KILL: usize = 129;
 pub const RISCV_SYS_RT_SIGACTION: usize = 134;
 pub const RISCV_SYS_RT_SIGPROCMASK: usize = 135;
 pub const RISCV_SYS_RT_SIGRETURN: usize = 139;
+// AGENT: Linux asm-generic memory syscall numbers used by the RV64 userspace ABI.
 pub const RISCV_SYS_BRK: usize = 214;
+pub const RISCV_SYS_MUNMAP: usize = 215;
 pub const RISCV_SYS_CLONE: usize = 220;
 // AGENT: map Linux RV64 execve into the migrated internal exec namespace.
 pub const RISCV_SYS_EXECVE: usize = 221;
+pub const RISCV_SYS_MMAP: usize = 222;
 pub const RISCV_SYS_WAIT4: usize = 260;
 pub const RISCV_SYS_EXIT: usize = 93;
 pub const RISCV_SYS_EXIT_GROUP: usize = 94;
@@ -48,6 +51,8 @@ pub const INTERNAL_SYS_READ: usize = 0;
 pub const INTERNAL_SYS_WRITE: usize = 1;
 pub const INTERNAL_SYS_CLOSE: usize = 3;
 pub const INTERNAL_SYS_FSTAT: usize = 5;
+pub const INTERNAL_SYS_MMAP: usize = 9;
+pub const INTERNAL_SYS_MUNMAP: usize = 11;
 pub const INTERNAL_SYS_BRK: usize = 12;
 // AGENT: retain the migrated internal ioctl id while mapping Linux RV64 29.
 pub const INTERNAL_SYS_IOCTL: usize = 16;
@@ -111,9 +116,11 @@ pub fn map_riscv_nr(nr: usize) -> Option<usize> {
         RISCV_SYS_RT_SIGACTION => Some(INTERNAL_SYS_RT_SIGACTION),
         RISCV_SYS_RT_SIGPROCMASK => Some(INTERNAL_SYS_RT_SIGPROCMASK),
         RISCV_SYS_RT_SIGRETURN => Some(INTERNAL_SYS_RT_SIGRETURN),
+        RISCV_SYS_MUNMAP => Some(INTERNAL_SYS_MUNMAP),
         RISCV_SYS_BRK => Some(INTERNAL_SYS_BRK),
         RISCV_SYS_CLONE => Some(INTERNAL_SYS_CLONE),
         RISCV_SYS_EXECVE => Some(INTERNAL_SYS_EXEC),
+        RISCV_SYS_MMAP => Some(INTERNAL_SYS_MMAP),
         RISCV_SYS_WAIT4 => Some(INTERNAL_SYS_WAIT4),
         RISCV_SYS_EXIT => Some(INTERNAL_SYS_EXIT),
         RISCV_SYS_EXIT_GROUP => Some(INTERNAL_SYS_EXIT_GROUP),

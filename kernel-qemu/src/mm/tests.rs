@@ -2,15 +2,16 @@
 // expose the same checks to the optional QEMU boot self-test path.
 use super::*;
 use crate::kernel::{
-    check_access, check_access_rw, hash_combine, BuddyAllocator, FramePool, VmMap, VmRegion,
-    MEM_OFF, PAGE_SZ, TRAMPOLINE, TRAP_CONTEXT, USER_SIGTRAMP, USER_TOP, VM_READ, VM_WRITE,
+    check_access, check_access_rw, hash_combine, AddrSpace, BuddyAllocator, FramePool, VmMap,
+    VmRegion, MEM_OFF, PAGE_SZ, TRAMPOLINE, TRAP_CONTEXT, USER_SIGTRAMP, USER_TOP, VM_READ,
+    VM_SHARED, VM_WRITE,
 };
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 // AGENT: run the VMA boundary and checked-merge regressions with the existing
 // QEMU MM checks.
-pub fn run_all() {
+pub fn run_all(pool: &FramePool) {
     checked_align_up_rejects_invalid_results();
     bitwise_merge_replaces_only_masked_bits();
     rotate_bits_masks_zero_distance_rotation();
@@ -25,6 +26,9 @@ pub fn run_all() {
     vm_map_insert_rejects_invalid_ranges_and_overlaps();
     user_range_checks_reserve_trap_pages();
     vm_map_find_free_rejects_non_page_granular_lengths();
+    vm_map_find_free_from_honors_hints_and_sigtramp_limit();
+    fixed_region_failure_restores_original_mapping(pool);
+    anonymous_shared_and_private_fork_semantics_hold(pool);
     buddy_allocator_alloc_free_smoke();
     buddy_free_merges_with_nonzero_base();
     buddy_free_rejects_duplicate_and_bad_ranges();
@@ -187,6 +191,105 @@ fn vm_map_find_free_rejects_non_page_granular_lengths() {
     assert_eq!(map.find_free(PAGE_SZ - 1, PAGE_SZ), None);
     assert_eq!(map.find_free(PAGE_SZ + 1, PAGE_SZ), None);
     assert_eq!(map.find_free(PAGE_SZ, PAGE_SZ), Some(0x7000_0000));
+}
+
+// AGENT: make non-fixed mmap hints deterministic, page-aligned, and unable to
+// select the signal-trampoline page even when the caller starts immediately below it.
+#[cfg_attr(test, test)]
+fn vm_map_find_free_from_honors_hints_and_sigtramp_limit() {
+    let mut map = VmMap::new();
+    let hinted = 0x7100_0001;
+    let aligned = 0x7100_1000;
+
+    assert_eq!(map.find_free_from(hinted, PAGE_SZ, PAGE_SZ), Some(aligned));
+    map.insert(VmRegion::new(aligned, PAGE_SZ, VM_READ))
+        .unwrap();
+    assert_eq!(
+        map.find_free_from(hinted, PAGE_SZ, PAGE_SZ),
+        Some(aligned + PAGE_SZ)
+    );
+    assert_eq!(
+        map.find_free_from(USER_SIGTRAMP - PAGE_SZ + 1, PAGE_SZ, PAGE_SZ),
+        None
+    );
+}
+
+// AGENT: reserve a private physical sandbox and prove that eager MAP_FIXED
+// allocation failure restores the exact old bytes, VMA policy, leaf, and frame owner.
+fn fixed_region_failure_restores_original_mapping(pool: &FramePool) {
+    let reservation = pool
+        .alloc_contiguous_pg_frames(4, 1)
+        .expect("fixed rollback test should reserve four physical pages");
+    let isolated_pool = FramePool::new(4, reservation[0].paddr());
+    let base = 0x5200_0000;
+    let mut addr_space = AddrSpace::new();
+    addr_space
+        .map_region(
+            VmRegion::new(base, PAGE_SZ, VM_READ | VM_WRITE),
+            &isolated_pool,
+        )
+        .unwrap();
+    addr_space
+        .write_user_bytes(base, &[0x5a], &isolated_pool)
+        .unwrap();
+    assert_eq!(isolated_pool.free_count(), 0);
+
+    assert_eq!(
+        addr_space.replace_region(
+            VmRegion::new(base, PAGE_SZ, VM_READ | VM_WRITE),
+            &isolated_pool,
+        ),
+        Err("enomem")
+    );
+    let mut restored = [0u8; 1];
+    addr_space.read_user_bytes(base, &mut restored).unwrap();
+    assert_eq!(restored, [0x5a]);
+    assert_eq!(
+        addr_space.mapped_region(base).map(|region| region.flags),
+        Some(VM_READ | VM_WRITE)
+    );
+    addr_space.check_page_table_consistency().unwrap();
+
+    addr_space.release_all_pages();
+    assert_eq!(isolated_pool.free_count(), 4);
+    drop(reservation);
+}
+
+// AGENT: preserve the migrated fork contract while mmap entry validation is
+// tightened: shared anonymous writes remain visible and private writes resolve COW.
+fn anonymous_shared_and_private_fork_semantics_hold(pool: &FramePool) {
+    let free_before = pool.free_count();
+    let shared = 0x5300_0000;
+    let private = shared + PAGE_SZ;
+    let mut parent = AddrSpace::new();
+    parent
+        .map_region(
+            VmRegion::new(shared, PAGE_SZ, VM_READ | VM_WRITE | VM_SHARED),
+            pool,
+        )
+        .unwrap();
+    parent
+        .map_region(VmRegion::new(private, PAGE_SZ, VM_READ | VM_WRITE), pool)
+        .unwrap();
+    parent.write_user_bytes(shared, &[1], pool).unwrap();
+    parent.write_user_bytes(private, &[2], pool).unwrap();
+
+    let mut child = AddrSpace::fork_from(&mut parent, pool).unwrap();
+    child.write_user_bytes(shared, &[3], pool).unwrap();
+    child.write_user_bytes(private, &[4], pool).unwrap();
+
+    let mut parent_shared = [0u8; 1];
+    let mut parent_private = [0u8; 1];
+    parent.read_user_bytes(shared, &mut parent_shared).unwrap();
+    parent
+        .read_user_bytes(private, &mut parent_private)
+        .unwrap();
+    assert_eq!(parent_shared, [3]);
+    assert_eq!(parent_private, [2]);
+
+    child.release_all_pages();
+    parent.release_all_pages();
+    assert_eq!(pool.free_count(), free_before);
 }
 
 #[cfg_attr(test, test)]

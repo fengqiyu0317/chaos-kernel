@@ -1,6 +1,6 @@
 # Chaos 项目交接状态
 
-更新日期：2026-07-30
+更新日期：2026-08-11
 
 ## 目标
 
@@ -13,6 +13,9 @@
 
 ## 已完成修改
 
+- 2026-08-11：`kernel-qemu` 已完成第一阶段匿名 `mmap` / `munmap` 闭环：RV64 syscall 222/215 已映射到迁移后的内部语义，`MAP_SHARED` / `MAP_PRIVATE` 必须恰好选择一种，非固定映射会优先从页对齐 hint 向上搜索并回退到 `MMAP_BASE`，而 `USER_SIGTRAMP` 已从 mmap/munmap 可变范围排除。
+- 2026-08-11：`kernel-qemu::AddrSpace::replace_region()` 已为 `MAP_FIXED` 保留原 VMA、resident page 所有权和 Sv39 leaf flags；新的 eager 匿名映射失败时恢复原映射、页内容与 COW 状态。文件 backing、lazy allocation 与旧 frame 就地复用仍保留为后续工作。
+- 2026-08-11：新增 `qemu-mm-selftest` syscall 回归，覆盖 RV64 六参数解码、零填充、frame 回收、flags 校验、hint/冲突/回退、`MAP_FIXED` 成功覆盖与 ENOMEM 回滚、signal trampoline 保护、shared fork 可见性与 private COW 隔离。RISC-V check、聚焦 MM selftest、全量 `qemu-selftest` 和普通 `tools/qemu-smoke.sh` 均通过。
 - 从外层目录复制项目规则到 `chaos/AGENTS.md`。
 - 创建 `chaos/docs/`。
 - 创建本文件，记录 Chaos 项目的当前交接状态。

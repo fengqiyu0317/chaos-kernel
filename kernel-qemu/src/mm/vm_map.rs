@@ -2,7 +2,7 @@
 // operations together, separate from physical frame ownership.
 use alloc::vec::Vec;
 
-use super::{checked_align_up, PAGE_SZ, USER_TOP};
+use super::{checked_align_up, max, PAGE_SZ, USER_SIGTRAMP, USER_TOP};
 
 // AGENT: keep VmRegion to the VMA metadata that is currently used by the
 // QEMU address-space code; derive Clone so transactional callers can snapshot
@@ -220,10 +220,16 @@ impl VmMap {
         self.regions = kept;
     }
 
-    // AGENT: search free VM gaps with checked candidate/end arithmetic and reuse
-    // the shared MM alignment helper; reject lengths that could not later be
-    // inserted as page-granular VMA metadata.
+    // AGENT: preserve the default mmap-base policy while delegating the actual
+    // bounded gap search to the hint-aware implementation.
     pub fn find_free(&self, len: usize, align: usize) -> Option<usize> {
+        self.find_free_from(MMAP_BASE, len, align)
+    }
+
+    // AGENT: search upward from one caller hint without entering the reserved
+    // signal-trampoline page; callers may retry from MMAP_BASE when a high hint
+    // has no suitable successor gap.
+    pub fn find_free_from(&self, start: usize, len: usize, align: usize) -> Option<usize> {
         if len == 0 || len % PAGE_SZ != 0 {
             return None;
         }
@@ -235,11 +241,11 @@ impl VmMap {
 
         let align_addr = |addr| checked_align_up(addr, align);
 
-        let mut cand = align_addr(MMAP_BASE)?;
+        let mut cand = align_addr(max(start, MMAP_BASE))?;
 
         loop {
             let end = cand.checked_add(len)?;
-            if end > USER_TOP {
+            if end > USER_SIGTRAMP {
                 return None;
             }
 

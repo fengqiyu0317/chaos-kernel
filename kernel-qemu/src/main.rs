@@ -95,7 +95,7 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     #[cfg(feature = "qemu-mm-selftest")]
     {
         println!("[kernel-qemu] mm bits selftest start");
-        mm_bits::tests::run_all();
+        mm_bits::tests::run_all(frame_pool.as_ref());
         // AGENT: exercise strict Sv39 PTE classification in the existing MM
         // boot selftest after the kernel page table and direct map are active.
         kernel::mm::sv39::tests::run_all();
@@ -130,8 +130,20 @@ pub extern "C" fn rust_main(hartid: usize, dtb_pa: usize) -> ! {
     }
     // AGENT: isolate selftests that intentionally mutate current-task, restored
     // process, and run-queue state from the production Kernel built below.
-    #[cfg(any(feature = "qemu-fs-selftest", feature = "qemu-checkpoint-selftest"))]
+    #[cfg(any(
+        feature = "qemu-mm-selftest",
+        feature = "qemu-fs-selftest",
+        feature = "qemu-checkpoint-selftest"
+    ))]
     let selftest_kernel = init_qemu_selftest_backend(frame_pool.as_ref().clone());
+    // AGENT: exercise the installed-Kernel mmap path only after process tests
+    // finish, then leave the disposable current address space clean for later tests.
+    #[cfg(feature = "qemu-mm-selftest")]
+    {
+        println!("[kernel-qemu] mmap syscall selftest start");
+        kernel::syscall::mm_tests::run_all(selftest_kernel);
+        println!("[kernel-qemu] mmap syscall selftest passed");
+    }
     // AGENT: filesystem syscall selftests cover ABI errno encoding before using
     // the installed Kernel, current task, frame pool, Sv39 mappings, and usercopy.
     #[cfg(feature = "qemu-fs-selftest")]
@@ -387,7 +399,11 @@ fn run_chaosfs_persistence_smoke(frame_pool: kernel::FramePool) {
 
 // AGENT: provide a disposable installed Kernel for boot selftests that require
 // live usercopy or checkpoint state without contaminating production scheduling.
-#[cfg(any(feature = "qemu-fs-selftest", feature = "qemu-checkpoint-selftest"))]
+#[cfg(any(
+    feature = "qemu-mm-selftest",
+    feature = "qemu-fs-selftest",
+    feature = "qemu-checkpoint-selftest"
+))]
 fn init_qemu_selftest_backend(frame_pool: kernel::FramePool) -> &'static kernel::Kernel {
     let kernel = Box::leak(Box::new(kernel::Kernel::new(frame_pool)));
     kernel.proc_init();
