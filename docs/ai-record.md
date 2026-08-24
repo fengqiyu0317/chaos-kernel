@@ -1,6 +1,6 @@
 # Chaos AI 工作日志
 
-更新时间：2026-08-11
+更新时间：2026-08-24
 
 ## 维护约定
 
@@ -11,6 +11,54 @@
   - `/home/huawei/.codex/sessions/2026/06/18/rollout-2026-06-18T23-57-15-019edb73-6ad9-7b23-8162-c76a589a57a9.jsonl`
 - 上一层 `record.md` 不作为本文件的事实来源；以后若要补日志，应优先查 Codex session JSONL 或当前项目内的 `TASK.md` / `NOTES.md`。
 - 涉及 `kernel-sim` 的修改目标是 `chaos/kernel-sim/`，不要修改 `chaos/kernel/src/kernel.rs`。
+
+## 2026-08-24：kernel-qemu brk 第一阶段语义收敛
+
+目标：修复 `kernel-qemu` 的页对齐简化 `brk`，在暂不引入 lazy anonymous fault 和 `RLIMIT_DATA` 的第一阶段完成字节级 program break、raw Linux 返回语义、heap VMA 所有权、失败回滚以及跨 fork/exec/checkpoint 的一致性。
+
+已完成修改：
+
+- `AddrSpace` 分离不可降低的 `start_brk` 与字节级 current `brk`；`resize_brk()` 只对 `PAGE_ALIGN(old_brk)..PAGE_ALIGN(new_brk)` 的完整页面执行映射变化，同页请求只更新元数据。
+- 新增内部 `VM_HEAP` 标志。heap 不再与普通匿名 VMA 合并；增长在 eager allocation 前检查目标与一页 guard，收缩遇到任何非 heap VMA 时拒绝，避免删除 ELF、mmap、stack 或 signal trampoline。
+- 新增 `BrkResizeError::{Rejected, Internal}`：低于 `start_brk`、越界、冲突和 ENOMEM 属于正常拒绝；页表/VMA 一致性错误继续上报，避免被伪装成普通用户失败。
+- `sys_brk()` 现在实现 raw Linux ABI：成功返回精确请求地址，普通失败返回未改变的旧 break；`brk(0)` 返回当前精确 break，不再伪造无 current-task fallback 或返回页对齐值/负 errno。
+- exec 初始化、fork、地址空间 teardown 和 checkpoint restore 同步维护两个 break 字段。checkpoint process payload 升级到 v2 并保存 `start_brk`；v1 明确返回 unsupported version，restore 验证 break 顺序、用户上界及所有 `VM_HEAP` VMA 均位于保存的 heap extent。
+- QEMU MM/selftest 新增未对齐增长与同页调整、跨页收缩、低于下界、guard/VMA 冲突、非 heap shrink 防护、隔离 FramePool OOM 回滚、fork 元数据和 RV64 raw-return 回归；checkpoint 格式测试也进入 `qemu-checkpoint-selftest`，不依赖不可用的 host test harness。
+
+关键文件：
+
+- `kernel-qemu/src/syscall/mm.rs`
+- `kernel-qemu/src/mm/address_space.rs`
+- `kernel-qemu/src/mm/vm_map.rs`
+- `kernel-qemu/src/mm/tests.rs`
+- `kernel-qemu/src/syscall/mm_tests.rs`
+- `kernel-qemu/src/proc/user_image.rs`
+- `kernel-qemu/src/checkpoint_image/`
+- `kernel-qemu/src/kernel_core/kernel_ops/checkpoint.rs`
+
+验收结果：
+
+```bash
+cargo fmt --manifest-path kernel-qemu/Cargo.toml -- --check
+cargo check --manifest-path kernel-qemu/Cargo.toml \
+  --target riscv64gc-unknown-none-elf --all-features
+
+cd kernel-qemu
+cargo build --release --features qemu-selftest
+timeout 30s cargo run --release --features qemu-selftest,ram-block-device
+
+cd ..
+bash tools/qemu-smoke.sh
+git diff --check
+```
+
+RISC-V all-features check 和 release selftest 构建通过；RAM QEMU 实际通过 MM、raw brk/mmap syscall、sync、sched、proc、fs、checkpoint v2、user-satp/signal 以及真实 init/exec 全链路；标准 VirtIO smoke 通过并正常退出。`cargo test` 的 host x86_64 路径会被本 crate 的 `build.rs` 主动拒绝，因为内核及嵌入用户程序要求 `riscv64gc-unknown-none-elf`，因此以可启动 QEMU selftest 作为测试执行入口。本轮未修改或运行 `kernel-sim`、`chaos-tests`，未修改禁止文件 `kernel/src/kernel.rs`。
+
+剩余限制：
+
+- heap 页仍由 `map_region()` eager 分配；下一阶段需要增加非 resident anonymous VMA 和 load/store/usercopy fault-in。
+- 尚未实现 `RLIMIT_DATA`、完整 overcommit/accounting、可配置 stack guard gap 或 mlock 相关 brk 行为。
+- checkpoint v1 因 process payload 缺少 `start_brk` 而明确不兼容 v2；如未来需要导入旧镜像，应新增独立 v1 解码迁移，而不能复用 v2 字段布局。
 
 ## 2026-08-11：kernel-qemu 匿名 mmap/munmap 第一阶段闭环
 

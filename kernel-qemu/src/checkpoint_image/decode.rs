@@ -2,23 +2,23 @@ use alloc::vec::Vec;
 use core::convert::TryFrom;
 
 use super::codec::{checked_u32_to_usize, checked_u64_to_usize, Cursor};
-use super::validate::{validate_first_version, validate_header_static};
+use super::validate::{validate_current_version, validate_header_static};
 use super::{
     CheckpointError, CheckpointHeader, CheckpointImage, SavedFdEntry, SavedFdKind, SavedPage,
     SavedProcess, SavedRunState, SavedTimer, SavedTimerTargetKind, SavedTrapFrame, SavedVma,
     SectionTag, IMAGE_HEADER_LEN,
 };
 
-// AGENT: decode bytes and immediately apply the first-version validation
+// AGENT: decode bytes and immediately apply the current-version validation
 // contract expected by restore.
-pub(super) fn decode_first_version(bytes: &[u8]) -> Result<CheckpointImage, CheckpointError> {
+pub(super) fn decode_current_version(bytes: &[u8]) -> Result<CheckpointImage, CheckpointError> {
     let image = decode_image(bytes)?;
-    validate_first_version(&image)?;
+    validate_current_version(&image)?;
     Ok(image)
 }
 
-// AGENT: parse a complete image while leaving first-version policy checks to
-// CheckpointImage::validate_first_version.
+// AGENT: parse a complete image while leaving current-version policy checks to
+// CheckpointImage::validate_current_version.
 fn decode_image(bytes: &[u8]) -> Result<CheckpointImage, CheckpointError> {
     let mut cursor = Cursor::new(bytes);
     let header = decode_header(&mut cursor)?;
@@ -98,6 +98,7 @@ fn decode_header(cursor: &mut Cursor<'_>) -> Result<CheckpointHeader, Checkpoint
 fn decode_process(bytes: &[u8]) -> Result<SavedProcess, CheckpointError> {
     let mut cursor = Cursor::new(bytes);
     let process = SavedProcess {
+        start_brk: cursor.read_u64()?,
         brk: cursor.read_u64()?,
         thread_count: cursor.read_u32()?,
         run_state: SavedRunState::try_from(cursor.read_u16()?)?,

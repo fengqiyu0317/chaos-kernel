@@ -11,6 +11,14 @@ const INITIAL_BRK: usize = 0x0040_0000;
 const TRAMPOLINE_FLAGS: usize = PTE_R | PTE_X | PTE_A;
 const TRAP_CONTEXT_FLAGS: usize = PTE_R | PTE_W | PTE_A | PTE_D;
 
+// AGENT: keep normal raw-brk rejection distinct from address-space invariant
+// failures so the syscall can return the old break without hiding kernel bugs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrkResizeError {
+    Rejected,
+    Internal(&'static str),
+}
+
 // AGENT: track supervisor-only leaves separately from VmMap/resident_pages so
 // trap transport does not become user-visible VMA, COW, or checkpoint state.
 struct ArchMappings {
@@ -50,11 +58,11 @@ impl ArchMappings {
     }
 }
 
-// AGENT: own address-space-wide layout metadata and coordinate VmMap, resident
-// page metadata, architecture leaves, and the Sv39 page table at their shared
-// consistency boundary.
+// AGENT: own the immutable heap lower bound and byte-granular current break in
+// addition to VMA, resident-page, architecture-leaf, and Sv39 state.
 pub struct AddrSpace {
     vm_map: VmMap,
+    start_brk: usize,
     brk: usize,
     resident_pages: ResidentPages,
     sv39: PageTable,
@@ -86,11 +94,12 @@ struct PreparedResidentPage {
 }
 
 impl AddrSpace {
-    // AGENT: construct an address space with its initial program break, empty VMA
-    // metadata, and no allocated Sv39 root.
+    // AGENT: construct an address space with matching initial break bounds,
+    // empty VMA metadata, and no allocated Sv39 root.
     pub fn new() -> Self {
         Self {
             vm_map: VmMap::new(),
+            start_brk: INITIAL_BRK,
             brk: INITIAL_BRK,
             resident_pages: ResidentPages::new(),
             sv39: PageTable::new(),
@@ -191,17 +200,28 @@ impl AddrSpace {
         self.vm_map.find_free_from(start, len, align)
     }
 
-    // AGENT: expose the current page-aligned program break owned by AddrSpace.
+    // AGENT: expose the byte-granular current program break owned by AddrSpace.
     pub fn brk(&self) -> usize {
         self.brk
     }
 
-    // AGENT: initialize or restore brk metadata after its image mappings have
+    // AGENT: expose the immutable lower bound needed by checkpoint and focused
+    // syscall regressions without allowing callers to bypass resize policy.
+    pub fn start_brk(&self) -> usize {
+        self.start_brk
+    }
+
+    // AGENT: initialize or restore exact brk metadata after image mappings have
     // already been built through transactional AddrSpace helpers.
-    pub(crate) fn set_brk_metadata(&mut self, brk: usize) -> Result<(), &'static str> {
-        if brk % PAGE_SZ != 0 || brk > USER_TOP {
+    pub(crate) fn set_brk_metadata(
+        &mut self,
+        start_brk: usize,
+        brk: usize,
+    ) -> Result<(), &'static str> {
+        if start_brk > brk || brk > USER_TOP {
             return Err("einval");
         }
+        self.start_brk = start_brk;
         self.brk = brk;
         Ok(())
     }
@@ -354,9 +374,10 @@ impl AddrSpace {
         Ok((saved_vmas, saved_pages))
     }
 
-    // AGENT: rebuild anonymous checkpoint memory by recreating VMAs, replaying
-    // page bytes, then restoring final protections.
+    // AGENT: rebuild anonymous checkpoint memory and both exact break bounds by
+    // recreating VMAs, replaying page bytes, then restoring final protections.
     pub fn restore_checkpoint_memory(
+        start_brk: usize,
         brk: usize,
         vmas: &[SavedVma],
         pages: &[SavedPage],
@@ -385,15 +406,16 @@ impl AddrSpace {
         for (start, len, flags) in final_regions {
             addr_space.protect(start, len, flags)?;
         }
-        addr_space.set_brk_metadata(brk)?;
+        addr_space.set_brk_metadata(start_brk, brk)?;
         Ok(addr_space)
     }
 
-    // AGENT: fork turns writable private pages into COW while shared-file page
-    // clones retain one PgFrame/dirty state and mapping-local write-enable bits.
+    // AGENT: fork copies both break bounds, turns writable private pages into
+    // COW, and retains writable shared-file mapping semantics.
     pub fn fork_from(parent: &mut AddrSpace, pool: &FramePool) -> Result<Self, &'static str> {
         parent.debug_check_page_table_consistency()?;
         let mut child = Self::new();
+        child.start_brk = parent.start_brk;
         child.brk = parent.brk;
         for region in parent.vm_map.clone_regions() {
             child.vm_map.insert(region)?;
@@ -922,9 +944,8 @@ impl AddrSpace {
         }
     }
 
-    // AGENT: process teardown removes hardware leaves before resident frames
-    // drop through RAII, then releases Sv39 frames and dynamic metadata backing
-    // allocations without reporting an ambiguous aliased-page count.
+    // AGENT: process teardown removes hardware leaves before resident frames,
+    // releases Sv39/dynamic state, and resets both program-break bounds.
     pub fn release_all_pages(&mut self) {
         self.check_page_table_consistency()
             .expect("address space should be consistent before release");
@@ -941,6 +962,7 @@ impl AddrSpace {
         self.sv39.clear();
         self.arch = ArchMappings::new();
         self.vm_map.regions = Vec::new();
+        self.start_brk = INITIAL_BRK;
         self.brk = INITIAL_BRK;
         crate::csr::sfence_vma();
     }
@@ -1210,15 +1232,48 @@ impl AddrSpace {
         self.install_prepared_region(region, prepared, pool)
     }
 
-    // AGENT: resize heap through the public mapping helpers so VmMap, resident
-    // metadata, and Sv39 leaves stay synchronized.
-    pub fn resize_brk(&mut self, new_brk: usize, pool: &FramePool) -> Result<(), &'static str> {
+    // AGENT: retain a byte-granular break while mapping only complete VM_HEAP
+    // pages, rejecting unsafe shrink ownership and one-page-guard collisions.
+    pub fn resize_brk(&mut self, new_brk: usize, pool: &FramePool) -> Result<(), BrkResizeError> {
         let old_brk = self.brk;
-        if new_brk < old_brk {
-            self.unmap_range(new_brk, old_brk - new_brk, pool)?;
-        } else if new_brk > old_brk {
-            let heap = VmRegion::new(old_brk, new_brk - old_brk, VM_READ | VM_WRITE);
-            self.map_region(heap, pool)?;
+        if new_brk < self.start_brk || new_brk > USER_TOP {
+            return Err(BrkResizeError::Rejected);
+        }
+
+        let old_mapped_end = checked_align_up(old_brk, PAGE_SZ).ok_or(BrkResizeError::Rejected)?;
+        let new_mapped_end = checked_align_up(new_brk, PAGE_SZ).ok_or(BrkResizeError::Rejected)?;
+        if old_mapped_end == new_mapped_end {
+            self.brk = new_brk;
+            return Ok(());
+        }
+
+        if new_mapped_end < old_mapped_end {
+            let len = old_mapped_end - new_mapped_end;
+            if self.vm_map.has_non_heap_overlap(new_mapped_end, len) {
+                return Err(BrkResizeError::Rejected);
+            }
+            self.unmap_range(new_mapped_end, len, pool)
+                .map_err(BrkResizeError::Internal)?;
+        } else {
+            let guarded_end = new_mapped_end
+                .checked_add(PAGE_SZ)
+                .ok_or(BrkResizeError::Rejected)?;
+            let guarded_len = guarded_end
+                .checked_sub(old_mapped_end)
+                .ok_or(BrkResizeError::Rejected)?;
+            if !self.vm_map.range_is_free(old_mapped_end, guarded_len) {
+                return Err(BrkResizeError::Rejected);
+            }
+
+            let heap = VmRegion::new(
+                old_mapped_end,
+                new_mapped_end - old_mapped_end,
+                VM_READ | VM_WRITE | VM_HEAP,
+            );
+            self.map_region(heap, pool).map_err(|err| match err {
+                "enomem" | "oom" => BrkResizeError::Rejected,
+                internal => BrkResizeError::Internal(internal),
+            })?;
         }
         self.brk = new_brk;
         Ok(())

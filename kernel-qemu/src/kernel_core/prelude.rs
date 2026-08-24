@@ -127,6 +127,9 @@ pub const VM_WRITE: u32 = 0x02;
 pub const VM_EXEC: u32 = 0x04;
 pub const VM_SHARED: u32 = 0x08;
 pub const VM_GROWSDOWN: u32 = 0x10;
+// AGENT: distinguish program-heap VMAs from ordinary anonymous mappings so
+// brk shrink cannot remove ELF, mmap, stack, or signal-trampoline mappings.
+pub const VM_HEAP: u32 = 0x20;
 pub const VM_HUGETLB: u32 = 0x40;
 pub const VM_PFNMAP: u32 = 0x80;
 

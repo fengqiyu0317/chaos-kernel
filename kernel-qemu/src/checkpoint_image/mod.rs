@@ -8,8 +8,10 @@ use alloc::vec::Vec;
 mod codec;
 mod decode;
 mod encode;
-#[cfg(test)]
-mod tests;
+// AGENT: expose format/validation regressions to the bootable checkpoint
+// selftest because the no_std RISC-V binary cannot use the host test harness.
+#[cfg(any(test, feature = "qemu-checkpoint-selftest"))]
+pub(crate) mod tests;
 mod types;
 mod validate;
 
@@ -21,8 +23,9 @@ pub use self::types::{
 
 // AGENT: fixed checkpoint image identity for guest-kernel process snapshots.
 pub const CHECKPOINT_MAGIC: [u8; 8] = *b"CHKM10\0\0";
-// AGENT: first image version only supports one process and one thread.
-pub const CHECKPOINT_VERSION: u16 = 1;
+// AGENT: version 2 adds the immutable start_brk beside the exact current brk;
+// version 1 images are rejected instead of being decoded with a shifted layout.
+pub const CHECKPOINT_VERSION: u16 = 2;
 // AGENT: this draft targets the current QEMU RISC-V 64-bit path.
 pub const CHECKPOINT_ARCH_RISCV64: u16 = 1;
 // AGENT: match the project-wide page size used by kernel-sim and kernel-qemu.
@@ -31,9 +34,9 @@ pub const CHECKPOINT_PAGE_SIZE: u32 = 4096;
 const IMAGE_HEADER_LEN: usize = 32;
 const SECTION_HEADER_LEN: usize = 16;
 
-// AGENT: construct and validate first-version process snapshot images.
+// AGENT: construct and validate current-version process snapshot images.
 impl CheckpointImage {
-    // AGENT: create an empty first-version RISC-V image before sections are added.
+    // AGENT: create an empty current-version RISC-V image before sections are added.
     pub fn new_riscv64() -> Self {
         Self {
             header: CheckpointHeader {
@@ -52,21 +55,21 @@ impl CheckpointImage {
         }
     }
 
-    // AGENT: enforce the M10 first-version scope before checkpoint bytes are
+    // AGENT: enforce the current M10 format scope before checkpoint bytes are
     // emitted or accepted by restore.
-    pub fn validate_first_version(&self) -> Result<(), CheckpointError> {
-        validate::validate_first_version(self)
+    pub fn validate_current_version(&self) -> Result<(), CheckpointError> {
+        validate::validate_current_version(self)
     }
 
-    // AGENT: serialize the validated first-version image into little-endian
+    // AGENT: serialize the validated current-version image into little-endian
     // sectioned bytes suitable for storage in a guest file or memory buffer.
-    pub fn encode_first_version(&self) -> Result<Vec<u8>, CheckpointError> {
-        encode::encode_first_version(self)
+    pub fn encode_current_version(&self) -> Result<Vec<u8>, CheckpointError> {
+        encode::encode_current_version(self)
     }
 
-    // AGENT: decode bytes and immediately apply the first-version validation
+    // AGENT: decode bytes and immediately apply the current-version validation
     // contract expected by restore.
-    pub fn decode_first_version(bytes: &[u8]) -> Result<Self, CheckpointError> {
-        decode::decode_first_version(bytes)
+    pub fn decode_current_version(bytes: &[u8]) -> Result<Self, CheckpointError> {
+        decode::decode_current_version(bytes)
     }
 }

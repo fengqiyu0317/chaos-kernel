@@ -1,6 +1,9 @@
 use super::*;
 
+// AGENT: run pure checkpoint-format validation before stateful Kernel restore
+// checks so QEMU covers the v2 process payload and heap-ownership rules.
 pub fn run_all(kernel: &Kernel) {
+    crate::kernel::checkpoint_image::tests::run_all();
     periodic_timer_preserves_phase_after_delayed_advance();
     checkpoint_stdio_round_trip_preserves_typed_terminal_objects(kernel);
     checkpoint_round_trip_restores_memory_and_trap_frame(kernel);
@@ -47,7 +50,7 @@ fn periodic_timer_preserves_phase_after_delayed_advance() {
     CLK.store(start, Ordering::Relaxed);
 }
 
-// AGENT: prove first-version checkpoint keeps stdio roles while reconstructing
+// AGENT: prove current-version checkpoint keeps stdio roles while reconstructing
 // typed terminal objects, and rejects a redirected regular file it cannot save.
 #[cfg_attr(test, test)]
 fn checkpoint_stdio_round_trip_preserves_typed_terminal_objects(kernel: &Kernel) {
@@ -143,8 +146,8 @@ fn ensure_checkpoint_regions(kernel: &Kernel, current: &Task, data_addr: usize, 
         .expect("checkpoint data page should be writable");
 }
 
-// AGENT: prove the first checkpoint vertical slice can copy current-task VMA
-// metadata, resident page bytes, and a complete saved trap frame into a new pid.
+// AGENT: prove the current checkpoint slice restores exact break bounds, VMA
+// bytes, and a complete saved trap frame into a new pid.
 #[cfg_attr(test, test)]
 fn checkpoint_round_trip_restores_memory_and_trap_frame(kernel: &Kernel) {
     let current = kernel
@@ -169,11 +172,20 @@ fn checkpoint_round_trip_restores_memory_and_trap_frame(kernel: &Kernel) {
     let image = kernel
         .checkpoint_current_image(0, frame.clone())
         .expect("current task should checkpoint");
+    let saved_process = image
+        .process
+        .as_ref()
+        .expect("checkpoint should save process");
+    let source_breaks = {
+        let addr_space = current.process.addr_space.lock().unwrap();
+        (addr_space.start_brk() as u64, addr_space.brk() as u64)
+    };
+    assert_eq!((saved_process.start_brk, saved_process.brk), source_breaks);
     let bytes = image
-        .encode_first_version()
+        .encode_current_version()
         .expect("checkpoint image should encode");
     let decoded =
-        CheckpointImage::decode_first_version(&bytes).expect("checkpoint image should decode");
+        CheckpointImage::decode_current_version(&bytes).expect("checkpoint image should decode");
     let restored_id = kernel
         .restore_process_from_image(decoded)
         .expect("checkpoint image should restore");
@@ -183,6 +195,13 @@ fn checkpoint_round_trip_restores_memory_and_trap_frame(kernel: &Kernel) {
         .tasks
         .find_task(restored_id)
         .expect("restored task should be registered");
+    {
+        let addr_space = restored.process.addr_space.lock().unwrap();
+        assert_eq!(
+            (addr_space.start_brk() as u64, addr_space.brk() as u64),
+            source_breaks
+        );
+    }
     let mut restored_pattern = [0u8; 8];
     restored
         .process

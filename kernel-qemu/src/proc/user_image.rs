@@ -281,7 +281,10 @@ fn populate_user_image(
         return Err("e2big");
     }
 
-    addr_space.set_brk_metadata(checked_align_up(image_end, PAGE_SZ).ok_or("ph_overflow")?)?;
+    // AGENT: initialize both the immutable lower bound and exact current break;
+    // the current normalized ELF end remains page-aligned by construction.
+    let initial_brk = checked_align_up(image_end, PAGE_SZ).ok_or("ph_overflow")?;
+    addr_space.set_brk_metadata(initial_brk, initial_brk)?;
     Ok(UserEntry {
         entry,
         stack_pointer: sp,

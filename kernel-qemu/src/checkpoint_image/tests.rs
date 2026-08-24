@@ -3,7 +3,7 @@ use alloc::vec;
 use super::*;
 use crate::kernel::VM_GROWSDOWN;
 
-// AGENT: build the smallest valid first-version checkpoint image used by
+// AGENT: build the smallest valid current-version checkpoint image used by
 // the local round-trip and validation tests.
 fn sample_image() -> CheckpointImage {
     let mut regs = [0u64; 32];
@@ -12,6 +12,7 @@ fn sample_image() -> CheckpointImage {
 
     let mut image = CheckpointImage::new_riscv64();
     image.process = Some(SavedProcess {
+        start_brk: 0x3fff_f123,
         brk: 0x4000_0000,
         thread_count: 1,
         run_state: SavedRunState::SyscallSafePoint,
@@ -49,69 +50,119 @@ fn sample_image() -> CheckpointImage {
     image
 }
 
-// AGENT: ensure the explicit binary format can carry the first supported
-// register, VMA, page, fd, timer, and process metadata sections.
-#[test]
+// AGENT: run codec and validation checks inside the QEMU checkpoint selftest in
+// addition to exposing each case to a compatible Rust test harness.
+pub fn run_all() {
+    checkpoint_image_round_trips_supported_state();
+    validation_rejects_blocked_wait_state();
+    validation_rejects_inverted_program_break_bounds();
+    validation_rejects_legacy_checkpoint_version();
+    validation_rejects_heap_vma_outside_break_extent();
+    validation_rejects_short_page_payload();
+    validation_rejects_unsupported_fd_kind();
+    validation_rejects_stdio_offset();
+    validation_rejects_inconsistent_open_description();
+}
+
+// AGENT: ensure the explicit current format round-trips byte-granular start/current
+// break values beside register, VMA, page, fd, and timer sections.
+#[cfg_attr(test, test)]
 fn checkpoint_image_round_trips_supported_state() {
     let image = sample_image();
-    let bytes = image.encode_first_version().unwrap();
+    let bytes = image.encode_current_version().unwrap();
     assert!(bytes.len() > IMAGE_HEADER_LEN + SECTION_HEADER_LEN);
-    let decoded = CheckpointImage::decode_first_version(&bytes).unwrap();
+    let decoded = CheckpointImage::decode_current_version(&bytes).unwrap();
     let mut expected = image;
     expected.header.section_count = 6;
     assert_eq!(decoded, expected);
 }
 
-// AGENT: first-version restore must reject wait-state snapshots.
-#[test]
+// AGENT: current-version restore must reject wait-state snapshots.
+#[cfg_attr(test, test)]
 fn validation_rejects_blocked_wait_state() {
     let mut image = sample_image();
     image.process.as_mut().unwrap().run_state = SavedRunState::BlockedWait;
     assert_eq!(
-        image.validate_first_version(),
+        image.validate_current_version(),
         Err(CheckpointError::UnsupportedState)
     );
 }
 
-// AGENT: first-version restore only accepts full page payloads at page
+// AGENT: reject snapshots that would let a restored brk shrink below the
+// immutable image boundary while accepting byte-granular valid bounds.
+#[cfg_attr(test, test)]
+fn validation_rejects_inverted_program_break_bounds() {
+    let mut image = sample_image();
+    image.process.as_mut().unwrap().start_brk = 0x4000_0001;
+    assert_eq!(
+        image.validate_current_version(),
+        Err(CheckpointError::UnsupportedState)
+    );
+}
+
+// AGENT: keep the process payload layout change explicit by rejecting v1
+// headers rather than decoding brk bytes into the new start_brk field.
+#[cfg_attr(test, test)]
+fn validation_rejects_legacy_checkpoint_version() {
+    let mut image = sample_image();
+    image.header.version = 1;
+    assert_eq!(
+        image.validate_current_version(),
+        Err(CheckpointError::UnsupportedVersion)
+    );
+}
+
+// AGENT: prevent a checkpoint from granting heap ownership to an unrelated
+// VMA outside the saved byte-granular program-break extent.
+#[cfg_attr(test, test)]
+fn validation_rejects_heap_vma_outside_break_extent() {
+    let mut image = sample_image();
+    image.vmas[0].flags |= crate::kernel::VM_HEAP;
+    assert_eq!(
+        image.validate_current_version(),
+        Err(CheckpointError::UnsupportedState)
+    );
+}
+
+// AGENT: current-version restore only accepts full page payloads at page
 // aligned virtual addresses.
-#[test]
+#[cfg_attr(test, test)]
 fn validation_rejects_short_page_payload() {
     let mut image = sample_image();
     image.pages[0].bytes.pop();
     assert_eq!(
-        image.validate_first_version(),
+        image.validate_current_version(),
         Err(CheckpointError::BadPageLength)
     );
 }
 
 // AGENT: unsupported fd-backed kernel objects should fail before image
 // serialization.
-#[test]
+#[cfg_attr(test, test)]
 fn validation_rejects_unsupported_fd_kind() {
     let mut image = sample_image();
     image.fds[0].kind = SavedFdKind::Epoll;
     assert_eq!(
-        image.validate_first_version(),
+        image.validate_current_version(),
         Err(CheckpointError::UnsupportedFd)
     );
 }
 
-// AGENT: typed stdio terminals are nonseekable, so first-version images must
+// AGENT: typed stdio terminals are nonseekable, so current images must
 // reject offsets left by the old path-tagged regular-file representation.
-#[test]
+#[cfg_attr(test, test)]
 fn validation_rejects_stdio_offset() {
     let mut image = sample_image();
     image.fds[0].offset = 1;
     assert_eq!(
-        image.validate_first_version(),
+        image.validate_current_version(),
         Err(CheckpointError::UnsupportedFd)
     );
 }
 
 // AGENT: duplicate descriptors sharing one open-file-description must agree
 // on serializable offset and status state.
-#[test]
+#[cfg_attr(test, test)]
 fn validation_rejects_inconsistent_open_description() {
     let mut image = sample_image();
     image.fds.push(SavedFdEntry {
@@ -123,7 +174,7 @@ fn validation_rejects_inconsistent_open_description() {
         offset: 0,
     });
     assert_eq!(
-        image.validate_first_version(),
+        image.validate_current_version(),
         Err(CheckpointError::InconsistentOpenDescription)
     );
 }

@@ -133,27 +133,18 @@ pub(super) fn sys_munmap(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize,
     Ok(0)
 }
 
-// AGENT TODO: sys_brk still stores a page-aligned break. Track the byte-granular
-// program break separately from the mapped heap extent, preserve the intended
-// raw-syscall or libc-wrapper failure semantics, enforce start_brk/min_brk, and
-// move heap pages toward lazy allocation.
-pub(super) fn sys_brk(kernel: &Kernel, a0: usize) -> Result<usize, &'static str> {
-    let new_brk = a0;
-    if new_brk == 0 {
-        return Ok(kernel
-            .cur_task(0)
-            .map(|t| t.process.addr_space.lock().unwrap().brk())
-            .unwrap_or(0x0040_0000));
-    }
-    if new_brk > USER_TOP {
-        return Err("enomem");
-    }
-    let aligned = checked_align_up(new_brk, PAGE_SZ).ok_or("enomem")?;
+// AGENT: implement the raw Linux brk ABI over byte-granular address-space
+// metadata: success returns the request and normal rejection returns old brk.
+pub(super) fn sys_brk(kernel: &Kernel, new_brk: usize) -> Result<usize, &'static str> {
     let task = kernel.cur_task(0).ok_or("esrch")?;
-    task.process
-        .addr_space
-        .lock()
-        .unwrap()
-        .resize_brk(aligned, &kernel.pool)?;
-    Ok(aligned)
+    let mut addr_space = task.process.addr_space.lock().unwrap();
+    let old_brk = addr_space.brk();
+    if new_brk == 0 {
+        return Ok(old_brk);
+    }
+    match addr_space.resize_brk(new_brk, &kernel.pool) {
+        Ok(()) => Ok(new_brk),
+        Err(BrkResizeError::Rejected) => Ok(old_brk),
+        Err(BrkResizeError::Internal(err)) => Err(err),
+    }
 }

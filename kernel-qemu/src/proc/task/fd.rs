@@ -231,7 +231,7 @@ fn checkpoint_description_id(
     Ok(id)
 }
 
-// AGENT: rebuild first-version stdio as an explicit terminal object instead of
+// AGENT: rebuild current-version stdio as an explicit terminal object instead of
 // manufacturing path-tagged regular files during checkpoint restore.
 fn checkpoint_stdio_file(
     kind: SavedFdKind,
@@ -411,7 +411,7 @@ impl Task {
         let mut saved = Vec::with_capacity(table.entries.len());
         for (&fd, entry) in table.entries.iter() {
             let kind = checkpoint_fd_kind(fd)?;
-            // AGENT: first-version checkpoint only supports the initial terminal
+            // AGENT: current-version checkpoint only supports the initial terminal
             // stdio surface and must reject redirected regular files explicitly.
             if !entry.is_tty() {
                 return Err("enotsup");

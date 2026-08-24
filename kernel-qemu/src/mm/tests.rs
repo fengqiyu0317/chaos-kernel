@@ -2,15 +2,15 @@
 // expose the same checks to the optional QEMU boot self-test path.
 use super::*;
 use crate::kernel::{
-    check_access, check_access_rw, hash_combine, AddrSpace, BuddyAllocator, FramePool, VmMap,
-    VmRegion, MEM_OFF, PAGE_SZ, TRAMPOLINE, TRAP_CONTEXT, USER_SIGTRAMP, USER_TOP, VM_READ,
-    VM_SHARED, VM_WRITE,
+    check_access, check_access_rw, hash_combine, AddrSpace, BrkResizeError, BuddyAllocator,
+    FramePool, VmMap, VmRegion, MEM_OFF, PAGE_SZ, TRAMPOLINE, TRAP_CONTEXT, USER_SIGTRAMP,
+    USER_TOP, VM_HEAP, VM_READ, VM_SHARED, VM_WRITE,
 };
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-// AGENT: run the VMA boundary and checked-merge regressions with the existing
-// QEMU MM checks.
+// AGENT: run VMA, exact-brk, frame, fork, and allocator regressions through the
+// existing QEMU MM check entry point.
 pub fn run_all(pool: &FramePool) {
     checked_align_up_rejects_invalid_results();
     bitwise_merge_replaces_only_masked_bits();
@@ -28,10 +28,109 @@ pub fn run_all(pool: &FramePool) {
     vm_map_find_free_rejects_non_page_granular_lengths();
     vm_map_find_free_from_honors_hints_and_sigtramp_limit();
     fixed_region_failure_restores_original_mapping(pool);
+    byte_granular_brk_preserves_bounds_and_heap_ownership(pool);
+    brk_allocation_failure_preserves_old_break(pool);
     anonymous_shared_and_private_fork_semantics_hold(pool);
     buddy_allocator_alloc_free_smoke();
     buddy_free_merges_with_nonzero_base();
     buddy_free_rejects_duplicate_and_bad_ranges();
+}
+
+// AGENT: prove exact break metadata changes independently of page mappings,
+// fork preserves both bounds, and rejection cannot remove non-heap VMAs.
+fn byte_granular_brk_preserves_bounds_and_heap_ownership(pool: &FramePool) {
+    let free_before = pool.free_count();
+    let mut parent = AddrSpace::new();
+    let start = parent.start_brk();
+    let image_page = start - PAGE_SZ;
+    parent
+        .map_region(VmRegion::new(image_page, PAGE_SZ, VM_READ), pool)
+        .unwrap();
+
+    assert_eq!(parent.resize_brk(start + 1, pool), Ok(()));
+    assert_eq!(parent.brk(), start + 1);
+    assert_eq!(
+        parent.mapped_region(start).map(|region| region.flags),
+        Some(VM_READ | VM_WRITE | VM_HEAP)
+    );
+    let free_after_first_heap_page = pool.free_count();
+
+    assert_eq!(parent.resize_brk(start + 2, pool), Ok(()));
+    assert_eq!(parent.brk(), start + 2);
+    assert_eq!(pool.free_count(), free_after_first_heap_page);
+
+    let mut child = AddrSpace::fork_from(&mut parent, pool).unwrap();
+    assert_eq!(child.start_brk(), start);
+    assert_eq!(child.brk(), start + 2);
+    child.release_all_pages();
+
+    assert_eq!(parent.resize_brk(start, pool), Ok(()));
+    assert_eq!(parent.brk(), start);
+    assert!(parent.mapped_region(start).is_none());
+    assert!(parent.mapped_region(image_page).is_some());
+    assert_eq!(
+        parent.resize_brk(start - 1, pool),
+        Err(BrkResizeError::Rejected)
+    );
+    assert_eq!(parent.brk(), start);
+    assert!(parent.mapped_region(image_page).is_some());
+
+    let collision = start + 2 * PAGE_SZ;
+    parent
+        .map_region(VmRegion::new(collision, PAGE_SZ, VM_READ), pool)
+        .unwrap();
+    assert_eq!(
+        parent.resize_brk(start + PAGE_SZ + 1, pool),
+        Err(BrkResizeError::Rejected)
+    );
+    assert_eq!(parent.brk(), start);
+    assert_eq!(
+        parent.mapped_region(collision).map(|region| region.flags),
+        Some(VM_READ)
+    );
+
+    parent.unmap_range(collision, PAGE_SZ, pool).unwrap();
+    let grown = start + PAGE_SZ + 1;
+    assert_eq!(parent.resize_brk(grown, pool), Ok(()));
+    parent
+        .replace_region(VmRegion::new(start + PAGE_SZ, PAGE_SZ, VM_READ), pool)
+        .unwrap();
+    assert_eq!(
+        parent.resize_brk(start, pool),
+        Err(BrkResizeError::Rejected)
+    );
+    assert_eq!(parent.brk(), grown);
+    assert_eq!(
+        parent
+            .mapped_region(start + PAGE_SZ)
+            .map(|region| region.flags),
+        Some(VM_READ)
+    );
+
+    parent.release_all_pages();
+    assert_eq!(pool.free_count(), free_before);
+}
+
+// AGENT: force Sv39 allocation exhaustion in an isolated physical pool and
+// prove eager brk growth rolls back VMA state while retaining the exact break.
+fn brk_allocation_failure_preserves_old_break(pool: &FramePool) {
+    let reservation = pool
+        .alloc_contiguous_pg_frames(3, 1)
+        .expect("brk OOM test should reserve three physical pages");
+    let isolated_pool = FramePool::new(3, reservation[0].paddr());
+    let mut addr_space = AddrSpace::new();
+    let old_brk = addr_space.brk();
+
+    assert_eq!(
+        addr_space.resize_brk(old_brk + 1, &isolated_pool),
+        Err(BrkResizeError::Rejected)
+    );
+    assert_eq!(addr_space.brk(), old_brk);
+    assert!(addr_space.mapped_region(old_brk).is_none());
+
+    addr_space.release_all_pages();
+    assert_eq!(isolated_pool.free_count(), 3);
+    drop(reservation);
 }
 
 // AGENT: verify that VmRegion merging is directional, permission-preserving,

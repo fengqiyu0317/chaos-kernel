@@ -2,7 +2,7 @@
 // operations together, separate from physical frame ownership.
 use alloc::vec::Vec;
 
-use super::{checked_align_up, max, MmapFileSource, PAGE_SZ, USER_SIGTRAMP, USER_TOP};
+use super::{checked_align_up, max, MmapFileSource, PAGE_SZ, USER_SIGTRAMP, USER_TOP, VM_HEAP};
 
 // AGENT: retain either anonymous policy or a positioned regular-file owner in
 // every VMA so fd close and partial VMA operations cannot detach its backing.
@@ -247,6 +247,39 @@ impl VmMap {
 
         let region = &self.regions[idx - 1];
         region.contains(addr).then_some(region)
+    }
+
+    // AGENT: preflight a page-granular range before eager allocation so a brk
+    // collision cannot consume frames merely to discover an existing VMA.
+    pub(super) fn range_is_free(&self, base: usize, len: usize) -> bool {
+        if len == 0 || base % PAGE_SZ != 0 || len % PAGE_SZ != 0 {
+            return false;
+        }
+        let Some(end) = base.checked_add(len) else {
+            return false;
+        };
+        end <= USER_TOP
+            && !self
+                .regions
+                .iter()
+                .any(|region| region.base < end && base < region.end())
+    }
+
+    // AGENT: reject brk shrink ranges containing any VMA not owned by the heap;
+    // holes and VM_HEAP fragments remain safe to remove transactionally.
+    pub(super) fn has_non_heap_overlap(&self, base: usize, len: usize) -> bool {
+        if len == 0 || base % PAGE_SZ != 0 || len % PAGE_SZ != 0 {
+            return true;
+        }
+        let Some(end) = base.checked_add(len) else {
+            return true;
+        };
+        if end > USER_TOP {
+            return true;
+        }
+        self.regions
+            .iter()
+            .any(|region| region.base < end && base < region.end() && region.flags & VM_HEAP == 0)
     }
 
     // AGENT: make an interior address a VMA collection boundary while leaving

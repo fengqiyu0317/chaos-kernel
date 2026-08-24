@@ -1,6 +1,6 @@
 # Chaos 项目交接状态
 
-更新日期：2026-08-11
+更新日期：2026-08-24
 
 ## 目标
 
@@ -13,6 +13,9 @@
 
 ## 已完成修改
 
+- 2026-08-24：`kernel-qemu` 已完成 `brk` 第一阶段 Linux raw-syscall 语义收敛：`AddrSpace` 分离不可降低的 `start_brk` 与字节级 current `brk`，只按 `PAGE_ALIGN(brk)` 增删整页；成功返回精确请求，普通失败返回未改变的旧 break，不再经通用 ABI 编码为负 errno。
+- 2026-08-24：heap VMA 新增内部 `VM_HEAP` 所有权，增长前先做空洞与一页 guard 预检，收缩拒绝覆盖 ELF/mmap/stack 等非 heap VMA；同页调整不分配或释放 frame，增长 OOM、低于 `start_brk`、越界和冲突均保持旧状态。fork/exec/teardown 已同步两个 break 字段。
+- 2026-08-24：checkpoint process payload 新增 `start_brk` 并显式升级为 v2，v1 镜像不再按新布局误解码；restore 会校验 break 顺序、用户上界和 `VM_HEAP` VMA 所属范围。MM、RV64 syscall ABI、OOM/回滚、fork 和 checkpoint 回归已进入可启动 QEMU selftest。
 - 2026-08-11：`kernel-qemu` 已完成第二阶段 eager 文件 `mmap`：普通文件 `MAP_PRIVATE` / `MAP_SHARED` 通过不改变 OFD offset 的定位 I/O 装页，VMA 和 resident page 保留文件身份、页偏移和 EOF `valid_len`；fd 关闭后 backing 仍由 `FInstance` mount pin 保持有效。私有可写页继续走 COW 且不写回，共享可写页通过首次 store fault 和 kernel usercopy 统一置 sticky dirty，fork 共享 frame 与 dirty state。
 - 2026-08-11：文件共享页的 `munmap`、`MAP_FIXED`、exec 和 exit 生命周期已接入写回；普通 unmap/覆盖在写入或 flush 失败时保留 VMA、PTE、frame 和 dirty 元数据，exec 失败保留旧映像，exit 记录错误后继续释放。文件 VMA 的 checkpoint 暂时明确返回 `ENOTSUP`。
 - 2026-08-11：第二阶段仍明确保留以下 Linux 差异：不做 lazy fault 装入，不做独立 `MAP_SHARED` 映射间的全局页缓存/即时一致性，不处理映射期间外部 truncate/grow，EOF 之外仍是不写回的零页而非访问时 `SIGBUS`，未增加 `msync`、`mprotect` syscall、`MAP_FIXED_NOREPLACE` 或更多 mmap flags。
@@ -480,6 +483,8 @@ cargo test --test pressure
 
 ### M4 内存管理、mmap、brk、地址空间与页表
 
+- `[M4][M9][重要] DONE`: `kernel-qemu` 的 raw `brk` 已分离 `start_brk` 与字节级 current break，通过 `VM_HEAP` 限定可收缩 VMA，以页对齐映射边界增删整页；同页调整、低于下界、越界、VMA/guard 冲突和 OOM 的返回/回滚语义已有 RV64 与 QEMU 回归。fork、exec、teardown 和 checkpoint v2 均保存对应元数据。
+- `[M4][M9][普通] TODO`: `kernel-qemu` 的 brk 第一阶段仍使用 eager 物理页分配；后续阶段应让 heap 先登记非 resident VMA，再由 load/store page fault 与 kernel usercopy 按需分配零页，并补 `RLIMIT_DATA`、更完整 overcommit/accounting 和 stack guard gap 策略。
 - `[M4][普通] TODO`: `kernel-sim` 尚未建模 `mlock/mlockall` 内存锁状态、`MADV_WIPEONFORK` 清零语义，以及完整 `madvise` fork 标志；已有 `VM_DONTCOPY` 只覆盖了 DONTFORK 类似行为的一部分。
 - `[M4][普通] TODO`: `kernel-sim/src/kernel/mm/address_space.rs` 的 `page_table_root` / `vm_token` 目前只是全局递增的模拟地址空间 token，`asid_from_token()` 也只是把 token 映射到非零 `u16`；尚未建模真实 `satp`/页表根、ASID generation、ASID 复用时的 TLB flush/shootdown 等完整 MMU 语义。
 - `[M4][普通] TODO`: `kernel-sim/src/kernel/mm/bits.rs` 目前只被公开导出，尚未接入实际 `FramePool` / VMA / 页表路径；若后续把 frame allocator 改为 bitmap 或 buddy allocator，应让该模块承担空闲 bit 查找、空闲页统计、2 的幂/order 计算、地址/页号按阶对齐，以及连续页块拆分/合并所需的底层位操作，并补充对应分配/碎片回归测试。

@@ -80,10 +80,11 @@ pub struct CheckpointHeader {
     pub section_count: u32,
 }
 
-// AGENT: process-level metadata that is not owned by a single VMA or trap
-// frame, including the first-version one-thread restriction.
+// AGENT: process-level metadata includes both exact program-break bounds and
+// the current-version one-thread restriction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SavedProcess {
+    pub start_brk: u64,
     pub brk: u64,
     pub thread_count: u32,
     pub run_state: SavedRunState,
@@ -137,7 +138,7 @@ pub struct SavedTimer {
     pub interval_ticks: u64,
 }
 
-// AGENT: complete first-version checkpoint image assembled from independently
+// AGENT: complete current-version checkpoint image assembled from independently
 // parseable sections.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckpointImage {

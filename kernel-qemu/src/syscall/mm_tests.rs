@@ -2,8 +2,8 @@
 // Kernel, current task, real frame pool, Sv39, filesystem, and RV64 adapter.
 use super::*;
 use crate::syscall_abi::{
-    decode_from_trap_frame, dispatch_from_trap_frame, map_riscv_nr, INTERNAL_SYS_MMAP,
-    INTERNAL_SYS_MUNMAP, RISCV_SYS_MMAP, RISCV_SYS_MUNMAP,
+    decode_from_trap_frame, dispatch_from_trap_frame, map_riscv_nr, INTERNAL_SYS_BRK,
+    INTERNAL_SYS_MMAP, INTERNAL_SYS_MUNMAP, RISCV_SYS_BRK, RISCV_SYS_MMAP, RISCV_SYS_MUNMAP,
 };
 
 const HINT_BASE: usize = 0x7100_0001;
@@ -17,15 +17,72 @@ const FILE_PARTIAL_BASE: usize = 0x7340_0000;
 const FILE_REPLACE_BASE: usize = 0x7350_0000;
 const FILE_FAILURE_BASE: usize = 0x7360_0000;
 
-// AGENT: run anonymous ABI checks on the shared selftest kernel, then isolate
-// file fixtures in disposable kernels so later fs/checkpoint tests stay clean.
+// AGENT: run exact raw-brk and anonymous mmap ABI checks on the shared kernel,
+// then isolate file fixtures so later fs/checkpoint tests stay clean.
 pub fn run_all(kernel: &Kernel) {
+    rv64_brk_returns_exact_or_unchanged_break(kernel);
     rv64_mmap_and_munmap_round_trip(kernel);
     mmap_rejects_invalid_types_and_reserved_signal_page(kernel);
     mmap_honors_hint_conflicts_and_default_fallback(kernel);
     fixed_mmap_replaces_contents_and_permissions(kernel);
     file_mmap_contracts(kernel.pool.clone());
     file_mmap_failure_transactions(kernel.pool.clone());
+}
+
+// AGENT: exercise brk through the RV64 trap adapter so byte-granular success
+// and rejected requests return addresses rather than generic negative errno.
+fn rv64_brk_returns_exact_or_unchanged_break(kernel: &Kernel) {
+    assert_eq!(map_riscv_nr(RISCV_SYS_BRK), Some(INTERNAL_SYS_BRK));
+    let task = kernel.cur_task(0).expect("brk selftest needs current init");
+    let (start_brk, old_brk) = {
+        let addr_space = task.process.addr_space.lock().unwrap();
+        (addr_space.start_brk(), addr_space.brk())
+    };
+    assert_eq!(old_brk % PAGE_SZ, 0);
+
+    let mut query = TrapFrame::new();
+    query.regs[17] = RISCV_SYS_BRK;
+    dispatch_from_trap_frame(&mut query);
+    assert_eq!(query.regs[10], old_brk);
+
+    let requested = old_brk + 1;
+    let mut grow = TrapFrame::new();
+    grow.regs[10] = requested;
+    grow.regs[17] = RISCV_SYS_BRK;
+    dispatch_from_trap_frame(&mut grow);
+    assert_eq!(grow.regs[10], requested);
+    {
+        let addr_space = task.process.addr_space.lock().unwrap();
+        assert_eq!(addr_space.brk(), requested);
+        assert_eq!(
+            addr_space.mapped_region(old_brk).map(|region| region.flags),
+            Some(VM_READ | VM_WRITE | VM_HEAP)
+        );
+    }
+
+    let same_page = old_brk + 2;
+    let mut adjust = TrapFrame::new();
+    adjust.regs[10] = same_page;
+    adjust.regs[17] = RISCV_SYS_BRK;
+    dispatch_from_trap_frame(&mut adjust);
+    assert_eq!(adjust.regs[10], same_page);
+
+    let mut below_start = TrapFrame::new();
+    below_start.regs[10] = start_brk - 1;
+    below_start.regs[17] = RISCV_SYS_BRK;
+    dispatch_from_trap_frame(&mut below_start);
+    assert_eq!(below_start.regs[10], same_page);
+
+    let mut overflow = TrapFrame::new();
+    overflow.regs[10] = usize::MAX;
+    overflow.regs[17] = RISCV_SYS_BRK;
+    dispatch_from_trap_frame(&mut overflow);
+    assert_eq!(overflow.regs[10], same_page);
+
+    assert_eq!(sys_brk(kernel, old_brk), Ok(old_brk));
+    let addr_space = task.process.addr_space.lock().unwrap();
+    assert_eq!(addr_space.brk(), old_brk);
+    assert!(addr_space.mapped_region(old_brk).is_none());
 }
 
 // AGENT: prove that RV64 syscall numbers and all six argument slots reach the

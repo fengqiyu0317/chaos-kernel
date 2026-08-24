@@ -6,10 +6,10 @@ use super::{
     SavedTimer, SavedTrapFrame, SavedVma, SectionTag, IMAGE_HEADER_LEN, SECTION_HEADER_LEN,
 };
 
-// AGENT: serialize the validated first-version image into little-endian
+// AGENT: serialize the validated current-version image into little-endian
 // sectioned bytes suitable for storage in a guest file or memory buffer.
-pub(super) fn encode_first_version(image: &CheckpointImage) -> Result<Vec<u8>, CheckpointError> {
-    image.validate_first_version()?;
+pub(super) fn encode_current_version(image: &CheckpointImage) -> Result<Vec<u8>, CheckpointError> {
+    image.validate_current_version()?;
     let sections = encoded_sections(image)?;
     let mut header = image.header.clone();
     header.section_count = checked_usize_to_u32(sections.len())?;
@@ -84,6 +84,7 @@ fn encode_section_header(
 // AGENT: serialize process metadata.
 fn encode_process(process: &SavedProcess) -> Vec<u8> {
     let mut out = Vec::new();
+    put_u64(&mut out, process.start_brk);
     put_u64(&mut out, process.brk);
     put_u32(&mut out, process.thread_count);
     put_u16(&mut out, process.run_state as u16);

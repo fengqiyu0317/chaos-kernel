@@ -2,8 +2,8 @@ use super::*;
 use crate::trap::TrapFrame;
 
 impl Kernel {
-    // AGENT: assemble a first-version checkpoint image for the current CPU task
-    // at a syscall-safe trap-frame boundary.
+    // AGENT: assemble a current-version checkpoint image with both exact break
+    // bounds for the current task at a syscall-safe trap-frame boundary.
     pub fn checkpoint_current_image(
         &self,
         cpu: usize,
@@ -14,20 +14,21 @@ impl Kernel {
         if thread_count != 1 {
             return Err("enotsup");
         }
-        // AGENT: the first checkpoint image has no record-lock or blocked-wait
+        // AGENT: the current checkpoint image has no record-lock or blocked-wait
         // section, so reject owned locks rather than silently losing semantics.
         if self.record_locks.process_has_locks(task.process.pid()) {
             return Err("enotsup");
         }
 
-        let (brk, vmas, pages) = {
+        let (start_brk, brk, vmas, pages) = {
             let addr_space = task.process.addr_space.lock().unwrap();
             let (vmas, pages) = addr_space.snapshot_checkpoint_memory()?;
-            (addr_space.brk(), vmas, pages)
+            (addr_space.start_brk(), addr_space.brk(), vmas, pages)
         };
 
         let mut image = CheckpointImage::new_riscv64();
         image.process = Some(SavedProcess {
+            start_brk: start_brk as u64,
             brk: brk as u64,
             thread_count,
             run_state: SavedRunState::SyscallSafePoint,
@@ -40,7 +41,7 @@ impl Kernel {
             .lock()
             .snapshot_checkpoint_timers(task.id())?;
         image
-            .validate_first_version()
+            .validate_current_version()
             .map_err(checkpoint_error_to_errno)?;
         Ok(image)
     }
@@ -57,7 +58,7 @@ impl Kernel {
         let output = task.get_fd_entry(fd).ok_or("ebadf")?;
         let image = self.checkpoint_current_image(cpu, trap_frame)?;
         let bytes = image
-            .encode_first_version()
+            .encode_current_version()
             .map_err(checkpoint_error_to_errno)?;
         match output.write(task.id(), &bytes)? {
             FdWriteOutcome::Written(n) => Ok(n),
@@ -79,13 +80,19 @@ impl Kernel {
         image: CheckpointImage,
     ) -> Result<usize, &'static str> {
         image
-            .validate_first_version()
+            .validate_current_version()
             .map_err(checkpoint_error_to_errno)?;
         let process = image.process.as_ref().ok_or("einval")?;
         let trap_frame = image.trap_frame.clone().ok_or("einval")?;
+        let start_brk = usize::try_from(process.start_brk).map_err(|_| "einval")?;
         let brk = usize::try_from(process.brk).map_err(|_| "einval")?;
-        let addr_space =
-            AddrSpace::restore_checkpoint_memory(brk, &image.vmas, &image.pages, &self.pool)?;
+        let addr_space = AddrSpace::restore_checkpoint_memory(
+            start_brk,
+            brk,
+            &image.vmas,
+            &image.pages,
+            &self.pool,
+        )?;
 
         let task = self.tasks.spawn()?;
         {
@@ -112,7 +119,7 @@ impl Kernel {
         let input = task.get_fd_entry(fd).ok_or("ebadf")?;
         let bytes = read_fd_to_end(&input, task.id())?;
         let image =
-            CheckpointImage::decode_first_version(&bytes).map_err(checkpoint_error_to_errno)?;
+            CheckpointImage::decode_current_version(&bytes).map_err(checkpoint_error_to_errno)?;
         self.restore_process_from_image(image)
     }
 }
