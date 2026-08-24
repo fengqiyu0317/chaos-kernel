@@ -2,7 +2,18 @@
 // operations together, separate from physical frame ownership.
 use alloc::vec::Vec;
 
-use super::{checked_align_up, max, PAGE_SZ, USER_SIGTRAMP, USER_TOP};
+use super::{checked_align_up, max, MmapFileSource, PAGE_SZ, USER_SIGTRAMP, USER_TOP};
+
+// AGENT: retain either anonymous policy or a positioned regular-file owner in
+// every VMA so fd close and partial VMA operations cannot detach its backing.
+#[derive(Clone)]
+pub(crate) enum VmBacking {
+    Anonymous,
+    File {
+        source: MmapFileSource,
+        offset: usize,
+    },
+}
 
 // AGENT: keep VmRegion to the VMA metadata that is currently used by the
 // QEMU address-space code; derive Clone so transactional callers can snapshot
@@ -12,6 +23,7 @@ pub struct VmRegion {
     pub base: usize,
     pub len: usize,
     pub flags: u32,
+    pub(crate) backing: VmBacking,
 }
 
 // AGENT: keep range-local validation, comparison, split, and merge operations
@@ -19,7 +31,54 @@ pub struct VmRegion {
 impl VmRegion {
     // AGENT: construct one VMA metadata value without mutating a VmMap.
     pub fn new(base: usize, len: usize, flags: u32) -> Self {
-        Self { base, len, flags }
+        Self {
+            base,
+            len,
+            flags,
+            backing: VmBacking::Anonymous,
+        }
+    }
+
+    // AGENT: construct one positioned file VMA while retaining the stable
+    // mount/inode owner independently from the descriptor used at mmap time.
+    pub(crate) fn new_file(
+        base: usize,
+        len: usize,
+        flags: u32,
+        source: MmapFileSource,
+        offset: usize,
+    ) -> Self {
+        Self {
+            base,
+            len,
+            flags,
+            backing: VmBacking::File { source, offset },
+        }
+    }
+
+    // AGENT: expose file-backed classification to checkpoint and lifecycle
+    // callers without leaking mutable backing state.
+    pub(crate) fn is_file_backed(&self) -> bool {
+        matches!(self.backing, VmBacking::File { .. })
+    }
+
+    // AGENT: preserve backing identity while deriving one page-aligned VMA
+    // fragment, advancing positioned file offsets by the virtual displacement.
+    fn subregion(&self, base: usize, len: usize) -> Option<Self> {
+        let displacement = base.checked_sub(self.base)?;
+        let backing = match &self.backing {
+            VmBacking::Anonymous => VmBacking::Anonymous,
+            VmBacking::File { source, offset } => VmBacking::File {
+                source: source.clone(),
+                offset: offset.checked_add(displacement)?,
+            },
+        };
+        Some(Self {
+            base,
+            len,
+            flags: self.flags,
+            backing,
+        })
     }
 
     // AGENT: expose a checked end for callers that must reject overflowed VM ranges.
@@ -63,16 +122,8 @@ impl VmRegion {
 
         let left_len = addr - self.base;
         let right_len = end - addr;
-        let left = VmRegion {
-            base: self.base,
-            len: left_len,
-            flags: self.flags,
-        };
-        let right = VmRegion {
-            base: addr,
-            len: right_len,
-            flags: self.flags,
-        };
+        let left = self.subregion(self.base, left_len)?;
+        let right = self.subregion(addr, right_len)?;
         Some((left, right))
     }
 
@@ -83,7 +134,7 @@ impl VmRegion {
         if se != other.base {
             return None;
         }
-        if self.flags != other.flags {
+        if self.flags != other.flags || !self.backing_merges_with(other) {
             return None;
         }
         let combined_end = other.checked_end()?;
@@ -92,8 +143,31 @@ impl VmRegion {
             base: self.base,
             len: combined_len,
             flags: self.flags,
+            backing: self.backing.clone(),
         };
         Some(combined)
+    }
+
+    // AGENT: merge file VMAs only when they retain the same inode and their
+    // positioned byte ranges are exactly contiguous; anonymous VMAs need no key.
+    fn backing_merges_with(&self, other: &VmRegion) -> bool {
+        match (&self.backing, &other.backing) {
+            (VmBacking::Anonymous, VmBacking::Anonymous) => true,
+            (
+                VmBacking::File {
+                    source: left,
+                    offset: left_offset,
+                },
+                VmBacking::File {
+                    source: right,
+                    offset: right_offset,
+                },
+            ) => {
+                left.file_identity() == right.file_identity()
+                    && left_offset.checked_add(self.len) == Some(*right_offset)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -191,8 +265,8 @@ impl VmMap {
         Ok(())
     }
 
-    // AGENT: remove the requested half-open range from VMA metadata by keeping
-    // any non-overlapping left/right fragments.
+    // AGENT: remove one half-open range while deriving left/right fragments
+    // through backing-aware offset adjustment instead of anonymous rebuilding.
     pub fn remove_range(&mut self, base: usize, len: usize) {
         if len == 0 {
             return;
@@ -211,10 +285,14 @@ impl VmMap {
             }
 
             if rb < base {
-                kept.push(VmRegion::new(rb, base - rb, region.flags));
+                if let Some(left) = region.subregion(rb, base - rb) {
+                    kept.push(left);
+                }
             }
             if end < re {
-                kept.push(VmRegion::new(end, re - end, region.flags));
+                if let Some(right) = region.subregion(end, re - end) {
+                    kept.push(right);
+                }
             }
         }
         self.regions = kept;

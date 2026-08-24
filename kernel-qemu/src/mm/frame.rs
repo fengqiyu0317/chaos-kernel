@@ -1,8 +1,9 @@
 // AGENT: isolate physical-frame ownership from direct-map conversion and VMA
 // metadata management.
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{copy_page, FramePool, FramePoolState, Mutex, PAGE_SZ};
+use super::{copy_page, FramePool, FramePoolState, MmapFileSource, Mutex, PAGE_SZ};
 
 // AGENT: PgFrame is the RAII mapping handle for a physical frame; cloning it
 // represents another PTE sharing that frame.
@@ -74,18 +75,110 @@ impl Drop for PgFrameInner {
     }
 }
 
-// AGENT: SharedPage is one by-value page handle: clones share the PgFrame while
-// each wrapper keeps independent mapping-local COW state.
+// AGENT: keep sticky dirty state shared by fork-related MAP_SHARED wrappers so
+// any later unmap writes the latest bytes even after another alias wrote them.
+pub(crate) struct SharedFilePageState {
+    pub(super) source: MmapFileSource,
+    pub(super) offset: usize,
+    pub(super) valid_len: usize,
+    dirty: AtomicBool,
+}
+
+// AGENT: centralize shared-file dirty publication and observation without
+// coupling backing state to one address space's mapping-local PTE permissions.
+impl SharedFilePageState {
+    // AGENT: initialize one clean file-page state with its positioned EOF span.
+    pub(super) fn new(source: MmapFileSource, offset: usize, valid_len: usize) -> Self {
+        Self {
+            source,
+            offset,
+            valid_len,
+            dirty: AtomicBool::new(false),
+        }
+    }
+
+    // AGENT: publish dirtiness monotonically so fork aliases cannot clear it.
+    pub(super) fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    // AGENT: acquire the sticky dirty publication before unmap copies bytes.
+    pub(super) fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+}
+
+// AGENT: distinguish anonymous, private-file, and shared-file ownership at the
+// resident-page boundary so fork, write fault, and unmap use one backing truth.
+#[derive(Clone)]
+pub(crate) enum PageBacking {
+    Anonymous,
+    FilePrivate {
+        source: MmapFileSource,
+        offset: usize,
+        valid_len: usize,
+    },
+    FileShared(Arc<SharedFilePageState>),
+}
+
+// AGENT: SharedPage is one by-value page handle: clones share the PgFrame and
+// file dirty state while keeping COW/write-enable state local to one mapping.
 #[derive(Clone)]
 pub struct SharedPage {
     pub(super) frame: PgFrame,
     pub(super) cow: bool,
+    pub(super) backing: PageBacking,
+    pub(super) shared_write_enabled: bool,
 }
 
 // AGENT: keep shared-frame identity and mapping-local COW transitions together.
 impl SharedPage {
+    // AGENT: construct an anonymous resident with ordinary non-COW ownership.
     pub fn new(frame: PgFrame) -> Self {
-        Self { frame, cow: false }
+        Self {
+            frame,
+            cow: false,
+            backing: PageBacking::Anonymous,
+            shared_write_enabled: false,
+        }
+    }
+
+    // AGENT: retain positioned file origin for a private resident page without
+    // granting it any shared writeback behavior.
+    pub(super) fn new_file_private(
+        frame: PgFrame,
+        source: MmapFileSource,
+        offset: usize,
+        valid_len: usize,
+    ) -> Self {
+        Self {
+            frame,
+            cow: false,
+            backing: PageBacking::FilePrivate {
+                source,
+                offset,
+                valid_len,
+            },
+            shared_write_enabled: false,
+        }
+    }
+
+    // AGENT: attach one sticky shared-file state while leaving every new
+    // writable mapping write-protected until its first observed store.
+    pub(super) fn new_file_shared(
+        frame: PgFrame,
+        source: MmapFileSource,
+        offset: usize,
+        valid_len: usize,
+    ) -> Self {
+        Self {
+            frame,
+            cow: false,
+            backing: PageBacking::FileShared(Arc::new(SharedFilePageState::new(
+                source, offset, valid_len,
+            ))),
+            shared_write_enabled: false,
+        }
     }
 
     pub fn frame_id(&self) -> usize {
@@ -110,8 +203,25 @@ impl SharedPage {
         self.cow = true;
     }
 
-    // AGENT: stage a writable replacement wrapper without changing the live
-    // mapping until AddrSpace has committed the corresponding Sv39 update.
+    // AGENT: classify the write-protected shared-file state separately from
+    // COW so the common store-fault handler can choose the correct transition.
+    pub(super) fn needs_shared_write_fault(&self) -> bool {
+        matches!(self.backing, PageBacking::FileShared(_)) && !self.shared_write_enabled
+    }
+
+    // AGENT: publish sticky file dirtiness before enabling this mapping's PTE
+    // write bit, ensuring unmap cannot miss a completed user or usercopy write.
+    pub(super) fn enable_shared_write(&mut self) -> Result<(), &'static str> {
+        let PageBacking::FileShared(state) = &self.backing else {
+            return Err("segfault");
+        };
+        state.mark_dirty();
+        self.shared_write_enabled = true;
+        Ok(())
+    }
+
+    // AGENT: stage a writable COW replacement while preserving its file backing
+    // and mapping-local shared state until AddrSpace commits the Sv39 update.
     pub(super) fn prepare_resolved_write(&self, pool: &FramePool) -> Result<Self, &'static str> {
         debug_assert!(self.cow);
         let frame = if self.frame.is_unique() {
@@ -122,6 +232,11 @@ impl SharedPage {
             copy_page(new_frame.paddr(), old_paddr);
             new_frame
         };
-        Ok(Self { frame, cow: false })
+        Ok(Self {
+            frame,
+            cow: false,
+            backing: self.backing.clone(),
+            shared_write_enabled: self.shared_write_enabled,
+        })
     }
 }

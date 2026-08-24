@@ -6,8 +6,8 @@ mod dispatch;
 mod epoll;
 mod fs;
 mod mm;
-// AGENT: expose anonymous mmap ABI and syscall regressions through the focused
-// QEMU MM selftest without coupling them to filesystem-backed mmap work.
+// AGENT: expose eager anonymous/file mmap ABI regressions through the focused
+// QEMU MM selftest while keeping ordinary builds free of fixture code.
 #[cfg(any(test, feature = "qemu-mm-selftest"))]
 pub mod mm_tests;
 mod proc;

@@ -1,8 +1,9 @@
 // AGENT
 use super::*;
 
-// AGENT: validate mmap flags/protections and route only anonymous mappings; file-backed
-// mmap is intentionally not carried in kernel-qemu yet.
+// AGENT: validate anonymous or regular-file mmap arguments, retain positioned
+// file backing independently from fd lifetime, and route fixed mappings through
+// the matching transactional eager replacement path.
 pub(super) fn sys_mmap(
     kernel: &Kernel,
     a0: usize,
@@ -16,7 +17,7 @@ pub(super) fn sys_mmap(
     let len = a1;
     let prot = a2;
     let flags = a3;
-    let _fd = a4;
+    let fd = a4;
     let offset = a5;
     if len == 0 {
         return Err("einval");
@@ -37,10 +38,10 @@ pub(super) fn sys_mmap(
     if map_shared == map_private {
         return Err("einval");
     }
-    if !map_anon {
-        return Err("enosys");
+    if map_anon && offset != 0 {
+        return Err("einval");
     }
-    if offset != 0 {
+    if !map_anon && (offset > i64::MAX as usize || offset % PAGE_SZ != 0) {
         return Err("einval");
     }
     let mut vm_flags: u32 = 0;
@@ -57,6 +58,20 @@ pub(super) fn sys_mmap(
         vm_flags |= VM_SHARED;
     }
     let task = kernel.cur_task(0).ok_or("esrch")?;
+    let file_source = if map_anon {
+        None
+    } else {
+        let file_end = offset.checked_add(aligned_len).ok_or("eoverflow")?;
+        if file_end > i64::MAX as usize {
+            return Err("eoverflow");
+        }
+        let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
+        let (source, status) = entry.mmap_source()?;
+        if !status.rd || (map_shared && prot & PROT_WRITE != 0 && !status.wr) {
+            return Err("eacces");
+        }
+        Some(source)
+    };
     let mut addr_space = task.process.addr_space.lock().unwrap();
     let result_addr = if map_fixed {
         if addr == 0 || addr % PAGE_SZ != 0 {
@@ -78,11 +93,20 @@ pub(super) fn sys_mmap(
     if result_end > USER_SIGTRAMP {
         return Err("enomem");
     }
-    let region = VmRegion::new(result_addr, aligned_len, vm_flags);
-    if map_fixed {
-        addr_space.replace_region(region, &kernel.pool)?;
+    if let Some(source) = file_source {
+        let region = VmRegion::new_file(result_addr, aligned_len, vm_flags, source, offset);
+        if map_fixed {
+            addr_space.replace_file_region(region, &kernel.pool)?;
+        } else {
+            addr_space.map_file_region(region, &kernel.pool)?;
+        }
     } else {
-        addr_space.map_region(region, &kernel.pool)?;
+        let region = VmRegion::new(result_addr, aligned_len, vm_flags);
+        if map_fixed {
+            addr_space.replace_region(region, &kernel.pool)?;
+        } else {
+            addr_space.map_region(region, &kernel.pool)?;
+        }
     }
     Ok(result_addr)
 }

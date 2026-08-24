@@ -77,6 +77,14 @@ struct LeafFlagUpdate {
     new_flags: usize,
 }
 
+// AGENT: carry one fully initialized resident owner and its exact first leaf
+// permissions across fallible file I/O and transactional VMA publication.
+struct PreparedResidentPage {
+    vaddr: usize,
+    page: SharedPage,
+    leaf_flags: usize,
+}
+
 impl AddrSpace {
     // AGENT: construct an address space with its initial program break, empty VMA
     // metadata, and no allocated Sv39 root.
@@ -198,15 +206,13 @@ impl AddrSpace {
         Ok(())
     }
 
-    // AGENT: enforce the AddrSpace invariant in both directions without
-    // allocating a leaf snapshot, keeping the audit safe on teardown paths.
+    // AGENT: enforce VMA/backing/resident/Sv39 invariants in both directions
+    // without allocating a leaf snapshot, keeping teardown audits safe.
     pub(crate) fn check_page_table_consistency(&self) -> Result<(), &'static str> {
         for (&vaddr, entry) in &self.resident_pages.entries {
             let region = self.vm_map.find(vaddr).ok_or("resident page outside VMA")?;
-            let mut expected_flags = vm_flags_to_pte_flags(region.flags);
-            if entry.cow {
-                expected_flags = pte_flags_without_write(expected_flags);
-            }
+            Self::check_resident_backing(vaddr, region, entry)?;
+            let expected_flags = Self::resident_leaf_flags(region.flags, entry);
 
             let leaf = self
                 .sv39
@@ -244,6 +250,67 @@ impl AddrSpace {
         Ok(())
     }
 
+    // AGENT: derive hardware permissions from VMA policy plus mapping-local COW
+    // and first-write tracking state, leaving sticky dirty state backing-wide.
+    fn resident_leaf_flags(flags: u32, page: &SharedPage) -> usize {
+        let mut leaf_flags = vm_flags_to_pte_flags(flags);
+        if page.cow || page.needs_shared_write_fault() {
+            leaf_flags = pte_flags_without_write(leaf_flags);
+        }
+        leaf_flags
+    }
+
+    // AGENT: verify each resident page retains the same anonymous/file kind,
+    // inode, positioned offset, and sharing policy declared by its owning VMA.
+    fn check_resident_backing(
+        vaddr: usize,
+        region: &VmRegion,
+        page: &SharedPage,
+    ) -> Result<(), &'static str> {
+        match (&region.backing, &page.backing) {
+            (VmBacking::Anonymous, PageBacking::Anonymous) => Ok(()),
+            (
+                VmBacking::File {
+                    source: region_source,
+                    offset: region_offset,
+                },
+                PageBacking::FilePrivate {
+                    source,
+                    offset,
+                    valid_len,
+                },
+            ) if region.flags & VM_SHARED == 0 => {
+                let displacement = vaddr.checked_sub(region.base).ok_or("efault")?;
+                let expected_offset = region_offset.checked_add(displacement).ok_or("efault")?;
+                if region_source.file_identity() != source.file_identity()
+                    || expected_offset != *offset
+                    || *valid_len > PAGE_SZ
+                {
+                    return Err("resident private-file backing disagrees with VMA");
+                }
+                Ok(())
+            }
+            (
+                VmBacking::File {
+                    source: region_source,
+                    offset: region_offset,
+                },
+                PageBacking::FileShared(state),
+            ) if region.flags & VM_SHARED != 0 => {
+                let displacement = vaddr.checked_sub(region.base).ok_or("efault")?;
+                let expected_offset = region_offset.checked_add(displacement).ok_or("efault")?;
+                if region_source.file_identity() != state.source.file_identity()
+                    || expected_offset != state.offset
+                    || state.valid_len > PAGE_SZ
+                {
+                    return Err("resident shared-file backing disagrees with VMA");
+                }
+                Ok(())
+            }
+            _ => Err("resident backing kind disagrees with VMA"),
+        }
+    }
+
     // AGENT: keep the exhaustive resident/Sv39 audit on development paths while
     // compiling it out of release hot paths that already use local preflight and
     // transactional rollback for the pages they mutate.
@@ -255,13 +322,16 @@ impl AddrSpace {
         Ok(())
     }
 
-    // AGENT: export VMA metadata and resident page bytes for process-level
-    // checkpoint images without exposing the internal resident page table.
+    // AGENT: export only anonymous VMA/page images and reject file backing
+    // explicitly until checkpoint has stable file-reopen serialization.
     pub fn snapshot_checkpoint_memory(
         &self,
     ) -> Result<(Vec<SavedVma>, Vec<SavedPage>), &'static str> {
         self.check_page_table_consistency()?;
         let regions = self.vm_map.clone_regions();
+        if regions.iter().any(VmRegion::is_file_backed) {
+            return Err("enotsup");
+        }
         let mut saved_vmas = Vec::with_capacity(regions.len());
         for region in &regions {
             saved_vmas.push(SavedVma {
@@ -319,8 +389,8 @@ impl AddrSpace {
         Ok(addr_space)
     }
 
-    // AGENT: fork exclusively updates parent COW metadata and Sv39 leaves, with
-    // exhaustive whole-address-space validation retained for debug builds.
+    // AGENT: fork turns writable private pages into COW while shared-file page
+    // clones retain one PgFrame/dirty state and mapping-local write-enable bits.
     pub fn fork_from(parent: &mut AddrSpace, pool: &FramePool) -> Result<Self, &'static str> {
         parent.debug_check_page_table_consistency()?;
         let mut child = Self::new();
@@ -435,6 +505,62 @@ impl AddrSpace {
         Ok(paddr)
     }
 
+    // AGENT: resolve either a private COW store or the first write to one eager
+    // shared-file page while rejecting every non-writable/nonresident fault.
+    pub fn handle_write_fault(
+        &mut self,
+        addr: usize,
+        pool: &FramePool,
+    ) -> Result<usize, &'static str> {
+        self.debug_check_page_table_consistency()?;
+        let page_addr = align_down(addr, PAGE_SZ);
+        let flags = self.vm_map.find(addr).ok_or("segfault")?.flags;
+        if flags & VM_WRITE == 0 {
+            return Err("segfault");
+        }
+        let (is_cow, needs_shared_write, paddr) = self
+            .resident_pages
+            .entries
+            .get(&page_addr)
+            .map(|page| {
+                (
+                    page.cow,
+                    page.needs_shared_write_fault(),
+                    page.frame.paddr(),
+                )
+            })
+            .ok_or("segfault")?;
+        if is_cow {
+            return self.handle_cow_fault(addr, pool);
+        }
+        if !needs_shared_write {
+            return Err("segfault");
+        }
+
+        let old_leaf = self.sv39.leaf_mapping(page_addr)?;
+        if old_leaf.paddr != paddr || old_leaf.flags & PTE_W != 0 {
+            return Err("efault");
+        }
+        let page = self
+            .resident_pages
+            .entries
+            .get_mut(&page_addr)
+            .ok_or("segfault")?;
+        page.enable_shared_write()?;
+        let new_leaf_flags = Self::resident_leaf_flags(flags, page);
+        if let Err(error) = self.sv39.update_leaf(page_addr, paddr, new_leaf_flags) {
+            self.resident_pages
+                .entries
+                .get_mut(&page_addr)
+                .expect("shared-file write fault page should remain resident")
+                .shared_write_enabled = false;
+            return Err(error);
+        }
+        crate::csr::sfence_vma();
+        self.debug_check_page_table_consistency()?;
+        Ok(paddr)
+    }
+
     // AGENT: validate user copy boundaries before touching VmMap or Sv39 state.
     fn checked_user_end(addr: usize, len: usize) -> Result<usize, &'static str> {
         let end = addr.checked_add(len).ok_or("efault")?;
@@ -487,7 +613,7 @@ impl AddrSpace {
     }
 
     // AGENT: report the contiguous writable userspace prefix before read-like
-    // syscalls consume file or pipe state; software COW pages remain writable.
+    // syscalls consume state; software COW and shared first-write pages qualify.
     pub fn writable_user_prefix_len(&self, addr: usize, len: usize) -> Result<usize, &'static str> {
         if len == 0 {
             return Ok(0);
@@ -520,7 +646,8 @@ impl AddrSpace {
                 (Some(resident), Ok(leaf)) => {
                     let hardware_writable = leaf.flags & PTE_W != 0;
                     let valid_write_state = (!resident.cow && hardware_writable)
-                        || (resident.cow && !hardware_writable);
+                        || ((resident.cow || resident.needs_shared_write_fault())
+                            && !hardware_writable);
                     leaf.paddr == resident.paddr() && leaf.flags & PTE_U != 0 && valid_write_state
                 }
                 _ => false,
@@ -546,7 +673,7 @@ impl AddrSpace {
     }
 
     // AGENT: prepare one write chunk under the exclusive AddrSpace borrow,
-    // resolving COW before verifying metadata against the live Sv39 leaf.
+    // resolving COW/shared dirty faults before checking the live Sv39 leaf.
     fn prepare_user_write_chunk(
         &mut self,
         cur: usize,
@@ -562,14 +689,14 @@ impl AddrSpace {
         let page_addr = align_down(cur, PAGE_SZ);
         let page_off = cur & (PAGE_SZ - 1);
         let len = min(end - cur, min(PAGE_SZ - page_off, region_end - cur));
-        let (is_cow, resident_paddr) = self
+        let (needs_write_fault, resident_paddr) = self
             .resident_pages
             .entries
             .get(&page_addr)
-            .map(|pte| (pte.cow, pte.frame.paddr()))
+            .map(|pte| (pte.cow || pte.needs_shared_write_fault(), pte.frame.paddr()))
             .ok_or("efault")?;
-        let frame_paddr = if is_cow {
-            self.handle_cow_fault(cur, pool).map_err(|_| "efault")?
+        let frame_paddr = if needs_write_fault {
+            self.handle_write_fault(cur, pool).map_err(|_| "efault")?
         } else {
             resident_paddr
         };
@@ -580,8 +707,8 @@ impl AddrSpace {
         Ok(UserWriteChunk { paddr, len })
     }
 
-    // AGENT: user writes resolve COW through resident metadata, then translate
-    // through Sv39 and copy directly into the target physical page.
+    // AGENT: user writes resolve COW or shared-file first-write tracking through
+    // resident metadata before copying through the writable Sv39 translation.
     pub fn write_user_bytes(
         &mut self,
         addr: usize,
@@ -602,9 +729,61 @@ impl AddrSpace {
         Ok(())
     }
 
-    // AGENT: preflight only resident pages inside the requested BTreeMap range,
-    // unmap hardware leaves transactionally, flush stale translations, then drop
-    // resident frame ownership and VMA metadata.
+    // AGENT: write every sticky-dirty shared-file resident in a range and flush
+    // each affected filesystem before any VMA, leaf, or frame owner is removed.
+    pub fn flush_shared_file_pages(&self, start: usize, len: usize) -> Result<(), &'static str> {
+        if len == 0 || start % PAGE_SZ != 0 || len % PAGE_SZ != 0 {
+            return Err("einval");
+        }
+        let end = start.checked_add(len).ok_or("efault")?;
+        if end > USER_TOP {
+            return Err("efault");
+        }
+        self.debug_check_page_table_consistency()?;
+
+        let mut flush_sources: Vec<MmapFileSource> = Vec::new();
+        for (&vaddr, page) in self.resident_pages.entries.range(start..end) {
+            let PageBacking::FileShared(state) = &page.backing else {
+                continue;
+            };
+            if !state.is_dirty() {
+                continue;
+            }
+            let leaf = self.sv39.leaf_mapping(vaddr)?;
+            if leaf.paddr != page.frame.paddr() {
+                return Err("resident and Sv39 physical pages disagree");
+            }
+            if state.valid_len != 0 {
+                let mut bytes = vec![0u8; PAGE_SZ];
+                copy_from_phys(page.frame.paddr(), &mut bytes);
+                let written = state
+                    .source
+                    .write_at(state.offset, &bytes[..state.valid_len])?;
+                if written != state.valid_len {
+                    return Err("eio");
+                }
+            }
+            if !flush_sources
+                .iter()
+                .any(|source| source.filesystem_id() == state.source.filesystem_id())
+            {
+                flush_sources.push(state.source.clone());
+            }
+        }
+        for source in flush_sources {
+            source.flush()?;
+        }
+        Ok(())
+    }
+
+    // AGENT: expose complete shared-file writeback for exec and process teardown
+    // while retaining range validation in the single transactional helper.
+    pub fn flush_all_shared_file_pages(&self) -> Result<(), &'static str> {
+        self.flush_shared_file_pages(0, USER_TOP)
+    }
+
+    // AGENT: write back shared-file pages before delegating the already-audited
+    // hardware/VMA removal transaction to its no-I/O commit phase.
     pub fn unmap_range(
         &mut self,
         start: usize,
@@ -618,6 +797,19 @@ impl AddrSpace {
         if end > USER_TOP {
             return Err("efault");
         }
+        self.flush_shared_file_pages(start, len)?;
+        self.unmap_range_after_writeback(start, len, pool)
+    }
+
+    // AGENT: preflight only resident pages inside a writeback-complete range,
+    // unmap leaves transactionally, then drop resident owners and VMA metadata.
+    fn unmap_range_after_writeback(
+        &mut self,
+        start: usize,
+        len: usize,
+        pool: &FramePool,
+    ) -> Result<usize, &'static str> {
+        let end = start.checked_add(len).ok_or("efault")?;
         self.debug_check_page_table_consistency()?;
         let mut pages_to_unmap = Vec::new();
         for (&addr, page) in self.resident_pages.entries.range(start..end) {
@@ -654,24 +846,49 @@ impl AddrSpace {
         Ok(pages_to_unmap.len())
     }
 
-    // AGENT: replace a fixed anonymous range transactionally by retaining the
-    // old VMA list, resident owners, and exact Sv39 leaf flags until the new
-    // mapping commits; restore that snapshot if eager allocation fails.
+    // AGENT: prepare an anonymous replacement only after old shared-file bytes
+    // are durable, leaving the live mapping intact on allocation failure.
     pub fn replace_region(
         &mut self,
         region: VmRegion,
         pool: &FramePool,
     ) -> Result<(), &'static str> {
-        if region.len == 0 || region.base % PAGE_SZ != 0 || region.len % PAGE_SZ != 0 {
-            return Err("einval");
-        }
+        Self::validate_eager_region(&region)?;
+        let start = region.base;
+        let len = region.len;
+        self.debug_check_page_table_consistency()?;
+        self.flush_shared_file_pages(start, len)?;
+        let prepared = Self::prepare_anonymous_region(&region, pool)?;
+        self.replace_prepared_region(region, prepared, pool)
+    }
+
+    // AGENT: flush an overwritten shared mapping before positioned reads build
+    // the new fixed file image, then use the common rollback transaction.
+    pub fn replace_file_region(
+        &mut self,
+        region: VmRegion,
+        pool: &FramePool,
+    ) -> Result<(), &'static str> {
+        Self::validate_eager_region(&region)?;
+        let start = region.base;
+        let len = region.len;
+        self.debug_check_page_table_consistency()?;
+        self.flush_shared_file_pages(start, len)?;
+        let prepared = Self::prepare_file_region(&region, pool)?;
+        self.replace_prepared_region(region, prepared, pool)
+    }
+
+    // AGENT: replace a fixed range by retaining its complete VMA, resident,
+    // backing, COW, and Sv39 snapshots until prepared-page installation commits.
+    fn replace_prepared_region(
+        &mut self,
+        region: VmRegion,
+        prepared: Vec<PreparedResidentPage>,
+        pool: &FramePool,
+    ) -> Result<(), &'static str> {
         let start = region.base;
         let len = region.len;
         let end = region.checked_end().ok_or("einval")?;
-        if end > USER_TOP {
-            return Err("einval");
-        }
-        self.debug_check_page_table_consistency()?;
 
         let old_regions = self.vm_map.clone_regions();
         let mut old_pages = Vec::new();
@@ -683,8 +900,8 @@ impl AddrSpace {
             old_pages.push((vaddr, page.clone(), leaf.flags));
         }
 
-        self.unmap_range(start, len, pool)?;
-        match self.map_region(region, pool) {
+        self.unmap_range_after_writeback(start, len, pool)?;
+        match self.install_prepared_region(region, prepared, pool) {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.vm_map.regions = old_regions;
@@ -728,8 +945,8 @@ impl AddrSpace {
         crate::csr::sfence_vma();
     }
 
-    // AGENT: snapshot live leaf flags for rollback, apply every Sv39 protection
-    // change, then commit the matching VMA policy.
+    // AGENT: snapshot leaf flags for rollback and keep clean shared-file pages
+    // write-protected when committing the requested VMA protection policy.
     pub fn protect(
         &mut self,
         start: usize,
@@ -763,10 +980,7 @@ impl AddrSpace {
                     return Err("resident and Sv39 physical pages disagree");
                 }
                 let flags = (region.flags & !prot_mask) | requested_prot;
-                let mut new_pte_flags = vm_flags_to_pte_flags(flags);
-                if pte.cow {
-                    new_pte_flags = pte_flags_without_write(new_pte_flags);
-                }
+                let new_pte_flags = Self::resident_leaf_flags(flags, pte);
                 updates.push(LeafFlagUpdate {
                     vaddr,
                     paddr: leaf.paddr,
@@ -815,45 +1029,112 @@ impl AddrSpace {
         Ok(())
     }
 
-    // AGENT: validate VmMap metadata, allocate resident frames, and install Sv39
-    // leaves through the split page-table owner.
-    pub fn map_region(&mut self, region: VmRegion, pool: &FramePool) -> Result<(), &'static str> {
+    // AGENT: validate an eager page-granular mapping before either anonymous
+    // allocation or positioned file I/O can publish observable address state.
+    fn validate_eager_region(region: &VmRegion) -> Result<(), &'static str> {
         if region.len == 0 || region.base % PAGE_SZ != 0 || region.len % PAGE_SZ != 0 {
             return Err("einval");
         }
-        let region_end = region.checked_end().ok_or("einval")?;
-        if region_end > USER_TOP {
+        if region.checked_end().ok_or("einval")? > USER_TOP {
             return Err("einval");
         }
-        self.debug_check_page_table_consistency()?;
+        Ok(())
+    }
 
-        let flags = region.flags;
-        let region_base = region.base;
-        let region_len = region.len;
-        let pte_flags = vm_flags_to_pte_flags(flags);
-        let pages: Vec<usize> = page_range(region_base, region_len).collect();
-
-        let mut frames = Vec::with_capacity(pages.len());
-        for _ in 0..pages.len() {
+    // AGENT: allocate and zero every anonymous resident before VMA publication
+    // so partial frame exhaustion drops all prepared owners automatically.
+    fn prepare_anonymous_region(
+        region: &VmRegion,
+        pool: &FramePool,
+    ) -> Result<Vec<PreparedResidentPage>, &'static str> {
+        if !matches!(&region.backing, VmBacking::Anonymous) {
+            return Err("einval");
+        }
+        let mut prepared = Vec::with_capacity(region.len / PAGE_SZ);
+        for vaddr in page_range(region.base, region.len) {
             let frame = pool.alloc_pg_frame().ok_or("enomem")?;
             zero_page(frame.paddr());
-            frames.push(frame);
+            let page = SharedPage::new(frame);
+            prepared.push(PreparedResidentPage {
+                vaddr,
+                leaf_flags: Self::resident_leaf_flags(region.flags, &page),
+                page,
+            });
         }
+        Ok(prepared)
+    }
 
+    // AGENT: eagerly populate zeroed physical pages through positioned reads,
+    // retaining per-page valid EOF bytes and private/shared backing identity.
+    fn prepare_file_region(
+        region: &VmRegion,
+        pool: &FramePool,
+    ) -> Result<Vec<PreparedResidentPage>, &'static str> {
+        let VmBacking::File {
+            source,
+            offset: region_offset,
+        } = &region.backing
+        else {
+            return Err("einval");
+        };
+        let shared = region.flags & VM_SHARED != 0;
+        let mut prepared = Vec::with_capacity(region.len / PAGE_SZ);
+        for vaddr in page_range(region.base, region.len) {
+            let displacement = vaddr.checked_sub(region.base).ok_or("eoverflow")?;
+            let file_offset = region_offset.checked_add(displacement).ok_or("eoverflow")?;
+            let frame = pool.alloc_pg_frame().ok_or("enomem")?;
+            zero_page(frame.paddr());
+            let mut bytes = vec![0u8; PAGE_SZ];
+            let valid_len = source.read_at(file_offset, &mut bytes)?;
+            if valid_len > PAGE_SZ {
+                return Err("eio");
+            }
+            if valid_len != 0 {
+                copy_to_phys(frame.paddr(), &bytes[..valid_len]);
+            }
+            let page = if shared {
+                SharedPage::new_file_shared(frame, source.clone(), file_offset, valid_len)
+            } else {
+                SharedPage::new_file_private(frame, source.clone(), file_offset, valid_len)
+            };
+            prepared.push(PreparedResidentPage {
+                vaddr,
+                leaf_flags: Self::resident_leaf_flags(region.flags, &page),
+                page,
+            });
+        }
+        Ok(prepared)
+    }
+
+    // AGENT: install one fully prepared region through VMA, Sv39, and resident
+    // owners, rolling back every published leaf if page-table allocation fails.
+    fn install_prepared_region(
+        &mut self,
+        region: VmRegion,
+        prepared: Vec<PreparedResidentPage>,
+        pool: &FramePool,
+    ) -> Result<(), &'static str> {
+        if prepared.len() != region.len / PAGE_SZ {
+            return Err("einval");
+        }
+        let region_base = region.base;
+        let region_len = region.len;
         if let Err(err) = self.vm_map.insert(region) {
             return Err(err);
         }
 
-        let mut mapped = Vec::with_capacity(pages.len());
-        for (page_addr, frame) in pages.into_iter().zip(frames.into_iter()) {
-            if let Err(err) = self
-                .sv39
-                .map_leaf(page_addr, frame.paddr(), pte_flags, pool)
-            {
+        let mut mapped: Vec<(usize, SharedPage)> = Vec::with_capacity(prepared.len());
+        for prepared_page in prepared {
+            if let Err(err) = self.sv39.map_leaf(
+                prepared_page.vaddr,
+                prepared_page.page.paddr(),
+                prepared_page.leaf_flags,
+                pool,
+            ) {
                 for (mapped_addr, _) in mapped.iter() {
                     self.sv39
                         .unmap_leaf(*mapped_addr)
-                        .expect("new anonymous Sv39 leaf rollback should succeed");
+                        .expect("prepared Sv39 leaf rollback should succeed");
                 }
                 self.vm_map.remove_range(region_base, region_len);
                 if !mapped.is_empty() {
@@ -861,16 +1142,41 @@ impl AddrSpace {
                 }
                 return Err(err);
             }
-            mapped.push((page_addr, frame));
+            mapped.push((prepared_page.vaddr, prepared_page.page));
         }
 
-        for (page_addr, frame) in mapped.into_iter() {
-            self.resident_pages
-                .entries
-                .insert(page_addr, SharedPage::new(frame));
+        for (vaddr, page) in mapped {
+            let replaced = self.resident_pages.entries.insert(vaddr, page);
+            assert!(
+                replaced.is_none(),
+                "prepared mapping must install into empty resident slots"
+            );
         }
         crate::csr::sfence_vma();
+        self.debug_check_page_table_consistency()?;
         Ok(())
+    }
+
+    // AGENT: preserve the anonymous mapping API while routing allocation and
+    // publication through the common prepared-resident transaction.
+    pub fn map_region(&mut self, region: VmRegion, pool: &FramePool) -> Result<(), &'static str> {
+        Self::validate_eager_region(&region)?;
+        self.debug_check_page_table_consistency()?;
+        let prepared = Self::prepare_anonymous_region(&region, pool)?;
+        self.install_prepared_region(region, prepared, pool)
+    }
+
+    // AGENT: eagerly read one file-backed VMA before publishing any of its
+    // pages, preserving the OFD offset and private/shared backing policy.
+    pub fn map_file_region(
+        &mut self,
+        region: VmRegion,
+        pool: &FramePool,
+    ) -> Result<(), &'static str> {
+        Self::validate_eager_region(&region)?;
+        self.debug_check_page_table_consistency()?;
+        let prepared = Self::prepare_file_region(&region, pool)?;
+        self.install_prepared_region(region, prepared, pool)
     }
 
     // AGENT: map an existing shared segment into this address space without
@@ -881,10 +1187,8 @@ impl AddrSpace {
         shared_pages: &[SharedPage],
         pool: &FramePool,
     ) -> Result<(), &'static str> {
-        if region.len == 0 || region.base % PAGE_SZ != 0 || region.len % PAGE_SZ != 0 {
-            return Err("einval");
-        }
-        if region.checked_end().ok_or("einval")? > USER_TOP {
+        Self::validate_eager_region(&region)?;
+        if !matches!(&region.backing, VmBacking::Anonymous) {
             return Err("einval");
         }
         if shared_pages.len() != region.len / PAGE_SZ {
@@ -893,39 +1197,17 @@ impl AddrSpace {
         self.debug_check_page_table_consistency()?;
 
         region.flags |= VM_SHARED;
-        let flags = region.flags;
-        let region_base = region.base;
-        let region_len = region.len;
-        let pte_flags = vm_flags_to_pte_flags(flags);
-        let pages: Vec<usize> = page_range(region_base, region_len).collect();
-
-        if let Err(err) = self.vm_map.insert(region) {
-            return Err(err);
-        }
-
-        let mut mapped = Vec::with_capacity(shared_pages.len());
-        for (page_addr, page) in pages.into_iter().zip(shared_pages.iter()) {
-            if let Err(err) = self.sv39.map_leaf(page_addr, page.paddr(), pte_flags, pool) {
-                for (mapped_addr, _) in mapped.iter() {
-                    self.sv39
-                        .unmap_leaf(*mapped_addr)
-                        .expect("new shared Sv39 leaf rollback should succeed");
-                }
-                self.vm_map.remove_range(region_base, region_len);
-                if !mapped.is_empty() {
-                    crate::csr::sfence_vma();
-                }
-                return Err(err);
-            }
-            mapped.push((page_addr, page.clone()));
-        }
-
-        for (page_addr, page) in mapped.into_iter() {
+        let mut prepared = Vec::with_capacity(shared_pages.len());
+        for (vaddr, page) in page_range(region.base, region.len).zip(shared_pages.iter()) {
             debug_assert!(!page.cow);
-            self.resident_pages.entries.insert(page_addr, page);
+            let page = page.clone();
+            prepared.push(PreparedResidentPage {
+                vaddr,
+                leaf_flags: Self::resident_leaf_flags(region.flags, &page),
+                page,
+            });
         }
-        crate::csr::sfence_vma();
-        Ok(())
+        self.install_prepared_region(region, prepared, pool)
     }
 
     // AGENT: resize heap through the public mapping helpers so VmMap, resident

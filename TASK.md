@@ -13,6 +13,9 @@
 
 ## 已完成修改
 
+- 2026-08-11：`kernel-qemu` 已完成第二阶段 eager 文件 `mmap`：普通文件 `MAP_PRIVATE` / `MAP_SHARED` 通过不改变 OFD offset 的定位 I/O 装页，VMA 和 resident page 保留文件身份、页偏移和 EOF `valid_len`；fd 关闭后 backing 仍由 `FInstance` mount pin 保持有效。私有可写页继续走 COW 且不写回，共享可写页通过首次 store fault 和 kernel usercopy 统一置 sticky dirty，fork 共享 frame 与 dirty state。
+- 2026-08-11：文件共享页的 `munmap`、`MAP_FIXED`、exec 和 exit 生命周期已接入写回；普通 unmap/覆盖在写入或 flush 失败时保留 VMA、PTE、frame 和 dirty 元数据，exec 失败保留旧映像，exit 记录错误后继续释放。文件 VMA 的 checkpoint 暂时明确返回 `ENOTSUP`。
+- 2026-08-11：第二阶段仍明确保留以下 Linux 差异：不做 lazy fault 装入，不做独立 `MAP_SHARED` 映射间的全局页缓存/即时一致性，不处理映射期间外部 truncate/grow，EOF 之外仍是不写回的零页而非访问时 `SIGBUS`，未增加 `msync`、`mprotect` syscall、`MAP_FIXED_NOREPLACE` 或更多 mmap flags。
 - 2026-08-11：`kernel-qemu` 已完成第一阶段匿名 `mmap` / `munmap` 闭环：RV64 syscall 222/215 已映射到迁移后的内部语义，`MAP_SHARED` / `MAP_PRIVATE` 必须恰好选择一种，非固定映射会优先从页对齐 hint 向上搜索并回退到 `MMAP_BASE`，而 `USER_SIGTRAMP` 已从 mmap/munmap 可变范围排除。
 - 2026-08-11：`kernel-qemu::AddrSpace::replace_region()` 已为 `MAP_FIXED` 保留原 VMA、resident page 所有权和 Sv39 leaf flags；新的 eager 匿名映射失败时恢复原映射、页内容与 COW 状态。文件 backing、lazy allocation 与旧 frame 就地复用仍保留为后续工作。
 - 2026-08-11：新增 `qemu-mm-selftest` syscall 回归，覆盖 RV64 六参数解码、零填充、frame 回收、flags 校验、hint/冲突/回退、`MAP_FIXED` 成功覆盖与 ENOMEM 回滚、signal trampoline 保护、shared fork 可见性与 private COW 隔离。RISC-V check、聚焦 MM selftest、全量 `qemu-selftest` 和普通 `tools/qemu-smoke.sh` 均通过。
@@ -96,6 +99,23 @@
 - `chaos/kernel/src/kernel.rs`：禁止修改的原始内核文件。
 
 ## 测试结果
+
+本次第二阶段 eager 文件 `mmap` 修改后执行过：
+
+```bash
+cd kernel-qemu
+cargo fmt --check
+cargo check --target riscv64gc-unknown-none-elf
+cargo check --target riscv64gc-unknown-none-elf --features qemu-mm-selftest
+cargo build --release --features qemu-selftest
+
+cd ..
+KERNEL_QEMU_SKIP_BUILD=1 bash tools/qemu-smoke.sh
+bash tools/qemu-smoke.sh
+git diff --check
+```
+
+结果：普通及 MM feature 的 RISC-V target check、release `qemu-selftest` 构建、组合 QEMU 自测镜像和独立 boot smoke 均通过；新增 mmap 自测已在 QEMU 中输出 `mmap syscall selftest passed`，后续 fs syscall、checkpoint、user satp/signal 及用户态 init/exec smoke 继续通过。本轮未修改或回归 `kernel-sim` / `chaos-tests`。
 
 本次 M9 trampoline / 用户 satp 切换修改后执行过：
 

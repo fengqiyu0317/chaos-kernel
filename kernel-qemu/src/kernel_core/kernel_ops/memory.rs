@@ -1,8 +1,8 @@
 use super::*;
 
 impl Kernel {
-    // AGENT: recover only migrated user COW store faults; other page faults
-    // stay fatal until demand paging or stack growth semantics are migrated.
+    // AGENT: recover private COW and first shared-file writes through the common
+    // address-space transition; lazy load/execute faults remain unsupported.
     pub fn handle_pgfault(
         &self,
         addr: usize,
@@ -16,7 +16,7 @@ impl Kernel {
         match access {
             KernelPageFaultAccess::Store => {
                 let mut addr_space = task.process.addr_space.lock().unwrap();
-                addr_space.handle_cow_fault(addr, &self.pool).map(|_| ())
+                addr_space.handle_write_fault(addr, &self.pool).map(|_| ())
             }
             KernelPageFaultAccess::Instruction | KernelPageFaultAccess::Load => Err("segfault"),
         }

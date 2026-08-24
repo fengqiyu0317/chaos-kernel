@@ -79,6 +79,43 @@ pub struct OpenFileDesc {
     epoll_watchers: Mutex<Vec<EpInstWeak>>,
 }
 
+// AGENT: retain a positioned-I/O-capable regular-file identity for mmap
+// without retaining an fd slot or borrowing the open-file-description offset.
+#[derive(Clone)]
+pub(crate) struct MmapFileSource {
+    instance: FInstance,
+}
+
+// AGENT: keep mmap backing I/O independent from the mutable OFD file position
+// while retaining the mount pin required after close or lazy unmount.
+impl MmapFileSource {
+    // AGENT: issue a backing read at an explicit byte offset without observing
+    // or mutating the descriptor's shared current position.
+    pub(crate) fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
+        self.instance.read_at(offset, buf)
+    }
+
+    // AGENT: issue shared-page writeback at its retained explicit file offset.
+    pub(crate) fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize, &'static str> {
+        self.instance.write_at(offset, buf)
+    }
+
+    // AGENT: make cached writeback stable through the pinned filesystem owner.
+    pub(crate) fn flush(&self) -> Result<(), &'static str> {
+        self.instance.mount.fs().flush().map(|_| ())
+    }
+
+    // AGENT: expose the stable filesystem/inode key used for VMA merge checks.
+    pub(crate) fn file_identity(&self) -> FileIdentity {
+        self.instance.file_identity()
+    }
+
+    // AGENT: expose the filesystem key used to deduplicate writeback barriers.
+    pub(crate) fn filesystem_id(&self) -> FsId {
+        self.instance.mount.fs().id()
+    }
+}
+
 impl OpenFileDesc {
     // AGENT: build an open-file description around a concrete file object.
     pub fn new(file: FLike) -> Self {
@@ -99,6 +136,23 @@ impl OpenFileDesc {
 
     pub fn file(&self) -> &FLike {
         &self.file
+    }
+
+    // AGENT: validate the concrete regular-file object once and return a
+    // positioned backing handle together with immutable open access rights.
+    pub(crate) fn mmap_source(&self) -> Result<(MmapFileSource, FdOpt), &'static str> {
+        let FLike::File(file) = &self.file else {
+            return Err("enodev");
+        };
+        if !file.instance().is_regular() {
+            return Err("enodev");
+        }
+        Ok((
+            MmapFileSource {
+                instance: file.instance().clone(),
+            },
+            self.status_flags(),
+        ))
     }
 
     // AGENT: keep object-type dispatch below the syscall layer so every fd stat
@@ -597,6 +651,12 @@ impl FdEntry {
     // last fd-table reference from temporary cloned FdEntry handles.
     pub fn same_open_description(&self, other: &FdEntry) -> bool {
         self.open_file_ref() == other.open_file_ref()
+    }
+
+    // AGENT: expose mmap backing without leaking FLike or changing the shared
+    // open-file-description offset used by read, splice, and lseek.
+    pub(crate) fn mmap_source(&self) -> Result<(MmapFileSource, FdOpt), &'static str> {
+        self.desc.mmap_source()
     }
 
     // AGENT: install a source-backed epoll subscription through the descriptor

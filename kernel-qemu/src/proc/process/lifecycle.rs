@@ -130,8 +130,8 @@ impl Process {
         true
     }
 
-    // AGENT: move droppable process resources out of locks before teardown,
-    // reclaim address-space storage, and retain only zombie/reap metadata.
+    // AGENT: move droppable process resources out of locks, best-effort flush
+    // eager shared-file mappings, then reclaim storage for zombie publication.
     pub fn release_exit_resources(&self) {
         let old_signal_actions = self.sig_state.lock().unwrap().release_for_exit();
         let old_resources = (
@@ -141,7 +141,15 @@ impl Process {
             old_signal_actions,
         );
         let _woken_futex_waiters = self.futex.wake_all();
-        self.addr_space.lock().unwrap().release_all_pages();
+        let mut addr_space = self.addr_space.lock().unwrap();
+        if let Err(error) = addr_space.flush_all_shared_file_pages() {
+            crate::println!(
+                "[kernel-qemu] process shared mmap writeback failed during exit: {}",
+                error
+            );
+        }
+        addr_space.release_all_pages();
+        drop(addr_space);
         drop(old_resources);
     }
 }

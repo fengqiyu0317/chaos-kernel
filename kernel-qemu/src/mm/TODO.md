@@ -14,8 +14,9 @@ The files are now registered through the migrated `kernel-qemu/src/mod.rs` tree
 and compile in the `#![no_std]` QEMU crate. The current MM work is no longer a
 plain source copy: anonymous resident pages are backed by QEMU `PgFrame`s and
 Sv39 leaf PTEs, while higher-level VMA and syscall-facing semantics still
-follow the `kernel-sim` source-first shape. File-backed `mmap` is intentionally
-not carried in `kernel-qemu` yet.
+follow the `kernel-sim` source-first shape. The second eager stage now also
+backs regular-file `MAP_PRIVATE` / `MAP_SHARED` VMAs with positioned I/O,
+resident file metadata, first-write dirty tracking, and transactional unmap.
 
 Remaining replacement and hardening work:
 
@@ -26,13 +27,17 @@ Remaining replacement and hardening work:
 - `CLK` timer references with the QEMU timer tick source.
 - Host `FramePool` slot accounting with QEMU physical-memory initialization
   from linker symbols and the QEMU `virt` RAM range.
-- Complete file-backed `mmap` on top of the existing
-  `FileNode`/`FileStorage`/`BlockCache` path: consume and validate `fd`/`offset`
-  in `sys_mmap()`, populate real resident frames from file contents, retain
-  per-page backing metadata, keep `MAP_PRIVATE` changes private, and flush
-  dirty `MAP_SHARED` pages transactionally before `unmap_range()` removes any
-  mapping. Add QEMU regressions for load, writeback, private isolation, invalid
-  descriptors/offsets, and writeback-failure rollback.
+- Replace eager file population with lazy page-fault loading and report `SIGBUS`
+  for accesses beyond the valid file object instead of retaining zero pages.
+- Add one global file-page cache so independently created `MAP_SHARED` aliases
+  observe writes immediately; define synchronization with external
+  truncate/grow while mappings remain live.
+- Add `msync`, the `mprotect` syscall surface, `MAP_FIXED_NOREPLACE`, and any
+  additional mmap flags only with their complete Linux validation/lifecycle
+  semantics. The current internal `protect()` helper is not an ABI endpoint.
+- Extend checkpoint images with explicit file backing and stable reopen rules;
+  until then any file-backed VMA deliberately returns `ENOTSUP` rather than
+  restoring silently as anonymous memory.
 - Implement fork-advice semantics as one complete feature: add `madvise`
   syscall dispatch, validate `MADV_DONTFORK` / `MADV_DOFORK`, split VMAs at
   advice-range boundaries, update the VMA policy, and cover fork inheritance

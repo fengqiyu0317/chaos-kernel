@@ -72,8 +72,8 @@ impl Kernel {
         user_entry
     }
 
-    // AGENT: perform the address-space and process-state exec transaction while
-    // returning the architecture entry update to the caller that owns the live frame.
+    // AGENT: prepare exec, fallibly flush the old shared-file mappings, then
+    // commit the image and return the entry update to the live-frame owner.
     pub(crate) fn do_exec_for_trap(
         &self,
         task_id: usize,
@@ -89,6 +89,13 @@ impl Kernel {
             return Err("enotsup");
         }
         let prepared = self.prepare_exec_image(&task, path, args, envs)?;
+        // AGENT: make eager MAP_SHARED bytes durable before the infallible
+        // address-space swap so writeback failure preserves the complete old image.
+        task.process
+            .addr_space
+            .lock()
+            .unwrap()
+            .flush_all_shared_file_pages()?;
         Ok(self.commit_exec(&task, prepared))
     }
 
