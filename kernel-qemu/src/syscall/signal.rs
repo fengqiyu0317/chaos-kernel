@@ -19,13 +19,13 @@ impl UserRtSigAction {
     const SIZE: usize = mem::size_of::<usize>() * 2 + KERNEL_SIGSET_SIZE;
 
     // AGENT: copy in one RV64 kernel sigaction without dereferencing its user VA.
-    fn read_from(task: &Task, addr: usize) -> Result<Self, &'static str> {
+    fn read_from(kernel: &Kernel, task: &Task, addr: usize) -> Result<Self, &'static str> {
         let mut bytes = [0u8; Self::SIZE];
         task.process
             .addr_space
             .lock()
             .unwrap()
-            .read_user_bytes(addr, &mut bytes)?;
+            .read_user_bytes(addr, &mut bytes, &kernel.pool)?;
 
         let mut handler = [0u8; mem::size_of::<usize>()];
         handler.copy_from_slice(&bytes[..8]);
@@ -55,13 +55,13 @@ impl UserRtSigAction {
 }
 
 // AGENT: copy one RV64 kernel sigset_t from the current process page table.
-fn read_user_sigset(task: &Task, addr: usize) -> Result<u64, &'static str> {
+fn read_user_sigset(kernel: &Kernel, task: &Task, addr: usize) -> Result<u64, &'static str> {
     let mut bytes = [0u8; KERNEL_SIGSET_SIZE];
     task.process
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(addr, &mut bytes)?;
+        .read_user_bytes(addr, &mut bytes, &kernel.pool)?;
     Ok(u64::from_ne_bytes(bytes))
 }
 
@@ -180,7 +180,7 @@ pub(super) fn sys_sigaction(
     let requested = if act_addr == 0 {
         None
     } else {
-        let action = UserRtSigAction::read_from(&cur, act_addr)?;
+        let action = UserRtSigAction::read_from(kernel, &cur, act_addr)?;
         // TODO(AGENT): implement sigaction flags as one coherent delivery
         // feature, starting with real SA_SIGINFO frames; until then reject
         // nonzero flags instead of storing or partially honoring them.
@@ -245,7 +245,7 @@ pub(super) fn sys_sigprocmask(
     let requested_set = if set_addr == 0 {
         None
     } else {
-        Some(read_user_sigset(&t, set_addr)?)
+        Some(read_user_sigset(kernel, &t, set_addr)?)
     };
     let old_mask = *t.sig_mask.lock().unwrap();
     if oldset_addr != 0 {

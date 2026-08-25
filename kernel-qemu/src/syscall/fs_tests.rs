@@ -61,14 +61,14 @@ fn write_user_string(kernel: &Kernel, task: &Task, addr: usize, value: &str) {
 
 // AGENT: decode the two native-width Linux int descriptors copied out by the
 // RV64 pipe2 syscall instead of relying on the removed packed return value.
-fn read_user_pipe_fds(task: &Task, addr: usize) -> (usize, usize) {
+fn read_user_pipe_fds(kernel: &Kernel, task: &Task, addr: usize) -> (usize, usize) {
     let fd_size = mem::size_of::<i32>();
     let mut bytes = [0u8; 2 * mem::size_of::<i32>()];
     task.process
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(addr, &mut bytes)
+        .read_user_bytes(addr, &mut bytes, &kernel.pool)
         .expect("pipe2 descriptor pair should be readable from userspace");
     let read_fd = i32::from_ne_bytes(
         bytes[..fd_size]
@@ -99,13 +99,13 @@ fn write_user_off(kernel: &Kernel, task: &Task, addr: usize, value: i64) {
 
 // AGENT: observe one sys_splice off_t copy-out without directly dereferencing
 // the emulated user virtual address.
-fn read_user_off(task: &Task, addr: usize) -> i64 {
+fn read_user_off(kernel: &Kernel, task: &Task, addr: usize) -> i64 {
     let mut bytes = [0u8; mem::size_of::<i64>()];
     task.process
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(addr, &mut bytes)
+        .read_user_bytes(addr, &mut bytes, &kernel.pool)
         .expect("splice offset should be readable in userspace");
     i64::from_ne_bytes(bytes)
 }
@@ -122,13 +122,13 @@ fn write_user_ioctl_int(kernel: &Kernel, task: &Task, addr: usize, value: i32) {
 }
 
 // AGENT: observe one ioctl int result through authoritative Sv39 usercopy.
-fn read_user_ioctl_int(task: &Task, addr: usize) -> i32 {
+fn read_user_ioctl_int(kernel: &Kernel, task: &Task, addr: usize) -> i32 {
     let mut bytes = [0u8; mem::size_of::<i32>()];
     task.process
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(addr, &mut bytes)
+        .read_user_bytes(addr, &mut bytes, &kernel.pool)
         .expect("ioctl integer result should be readable");
     i32::from_ne_bytes(bytes)
 }
@@ -152,13 +152,13 @@ fn write_user_flock_fixture(kernel: &Kernel, task: &Task, addr: usize, flock: Fl
 
 // AGENT: decode a returned RV64 flock through AddrSpace rather than directly
 // dereferencing its user virtual address in the kernel selftest.
-fn read_user_flock_fixture(task: &Task, addr: usize) -> FlockArg {
+fn read_user_flock_fixture(kernel: &Kernel, task: &Task, addr: usize) -> FlockArg {
     let mut bytes = [0u8; RISCV64_FLOCK_SIZE];
     task.process
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(addr, &mut bytes)
+        .read_user_bytes(addr, &mut bytes, &kernel.pool)
         .expect("fcntl flock result should be readable");
     FlockArg {
         lock_type: i16::from_le_bytes(bytes[0..2].try_into().unwrap()),
@@ -200,13 +200,13 @@ fn stat_u64(bytes: &[u8; RISCV64_STAT_SIZE], offset: usize) -> u64 {
 
 // AGENT: copy one complete stat image back through AddrSpace so assertions audit
 // the same Sv39 usercopy result returned to a real user ecall.
-fn read_user_stat(task: &Task, addr: usize) -> [u8; RISCV64_STAT_SIZE] {
+fn read_user_stat(kernel: &Kernel, task: &Task, addr: usize) -> [u8; RISCV64_STAT_SIZE] {
     let mut bytes = [0u8; RISCV64_STAT_SIZE];
     task.process
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(addr, &mut bytes)
+        .read_user_bytes(addr, &mut bytes, &kernel.pool)
         .expect("stat result should be readable");
     bytes
 }
@@ -269,7 +269,7 @@ fn stat_syscalls_copy_real_inode_attributes_to_userspace(kernel: &Kernel) {
         ),
         Ok(0)
     );
-    let path_stat = read_user_stat(&task, stat_addr);
+    let path_stat = read_user_stat(kernel, &task, stat_addr);
     assert_eq!(stat_u64(&path_stat, 0), expected_dev);
     assert_eq!(stat_u64(&path_stat, 8), expected_ino);
     assert_eq!(stat_u32(&path_stat, 16) & S_IFMT, S_IFREG);
@@ -297,7 +297,7 @@ fn stat_syscalls_copy_real_inode_attributes_to_userspace(kernel: &Kernel) {
         kernel.dispatch_syscall_without_signal_delivery(SYS_FSTAT, fd, stat_addr, 0, 0, 0, 0,),
         Ok(0)
     );
-    assert_eq!(read_user_stat(&task, stat_addr), path_stat);
+    assert_eq!(read_user_stat(kernel, &task, stat_addr), path_stat);
 
     assert_eq!(
         kernel.dispatch_syscall_without_signal_delivery(
@@ -311,7 +311,7 @@ fn stat_syscalls_copy_real_inode_attributes_to_userspace(kernel: &Kernel) {
         ),
         Ok(0)
     );
-    let directory_stat = read_user_stat(&task, stat_addr);
+    let directory_stat = read_user_stat(kernel, &task, stat_addr);
     assert_eq!(stat_u32(&directory_stat, 16) & S_IFMT, S_IFDIR);
     assert_eq!(stat_u64(&directory_stat, 48), 0);
 
@@ -400,7 +400,7 @@ fn stat_syscalls_copy_real_inode_attributes_to_userspace(kernel: &Kernel) {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(partial_addr, &mut partial)
+        .read_user_bytes(partial_addr, &mut partial, &kernel.pool)
         .expect("failed stat should leave the writable prefix readable");
     assert_eq!(partial, [0x3c; 64]);
 
@@ -1460,7 +1460,7 @@ fn pipe2_copies_fds_and_publishes_them_transactionally(kernel: &Kernel) {
         ),
         Ok(0)
     );
-    let first_pair = read_user_pipe_fds(&task, PIPE_USER_BASE);
+    let first_pair = read_user_pipe_fds(kernel, &task, PIPE_USER_BASE);
     let read_entry = task
         .get_fd_entry(first_pair.0)
         .expect("pipe2 read fd should be installed");
@@ -1510,7 +1510,7 @@ fn pipe2_copies_fds_and_publishes_them_transactionally(kernel: &Kernel) {
         kernel.dispatch_syscall_without_signal_delivery(SYS_PIPE, PIPE_USER_BASE, 0, 0, 0, 0, 0,),
         Ok(0)
     );
-    let reused_pair = read_user_pipe_fds(&task, PIPE_USER_BASE);
+    let reused_pair = read_user_pipe_fds(kernel, &task, PIPE_USER_BASE);
     assert_eq!(reused_pair, first_pair);
     task.close_fd(reused_pair.0)
         .expect("reused pipe2 read fd should close");
@@ -1619,7 +1619,7 @@ fn ioctl_uses_usercopy_and_correct_fd_ownership(kernel: &Kernel) {
         ),
         Ok(0)
     );
-    assert_eq!(read_user_ioctl_int(&task, result_addr), 3);
+    assert_eq!(read_user_ioctl_int(kernel, &task, result_addr), 3);
     for bad_output in [IOCTL_USER_BASE + PAGE_SZ, IOCTL_USER_BASE + 2 * PAGE_SZ] {
         assert_eq!(
             kernel.dispatch_syscall_without_signal_delivery(
@@ -2001,7 +2001,7 @@ fn fcntl_implements_fd_ofd_record_lock_and_lifecycle_semantics(kernel: &Kernel) 
         Ok(0)
     );
     assert_eq!(
-        read_user_flock_fixture(&task, flock_addr).lock_type,
+        read_user_flock_fixture(kernel, &task, flock_addr).lock_type,
         F_UNLCK
     );
     assert_eq!(
@@ -2043,7 +2043,7 @@ fn fcntl_implements_fd_ofd_record_lock_and_lifecycle_semantics(kernel: &Kernel) 
             .dispatch_syscall_without_signal_delivery(SYS_FCNTL, fd, F_GETLK, flock_addr, 0, 0, 0,),
         Ok(0)
     );
-    let conflict = read_user_flock_fixture(&task, flock_addr);
+    let conflict = read_user_flock_fixture(kernel, &task, flock_addr);
     assert_eq!(conflict.lock_type, F_WRLCK);
     assert_eq!(conflict.whence, SEEK_SET);
     assert_eq!(conflict.start, 10);
@@ -2323,7 +2323,7 @@ fn read_uses_usercopy_and_shared_open_file_offsets(kernel: &Kernel) {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(buf_addr, &mut bytes)
+        .read_user_bytes(buf_addr, &mut bytes, &kernel.pool)
         .expect("first read result should be copied to userspace");
     assert_eq!(&bytes, b"abc");
 
@@ -2355,7 +2355,7 @@ fn read_uses_usercopy_and_shared_open_file_offsets(kernel: &Kernel) {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(buf_addr, &mut bytes)
+        .read_user_bytes(buf_addr, &mut bytes, &kernel.pool)
         .expect("dup read result should be copied to userspace");
     assert_eq!(&bytes, b"def");
     assert_eq!(
@@ -2482,7 +2482,7 @@ fn read_uses_usercopy_and_shared_open_file_offsets(kernel: &Kernel) {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(partial_addr, &mut partial)
+        .read_user_bytes(partial_addr, &mut partial, &kernel.pool)
         .expect("short read prefix should be copied to userspace");
     assert_eq!(&partial, b"ab");
     assert_eq!(
@@ -2494,7 +2494,7 @@ fn read_uses_usercopy_and_shared_open_file_offsets(kernel: &Kernel) {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(buf_addr, &mut partial)
+        .read_user_bytes(buf_addr, &mut partial, &kernel.pool)
         .expect("read after short prefix should continue at the shared offset");
     assert_eq!(&partial, b"cd");
     task.close_fd(partial_fd)
@@ -2509,7 +2509,7 @@ fn read_uses_usercopy_and_shared_open_file_offsets(kernel: &Kernel) {
         .unwrap()
         .write_user_bytes(buf_addr, &[0u8; 3], &kernel.pool)
         .expect("COW destination should start cleared");
-    let child_addr_space = {
+    let mut child_addr_space = {
         let mut parent = task.process.addr_space.lock().unwrap();
         AddrSpace::fork_from(&mut parent, &kernel.pool)
             .expect("read destination should become a COW mapping")
@@ -2522,12 +2522,12 @@ fn read_uses_usercopy_and_shared_open_file_offsets(kernel: &Kernel) {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(buf_addr, &mut bytes)
+        .read_user_bytes(buf_addr, &mut bytes, &kernel.pool)
         .expect("sys_read should resolve the parent COW destination");
     assert_eq!(&bytes, b"abc");
     let mut child_bytes = [1u8; 3];
     child_addr_space
-        .read_user_bytes(buf_addr, &mut child_bytes)
+        .read_user_bytes(buf_addr, &mut child_bytes, &kernel.pool)
         .expect("child should retain the pre-read COW bytes");
     assert_eq!(child_bytes, [0u8; 3]);
     task.close_fd(cow_fd)
@@ -2559,7 +2559,7 @@ fn read_moves_pipe_bytes_and_reports_empty_states(kernel: &Kernel) {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(buf_addr, &mut bytes)
+        .read_user_bytes(buf_addr, &mut bytes, &kernel.pool)
         .expect("pipe read bytes should be copied to userspace");
     assert_eq!(&bytes, b"pipe");
     task.get_fd_entry(read_fd)
@@ -2759,7 +2759,7 @@ fn splice_moves_between_files_and_pipes_with_linux_offsets(kernel: &Kernel) {
         ),
         Ok(3)
     );
-    assert_eq!(read_user_off(&task, input_offset_addr), 4);
+    assert_eq!(read_user_off(kernel, &task, input_offset_addr), 4);
     assert_eq!(
         task.get_fd_entry(src_fd)
             .expect("splice source descriptor should exist")
@@ -2856,7 +2856,7 @@ fn splice_moves_between_files_and_pipes_with_linux_offsets(kernel: &Kernel) {
         ),
         Ok(3)
     );
-    assert_eq!(read_user_off(&task, output_offset_addr), 4);
+    assert_eq!(read_user_off(kernel, &task, output_offset_addr), 4);
     assert_eq!(
         task.get_fd_entry(dst_fd)
             .expect("splice destination descriptor should exist")

@@ -186,10 +186,10 @@ fn failed_exec_preserves_old_process_image(pool: &FramePool) {
 
     let mut old_bytes = [0u8; OLD_BYTES.len()];
     {
-        let addr_space = task.process.addr_space.lock().unwrap();
+        let mut addr_space = task.process.addr_space.lock().unwrap();
         assert_eq!(addr_space.vm_token(), Ok(old_token));
         addr_space
-            .read_user_bytes(OLD_MAPPING, &mut old_bytes)
+            .read_user_bytes(OLD_MAPPING, &mut old_bytes, pool)
             .expect("failed exec should preserve old user bytes");
     }
     assert_eq!(&old_bytes, OLD_BYTES);
@@ -282,24 +282,24 @@ fn successful_exec_commits_raw_bytes_and_process_state(pool: &FramePool) {
         .expect("successful exec should install a fresh frame");
     assert_eq!(frame.sepc, ENTRY);
     let sp = frame.regs[2];
-    let addr_space = task.process.addr_space.lock().unwrap();
+    let mut addr_space = task.process.addr_space.lock().unwrap();
     assert_ne!(addr_space.vm_token(), Ok(old_token));
     let mut old_byte = [0u8; 1];
     assert_eq!(
-        addr_space.read_user_bytes(OLD_MAPPING, &mut old_byte),
+        addr_space.read_user_bytes(OLD_MAPPING, &mut old_byte, pool),
         Err("efault")
     );
 
     let word = mem::size_of::<usize>();
-    assert_eq!(addr_space.read_user_usize(sp).unwrap(), 2);
-    let argv0 = addr_space.read_user_usize(sp + word).unwrap();
-    let argv1 = addr_space.read_user_usize(sp + word * 2).unwrap();
-    assert_eq!(addr_space.read_user_usize(sp + word * 3).unwrap(), 0);
-    let env0 = addr_space.read_user_usize(sp + word * 4).unwrap();
-    assert_eq!(addr_space.read_user_usize(sp + word * 5).unwrap(), 0);
-    assert_user_cbytes(&addr_space, argv0, b"raw-exec");
-    assert_user_cbytes(&addr_space, argv1, RAW_ARG);
-    assert_user_cbytes(&addr_space, env0, RAW_ENV);
+    assert_eq!(addr_space.read_user_usize(sp, pool).unwrap(), 2);
+    let argv0 = addr_space.read_user_usize(sp + word, pool).unwrap();
+    let argv1 = addr_space.read_user_usize(sp + word * 2, pool).unwrap();
+    assert_eq!(addr_space.read_user_usize(sp + word * 3, pool).unwrap(), 0);
+    let env0 = addr_space.read_user_usize(sp + word * 4, pool).unwrap();
+    assert_eq!(addr_space.read_user_usize(sp + word * 5, pool).unwrap(), 0);
+    assert_user_cbytes(&mut addr_space, argv0, b"raw-exec", pool);
+    assert_user_cbytes(&mut addr_space, argv1, RAW_ARG, pool);
+    assert_user_cbytes(&mut addr_space, env0, RAW_ENV, pool);
     drop(addr_space);
 
     assert!(task.get_fd_entry(inherited_fd).is_some());
@@ -455,7 +455,7 @@ fn resident_and_sv39_stay_consistent_across_transitions(pool: &FramePool) {
         .check_page_table_consistency()
         .expect("remaining resident pages should match Sv39");
     assert!(addr_space
-        .read_user_bytes(base + PAGE_SZ, &mut [0u8; 1])
+        .read_user_bytes(base + PAGE_SZ, &mut [0u8; 1], pool)
         .is_err());
 
     addr_space.release_all_pages();
@@ -525,10 +525,10 @@ fn forked_writable_page_resolves_cow(pool: &FramePool) {
     let mut parent_bytes = [0u8; 6];
     let mut child_bytes = [0u8; 6];
     parent
-        .read_user_bytes(addr, &mut parent_bytes)
+        .read_user_bytes(addr, &mut parent_bytes, pool)
         .expect("parent page should remain readable");
     child
-        .read_user_bytes(addr, &mut child_bytes)
+        .read_user_bytes(addr, &mut child_bytes, pool)
         .expect("child page should remain readable");
     assert_eq!(&parent_bytes, b"parent");
     assert_eq!(&child_bytes, b"child!");
@@ -540,10 +540,10 @@ fn forked_writable_page_resolves_cow(pool: &FramePool) {
         .check_page_table_consistency()
         .expect("resolved parent COW state should match Sv39");
     parent
-        .read_user_bytes(addr, &mut parent_bytes)
+        .read_user_bytes(addr, &mut parent_bytes, pool)
         .expect("resolved parent page should remain readable");
     child
-        .read_user_bytes(addr, &mut child_bytes)
+        .read_user_bytes(addr, &mut child_bytes, pool)
         .expect("child page should remain isolated");
     assert_eq!(&parent_bytes, b"newpar");
     assert_eq!(&child_bytes, b"child!");
@@ -1407,7 +1407,7 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(mapped_addr, &mut cleared_tid)
+        .read_user_bytes(mapped_addr, &mut cleared_tid, pool)
         .expect("surviving process should retain clear_child_tid page");
     assert_eq!(u32::from_ne_bytes(cleared_tid), 0);
     let mut robust_owner = [0u8; 4];
@@ -1416,7 +1416,7 @@ fn nonleader_exit_keeps_leader_resources_and_parent_quiet(pool: &FramePool) {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(robust_futex, &mut robust_owner)
+        .read_user_bytes(robust_futex, &mut robust_owner, pool)
         .expect("surviving process should retain robust futex page");
     assert_eq!(u32::from_ne_bytes(robust_owner), 0xc000_0000);
     assert!(!global_timer_wheel().lock().cancel(owned_timer));
@@ -1740,28 +1740,40 @@ fn proc_init_push_at_writes_user_stack(pool: &FramePool) {
     assert!(sp < top);
 
     let word = mem::size_of::<usize>();
-    assert_eq!(addr_space.read_user_usize(sp).unwrap(), 1);
-    let argv0 = addr_space.read_user_usize(sp + word).unwrap();
-    assert_eq!(addr_space.read_user_usize(sp + word * 2).unwrap(), 0);
-    let env0 = addr_space.read_user_usize(sp + word * 3).unwrap();
-    assert_eq!(addr_space.read_user_usize(sp + word * 4).unwrap(), 0);
+    assert_eq!(addr_space.read_user_usize(sp, pool).unwrap(), 1);
+    let argv0 = addr_space.read_user_usize(sp + word, pool).unwrap();
+    assert_eq!(addr_space.read_user_usize(sp + word * 2, pool).unwrap(), 0);
+    let env0 = addr_space.read_user_usize(sp + word * 3, pool).unwrap();
+    assert_eq!(addr_space.read_user_usize(sp + word * 4, pool).unwrap(), 0);
 
-    assert_user_cstr(&addr_space, argv0, "init");
-    assert_user_cstr(&addr_space, env0, "A=B");
+    assert_user_cstr(&mut addr_space, argv0, "init", pool);
+    assert_user_cstr(&mut addr_space, env0, "A=B", pool);
 
     let auxv = sp + word * 5;
     assert_eq!(
-        addr_space.read_user_usize(auxv).unwrap(),
+        addr_space.read_user_usize(auxv, pool).unwrap(),
         AT_PAGESZ as usize
     );
-    assert_eq!(addr_space.read_user_usize(auxv + word).unwrap(), PAGE_SZ);
     assert_eq!(
-        addr_space.read_user_usize(auxv + word * 2).unwrap(),
+        addr_space.read_user_usize(auxv + word, pool).unwrap(),
+        PAGE_SZ
+    );
+    assert_eq!(
+        addr_space.read_user_usize(auxv + word * 2, pool).unwrap(),
         AT_ENTRY as usize
     );
-    assert_eq!(addr_space.read_user_usize(auxv + word * 3).unwrap(), entry);
-    assert_eq!(addr_space.read_user_usize(auxv + word * 4).unwrap(), 0);
-    assert_eq!(addr_space.read_user_usize(auxv + word * 5).unwrap(), 0);
+    assert_eq!(
+        addr_space.read_user_usize(auxv + word * 3, pool).unwrap(),
+        entry
+    );
+    assert_eq!(
+        addr_space.read_user_usize(auxv + word * 4, pool).unwrap(),
+        0
+    );
+    assert_eq!(
+        addr_space.read_user_usize(auxv + word * 5, pool).unwrap(),
+        0
+    );
 }
 
 // AGENT: exercise the ELF image builder used by exec, including file bytes,
@@ -1783,13 +1795,13 @@ fn prepared_user_image_loads_elf_segment_and_stack(pool: &FramePool) {
     let mut loaded = [0u8; 4];
     image
         .addr_space
-        .read_user_bytes(segment_vaddr, &mut loaded)
+        .read_user_bytes(segment_vaddr, &mut loaded, pool)
         .expect("ELF payload should be readable");
     assert_eq!(&loaded, payload);
     let mut bss = [0xffu8; 12];
     image
         .addr_space
-        .read_user_bytes(segment_vaddr + payload.len(), &mut bss)
+        .read_user_bytes(segment_vaddr + payload.len(), &mut bss, pool)
         .expect("ELF bss should be readable");
     assert_eq!(bss, [0u8; 12]);
     assert!(image
@@ -1804,7 +1816,7 @@ fn prepared_user_image_loads_elf_segment_and_stack(pool: &FramePool) {
     let mut sigtramp_code = [0u8; USER_SIGTRAMP_CODE.len()];
     image
         .addr_space
-        .read_user_bytes(USER_SIGTRAMP, &mut sigtramp_code)
+        .read_user_bytes(USER_SIGTRAMP, &mut sigtramp_code, pool)
         .expect("signal restorer code should be readable");
     assert_eq!(sigtramp_code, USER_SIGTRAMP_CODE);
     assert!(image
@@ -1813,12 +1825,12 @@ fn prepared_user_image_loads_elf_segment_and_stack(pool: &FramePool) {
         .is_err());
 
     let sp = image.user_entry.stack_pointer;
-    assert_eq!(image.addr_space.read_user_usize(sp).unwrap(), 1);
+    assert_eq!(image.addr_space.read_user_usize(sp, pool).unwrap(), 1);
     let argv0 = image
         .addr_space
-        .read_user_usize(sp + mem::size_of::<usize>())
+        .read_user_usize(sp + mem::size_of::<usize>(), pool)
         .unwrap();
-    assert_user_cstr(&image.addr_space, argv0, "init");
+    assert_user_cstr(&mut image.addr_space, argv0, "init", pool);
     assert_eq!(image.addr_space.brk(), 0x0040_2000);
 
     image.addr_space.release_all_pages();
@@ -1846,7 +1858,7 @@ fn prepared_user_image_preserves_no_access_segment(pool: &FramePool) {
     let mut byte = [0u8; 1];
     assert!(image
         .addr_space
-        .read_user_bytes(no_access_vaddr, &mut byte)
+        .read_user_bytes(no_access_vaddr, &mut byte, pool)
         .is_err());
     assert!(image
         .addr_space
@@ -1981,19 +1993,19 @@ fn prepared_user_image_loads_segments_sharing_a_page(pool: &FramePool) {
     let mut right_bss = [0xffu8; 8];
     image
         .addr_space
-        .read_user_bytes(left_vaddr, &mut left)
+        .read_user_bytes(left_vaddr, &mut left, pool)
         .unwrap();
     image
         .addr_space
-        .read_user_bytes(right_vaddr, &mut right)
+        .read_user_bytes(right_vaddr, &mut right, pool)
         .unwrap();
     image
         .addr_space
-        .read_user_bytes(left_vaddr + left.len(), &mut left_bss)
+        .read_user_bytes(left_vaddr + left.len(), &mut left_bss, pool)
         .unwrap();
     image
         .addr_space
-        .read_user_bytes(right_vaddr + right.len(), &mut right_bss)
+        .read_user_bytes(right_vaddr + right.len(), &mut right_bss, pool)
         .unwrap();
     assert_eq!(&left, b"left");
     assert_eq!(&right, b"right");
@@ -2029,11 +2041,11 @@ fn prepared_user_image_loads_out_of_order_segments(pool: &FramePool) {
     let mut low = [0u8; 3];
     image
         .addr_space
-        .read_user_bytes(high_vaddr, &mut high)
+        .read_user_bytes(high_vaddr, &mut high, pool)
         .unwrap();
     image
         .addr_space
-        .read_user_bytes(low_vaddr, &mut low)
+        .read_user_bytes(low_vaddr, &mut low, pool)
         .unwrap();
     assert_eq!(&high, b"high");
     assert_eq!(&low, b"low");
@@ -2141,7 +2153,7 @@ fn shm_segment_maps_shared_physical_page(pool: &FramePool) {
 
     let mut bytes = [0u8; 6];
     right
-        .read_user_bytes(right_addr + 17, &mut bytes)
+        .read_user_bytes(right_addr + 17, &mut bytes, pool)
         .expect("shared mapping should be readable");
     assert_eq!(&bytes, b"shared");
 }
@@ -2177,16 +2189,16 @@ fn release_all_pages_drops_same_space_aliases(pool: &FramePool) {
 
 // AGENT: read a known-length C string from user memory and verify its trailing
 // NUL byte without relying on host-side string helpers.
-fn assert_user_cstr(addr_space: &AddrSpace, addr: usize, expected: &str) {
-    assert_user_cbytes(addr_space, addr, expected.as_bytes());
+fn assert_user_cstr(addr_space: &mut AddrSpace, addr: usize, expected: &str, pool: &FramePool) {
+    assert_user_cbytes(addr_space, addr, expected.as_bytes(), pool);
 }
 
 // AGENT: verify one initial-stack C string as raw bytes so exec tests can cover
 // values that intentionally cannot be represented as Rust UTF-8 strings.
-fn assert_user_cbytes(addr_space: &AddrSpace, addr: usize, expected: &[u8]) {
+fn assert_user_cbytes(addr_space: &mut AddrSpace, addr: usize, expected: &[u8], pool: &FramePool) {
     let mut bytes = vec![0u8; expected.len() + 1];
     addr_space
-        .read_user_bytes(addr, &mut bytes)
+        .read_user_bytes(addr, &mut bytes, pool)
         .expect("user string should be readable");
     assert_eq!(&bytes[..expected.len()], expected);
     assert_eq!(bytes[expected.len()], 0);

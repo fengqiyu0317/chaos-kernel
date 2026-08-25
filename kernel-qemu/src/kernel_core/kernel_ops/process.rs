@@ -123,7 +123,10 @@ impl Kernel {
         let mut visited = BTreeSet::new();
         let mut addr_space = current.process.addr_space.lock().unwrap();
         let mut head = [0u8; ROBUST_LIST_HEAD_SIZE];
-        if addr_space.read_user_bytes(head_addr, &mut head).is_err() {
+        if addr_space
+            .read_user_bytes(head_addr, &mut head, &self.pool)
+            .is_err()
+        {
             return;
         }
         let first = usize::from_ne_bytes(head[0..8].try_into().unwrap());
@@ -147,7 +150,10 @@ impl Kernel {
                 }
             }
             let mut next = [0u8; mem::size_of::<usize>()];
-            if addr_space.read_user_bytes(node, &mut next).is_err() {
+            if addr_space
+                .read_user_bytes(node, &mut next, &self.pool)
+                .is_err()
+            {
                 break;
             }
             node = usize::from_ne_bytes(next);
@@ -236,7 +242,10 @@ fn mark_robust_futex_owner_dead(
         return false;
     }
     let mut bytes = [0u8; mem::size_of::<u32>()];
-    if addr_space.read_user_bytes(futex_addr, &mut bytes).is_err() {
+    if addr_space
+        .read_user_bytes(futex_addr, &mut bytes, pool)
+        .is_err()
+    {
         return false;
     }
     let old = u32::from_ne_bytes(bytes);

@@ -64,7 +64,7 @@ fn copy_stat_to_user(
     }
     let bytes = encode_riscv64_stat(attr)?;
     let mut addr_space = task.process.addr_space.lock().unwrap();
-    if addr_space.writable_user_prefix_len(stat_addr, bytes.len())? != bytes.len() {
+    if addr_space.writable_user_prefix_len(stat_addr, bytes.len(), &kernel.pool)? != bytes.len() {
         return Err("efault");
     }
     addr_space.write_user_bytes(stat_addr, &bytes, &kernel.pool)
@@ -97,7 +97,7 @@ pub(super) fn sys_newfstatat(
         return Err("enotsup");
     }
     let task = kernel.cur_task(0).ok_or("esrch")?;
-    let path = super::fs::read_user_path(&task, path_addr)?;
+    let path = super::fs::read_user_path(kernel, &task, path_addr)?;
     if path.is_empty() {
         return Err("enoent");
     }

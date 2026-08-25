@@ -40,7 +40,7 @@ pub(super) fn sys_futex(
             let deadline = if timeout_addr == 0 {
                 None
             } else {
-                let timeout = read_futex_timeout(&current, timeout_addr)?;
+                let timeout = read_futex_timeout(kernel, &current, timeout_addr)?;
                 Some(
                     CLK.load(Ordering::Relaxed)
                         .saturating_add(duration_to_ticks(timeout)),
@@ -48,7 +48,7 @@ pub(super) fn sys_futex(
             };
             let futex = current.process.futex.clone();
             match futex.wait(current.id(), uaddr, val as u32, deadline, || {
-                read_user_u32(&current, uaddr)
+                read_user_u32(kernel, &current, uaddr)
             }) {
                 Ok(()) => Ok(0),
                 Err("changed") => Err("eagain"),
@@ -72,7 +72,7 @@ pub(super) fn sys_futex(
             let current = kernel.cur_task(0).ok_or("esrch")?;
             // AGENT: resolve the target futex through AddrSpace before publishing
             // requeued waiters, so an aligned but unmapped uaddr2 returns EFAULT.
-            let _ = read_user_u32(&current, uaddr2)?;
+            let _ = read_user_u32(kernel, &current, uaddr2)?;
             Ok(current
                 .process
                 .futex
@@ -107,10 +107,10 @@ pub(super) fn sys_futex(
             let current = kernel.cur_task(0).ok_or("esrch")?;
             // AGENT: validate the target mapping separately from the compared
             // source word because cmp_requeue only reads uaddr itself.
-            let _ = read_user_u32(&current, uaddr2)?;
+            let _ = read_user_u32(kernel, &current, uaddr2)?;
             let futex = current.process.futex.clone();
             match futex.cmp_requeue(uaddr, uaddr2, val, timeout_addr, val3 as u32, || {
-                read_user_u32(&current, uaddr)
+                read_user_u32(kernel, &current, uaddr)
             }) {
                 Ok(n) => Ok(n),
                 Err("changed") => Err("eagain"),
@@ -123,13 +123,13 @@ pub(super) fn sys_futex(
 
 // AGENT: futex words are user memory; route reads through the current
 // address-space copy-in path instead of directly dereferencing user pointers.
-fn read_user_u32(task: &Task, addr: usize) -> Result<u32, &'static str> {
+fn read_user_u32(kernel: &Kernel, task: &Task, addr: usize) -> Result<u32, &'static str> {
     let mut bytes = [0u8; mem::size_of::<u32>()];
     task.process
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(addr, &mut bytes)?;
+        .read_user_bytes(addr, &mut bytes, &kernel.pool)?;
     Ok(u32::from_ne_bytes(bytes))
 }
 
@@ -150,13 +150,17 @@ fn write_user_u32(
 
 // AGENT: copy the userspace timespec fields through AddrSpace so unmapped
 // timeout pointers return efault.
-fn read_futex_timeout(task: &Task, timeout_addr: usize) -> Result<Duration, &'static str> {
+fn read_futex_timeout(
+    kernel: &Kernel,
+    task: &Task,
+    timeout_addr: usize,
+) -> Result<Duration, &'static str> {
     let tv_nsec_addr = timeout_addr
         .checked_add(mem::size_of::<usize>())
         .ok_or("efault")?;
-    let addr_space = task.process.addr_space.lock().unwrap();
-    let tv_sec = addr_space.read_user_usize(timeout_addr)?;
-    let tv_nsec = addr_space.read_user_usize(tv_nsec_addr)?;
+    let mut addr_space = task.process.addr_space.lock().unwrap();
+    let tv_sec = addr_space.read_user_usize(timeout_addr, &kernel.pool)?;
+    let tv_nsec = addr_space.read_user_usize(tv_nsec_addr, &kernel.pool)?;
     if tv_nsec >= 1_000_000_000 {
         return Err("einval");
     }
@@ -189,7 +193,7 @@ fn futex_wake_op_apply(
         }
         oparg = 1i32 << oparg;
     }
-    let old = read_user_u32(task, uaddr2)?;
+    let old = read_user_u32(kernel, task, uaddr2)?;
     let new = match op_kind {
         FUTEX_OP_SET => oparg as u32,
         FUTEX_OP_ADD => old.wrapping_add(oparg as u32),

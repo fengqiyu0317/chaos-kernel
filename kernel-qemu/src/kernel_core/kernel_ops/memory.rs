@@ -1,25 +1,30 @@
 use super::*;
 
 impl Kernel {
-    // AGENT: recover private COW and first shared-file writes through the common
-    // address-space transition; lazy load/execute faults remain unsupported.
+    // AGENT: route load/store/instruction faults through the common AddrSpace
+    // resolver so lazy heap allocation and existing write transitions agree.
     pub fn handle_pgfault(
         &self,
         addr: usize,
         access: KernelPageFaultAccess,
-    ) -> Result<(), &'static str> {
+    ) -> Result<UserPageResolution, UserPageFault> {
         if addr >= USER_TOP {
-            return Err("efault");
+            return Err(UserPageFault::NotMapped);
         }
 
-        let task = self.cur_task(0).ok_or("esrch")?;
-        match access {
-            KernelPageFaultAccess::Store => {
-                let mut addr_space = task.process.addr_space.lock().unwrap();
-                addr_space.handle_write_fault(addr, &self.pool).map(|_| ())
-            }
-            KernelPageFaultAccess::Instruction | KernelPageFaultAccess::Load => Err("segfault"),
-        }
+        let task = self.cur_task(0).ok_or(UserPageFault::Internal("esrch"))?;
+        let access = match access {
+            KernelPageFaultAccess::Instruction => UserPageAccess::Execute,
+            KernelPageFaultAccess::Load => UserPageAccess::Read,
+            KernelPageFaultAccess::Store => UserPageAccess::Write,
+        };
+        let resolution = task
+            .process
+            .addr_space
+            .lock()
+            .unwrap()
+            .resolve_user_page(addr, access, &self.pool);
+        resolution
     }
 
     // AGENT: report pressure over the complete physical-memory span represented

@@ -54,16 +54,20 @@ impl OpenOptions {
 }
 
 // AGENT: read a NUL-terminated path from the current user address space.
-pub(super) fn read_user_path(task: &Task, addr: usize) -> Result<String, &'static str> {
+pub(super) fn read_user_path(
+    kernel: &Kernel,
+    task: &Task,
+    addr: usize,
+) -> Result<String, &'static str> {
     if addr == 0 {
         return Err("efault");
     }
-    let addr_space = task.process.addr_space.lock().unwrap();
+    let mut addr_space = task.process.addr_space.lock().unwrap();
     let mut bytes = Vec::new();
     for offset in 0..4096 {
         let cur = addr.checked_add(offset).ok_or("efault")?;
         let mut byte = [0u8; 1];
-        addr_space.read_user_bytes(cur, &mut byte)?;
+        addr_space.read_user_bytes(cur, &mut byte, &kernel.pool)?;
         if byte[0] == 0 {
             return String::from_utf8(bytes).map_err(|_| "einval");
         }
@@ -90,9 +94,9 @@ pub(super) fn sys_mount(
     }
 
     let task = kernel.cur_task(0).ok_or("esrch")?;
-    let source = read_user_path(&task, source_addr)?;
-    let target = read_user_path(&task, target_addr)?;
-    let filesystem_type = read_user_path(&task, filesystem_type_addr)?;
+    let source = read_user_path(kernel, &task, source_addr)?;
+    let target = read_user_path(kernel, &task, target_addr)?;
+    let filesystem_type = read_user_path(kernel, &task, filesystem_type_addr)?;
     if source.is_empty() || filesystem_type.is_empty() {
         return Err("einval");
     }
@@ -117,14 +121,14 @@ pub(super) fn sys_umount2(
         _ => return Err("enotsup"),
     };
     let task = kernel.cur_task(0).ok_or("esrch")?;
-    let target = read_user_path(&task, target_addr)?;
+    let target = read_user_path(kernel, &task, target_addr)?;
     kernel.vfs.unmount(&target, mode)?;
     Ok(0)
 }
 
 // AGENT: ioctl integer arguments live in user memory; copy them through the
 // active address space instead of trusting the raw pointer.
-fn read_user_i32(task: &Task, addr: usize) -> Result<i32, &'static str> {
+fn read_user_i32(kernel: &Kernel, task: &Task, addr: usize) -> Result<i32, &'static str> {
     if addr == 0 {
         return Err("efault");
     }
@@ -133,7 +137,7 @@ fn read_user_i32(task: &Task, addr: usize) -> Result<i32, &'static str> {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(addr, &mut bytes)?;
+        .read_user_bytes(addr, &mut bytes, &kernel.pool)?;
     Ok(i32::from_ne_bytes(bytes))
 }
 
@@ -157,13 +161,13 @@ fn write_user_i32(
 
 // AGENT: copy one native RV64 off_t through the live address space without
 // directly dereferencing a userspace pointer.
-fn read_user_i64(task: &Task, addr: usize) -> Result<i64, &'static str> {
+fn read_user_i64(kernel: &Kernel, task: &Task, addr: usize) -> Result<i64, &'static str> {
     let mut bytes = [0u8; mem::size_of::<i64>()];
     task.process
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(addr, &mut bytes)?;
+        .read_user_bytes(addr, &mut bytes, &kernel.pool)?;
     Ok(i64::from_ne_bytes(bytes))
 }
 
@@ -184,7 +188,7 @@ fn write_user_i64(
 
 // AGENT: decode the fixed 32-byte Linux asm-generic RV64 flock image without
 // exposing Rust struct padding or trusting a raw user pointer.
-fn read_user_flock(task: &Task, addr: usize) -> Result<FlockArg, &'static str> {
+fn read_user_flock(kernel: &Kernel, task: &Task, addr: usize) -> Result<FlockArg, &'static str> {
     if addr == 0 {
         return Err("efault");
     }
@@ -193,7 +197,7 @@ fn read_user_flock(task: &Task, addr: usize) -> Result<FlockArg, &'static str> {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(addr, &mut bytes)?;
+        .read_user_bytes(addr, &mut bytes, &kernel.pool)?;
     Ok(FlockArg {
         lock_type: i16::from_le_bytes(bytes[0..2].try_into().map_err(|_| "efault")?),
         whence: i16::from_le_bytes(bytes[2..4].try_into().map_err(|_| "efault")?),
@@ -221,7 +225,7 @@ fn write_user_flock(
     bytes[16..24].copy_from_slice(&flock.len.to_le_bytes());
     bytes[24..28].copy_from_slice(&flock.pid.to_le_bytes());
     let mut addr_space = task.process.addr_space.lock().unwrap();
-    if addr_space.writable_user_prefix_len(addr, bytes.len())? != bytes.len() {
+    if addr_space.writable_user_prefix_len(addr, bytes.len(), &kernel.pool)? != bytes.len() {
         return Err("efault");
     }
     addr_space.write_user_bytes(addr, &bytes, &kernel.pool)
@@ -247,8 +251,8 @@ pub(super) fn sys_read(
     let task = kernel.cur_task(0).ok_or("esrch")?;
     let request_len = min(count, MAX_RW_COUNT);
     let writable_len = {
-        let addr_space = task.process.addr_space.lock().unwrap();
-        addr_space.writable_user_prefix_len(buf_addr, request_len)?
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space.writable_user_prefix_len(buf_addr, request_len, &kernel.pool)?
     };
     let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
     let mut tmp = vec![0u8; writable_len];
@@ -286,16 +290,16 @@ pub(super) fn sys_write(
     let task = kernel.cur_task(0).ok_or("esrch")?;
     let request_len = min(count, MAX_RW_COUNT);
     let readable_len = {
-        let addr_space = task.process.addr_space.lock().unwrap();
-        addr_space.readable_user_prefix_len(buf_addr, request_len)?
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space.readable_user_prefix_len(buf_addr, request_len, &kernel.pool)?
     };
     let mut tmp = vec![0u8; readable_len];
     if readable_len != 0 {
-        task.process
-            .addr_space
-            .lock()
-            .unwrap()
-            .read_user_bytes(buf_addr, &mut tmp)?;
+        task.process.addr_space.lock().unwrap().read_user_bytes(
+            buf_addr,
+            &mut tmp,
+            &kernel.pool,
+        )?;
     }
     let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
     match entry.write(task.id(), &tmp)? {
@@ -346,7 +350,7 @@ pub(super) fn sys_openat(
     mode: usize,
 ) -> Result<usize, &'static str> {
     let task = kernel.cur_task(0).ok_or("esrch")?;
-    let path = read_user_path(&task, path_addr)?;
+    let path = read_user_path(kernel, &task, path_addr)?;
     do_open(kernel, &task, &path, flags, mode)
 }
 
@@ -359,7 +363,7 @@ pub(super) fn sys_mkdirat(
     _mode: usize,
 ) -> Result<usize, &'static str> {
     let task = kernel.cur_task(0).ok_or("esrch")?;
-    let path = read_user_path(&task, path_addr)?;
+    let path = read_user_path(kernel, &task, path_addr)?;
     if path.is_empty() {
         return Err("enoent");
     }
@@ -409,7 +413,7 @@ pub(super) fn sys_ioctl(
             Ok(0)
         }
         FIONBIO => {
-            let nonblock = read_user_i32(&task, arg)? != 0;
+            let nonblock = read_user_i32(kernel, &task, arg)? != 0;
             entry.set_nonblocking(nonblock);
             Ok(0)
         }
@@ -442,7 +446,7 @@ pub(super) fn sys_pipe(kernel: &Kernel, a0: usize, a1: usize) -> Result<usize, &
         .addr_space
         .lock()
         .unwrap()
-        .writable_user_prefix_len(fds_addr, output_len)?;
+        .writable_user_prefix_len(fds_addr, output_len, &kernel.pool)?;
     if writable_len != output_len {
         return Err("efault");
     }
@@ -555,12 +559,12 @@ pub(super) fn sys_splice(
         input: if off_in_addr == 0 {
             None
         } else {
-            Some(read_user_i64(&task, off_in_addr)?)
+            Some(read_user_i64(kernel, &task, off_in_addr)?)
         },
         output: if off_out_addr == 0 {
             None
         } else {
-            Some(read_user_i64(&task, off_out_addr)?)
+            Some(read_user_i64(kernel, &task, off_out_addr)?)
         },
     };
 
@@ -653,7 +657,7 @@ pub(super) fn sys_fcntl(
         }
         F_GETLK | F_SETLK | F_SETLKW => {
             let entry = task.get_fd_entry(fd).ok_or("ebadf")?;
-            let mut flock = read_user_flock(&task, arg)?;
+            let mut flock = read_user_flock(kernel, &task, arg)?;
             let request = entry.record_lock_request(flock, cmd != F_GETLK)?;
             let owner_pid = task.process.pid();
             match cmd {

@@ -19,6 +19,45 @@ pub enum BrkResizeError {
     Internal(&'static str),
 }
 
+// AGENT: describe one semantic userspace access independently from the RISC-V
+// trap cause so hardware faults and kernel usercopy share the same resolver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserPageAccess {
+    Read,
+    Write,
+    Execute,
+}
+
+// AGENT: keep ordinary userspace mapping/protection failures and physical-memory
+// pressure distinct from address-space invariant failures at the fault boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserPageFault {
+    NotMapped,
+    Protection,
+    OutOfMemory,
+    Internal(&'static str),
+}
+
+// AGENT: tell the trap path whether retrying the faulting instruction can make
+// progress while still returning the resolved physical byte to kernel usercopy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserPageResolution {
+    AlreadyAccessible(usize),
+    Installed(usize),
+    PermissionUpdated(usize),
+}
+
+// AGENT: expose the translated physical byte uniformly to usercopy callers.
+impl UserPageResolution {
+    fn paddr(self) -> usize {
+        match self {
+            Self::AlreadyAccessible(paddr)
+            | Self::Installed(paddr)
+            | Self::PermissionUpdated(paddr) => paddr,
+        }
+    }
+}
+
 // AGENT: track supervisor-only leaves separately from VmMap/resident_pages so
 // trap transport does not become user-visible VMA, COW, or checkpoint state.
 struct ArchMappings {
@@ -115,7 +154,7 @@ impl AddrSpace {
                 return Err("eacces");
             }
             let mut code = [0u8; USER_SIGTRAMP_CODE.len()];
-            self.read_user_bytes(USER_SIGTRAMP, &mut code)?;
+            self.read_user_bytes(USER_SIGTRAMP, &mut code, pool)?;
             return if code == USER_SIGTRAMP_CODE {
                 Ok(())
             } else {
@@ -209,6 +248,20 @@ impl AddrSpace {
     // syscall regressions without allowing callers to bypass resize policy.
     pub fn start_brk(&self) -> usize {
         self.start_brk
+    }
+
+    // AGENT: expose resident accounting without leaking mutable page ownership
+    // so lazy-allocation tests and diagnostics can distinguish VMA from RSS.
+    pub fn resident_page_count(&self) -> usize {
+        self.resident_pages.entries.len()
+    }
+
+    // AGENT: report whether one page has a software owner and therefore a
+    // matching Sv39 leaf under the address-space consistency invariant.
+    pub fn is_page_resident(&self, addr: usize) -> bool {
+        self.resident_pages
+            .entries
+            .contains_key(&align_down(addr, PAGE_SZ))
     }
 
     // AGENT: initialize or restore exact brk metadata after image mappings have
@@ -391,7 +444,12 @@ impl AddrSpace {
             let len = checked_u64_to_usize(vma.len)?;
             let flags = vma.flags;
             let temp_flags = flags | VM_WRITE;
-            addr_space.map_region(VmRegion::new(start, len, temp_flags), pool)?;
+            let region = VmRegion::new(start, len, temp_flags);
+            if flags & VM_HEAP != 0 {
+                addr_space.reserve_anonymous_region(region)?;
+            } else {
+                addr_space.map_region(region, pool)?;
+            }
             final_regions.push((start, len, flags));
         }
 
@@ -583,6 +641,110 @@ impl AddrSpace {
         Ok(paddr)
     }
 
+    // AGENT: install one zero-filled anonymous heap page only after its VMA has
+    // been published, committing the resident owner after the Sv39 leaf exists.
+    fn install_lazy_zero_page(
+        &mut self,
+        page_addr: usize,
+        vm_flags: u32,
+        pool: &FramePool,
+    ) -> Result<usize, UserPageFault> {
+        self.debug_check_page_table_consistency()
+            .map_err(UserPageFault::Internal)?;
+        if self.resident_pages.entries.contains_key(&page_addr) {
+            return Err(UserPageFault::Internal("lazy page already resident"));
+        }
+
+        let frame = pool.alloc_pg_frame().ok_or(UserPageFault::OutOfMemory)?;
+        zero_page(frame.paddr());
+        let page = SharedPage::new(frame);
+        let paddr = page.paddr();
+        let leaf_flags = Self::resident_leaf_flags(vm_flags, &page);
+        self.sv39
+            .map_leaf(page_addr, paddr, leaf_flags, pool)
+            .map_err(|err| match err {
+                "enomem" | "oom" => UserPageFault::OutOfMemory,
+                internal => UserPageFault::Internal(internal),
+            })?;
+
+        let replaced = self.resident_pages.entries.insert(page_addr, page);
+        assert!(
+            replaced.is_none(),
+            "AddrSpace lock must exclude duplicate lazy resident installation"
+        );
+        crate::csr::sfence_vma();
+        self.debug_check_page_table_consistency()
+            .map_err(UserPageFault::Internal)?;
+        Ok(paddr)
+    }
+
+    // AGENT: resolve lazy anonymous allocation, private COW, and shared-file
+    // first-write state through one address-space-locked transition machine.
+    pub fn resolve_user_page(
+        &mut self,
+        addr: usize,
+        access: UserPageAccess,
+        pool: &FramePool,
+    ) -> Result<UserPageResolution, UserPageFault> {
+        if addr >= USER_TOP {
+            return Err(UserPageFault::NotMapped);
+        }
+        self.debug_check_page_table_consistency()
+            .map_err(UserPageFault::Internal)?;
+
+        let (vm_flags, lazy_heap) = {
+            let region = self.vm_map.find(addr).ok_or(UserPageFault::NotMapped)?;
+            let allowed = match access {
+                UserPageAccess::Read => region.flags & VM_READ != 0,
+                UserPageAccess::Write => region.flags & VM_WRITE != 0,
+                UserPageAccess::Execute => region.flags & VM_EXEC != 0,
+            };
+            if !allowed {
+                return Err(UserPageFault::Protection);
+            }
+            (
+                region.flags,
+                region.flags & VM_HEAP != 0 && matches!(&region.backing, VmBacking::Anonymous),
+            )
+        };
+
+        let page_addr = align_down(addr, PAGE_SZ);
+        let page_offset = addr - page_addr;
+        if let Some(page) = self.resident_pages.entries.get(&page_addr) {
+            let needs_write_transition = page.cow || page.needs_shared_write_fault();
+            if access == UserPageAccess::Write && needs_write_transition {
+                let page_paddr = self
+                    .handle_write_fault(addr, pool)
+                    .map_err(|err| match err {
+                        "enomem" | "oom" => UserPageFault::OutOfMemory,
+                        internal => UserPageFault::Internal(internal),
+                    })?;
+                return Ok(UserPageResolution::PermissionUpdated(
+                    page_paddr + page_offset,
+                ));
+            }
+
+            let hardware_access = match access {
+                UserPageAccess::Read => PageAccess::Read,
+                UserPageAccess::Write => PageAccess::Write,
+                UserPageAccess::Execute => PageAccess::Execute,
+            };
+            let paddr = self
+                .sv39
+                .translate(addr, hardware_access)
+                .map_err(UserPageFault::Internal)?;
+            return Ok(UserPageResolution::AlreadyAccessible(paddr));
+        }
+
+        if !lazy_heap {
+            return Err(UserPageFault::Internal(
+                "non-heap VMA unexpectedly lacks a resident page",
+            ));
+        }
+        let page_paddr = self.install_lazy_zero_page(page_addr, vm_flags, pool)?;
+        Ok(UserPageResolution::Installed(page_paddr + page_offset))
+    }
+
     // AGENT: validate user copy boundaries before touching VmMap or Sv39 state.
     fn checked_user_end(addr: usize, len: usize) -> Result<usize, &'static str> {
         let end = addr.checked_add(len).ok_or("efault")?;
@@ -592,9 +754,14 @@ impl AddrSpace {
         Ok(end)
     }
 
-    // AGENT: copy user bytes by trusting the live Sv39 page table as the read
-    // authority instead of duplicating resident-page or VmMap validity checks.
-    pub fn read_user_bytes(&self, addr: usize, dst: &mut [u8]) -> Result<(), &'static str> {
+    // AGENT: fault in lazy heap pages before copying user bytes, then use the
+    // resolver's live Sv39 translation as the physical read authority.
+    pub fn read_user_bytes(
+        &mut self,
+        addr: usize,
+        dst: &mut [u8],
+        pool: &FramePool,
+    ) -> Result<(), &'static str> {
         if dst.is_empty() {
             return Ok(());
         }
@@ -604,16 +771,24 @@ impl AddrSpace {
             let cur = addr + copied;
             let page_off = cur & (PAGE_SZ - 1);
             let chunk = min(end - cur, PAGE_SZ - page_off);
-            let paddr = self.sv39.translate(cur, PageAccess::Read)?;
+            let paddr = self
+                .resolve_user_page(cur, UserPageAccess::Read, pool)
+                .map_err(|_| "efault")?
+                .paddr();
             copy_from_phys(paddr, &mut dst[copied..copied + chunk]);
             copied += chunk;
         }
         Ok(())
     }
 
-    // AGENT: report the contiguous Sv39-readable prefix of a user buffer so
-    // write-like syscalls can preserve the kernel-sim short-I/O boundary.
-    pub fn readable_user_prefix_len(&self, addr: usize, len: usize) -> Result<usize, &'static str> {
+    // AGENT: fault in the contiguous readable heap prefix before write-like
+    // syscalls consume external state, preserving the existing short-I/O edge.
+    pub fn readable_user_prefix_len(
+        &mut self,
+        addr: usize,
+        len: usize,
+        pool: &FramePool,
+    ) -> Result<usize, &'static str> {
         if len == 0 {
             return Ok(0);
         }
@@ -621,7 +796,10 @@ impl AddrSpace {
         let mut checked = 0usize;
         while checked < len {
             let cur = addr + checked;
-            if self.sv39.translate(cur, PageAccess::Read).is_err() {
+            if self
+                .resolve_user_page(cur, UserPageAccess::Read, pool)
+                .is_err()
+            {
                 return if checked == 0 {
                     Err("efault")
                 } else {
@@ -634,9 +812,14 @@ impl AddrSpace {
         Ok(checked)
     }
 
-    // AGENT: report the contiguous writable userspace prefix before read-like
-    // syscalls consume state; software COW and shared first-write pages qualify.
-    pub fn writable_user_prefix_len(&self, addr: usize, len: usize) -> Result<usize, &'static str> {
+    // AGENT: fault in lazy heap pages and resolve writable transitions before a
+    // read-like syscall consumes state, retaining the contiguous-prefix rule.
+    pub fn writable_user_prefix_len(
+        &mut self,
+        addr: usize,
+        len: usize,
+        pool: &FramePool,
+    ) -> Result<usize, &'static str> {
         if len == 0 {
             return Ok(0);
         }
@@ -644,14 +827,8 @@ impl AddrSpace {
         let mut checked = 0usize;
         while checked < len {
             let cur = addr + checked;
-            let Some(region) = self.vm_map.find(cur) else {
-                return if checked == 0 {
-                    Err("efault")
-                } else {
-                    Ok(checked)
-                };
-            };
-            if region.flags & VM_WRITE == 0 {
+            let resolution = self.resolve_user_page(cur, UserPageAccess::Write, pool);
+            if resolution.is_err() {
                 return if checked == 0 {
                     Err("efault")
                 } else {
@@ -659,38 +836,20 @@ impl AddrSpace {
                 };
             }
 
-            let page_addr = align_down(cur, PAGE_SZ);
             let page_off = cur & (PAGE_SZ - 1);
-            let page_writable = match (
-                self.resident_pages.entries.get(&page_addr),
-                self.sv39.leaf_mapping(page_addr),
-            ) {
-                (Some(resident), Ok(leaf)) => {
-                    let hardware_writable = leaf.flags & PTE_W != 0;
-                    let valid_write_state = (!resident.cow && hardware_writable)
-                        || ((resident.cow || resident.needs_shared_write_fault())
-                            && !hardware_writable);
-                    leaf.paddr == resident.paddr() && leaf.flags & PTE_U != 0 && valid_write_state
-                }
-                _ => false,
-            };
-            if !page_writable {
-                return if checked == 0 {
-                    Err("efault")
-                } else {
-                    Ok(checked)
-                };
-            }
-
-            checked += min(end - cur, min(PAGE_SZ - page_off, region.end() - cur));
+            checked += min(end - cur, PAGE_SZ - page_off);
         }
         Ok(checked)
     }
 
     // AGENT: read scalar user data through the unified byte-copy path.
-    pub fn read_user_usize(&self, addr: usize) -> Result<usize, &'static str> {
+    pub fn read_user_usize(
+        &mut self,
+        addr: usize,
+        pool: &FramePool,
+    ) -> Result<usize, &'static str> {
         let mut bytes = [0u8; mem::size_of::<usize>()];
-        self.read_user_bytes(addr, &mut bytes)?;
+        self.read_user_bytes(addr, &mut bytes, pool)?;
         Ok(usize::from_ne_bytes(bytes))
     }
 
@@ -702,30 +861,13 @@ impl AddrSpace {
         end: usize,
         pool: &FramePool,
     ) -> Result<UserWriteChunk, &'static str> {
-        let region = self.vm_map.find(cur).ok_or("efault")?;
-        if region.flags & VM_WRITE == 0 {
-            return Err("efault");
-        }
-
-        let region_end = region.end();
-        let page_addr = align_down(cur, PAGE_SZ);
+        let region_end = self.vm_map.find(cur).ok_or("efault")?.end();
         let page_off = cur & (PAGE_SZ - 1);
         let len = min(end - cur, min(PAGE_SZ - page_off, region_end - cur));
-        let (needs_write_fault, resident_paddr) = self
-            .resident_pages
-            .entries
-            .get(&page_addr)
-            .map(|pte| (pte.cow || pte.needs_shared_write_fault(), pte.frame.paddr()))
-            .ok_or("efault")?;
-        let frame_paddr = if needs_write_fault {
-            self.handle_write_fault(cur, pool).map_err(|_| "efault")?
-        } else {
-            resident_paddr
-        };
-        let paddr = self.sv39.translate(cur, PageAccess::Write)?;
-        if align_down(paddr, PAGE_SZ) != frame_paddr {
-            return Err("efault");
-        }
+        let paddr = self
+            .resolve_user_page(cur, UserPageAccess::Write, pool)
+            .map_err(|_| "efault")?
+            .paddr();
         Ok(UserWriteChunk { paddr, len })
     }
 
@@ -1188,6 +1330,21 @@ impl AddrSpace {
         self.install_prepared_region(region, prepared, pool)
     }
 
+    // AGENT: publish an anonymous VMA without allocating resident frames or
+    // Sv39 leaves so VM_HEAP pages can be materialized by the shared fault path.
+    pub(crate) fn reserve_anonymous_region(
+        &mut self,
+        region: VmRegion,
+    ) -> Result<(), &'static str> {
+        Self::validate_eager_region(&region)?;
+        if region.flags & VM_HEAP == 0 || !matches!(&region.backing, VmBacking::Anonymous) {
+            return Err("einval");
+        }
+        self.debug_check_page_table_consistency()?;
+        self.vm_map.insert(region)?;
+        self.debug_check_page_table_consistency()
+    }
+
     // AGENT: eagerly read one file-backed VMA before publishing any of its
     // pages, preserving the OFD offset and private/shared backing policy.
     pub fn map_file_region(
@@ -1270,10 +1427,11 @@ impl AddrSpace {
                 new_mapped_end - old_mapped_end,
                 VM_READ | VM_WRITE | VM_HEAP,
             );
-            self.map_region(heap, pool).map_err(|err| match err {
-                "enomem" | "oom" => BrkResizeError::Rejected,
-                internal => BrkResizeError::Internal(internal),
-            })?;
+            self.reserve_anonymous_region(heap)
+                .map_err(|err| match err {
+                    "enomem" | "oom" => BrkResizeError::Rejected,
+                    internal => BrkResizeError::Internal(internal),
+                })?;
         }
         self.brk = new_brk;
         Ok(())

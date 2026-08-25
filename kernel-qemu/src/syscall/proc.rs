@@ -224,14 +224,20 @@ pub(super) fn sys_exec(
     if task.process.thread_count() != 1 {
         return Err("enotsup");
     }
-    let addr_space = task.process.addr_space.lock().unwrap();
-    let path_bytes = read_user_c_bytes(&addr_space, path_addr, EXEC_PATH_MAX, "enametoolong")?;
+    let mut addr_space = task.process.addr_space.lock().unwrap();
+    let path_bytes = read_user_c_bytes(
+        &mut addr_space,
+        &kernel.pool,
+        path_addr,
+        EXEC_PATH_MAX,
+        "enametoolong",
+    )?;
     // AGENT: keep raw bytes for argv/envp, but retain the current UTF-8 VFS
     // pathname boundary until directory entries gain byte-string names.
     let path = core::str::from_utf8(&path_bytes).map_err(|_| "einval")?;
     let mut budget = ExecCopyBudget::default();
-    let args = read_user_byte_array(&addr_space, argv_addr, &mut budget)?;
-    let envs = read_user_byte_array(&addr_space, envp_addr, &mut budget)?;
+    let args = read_user_byte_array(&mut addr_space, &kernel.pool, argv_addr, &mut budget)?;
+    let envs = read_user_byte_array(&mut addr_space, &kernel.pool, envp_addr, &mut budget)?;
     if ProcInit::checked_total_size_for(&args, &envs, 2)? > EXEC_ARG_MAX {
         return Err("e2big");
     }
@@ -247,7 +253,8 @@ pub(super) fn sys_exec(
 // AGENT: copy one NUL-terminated userspace string without imposing UTF-8 on
 // argv/envp; the returned byte vector deliberately excludes the terminator.
 fn read_user_c_bytes(
-    addr_space: &AddrSpace,
+    addr_space: &mut AddrSpace,
+    pool: &FramePool,
     addr: usize,
     max_len: usize,
     too_long: &'static str,
@@ -259,7 +266,7 @@ fn read_user_c_bytes(
     for offset in 0..max_len {
         let cur = addr.checked_add(offset).ok_or("efault")?;
         let mut byte = [0u8; 1];
-        addr_space.read_user_bytes(cur, &mut byte)?;
+        addr_space.read_user_bytes(cur, &mut byte, pool)?;
         if byte[0] == 0 {
             return Ok(bytes);
         }
@@ -271,7 +278,8 @@ fn read_user_c_bytes(
 // AGENT: walk one native-pointer array while charging the caller-provided
 // budget shared by argv and envp, including each copied trailing NUL.
 fn read_user_byte_array(
-    addr_space: &AddrSpace,
+    addr_space: &mut AddrSpace,
+    pool: &FramePool,
     array_addr: usize,
     budget: &mut ExecCopyBudget,
 ) -> Result<Vec<UserCString>, &'static str> {
@@ -285,12 +293,12 @@ fn read_user_byte_array(
         let ptr_addr = array_addr
             .checked_add(idx.checked_mul(word).ok_or("efault")?)
             .ok_or("efault")?;
-        let ptr = addr_space.read_user_usize(ptr_addr)?;
+        let ptr = addr_space.read_user_usize(ptr_addr, pool)?;
         if ptr == 0 {
             return Ok(out);
         }
         budget.charge_pointer()?;
-        let value = read_user_c_bytes(addr_space, ptr, budget.remaining_bytes(), "e2big")?;
+        let value = read_user_c_bytes(addr_space, pool, ptr, budget.remaining_bytes(), "e2big")?;
         budget.charge_string(value.len())?;
         out.push(value);
         idx = idx.checked_add(1).ok_or("e2big")?;

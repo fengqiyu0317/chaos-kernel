@@ -24,6 +24,9 @@ const SYS_SETSID: usize = 157;
 const SYS_GETPID: usize = 172;
 const SYS_GETPPID: usize = 173;
 const SYS_GETTID: usize = 178;
+// AGENT: exercise the raw Linux program-break ABI and the real U-mode lazy
+// heap fault path before the rest of the embedded init smoke sequence.
+const SYS_BRK: usize = 214;
 const SYS_EXECVE: usize = 221;
 const AT_FDCWD: usize = (-100isize) as usize;
 const O_WRONLY: usize = 1;
@@ -47,6 +50,7 @@ const STDOUT_FILENO: usize = 1;
 const DUP3_TARGET_FD: usize = 100;
 const EXEC_CLOEXEC_FD: usize = 101;
 const INIT_MESSAGE: &[u8] = b"[init] userspace /bin/init reached\n";
+const BRK_MESSAGE: &[u8] = b"[init] lazy brk page-fault round-trip passed\n";
 const PROCESS_IDENTITY_MESSAGE: &[u8] = b"[init] process identity round-trip passed\n";
 const MKDIR_MESSAGE: &[u8] = b"[init] mkdirat round-trip passed\n";
 const OPEN_MESSAGE: &[u8] = b"[init] openat round-trip passed\n";
@@ -226,8 +230,8 @@ fn flock_type(bytes: &[u8; 32]) -> i16 {
     i16::from_le_bytes([bytes[0], bytes[1]])
 }
 
-// AGENT: prove user-mode process identity, mkdirat/openat/dup/dup3/pipe2/splice,
-// stat/close, six-argument offset copyout, exact-target survival, and OFD teardown.
+// AGENT: prove real U-mode lazy brk faults, process identity, filesystem/fd
+// syscalls, six-argument offset copyout, exact-target survival, and OFD teardown.
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -239,7 +243,51 @@ pub extern "C" fn _start() -> ! {
             INIT_MESSAGE.len(),
         )
     };
-    let getpid_result = unsafe { syscall0(SYS_GETPID) };
+    let old_brk = unsafe { syscall1(SYS_BRK, 0) };
+    let requested_brk = if old_brk > 0 {
+        (old_brk as usize).checked_add(4097).unwrap_or(0)
+    } else {
+        0
+    };
+    let grown_brk = if requested_brk != 0 {
+        unsafe { syscall1(SYS_BRK, requested_brk) }
+    } else {
+        old_brk
+    };
+    let lazy_heap_bytes_ok = if grown_brk == requested_brk as isize {
+        let first = old_brk as usize as *mut u8;
+        let second = (old_brk as usize + 4096) as *mut u8;
+        unsafe {
+            core::ptr::write_volatile(first, 0x5a);
+            core::ptr::write_volatile(second, 0xa5);
+            core::ptr::read_volatile(first) == 0x5a && core::ptr::read_volatile(second) == 0xa5
+        }
+    } else {
+        false
+    };
+    let shrunk_brk = if lazy_heap_bytes_ok {
+        unsafe { syscall1(SYS_BRK, old_brk as usize) }
+    } else {
+        grown_brk
+    };
+    let brk_round_trip_ok = lazy_heap_bytes_ok && shrunk_brk == old_brk;
+    let brk_message_written = if brk_round_trip_ok {
+        unsafe {
+            syscall3(
+                SYS_WRITE,
+                STDOUT_FILENO,
+                BRK_MESSAGE.as_ptr() as usize,
+                BRK_MESSAGE.len(),
+            )
+        }
+    } else {
+        -1
+    };
+    let getpid_result = if brk_round_trip_ok {
+        unsafe { syscall0(SYS_GETPID) }
+    } else {
+        -1
+    };
     let getppid_result = unsafe { syscall0(SYS_GETPPID) };
     let gettid_result = unsafe { syscall0(SYS_GETTID) };
     let getpgid_result = unsafe { syscall1(SYS_GETPGID, 0) };
@@ -700,6 +748,8 @@ pub extern "C" fn _start() -> ! {
     };
     let status = usize::from(
         console_written != INIT_MESSAGE.len() as isize
+            || !brk_round_trip_ok
+            || brk_message_written != BRK_MESSAGE.len() as isize
             || !process_identity_round_trip_ok
             || process_identity_message_written != PROCESS_IDENTITY_MESSAGE.len() as isize
             || mkdir_result != 0

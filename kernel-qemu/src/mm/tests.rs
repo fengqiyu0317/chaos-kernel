@@ -3,8 +3,8 @@
 use super::*;
 use crate::kernel::{
     check_access, check_access_rw, hash_combine, AddrSpace, BrkResizeError, BuddyAllocator,
-    FramePool, VmMap, VmRegion, MEM_OFF, PAGE_SZ, TRAMPOLINE, TRAP_CONTEXT, USER_SIGTRAMP,
-    USER_TOP, VM_HEAP, VM_READ, VM_SHARED, VM_WRITE,
+    FramePool, UserPageAccess, UserPageFault, VmMap, VmRegion, MEM_OFF, PAGE_SZ, TRAMPOLINE,
+    TRAP_CONTEXT, USER_SIGTRAMP, USER_TOP, VM_HEAP, VM_READ, VM_SHARED, VM_WRITE,
 };
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -30,14 +30,15 @@ pub fn run_all(pool: &FramePool) {
     fixed_region_failure_restores_original_mapping(pool);
     byte_granular_brk_preserves_bounds_and_heap_ownership(pool);
     brk_allocation_failure_preserves_old_break(pool);
+    checkpoint_preserves_sparse_heap_residency(pool);
     anonymous_shared_and_private_fork_semantics_hold(pool);
     buddy_allocator_alloc_free_smoke();
     buddy_free_merges_with_nonzero_base();
     buddy_free_rejects_duplicate_and_bad_ranges();
 }
 
-// AGENT: prove exact break metadata changes independently of page mappings,
-// fork preserves both bounds, and rejection cannot remove non-heap VMAs.
+// AGENT: prove exact break metadata changes independently of lazy resident
+// pages, fork preserves both bounds, and rejection cannot remove non-heap VMAs.
 fn byte_granular_brk_preserves_bounds_and_heap_ownership(pool: &FramePool) {
     let free_before = pool.free_count();
     let mut parent = AddrSpace::new();
@@ -46,6 +47,7 @@ fn byte_granular_brk_preserves_bounds_and_heap_ownership(pool: &FramePool) {
     parent
         .map_region(VmRegion::new(image_page, PAGE_SZ, VM_READ), pool)
         .unwrap();
+    let free_after_image = pool.free_count();
 
     assert_eq!(parent.resize_brk(start + 1, pool), Ok(()));
     assert_eq!(parent.brk(), start + 1);
@@ -53,11 +55,13 @@ fn byte_granular_brk_preserves_bounds_and_heap_ownership(pool: &FramePool) {
         parent.mapped_region(start).map(|region| region.flags),
         Some(VM_READ | VM_WRITE | VM_HEAP)
     );
-    let free_after_first_heap_page = pool.free_count();
+    assert!(!parent.is_page_resident(start));
+    assert_eq!(pool.free_count(), free_after_image);
+    let free_after_heap_reservation = pool.free_count();
 
     assert_eq!(parent.resize_brk(start + 2, pool), Ok(()));
     assert_eq!(parent.brk(), start + 2);
-    assert_eq!(pool.free_count(), free_after_first_heap_page);
+    assert_eq!(pool.free_count(), free_after_heap_reservation);
 
     let mut child = AddrSpace::fork_from(&mut parent, pool).unwrap();
     assert_eq!(child.start_brk(), start);
@@ -111,8 +115,8 @@ fn byte_granular_brk_preserves_bounds_and_heap_ownership(pool: &FramePool) {
     assert_eq!(pool.free_count(), free_before);
 }
 
-// AGENT: force Sv39 allocation exhaustion in an isolated physical pool and
-// prove eager brk growth rolls back VMA state while retaining the exact break.
+// AGENT: prove brk reservation succeeds without physical memory, while the
+// first lazy fault reports OOM without corrupting the VMA or exact break.
 fn brk_allocation_failure_preserves_old_break(pool: &FramePool) {
     let reservation = pool
         .alloc_contiguous_pg_frames(3, 1)
@@ -121,16 +125,60 @@ fn brk_allocation_failure_preserves_old_break(pool: &FramePool) {
     let mut addr_space = AddrSpace::new();
     let old_brk = addr_space.brk();
 
+    assert_eq!(addr_space.resize_brk(old_brk + 1, &isolated_pool), Ok(()));
+    assert_eq!(addr_space.brk(), old_brk + 1);
+    assert!(addr_space.mapped_region(old_brk).is_some());
+    assert!(!addr_space.is_page_resident(old_brk));
+    assert_eq!(isolated_pool.free_count(), 3);
     assert_eq!(
-        addr_space.resize_brk(old_brk + 1, &isolated_pool),
-        Err(BrkResizeError::Rejected)
+        addr_space.resolve_user_page(old_brk, UserPageAccess::Write, &isolated_pool),
+        Err(UserPageFault::OutOfMemory)
     );
-    assert_eq!(addr_space.brk(), old_brk);
-    assert!(addr_space.mapped_region(old_brk).is_none());
+    assert_eq!(addr_space.brk(), old_brk + 1);
+    assert!(addr_space.mapped_region(old_brk).is_some());
+    assert!(!addr_space.is_page_resident(old_brk));
 
     addr_space.release_all_pages();
     assert_eq!(isolated_pool.free_count(), 3);
     drop(reservation);
+}
+
+// AGENT: serialize only materialized heap pages and rebuild the VM_HEAP VMA
+// without eagerly allocating holes that were untouched at checkpoint time.
+fn checkpoint_preserves_sparse_heap_residency(pool: &FramePool) {
+    let free_before = pool.free_count();
+    let mut source = AddrSpace::new();
+    let start = source.start_brk();
+    let end = start + 3 * PAGE_SZ;
+    source.resize_brk(end, pool).unwrap();
+    source
+        .write_user_bytes(start + PAGE_SZ + 19, b"saved", pool)
+        .unwrap();
+    assert_eq!(source.resident_page_count(), 1);
+
+    let (vmas, pages) = source.snapshot_checkpoint_memory().unwrap();
+    assert_eq!(vmas.len(), 1);
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].vaddr as usize, start + PAGE_SZ);
+
+    let mut restored = AddrSpace::restore_checkpoint_memory(start, end, &vmas, &pages, pool)
+        .expect("sparse heap checkpoint should restore");
+    assert_eq!(restored.resident_page_count(), 1);
+    assert!(!restored.is_page_resident(start));
+    assert!(restored.is_page_resident(start + PAGE_SZ));
+    assert!(!restored.is_page_resident(start + 2 * PAGE_SZ));
+
+    let mut zero = [0xffu8; 1];
+    restored.read_user_bytes(start, &mut zero, pool).unwrap();
+    assert_eq!(zero, [0]);
+    assert_eq!(restored.resident_page_count(), 2);
+    assert!(!restored.is_page_resident(start + 2 * PAGE_SZ));
+
+    drop(pages);
+    drop(vmas);
+    source.release_all_pages();
+    restored.release_all_pages();
+    assert_eq!(pool.free_count(), free_before);
 }
 
 // AGENT: verify that VmRegion merging is directional, permission-preserving,
@@ -341,7 +389,9 @@ fn fixed_region_failure_restores_original_mapping(pool: &FramePool) {
         Err("enomem")
     );
     let mut restored = [0u8; 1];
-    addr_space.read_user_bytes(base, &mut restored).unwrap();
+    addr_space
+        .read_user_bytes(base, &mut restored, &isolated_pool)
+        .unwrap();
     assert_eq!(restored, [0x5a]);
     assert_eq!(
         addr_space.mapped_region(base).map(|region| region.flags),
@@ -379,9 +429,11 @@ fn anonymous_shared_and_private_fork_semantics_hold(pool: &FramePool) {
 
     let mut parent_shared = [0u8; 1];
     let mut parent_private = [0u8; 1];
-    parent.read_user_bytes(shared, &mut parent_shared).unwrap();
     parent
-        .read_user_bytes(private, &mut parent_private)
+        .read_user_bytes(shared, &mut parent_shared, pool)
+        .unwrap();
+    parent
+        .read_user_bytes(private, &mut parent_private, pool)
         .unwrap();
     assert_eq!(parent_shared, [3]);
     assert_eq!(parent_private, [2]);

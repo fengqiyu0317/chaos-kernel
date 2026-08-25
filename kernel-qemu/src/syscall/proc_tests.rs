@@ -309,10 +309,10 @@ fn assert_exec_error_preserves(
     assert_eq!(pool.free_count(), free_before);
 
     let mut old_bytes = [0u8; OLD_BYTES.len()];
-    let addr_space = task.process.addr_space.lock().unwrap();
+    let mut addr_space = task.process.addr_space.lock().unwrap();
     assert_eq!(addr_space.vm_token(), Ok(old_token));
     addr_space
-        .read_user_bytes(OLD_MAPPING, &mut old_bytes)
+        .read_user_bytes(OLD_MAPPING, &mut old_bytes, pool)
         .expect("failed syscall exec should preserve old mapping");
     drop(addr_space);
     assert_eq!(&old_bytes, OLD_BYTES);

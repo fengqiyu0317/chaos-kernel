@@ -21,12 +21,66 @@ const FILE_FAILURE_BASE: usize = 0x7360_0000;
 // then isolate file fixtures so later fs/checkpoint tests stay clean.
 pub fn run_all(kernel: &Kernel) {
     rv64_brk_returns_exact_or_unchanged_break(kernel);
+    brk_heap_faults_in_pages_lazily(kernel);
     rv64_mmap_and_munmap_round_trip(kernel);
     mmap_rejects_invalid_types_and_reserved_signal_page(kernel);
     mmap_honors_hint_conflicts_and_default_fallback(kernel);
     fixed_mmap_replaces_contents_and_permissions(kernel);
     file_mmap_contracts(kernel.pool.clone());
     file_mmap_failure_transactions(kernel.pool.clone());
+}
+
+// AGENT: reserve several heap pages without changing RSS, then prove both a
+// hardware-style load fault and kernel usercopy install only the touched pages.
+fn brk_heap_faults_in_pages_lazily(kernel: &Kernel) {
+    let task = kernel
+        .cur_task(0)
+        .expect("lazy brk selftest needs current init");
+    let old_brk = task.process.addr_space.lock().unwrap().brk();
+    let requested = old_brk + 2 * PAGE_SZ + 1;
+    let resident_before = task
+        .process
+        .addr_space
+        .lock()
+        .unwrap()
+        .resident_page_count();
+
+    assert_eq!(sys_brk(kernel, requested), Ok(requested));
+    {
+        let addr_space = task.process.addr_space.lock().unwrap();
+        assert_eq!(addr_space.resident_page_count(), resident_before);
+        assert!(!addr_space.is_page_resident(old_brk));
+        assert!(!addr_space.is_page_resident(old_brk + PAGE_SZ));
+        assert!(!addr_space.is_page_resident(old_brk + 2 * PAGE_SZ));
+    }
+
+    assert!(matches!(
+        kernel.handle_pgfault(old_brk + 17, KernelPageFaultAccess::Load),
+        Ok(UserPageResolution::Installed(_))
+    ));
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        assert!(addr_space.is_page_resident(old_brk));
+        assert!(!addr_space.is_page_resident(old_brk + PAGE_SZ));
+        let mut zero = [0xffu8; 1];
+        addr_space
+            .read_user_bytes(old_brk + 17, &mut zero, &kernel.pool)
+            .unwrap();
+        assert_eq!(zero, [0]);
+        addr_space
+            .write_user_bytes(old_brk + PAGE_SZ + 23, b"lazy", &kernel.pool)
+            .unwrap();
+        assert!(addr_space.is_page_resident(old_brk + PAGE_SZ));
+        assert!(!addr_space.is_page_resident(old_brk + 2 * PAGE_SZ));
+        assert_eq!(addr_space.resident_page_count(), resident_before + 2);
+        addr_space.check_page_table_consistency().unwrap();
+    }
+
+    assert_eq!(sys_brk(kernel, old_brk), Ok(old_brk));
+    let addr_space = task.process.addr_space.lock().unwrap();
+    assert_eq!(addr_space.resident_page_count(), resident_before);
+    assert!(addr_space.mapped_region(old_brk).is_none());
+    addr_space.check_page_table_consistency().unwrap();
 }
 
 // AGENT: exercise brk through the RV64 trap adapter so byte-granular success
@@ -117,7 +171,7 @@ fn rv64_mmap_and_munmap_round_trip(kernel: &Kernel) {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(mapped, &mut zeros)
+        .read_user_bytes(mapped, &mut zeros, &kernel.pool)
         .unwrap();
     assert_eq!(zeros, [0u8; 16]);
     task.process
@@ -246,7 +300,9 @@ fn fixed_mmap_replaces_contents_and_permissions(kernel: &Kernel) {
     );
     let mut value = [0xffu8; 1];
     let mut addr_space = task.process.addr_space.lock().unwrap();
-    addr_space.read_user_bytes(FIXED_BASE, &mut value).unwrap();
+    addr_space
+        .read_user_bytes(FIXED_BASE, &mut value, &kernel.pool)
+        .unwrap();
     assert_eq!(value, [0]);
     assert_eq!(
         addr_space.write_user_bytes(FIXED_BASE, &[1], &kernel.pool),
@@ -306,12 +362,12 @@ fn file_mmap_loads_positionally_and_validates(kernel: &Kernel) {
     let mut cross_page = [0u8; 48];
     let mut eof_tail = [0xffu8; 16];
     {
-        let addr_space = task.process.addr_space.lock().unwrap();
+        let mut addr_space = task.process.addr_space.lock().unwrap();
         addr_space
-            .read_user_bytes(FILE_READ_BASE + PAGE_SZ - 8, &mut cross_page)
+            .read_user_bytes(FILE_READ_BASE + PAGE_SZ - 8, &mut cross_page, &kernel.pool)
             .unwrap();
         addr_space
-            .read_user_bytes(FILE_READ_BASE + PAGE_SZ + 31, &mut eof_tail)
+            .read_user_bytes(FILE_READ_BASE + PAGE_SZ + 31, &mut eof_tail, &kernel.pool)
             .unwrap();
     }
     assert_eq!(&cross_page[..39], &original[PAGE_SZ - 8..]);
@@ -408,7 +464,11 @@ fn private_and_shared_file_mmap_semantics(kernel: &Kernel) {
         .unwrap();
     let mut parent_private_byte = [0u8; 1];
     private_parent
-        .read_user_bytes(FILE_PRIVATE_BASE + 32, &mut parent_private_byte)
+        .read_user_bytes(
+            FILE_PRIVATE_BASE + 32,
+            &mut parent_private_byte,
+            &kernel.pool,
+        )
         .unwrap();
     assert_eq!(parent_private_byte, [0x31]);
     private_child
@@ -496,7 +556,7 @@ fn shared_file_fork_split_and_checkpoint(kernel: &Kernel) {
         .unwrap();
     let mut parent_view = [0u8; 4];
     parent
-        .read_user_bytes(FILE_FORK_BASE + 3, &mut parent_view)
+        .read_user_bytes(FILE_FORK_BASE + 3, &mut parent_view, &kernel.pool)
         .unwrap();
     assert_eq!(&parent_view, b"fork");
     child
@@ -619,7 +679,7 @@ fn fixed_file_mmap_writes_back_before_replacement(kernel: &Kernel) {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(FILE_REPLACE_BASE, &mut new_view)
+        .read_user_bytes(FILE_REPLACE_BASE, &mut new_view, &kernel.pool)
         .unwrap();
     assert_eq!(&new_view, &[0x72; 4]);
     assert_eq!(&read_fixture(kernel, old_path, PAGE_SZ)[..4], b"old!");
@@ -709,10 +769,10 @@ fn file_mmap_failure_transactions(pool: FramePool) {
     assert_eq!(sys_munmap(&kernel, FILE_FAILURE_BASE, PAGE_SZ), Err("eio"));
     let mut retained = [0u8; 4];
     {
-        let addr_space = task.process.addr_space.lock().unwrap();
+        let mut addr_space = task.process.addr_space.lock().unwrap();
         assert!(addr_space.mapped_region(FILE_FAILURE_BASE).is_some());
         addr_space
-            .read_user_bytes(FILE_FAILURE_BASE + 4, &mut retained)
+            .read_user_bytes(FILE_FAILURE_BASE + 4, &mut retained, &kernel.pool)
             .unwrap();
         addr_space.check_page_table_consistency().unwrap();
     }
@@ -766,9 +826,9 @@ fn file_mmap_failure_transactions(pool: FramePool) {
     fail_reads.store(false, Ordering::Release);
     let mut old_view = [0u8; 4];
     {
-        let addr_space = task.process.addr_space.lock().unwrap();
+        let mut addr_space = task.process.addr_space.lock().unwrap();
         addr_space
-            .read_user_bytes(FILE_FAILURE_BASE, &mut old_view)
+            .read_user_bytes(FILE_FAILURE_BASE, &mut old_view, &kernel.pool)
             .unwrap();
         addr_space.check_page_table_consistency().unwrap();
     }
@@ -790,7 +850,7 @@ fn file_mmap_failure_transactions(pool: FramePool) {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(FILE_FAILURE_BASE, &mut new_view)
+        .read_user_bytes(FILE_FAILURE_BASE, &mut new_view, &kernel.pool)
         .unwrap();
     assert_eq!(&new_view, &[0x92; 4]);
     assert_eq!(sys_munmap(&kernel, FILE_FAILURE_BASE, large_len), Ok(0));

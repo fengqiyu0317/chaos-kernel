@@ -208,7 +208,7 @@ fn checkpoint_round_trip_restores_memory_and_trap_frame(kernel: &Kernel) {
         .addr_space
         .lock()
         .unwrap()
-        .read_user_bytes(data_addr, &mut restored_pattern)
+        .read_user_bytes(data_addr, &mut restored_pattern, &kernel.pool)
         .expect("restored page should be readable");
     assert_eq!(restored_pattern, pattern);
     assert_eq!(

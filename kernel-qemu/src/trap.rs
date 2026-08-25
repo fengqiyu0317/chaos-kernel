@@ -268,7 +268,20 @@ fn handle_page_fault(frame: &TrapFrame, origin: TrapOrigin, scause: usize, stval
 // semantics stay behind Kernel::handle_pgfault.
 fn recover_user_page_fault(addr: usize, access: PageFaultAccess) -> Result<(), &'static str> {
     let kernel = crate::kernel::global_kernel().ok_or("esrch")?;
-    kernel.handle_pgfault(addr, access.into_kernel_access())
+    match kernel.handle_pgfault(addr, access.into_kernel_access()) {
+        Ok(
+            crate::kernel::UserPageResolution::Installed(_)
+            | crate::kernel::UserPageResolution::PermissionUpdated(_),
+        ) => Ok(()),
+        Ok(crate::kernel::UserPageResolution::AlreadyAccessible(_)) => {
+            Err("faulting page was already accessible")
+        }
+        Err(crate::kernel::UserPageFault::NotMapped | crate::kernel::UserPageFault::Protection) => {
+            Err("segfault")
+        }
+        Err(crate::kernel::UserPageFault::OutOfMemory) => Err("oom"),
+        Err(crate::kernel::UserPageFault::Internal(err)) => Err(err),
+    }
 }
 
 // AGENT: Illegal instructions are reported explicitly before the later per-task kill path exists.

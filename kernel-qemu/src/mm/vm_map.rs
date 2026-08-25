@@ -233,6 +233,9 @@ impl VmMap {
             }
         }
 
+        // AGENT: keep VMA publication fallible under kernel-heap pressure instead
+        // of letting Vec growth invoke the global allocation failure handler.
+        self.regions.try_reserve(1).map_err(|_| "enomem")?;
         self.regions.insert(idx, region);
         Ok(())
     }
