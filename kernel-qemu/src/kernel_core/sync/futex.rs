@@ -2,11 +2,16 @@
 use super::{WaitOutcome, WaitToken};
 use crate::kernel::kernel_core::prelude::*;
 
-// AGENT: futex wait queues keep kernel-style wait tokens instead of host
-// thread handles.
+// AGENT: ordinary WAIT/WAKE operations match every bitset-aware waiter, while
+// their BITSET variants carry an explicit nonzero mask through the same queue.
+const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
+
+// AGENT: futex wait queues retain each waiter's Linux bitset in addition to its
+// kernel-style wait token so masked wakeups can skip nonmatching entries.
 #[derive(Clone)]
 pub(super) struct FutexWaiter {
     pub(super) addr: usize,
+    pub(super) bitset: u32,
     pub(super) token: WaitToken,
 }
 
@@ -39,8 +44,8 @@ impl FutexBucket {
         }
     }
 
-    // AGENT: compare and enqueue under one queue lock so a wake cannot slip
-    // between seeing the expected value and publishing this waiter.
+    // AGENT: keep ordinary FUTEX_WAIT as the match-any wrapper so existing
+    // clear-child-tid, robust-futex, and internal callers retain their API.
     pub fn wait<R>(
         &self,
         task_id: usize,
@@ -52,6 +57,33 @@ impl FutexBucket {
     where
         R: FnOnce() -> Result<u32, &'static str>,
     {
+        self.wait_bitset(
+            task_id,
+            addr,
+            expected,
+            deadline,
+            FUTEX_BITSET_MATCH_ANY,
+            read_word,
+        )
+    }
+
+    // AGENT: compare and publish the expected word plus nonzero waiter bitset
+    // under one queue lock so no wake can slip between those two actions.
+    pub fn wait_bitset<R>(
+        &self,
+        task_id: usize,
+        addr: usize,
+        expected: u32,
+        deadline: Option<usize>,
+        bitset: u32,
+        read_word: R,
+    ) -> Result<(), &'static str>
+    where
+        R: FnOnce() -> Result<u32, &'static str>,
+    {
+        if bitset == 0 {
+            return Err("einval");
+        }
         let token = WaitToken::for_task(task_id);
         {
             let mut w = self.waiters.lock().unwrap();
@@ -60,6 +92,7 @@ impl FutexBucket {
             }
             w.push_back(FutexWaiter {
                 addr,
+                bitset,
                 token: token.clone(),
             });
         }
@@ -68,10 +101,20 @@ impl FutexBucket {
         self.finish_wait(&token, outcome)
     }
 
-    // AGENT: place the basic address wake operation first in the wake API group.
+    // AGENT: keep ordinary FUTEX_WAKE as the match-any wrapper used by robust
+    // cleanup and other existing kernel wake paths.
     pub fn wake(&self, addr: usize, count: usize) -> usize {
+        self.wake_bitset(addr, count, FUTEX_BITSET_MATCH_ANY)
+    }
+
+    // AGENT: wake at most count waiters whose stored mask intersects the
+    // caller's nonzero FUTEX_WAKE_BITSET selection mask.
+    pub fn wake_bitset(&self, addr: usize, count: usize, wake_mask: u32) -> usize {
+        if wake_mask == 0 {
+            return 0;
+        }
         let mut w = self.waiters.lock().unwrap();
-        Self::wake_locked(&mut w, addr, count)
+        Self::wake_locked(&mut w, addr, count, wake_mask)
     }
 
     // AGENT: process exit detaches the complete queue under its lock, then wakes
@@ -101,9 +144,9 @@ impl FutexBucket {
         let mut w = self.waiters.lock().unwrap();
         let old = op()?;
         let should_wake_addr2 = cmp(old)?;
-        let mut woken = Self::wake_locked(&mut w, addr, count);
+        let mut woken = Self::wake_locked(&mut w, addr, count, FUTEX_BITSET_MATCH_ANY);
         if should_wake_addr2 {
-            woken += Self::wake_locked(&mut w, addr2, count2);
+            woken += Self::wake_locked(&mut w, addr2, count2, FUTEX_BITSET_MATCH_ANY);
         }
         Ok(woken)
     }
@@ -149,10 +192,23 @@ impl FutexBucket {
     // exposing queue mutation through the production FutexBucket API.
     #[cfg(any(test, feature = "qemu-sync-selftest"))]
     pub(super) fn publish_waiter_for_test(&self, addr: usize, token: WaitToken) {
-        self.waiters
-            .lock()
-            .unwrap()
-            .push_back(FutexWaiter { addr, token });
+        self.publish_waiter_bitset_for_test(addr, FUTEX_BITSET_MATCH_ANY, token);
+    }
+
+    // AGENT: let bitset regressions publish masked waiters without widening the
+    // production queue mutation API or changing older match-any fixtures.
+    #[cfg(any(test, feature = "qemu-sync-selftest"))]
+    pub(super) fn publish_waiter_bitset_for_test(
+        &self,
+        addr: usize,
+        bitset: u32,
+        token: WaitToken,
+    ) {
+        self.waiters.lock().unwrap().push_back(FutexWaiter {
+            addr,
+            bitset,
+            token,
+        });
     }
 
     // AGENT: collect wait completion cleanup with the other private helpers.
@@ -169,11 +225,17 @@ impl FutexBucket {
         }
     }
 
-    // AGENT: keep lock-assuming wake mechanics outside the public API group.
-    fn wake_locked(waiters: &mut VecDeque<FutexWaiter>, addr: usize, count: usize) -> usize {
+    // AGENT: skip nonintersecting waiter bitsets without consuming the wake
+    // quota; only a successfully completed matching token counts as woken.
+    fn wake_locked(
+        waiters: &mut VecDeque<FutexWaiter>,
+        addr: usize,
+        count: usize,
+        wake_mask: u32,
+    ) -> usize {
         let mut woken = 0;
         waiters.retain(|waiter| {
-            if waiter.addr == addr && woken < count {
+            if waiter.addr == addr && waiter.bitset & wake_mask != 0 && woken < count {
                 if waiter.token.wake() {
                     woken += 1;
                 }

@@ -9,9 +9,12 @@ const FUTEX_WAKE: u32 = 1;
 const FUTEX_REQUEUE: u32 = 3;
 const FUTEX_CMP_REQUEUE: u32 = 4;
 const FUTEX_WAKE_OP: u32 = 5;
+const FUTEX_WAIT_BITSET: u32 = 9;
+const FUTEX_WAKE_BITSET: u32 = 10;
 const FUTEX_PRIVATE_FLAG: u32 = 0x80;
 const FUTEX_CLOCK_REALTIME: u32 = 0x100;
 const FUTEX_CMD_MASK: u32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
 
 // AGENT: futex syscall now reads futex words and timeout structures through the
 // current task address space instead of directly dereferencing user pointers.
@@ -37,16 +40,27 @@ pub(super) fn sys_futex(
     let private = op & FUTEX_PRIVATE_FLAG != 0;
     let clock_realtime = op & FUTEX_CLOCK_REALTIME != 0;
     let futex_op = op & FUTEX_CMD_MASK;
-    // AGENT: the implemented FUTEX_WAIT timeout is relative CLOCK_MONOTONIC;
-    // never silently reinterpret an unsupported realtime modifier.
-    if clock_realtime {
+    // AGENT: legacy FUTEX_CLOCK_REALTIME is valid only for the implemented
+    // absolute WAIT_BITSET command; ordinary WAIT remains relative monotonic.
+    if clock_realtime && futex_op != FUTEX_WAIT_BITSET {
         return Err("enosys");
     }
     if !matches!(
         futex_op,
-        FUTEX_WAIT | FUTEX_WAKE | FUTEX_REQUEUE | FUTEX_CMP_REQUEUE | FUTEX_WAKE_OP
+        FUTEX_WAIT
+            | FUTEX_WAKE
+            | FUTEX_REQUEUE
+            | FUTEX_CMP_REQUEUE
+            | FUTEX_WAKE_OP
+            | FUTEX_WAIT_BITSET
+            | FUTEX_WAKE_BITSET
     ) {
         return Err("enosys");
+    }
+    // AGENT: Linux rejects a zero bitset before attempting either masked wait
+    // or wake; no waiter can intersect an empty selection mask.
+    if matches!(futex_op, FUTEX_WAIT_BITSET | FUTEX_WAKE_BITSET) && val3 == 0 {
+        return Err("einval");
     }
     if !check_access(uaddr, 4) {
         return Err("efault");
@@ -56,35 +70,44 @@ pub(super) fn sys_futex(
     }
     match futex_op {
         FUTEX_WAIT => {
-            let timeout_size = 2 * mem::size_of::<i64>();
-            if timeout_addr != 0 && !check_access(timeout_addr, timeout_size) {
-                return Err("efault");
-            }
             let current = kernel.cur_task(0).ok_or("esrch")?;
             // AGENT: convert FUTEX_WAIT's relative timespec once at the syscall
             // boundary so WaitToken and its timer wheel use only absolute ticks.
-            let deadline = if timeout_addr == 0 {
-                None
-            } else {
-                let timeout = read_futex_timeout(kernel, &current, timeout_addr)?;
-                Some(
-                    CLK.load(Ordering::Relaxed)
-                        .saturating_add(duration_to_ticks(timeout)),
-                )
-            };
-            let futex = current.process.futex.clone();
-            match futex.wait(current.id(), uaddr, val, deadline, || {
-                read_user_u32(kernel, &current, uaddr)
-            }) {
-                Ok(()) => Ok(0),
-                Err("changed") => Err("eagain"),
-                Err(e) => Err(e),
-            }
+            let deadline = read_futex_deadline(
+                kernel,
+                &current,
+                timeout_addr,
+                FutexTimeoutKind::RelativeMonotonic,
+            )?;
+            wait_on_futex(
+                kernel,
+                &current,
+                uaddr,
+                val,
+                deadline,
+                FUTEX_BITSET_MATCH_ANY,
+            )
         }
         FUTEX_WAKE => {
             let wake_count = val as usize;
             let current = kernel.cur_task(0).ok_or("esrch")?;
             Ok(current.process.futex.wake(uaddr, wake_count))
+        }
+        FUTEX_WAIT_BITSET => {
+            let current = kernel.cur_task(0).ok_or("esrch")?;
+            // AGENT: unlike ordinary WAIT, WAIT_BITSET consumes an absolute
+            // deadline in the selected monotonic or realtime clock domain.
+            let timeout_kind = if clock_realtime {
+                FutexTimeoutKind::AbsoluteRealtime
+            } else {
+                FutexTimeoutKind::AbsoluteMonotonic
+            };
+            let deadline = read_futex_deadline(kernel, &current, timeout_addr, timeout_kind)?;
+            wait_on_futex(kernel, &current, uaddr, val, deadline, val3)
+        }
+        FUTEX_WAKE_BITSET => {
+            let current = kernel.cur_task(0).ok_or("esrch")?;
+            Ok(current.process.futex.wake_bitset(uaddr, val as usize, val3))
         }
         FUTEX_REQUEUE => {
             if !check_access(uaddr2, 4) {
@@ -151,6 +174,61 @@ pub(super) fn sys_futex(
             }
         }
         _ => Err("enosys"),
+    }
+}
+
+// AGENT: distinguish the sole relative legacy timeout from the absolute clock
+// domains used by FUTEX_WAIT_BITSET before converting all three to CLK ticks.
+#[derive(Clone, Copy)]
+enum FutexTimeoutKind {
+    RelativeMonotonic,
+    AbsoluteMonotonic,
+    AbsoluteRealtime,
+}
+
+// AGENT: validate and copy one optional futex timespec, then normalize it to
+// the absolute logical-tick deadline consumed by WaitToken and the timer wheel.
+fn read_futex_deadline(
+    kernel: &Kernel,
+    task: &Task,
+    timeout_addr: usize,
+    kind: FutexTimeoutKind,
+) -> Result<Option<usize>, &'static str> {
+    if timeout_addr == 0 {
+        return Ok(None);
+    }
+    let timeout_size = 2 * mem::size_of::<i64>();
+    if !check_access(timeout_addr, timeout_size) {
+        return Err("efault");
+    }
+    let ticks = duration_to_ticks(read_futex_timeout(kernel, task, timeout_addr)?);
+    let deadline = match kind {
+        FutexTimeoutKind::RelativeMonotonic => CLK.load(Ordering::Relaxed).saturating_add(ticks),
+        FutexTimeoutKind::AbsoluteMonotonic => ticks,
+        FutexTimeoutKind::AbsoluteRealtime => {
+            ticks.saturating_sub(BOOT_EPOCH.saturating_mul(TIMER_TICK_HZ))
+        }
+    };
+    Ok(Some(deadline))
+}
+
+// AGENT: share the compare/enqueue/error translation between WAIT and
+// WAIT_BITSET while retaining the latter's explicit waiter selection mask.
+fn wait_on_futex(
+    kernel: &Kernel,
+    task: &Task,
+    uaddr: usize,
+    expected: u32,
+    deadline: Option<usize>,
+    bitset: u32,
+) -> Result<usize, &'static str> {
+    let futex = task.process.futex.clone();
+    match futex.wait_bitset(task.id(), uaddr, expected, deadline, bitset, || {
+        read_user_u32(kernel, task, uaddr)
+    }) {
+        Ok(()) => Ok(0),
+        Err("changed") => Err("eagain"),
+        Err(e) => Err(e),
     }
 }
 

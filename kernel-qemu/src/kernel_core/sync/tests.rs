@@ -83,6 +83,8 @@ pub fn run_all(pool: &FramePool) {
     futex_wait_returns_changed_without_queueing();
     futex_wait_propagates_word_read_fault();
     futex_wait_timeout_removes_published_waiter();
+    futex_bitset_masks_filter_without_consuming_quota();
+    futex_requeue_preserves_waiter_bitset();
     futex_wait_event_removes_published_waiter(pool);
     futex_wait_signal_removes_published_waiter(pool);
     futex_cmp_requeue_propagates_word_read_fault();
@@ -90,6 +92,7 @@ pub fn run_all(pool: &FramePool) {
     futex_cmp_requeue_wakes_moves_and_returns_affected();
     futex_requeue_skips_completed_waiters_when_moving();
     futex_syscall_uses_linux_commands_widths_and_atomic_wake_op(pool);
+    futex_bitset_syscalls_use_masks_and_absolute_timeouts(pool);
     futex_requeue_syscalls_reject_unmapped_destination(pool);
     pipe_uses_bounded_ring_buffer_and_reports_writable();
     pipe_nonblocking_small_write_is_atomic();
@@ -799,6 +802,62 @@ fn futex_wait_timeout_removes_published_waiter() {
     clear_wait_token_state();
 }
 
+// AGENT: masked wakeups skip nonintersecting waiters without consuming count,
+// while ordinary FUTEX_WAKE remains the match-any compatibility operation.
+#[cfg_attr(test, test)]
+fn futex_bitset_masks_filter_without_consuming_quota() {
+    reset_wait_token_state();
+
+    let futex = FutexBucket::new();
+    let addr = 0x6800;
+    let first = WaitToken::for_task(61);
+    let second = WaitToken::for_task(62);
+    let third = WaitToken::for_task(63);
+    futex.publish_waiter_bitset_for_test(addr, 0x1, first.clone());
+    futex.publish_waiter_bitset_for_test(addr, 0x2, second.clone());
+    futex.publish_waiter_bitset_for_test(addr, 0x3, third.clone());
+
+    assert_eq!(futex.wake_bitset(addr, 1, 0x2), 1);
+    assert!(!first.is_woken());
+    assert!(second.is_woken());
+    assert!(!third.is_woken());
+    assert_eq!(futex.pending_at(addr), 2);
+
+    assert_eq!(futex.wake_bitset(addr, usize::MAX, 0x4), 0);
+    assert_eq!(futex.pending_at(addr), 2);
+    assert_eq!(futex.wake(addr, 1), 1);
+    assert!(first.is_woken());
+    assert!(!third.is_woken());
+    assert_eq!(futex.wake_bitset(addr, 1, 0x1), 1);
+    assert!(third.is_woken());
+    assert_eq!(futex.pending_at(addr), 0);
+
+    clear_wait_token_state();
+}
+
+// AGENT: requeue changes only the futex address; the waiter's original bitset
+// must continue filtering WAKE_BITSET after it reaches the destination queue.
+#[cfg_attr(test, test)]
+fn futex_requeue_preserves_waiter_bitset() {
+    reset_wait_token_state();
+
+    let futex = FutexBucket::new();
+    let src = 0x6900;
+    let dst = 0x6A00;
+    let waiter = WaitToken::for_task(64);
+    futex.publish_waiter_bitset_for_test(src, 0x8, waiter.clone());
+
+    assert_eq!(futex.requeue(src, dst, 0, 1), 1);
+    assert_eq!(futex.pending_at(src), 0);
+    assert_eq!(futex.pending_at(dst), 1);
+    assert_eq!(futex.wake_bitset(dst, 1, 0x4), 0);
+    assert!(!waiter.is_woken());
+    assert_eq!(futex.wake_bitset(dst, 1, 0x8), 1);
+    assert!(waiter.is_woken());
+
+    clear_wait_token_state();
+}
+
 // AGENT: a real FUTEX_WAKE round trip must return success and leave no waiter,
 // even though the event producer currently also unlinks the selected entry.
 fn futex_wait_event_removes_published_waiter(pool: &FramePool) {
@@ -1129,10 +1188,12 @@ fn futex_requeue_skips_completed_waiters_when_moving() {
     assert!(stale.wake_timeout());
     waiters.push_back(FutexWaiter {
         addr: src,
+        bitset: u32::MAX,
         token: stale,
     });
     waiters.push_back(FutexWaiter {
         addr: src,
+        bitset: u32::MAX,
         token: live.clone(),
     });
 
@@ -1211,8 +1272,8 @@ fn futex_syscall_uses_linux_commands_widths_and_atomic_wake_op(pool: &FramePool)
     assert_eq!(task.process.futex.pending_at(dst), 1);
 
     assert_eq!(
-        kernel.dispatch_syscall(SYS_FUTEX, src, 9, 0, 0, dst, 0),
-        Err("enosys")
+        kernel.dispatch_syscall(SYS_FUTEX, src, 9, 0, 0, usize::MAX, 1),
+        Err("eagain")
     );
     assert_eq!(
         kernel.dispatch_syscall(SYS_FUTEX, src, 0x10, 0, 0, 0, 0),
@@ -1283,8 +1344,155 @@ fn futex_syscall_uses_linux_commands_widths_and_atomic_wake_op(pool: &FramePool)
     clear_wait_token_state();
 }
 
-// AGENT: REQUEUE and CMP_REQUEUE must resolve uaddr2 through the live Sv39 map,
-// not accept every aligned numeric address below USER_TOP as a valid futex.
+// AGENT: exercise WAIT_BITSET and WAKE_BITSET through the RV64 syscall ABI,
+// including zero-mask rejection, ignored arguments, absolute deadlines, and
+// the realtime modifier accepted only by the bitset wait command.
+#[cfg_attr(test, test)]
+fn futex_bitset_syscalls_use_masks_and_absolute_timeouts(pool: &FramePool) {
+    reset_wait_token_state();
+
+    const FUTEX_WAIT: usize = 0;
+    const FUTEX_WAIT_BITSET: usize = 9;
+    const FUTEX_WAKE_BITSET: usize = 10;
+    const FUTEX_PRIVATE_FLAG: usize = 0x80;
+    const FUTEX_CLOCK_REALTIME: usize = 0x100;
+
+    let kernel = Kernel::new(pool.clone());
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init task should be current");
+    let page = 0x4400_0000;
+    let uaddr = page;
+    let timeout = page + 2 * mem::size_of::<u64>();
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(page, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("bitset futex ABI page should map");
+        addr_space
+            .write_user_bytes(uaddr, &7u32.to_ne_bytes(), &kernel.pool)
+            .expect("bitset futex word should initialize");
+        addr_space
+            .write_user_bytes(timeout, &0i64.to_ne_bytes(), &kernel.pool)
+            .expect("absolute timeout seconds should initialize");
+        addr_space
+            .write_user_bytes(
+                timeout + mem::size_of::<i64>(),
+                &400_000_000i64.to_ne_bytes(),
+                &kernel.pool,
+            )
+            .expect("absolute timeout nanoseconds should initialize");
+    }
+
+    assert_eq!(
+        kernel.dispatch_syscall(
+            SYS_FUTEX,
+            uaddr,
+            FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG,
+            7,
+            timeout,
+            usize::MAX,
+            0,
+        ),
+        Err("einval")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall(
+            SYS_FUTEX,
+            uaddr,
+            FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG,
+            1,
+            usize::MAX,
+            usize::MAX,
+            0,
+        ),
+        Err("einval")
+    );
+
+    assert_eq!(
+        kernel.dispatch_syscall(
+            SYS_FUTEX,
+            uaddr,
+            FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG,
+            8,
+            0,
+            usize::MAX,
+            0x1,
+        ),
+        Err("eagain")
+    );
+
+    CLK.store(50, Ordering::Relaxed);
+    assert_eq!(
+        kernel.dispatch_syscall(
+            SYS_FUTEX,
+            uaddr,
+            FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG,
+            7,
+            timeout,
+            usize::MAX,
+            0x1,
+        ),
+        Err("timeout")
+    );
+    assert_eq!(task.process.futex.pending_at(uaddr), 0);
+    assert_eq!(
+        kernel.dispatch_syscall(
+            SYS_FUTEX,
+            uaddr,
+            FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME,
+            7,
+            timeout,
+            usize::MAX,
+            0x1,
+        ),
+        Err("timeout")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall(
+            SYS_FUTEX,
+            uaddr,
+            FUTEX_WAIT | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME,
+            7,
+            timeout,
+            0,
+            0,
+        ),
+        Err("enosys")
+    );
+
+    let first = WaitToken::for_task(65);
+    let second = WaitToken::for_task(66);
+    task.process
+        .futex
+        .publish_waiter_bitset_for_test(uaddr, 0x1, first.clone());
+    task.process
+        .futex
+        .publish_waiter_bitset_for_test(uaddr, 0x2, second.clone());
+    assert_eq!(
+        kernel.dispatch_syscall(
+            SYS_FUTEX,
+            uaddr,
+            FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG,
+            1,
+            usize::MAX,
+            usize::MAX,
+            0x2,
+        ),
+        Ok(1)
+    );
+    assert!(!first.is_woken());
+    assert!(second.is_woken());
+    assert_eq!(task.process.futex.wake(uaddr, 1), 1);
+    assert!(first.is_woken());
+
+    clear_wait_token_state();
+}
+
+// AGENT: shared REQUEUE commands resolve uaddr2 through the live Sv39 map,
+// private requeue keys do not, and WAIT_BITSET ignores its unused uaddr2 field.
 #[cfg_attr(test, test)]
 fn futex_requeue_syscalls_reject_unmapped_destination(pool: &FramePool) {
     reset_wait_token_state();
@@ -1317,7 +1525,7 @@ fn futex_requeue_syscalls_reject_unmapped_destination(pool: &FramePool) {
     );
     assert_eq!(
         kernel.dispatch_syscall(SYS_FUTEX, src, 9, 0, 0, unmapped_dst, 7),
-        Err("enosys")
+        Err("eagain")
     );
     // AGENT: private requeue keys do not need to resolve a VMA for uaddr2.
     assert_eq!(
