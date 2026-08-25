@@ -853,6 +853,33 @@ impl AddrSpace {
         Ok(usize::from_ne_bytes(bytes))
     }
 
+    // AGENT: read signed RV64 syscall-ABI fields without first interpreting
+    // their high bit as an enormous unsigned duration or offset.
+    pub fn read_user_i64(&mut self, addr: usize, pool: &FramePool) -> Result<i64, &'static str> {
+        let mut bytes = [0u8; mem::size_of::<i64>()];
+        self.read_user_bytes(addr, &mut bytes, pool)?;
+        Ok(i64::from_ne_bytes(bytes))
+    }
+
+    // AGENT: resolve write permission, lazy allocation, COW, and shared dirty
+    // state under the AddrSpace lock before issuing one hardware-atomic RMW on
+    // the translated four-byte futex word.
+    pub fn atomic_user_u32(
+        &mut self,
+        addr: usize,
+        op: UserAtomicU32Op,
+        pool: &FramePool,
+    ) -> Result<u32, &'static str> {
+        if addr % mem::size_of::<u32>() != 0 {
+            return Err("einval");
+        }
+        let paddr = self
+            .resolve_user_page(addr, UserPageAccess::Write, pool)
+            .map_err(|_| "efault")?
+            .paddr();
+        Ok(atomic_u32_at_phys(paddr, op))
+    }
+
     // AGENT: prepare one write chunk under the exclusive AddrSpace borrow,
     // resolving COW/shared dirty faults before checking the live Sv39 leaf.
     fn prepare_user_write_chunk(

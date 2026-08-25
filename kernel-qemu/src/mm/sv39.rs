@@ -1,5 +1,6 @@
 // AGENT: Minimal Sv39 page-table helpers used by the migrated AddrSpace layer.
 use super::*;
+use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 pub const PTE_V: usize = 1 << 0;
@@ -20,6 +21,17 @@ const SV39_PADDR_BITS: usize = 56;
 
 static DIRECT_MAP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+// AGENT: enumerate the five 32-bit atomic transformations required by the
+// FUTEX_WAKE_OP UAPI after syscall-level operand decoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserAtomicU32Op {
+    Swap(u32),
+    Add(u32),
+    Or(u32),
+    And(u32),
+    Xor(u32),
+}
+
 #[derive(Clone, Copy)]
 pub enum PageAccess {
     Read,
@@ -34,6 +46,55 @@ fn phys_access_addr(paddr: usize) -> usize {
     } else {
         paddr
     }
+}
+
+// AGENT: use RV64 A-extension word AMOs through the kernel physical/direct map
+// so a user thread on another hart cannot interleave a store between the old
+// value read and FUTEX_WAKE_OP's replacement value publication.
+pub(crate) fn atomic_u32_at_phys(paddr: usize, op: UserAtomicU32Op) -> u32 {
+    debug_assert_eq!(paddr % mem::size_of::<u32>(), 0);
+    let addr = phys_access_addr(paddr);
+    let old: usize;
+    unsafe {
+        match op {
+            UserAtomicU32Op::Swap(value) => asm!(
+                "amoswap.w.aqrl {old}, {value}, ({addr})",
+                old = lateout(reg) old,
+                value = in(reg) value as usize,
+                addr = in(reg) addr,
+                options(nostack),
+            ),
+            UserAtomicU32Op::Add(value) => asm!(
+                "amoadd.w.aqrl {old}, {value}, ({addr})",
+                old = lateout(reg) old,
+                value = in(reg) value as usize,
+                addr = in(reg) addr,
+                options(nostack),
+            ),
+            UserAtomicU32Op::Or(value) => asm!(
+                "amoor.w.aqrl {old}, {value}, ({addr})",
+                old = lateout(reg) old,
+                value = in(reg) value as usize,
+                addr = in(reg) addr,
+                options(nostack),
+            ),
+            UserAtomicU32Op::And(value) => asm!(
+                "amoand.w.aqrl {old}, {value}, ({addr})",
+                old = lateout(reg) old,
+                value = in(reg) value as usize,
+                addr = in(reg) addr,
+                options(nostack),
+            ),
+            UserAtomicU32Op::Xor(value) => asm!(
+                "amoxor.w.aqrl {old}, {value}, ({addr})",
+                old = lateout(reg) old,
+                value = in(reg) value as usize,
+                addr = in(reg) addr,
+                options(nostack),
+            ),
+        }
+    }
+    old as u32
 }
 
 // AGENT: expose the direct-map state so boot code can report the installed

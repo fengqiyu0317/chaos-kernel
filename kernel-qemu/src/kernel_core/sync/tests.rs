@@ -89,6 +89,7 @@ pub fn run_all(pool: &FramePool) {
     futex_cmp_requeue_mismatch_preserves_waiters();
     futex_cmp_requeue_wakes_moves_and_returns_affected();
     futex_requeue_skips_completed_waiters_when_moving();
+    futex_syscall_uses_linux_commands_widths_and_atomic_wake_op(pool);
     futex_requeue_syscalls_reject_unmapped_destination(pool);
     pipe_uses_bounded_ring_buffer_and_reports_writable();
     pipe_nonblocking_small_write_is_atomic();
@@ -1146,6 +1147,142 @@ fn futex_requeue_skips_completed_waiters_when_moving() {
     clear_wait_token_state();
 }
 
+// AGENT: exercise the RV64 futex ABI at the syscall boundary: command 4 is
+// CMP_REQUEUE, command 9 is not, register values truncate to u32, negative
+// timespec fields fail, requeue returns wake+move, and WAKE_OP commits one AMO.
+#[cfg_attr(test, test)]
+fn futex_syscall_uses_linux_commands_widths_and_atomic_wake_op(pool: &FramePool) {
+    reset_wait_token_state();
+
+    const FUTEX_PRIVATE_FLAG: usize = 0x80;
+    const FUTEX_CLOCK_REALTIME: usize = 0x100;
+    const FUTEX_OP_ADD: u32 = 1;
+    const FUTEX_OP_CMP_EQ: u32 = 0;
+
+    let kernel = Kernel::new(pool.clone());
+    kernel.proc_init();
+    let task = kernel.cur_task(0).expect("init task should be current");
+    let page = 0x4300_0000;
+    let src = page;
+    let dst = page + mem::size_of::<u32>();
+    let timeout = page + 4 * mem::size_of::<u32>();
+    {
+        let mut addr_space = task.process.addr_space.lock().unwrap();
+        addr_space
+            .map_region(
+                VmRegion::new(page, PAGE_SZ, VM_READ | VM_WRITE),
+                &kernel.pool,
+            )
+            .expect("futex ABI page should map");
+        addr_space
+            .write_user_bytes(src, &7u32.to_ne_bytes(), &kernel.pool)
+            .expect("source futex should initialize");
+        addr_space
+            .write_user_bytes(dst, &10u32.to_ne_bytes(), &kernel.pool)
+            .expect("target futex should initialize");
+        addr_space
+            .write_user_bytes(timeout, &(-1i64).to_ne_bytes(), &kernel.pool)
+            .expect("negative timeout seconds should initialize");
+        addr_space
+            .write_user_bytes(
+                timeout + mem::size_of::<i64>(),
+                &0i64.to_ne_bytes(),
+                &kernel.pool,
+            )
+            .expect("timeout nanoseconds should initialize");
+    }
+
+    let first = WaitToken::for_task(51);
+    let second = WaitToken::for_task(52);
+    task.process
+        .futex
+        .publish_waiter_for_test(src, first.clone());
+    task.process
+        .futex
+        .publish_waiter_for_test(src, second.clone());
+
+    assert_eq!(
+        kernel.dispatch_syscall(SYS_FUTEX, src, 4, 1, 1, dst, 7),
+        Ok(2)
+    );
+    assert!(first.is_woken());
+    assert!(!second.is_woken());
+    assert_eq!(task.process.futex.pending_at(src), 0);
+    assert_eq!(task.process.futex.pending_at(dst), 1);
+
+    assert_eq!(
+        kernel.dispatch_syscall(SYS_FUTEX, src, 9, 0, 0, dst, 0),
+        Err("enosys")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall(SYS_FUTEX, src, 0x10, 0, 0, 0, 0),
+        Err("enosys")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall(
+            SYS_FUTEX,
+            src,
+            FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME,
+            7,
+            timeout,
+            0,
+            0,
+        ),
+        Err("enosys")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall(SYS_FUTEX, src, FUTEX_PRIVATE_FLAG, 7, timeout, 0, 0,),
+        Err("einval")
+    );
+
+    let width_waiter = WaitToken::for_task(53);
+    task.process
+        .futex
+        .publish_waiter_for_test(src, width_waiter.clone());
+    assert_eq!(
+        kernel.dispatch_syscall(
+            SYS_FUTEX,
+            src,
+            FUTEX_PRIVATE_FLAG | 1,
+            1usize << 32,
+            0,
+            0,
+            0,
+        ),
+        Ok(0)
+    );
+    assert!(!width_waiter.is_woken());
+
+    let encoded = (FUTEX_OP_ADD << 28) | (FUTEX_OP_CMP_EQ << 24) | (3 << 12) | 10;
+    assert_eq!(
+        kernel.dispatch_syscall(
+            SYS_FUTEX,
+            src,
+            FUTEX_PRIVATE_FLAG | 5,
+            0,
+            0,
+            dst,
+            encoded as usize,
+        ),
+        Ok(0)
+    );
+    let mut updated = [0u8; mem::size_of::<u32>()];
+    task.process
+        .addr_space
+        .lock()
+        .unwrap()
+        .read_user_bytes(dst, &mut updated, &kernel.pool)
+        .expect("atomically updated futex should remain readable");
+    assert_eq!(u32::from_ne_bytes(updated), 13);
+
+    assert_eq!(task.process.futex.wake(src, usize::MAX), 1);
+    assert!(width_waiter.is_woken());
+    assert_eq!(task.process.futex.wake(dst, usize::MAX), 1);
+    assert!(second.is_woken());
+
+    clear_wait_token_state();
+}
+
 // AGENT: REQUEUE and CMP_REQUEUE must resolve uaddr2 through the live Sv39 map,
 // not accept every aligned numeric address below USER_TOP as a valid futex.
 #[cfg_attr(test, test)]
@@ -1175,8 +1312,17 @@ fn futex_requeue_syscalls_reject_unmapped_destination(pool: &FramePool) {
         Err("efault")
     );
     assert_eq!(
-        kernel.dispatch_syscall(SYS_FUTEX, src, 9, 0, 0, unmapped_dst, 7),
+        kernel.dispatch_syscall(SYS_FUTEX, src, 4, 0, 0, unmapped_dst, 7),
         Err("efault")
+    );
+    assert_eq!(
+        kernel.dispatch_syscall(SYS_FUTEX, src, 9, 0, 0, unmapped_dst, 7),
+        Err("enosys")
+    );
+    // AGENT: private requeue keys do not need to resolve a VMA for uaddr2.
+    assert_eq!(
+        kernel.dispatch_syscall(SYS_FUTEX, src, 3 | 0x80, 0, 0, unmapped_dst, 0),
+        Ok(0)
     );
 
     clear_wait_token_state();

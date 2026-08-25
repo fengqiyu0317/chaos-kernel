@@ -10,8 +10,8 @@ pub(super) struct FutexWaiter {
     pub(super) token: WaitToken,
 }
 
-// AGENT: keep wake and move counts separate because FUTEX_REQUEUE and
-// FUTEX_CMP_REQUEUE expose different return-value semantics.
+// AGENT: keep wake and move counts separate for queue bookkeeping while both
+// Linux requeue operations expose their sum as the successful syscall result.
 pub(super) struct FutexRequeueResult {
     pub(super) woken: usize,
     pub(super) moved: usize,
@@ -111,7 +111,7 @@ impl FutexBucket {
     // AGENT: place the unconditional requeue operation before its compare variant.
     pub fn requeue(&self, src: usize, dst: usize, wake_n: usize, move_n: usize) -> usize {
         let mut w = self.waiters.lock().unwrap();
-        Self::requeue_locked(&mut w, src, dst, wake_n, move_n).woken
+        Self::requeue_locked(&mut w, src, dst, wake_n, move_n).affected()
     }
 
     // AGENT: compare the source futex word through a caller-supplied reader
